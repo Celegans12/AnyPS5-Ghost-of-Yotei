@@ -3,6 +3,10 @@
 
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
+#if defined(ANYPS5_KYTY)
+#include <optional>
+#endif
+
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 struct ResourceSpecialization {
@@ -78,6 +82,18 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 bool ReadsStrideAtRunTime(const ResourcePlan& program, uint32_t index,
                           const ResourceSpecialization::Buffer& buffer);
 void ReadStridesAtRunTime(const ResourcePlan& program, ResourceSpecialization& specialization);
+#if defined(ANYPS5_KYTY)
+bool SharesEmptyBuffers();
+void ShareNullBufferVariants(const ResourcePlan& program, ResourceSpecialization& specialization,
+                             bool runtime_stride);
+uint32_t FormattedReadComponents(const ResourcePlan& program, uint32_t index);
+std::optional<uint32_t> EmptyBufferReadBits(const ResourceSpecialization::Buffer& buffer, uint32_t component);
+bool EmptyBufferServes(const ResourcePlan& program, const ResourceSnapshot& snapshot, uint32_t index,
+                       const ResourceSpecialization::Buffer& requested,
+                       const ResourceSpecialization::Buffer& candidate);
+bool EmptyBuffersServe(const ResourcePlan& program, const ResourceSnapshot& snapshot,
+                       const ResourceSpecialization& requested, const ResourceSpecialization& candidate);
+#endif
 bool SpecializeDirectResources(const ResourcePlan& program, ResourceSnapshot& snapshot,
                                ResourceSpecialization& specialization);
 

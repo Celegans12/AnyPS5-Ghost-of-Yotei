@@ -289,6 +289,7 @@ struct ShaderModule {
 	const ShaderRecompiler::IR::ResourcePlan*    plan = nullptr;
 #if defined(ANYPS5_KYTY)
 	mutable bool                                 pipeline_requested = false;
+	bool                                         shared_variant     = false;
 #endif
 };
 
@@ -471,6 +472,12 @@ private:
 		[[nodiscard]] bool Failed(const ShaderRecompiler::IR::ResourceSpecialization& candidate,
 		                          uint32_t push_data_cursor) const;
 		void               NoteFailed(uint32_t push_data_cursor);
+		ShaderModule*      ShareModule(const ShaderRecompiler::IR::ResourceSpecialization& requested,
+		                               const ShaderRecompiler::IR::ResourceSnapshot&       snapshot,
+		                               uint32_t push_data_cursor, bool calls);
+		void               PromoteEmptyBuffers(const ShaderRecompiler::IR::ResourceSnapshot& snapshot,
+		                                       ShaderRecompiler::IR::ResourceSpecialization& specialization,
+		                                       uint32_t push_data_cursor) const;
 #endif
 
 		[[nodiscard]] std::span<const uint32_t> FunctionCode() const;

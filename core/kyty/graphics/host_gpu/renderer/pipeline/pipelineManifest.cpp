@@ -2600,6 +2600,19 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 				return;
 			}
 		}
+#if defined(ANYPS5_KYTY)
+		const auto recorded = specialization;
+		ShaderRecompiler::IR::ShareNullBufferVariants(
+		    *plan, specialization, record.stage == ShaderType::Compute && RuntimeStride(key.hash));
+		if (specialization != recorded) {
+			LockPrograms();
+			compiled = FindCompiledModule(key, specialization, record.push_data_cursor);
+			UnlockPrograms();
+			if (compiled != nullptr) {
+				return;
+			}
+		}
+#endif
 		module          = BuildModule(key, options, std::move(translated), specialization, {},
 		                              record.push_data_cursor, spirv, plain_spirv);
 	});

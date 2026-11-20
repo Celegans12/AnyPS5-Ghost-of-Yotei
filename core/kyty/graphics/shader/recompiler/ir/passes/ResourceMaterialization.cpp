@@ -2290,6 +2290,114 @@ void ReadStridesAtRunTime(const ResourcePlan& program, ResourceSpecialization& s
 	}
 }
 
+#if defined(ANYPS5_KYTY)
+bool SharesEmptyBuffers() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_SHARE_EMPTY_BUFFERS");
+		return value == nullptr || std::string_view(value) != "0";
+	}();
+	return on;
+}
+
+static bool DirectBufferSlot(const ResourcePlan& program, uint32_t index,
+                             const ResourceSpecialization::Buffer& buffer) {
+	if (index >= program.info.buffers.size() || buffer.indirect_root != BufferResource::NoIndirectBuffer) {
+		return false;
+	}
+	const auto& base = program.info.buffers[index];
+	return base.source < program.descriptor_sources.size() &&
+	       !program.descriptor_sources[base.source].indirect_descriptor.has_value() &&
+	       base.indirect_root == BufferResource::NoIndirectBuffer && base.indirect_resources.empty();
+}
+
+static void ShareEmptyBuffer(const ResourcePlan& program, uint32_t index, bool runtime_stride,
+                             ResourceSpecialization::Buffer& buffer) {
+	if (!DirectBufferSlot(program, index, buffer)) return;
+	const bool vector = index < program.buffer_vector_access.size() && program.buffer_vector_access[index];
+	if (!vector) {
+		buffer.scalar_empty = false;
+	} else if (runtime_stride && !program.info.buffers[index].formatted) {
+		buffer.packed_stride   = RuntimeBufferStride;
+		buffer.zero_stride_oob = false;
+		buffer.scalar_empty    = false;
+	} else {
+		buffer.scalar_empty = true;
+	}
+}
+
+void ShareNullBufferVariants(const ResourcePlan& program, ResourceSpecialization& specialization,
+                             bool runtime_stride) {
+	if (!SharesEmptyBuffers()) return;
+	for (uint32_t i = 0; i < specialization.buffers.size(); i++) {
+		auto& buffer = specialization.buffers[i];
+		if (buffer.scalar_empty || (buffer.zero_stride_oob && buffer.packed_stride == 0u)) {
+			ShareEmptyBuffer(program, i, runtime_stride, buffer);
+		}
+	}
+}
+
+uint32_t FormattedReadComponents(const ResourcePlan& program, uint32_t index) {
+	uint32_t mask = 0;
+	for (const auto& memory: program.memory_info) {
+		if (memory.kind != ResourceKind::Buffer || memory.resource != index || !memory.formatted ||
+		    memory.typed) {
+			continue;
+		}
+		const auto count = std::min(memory.data_bits == 16u ? memory.component_count : memory.data_dwords, 4u);
+		mask |= (1u << count) - 1u;
+	}
+	return mask;
+}
+
+std::optional<uint32_t> EmptyBufferReadBits(const ResourceSpecialization::Buffer& buffer, uint32_t component) {
+	const auto selector = GetDstSel(buffer.descriptor_swizzle, component);
+	const auto format   = Format::GetFormatInfo(buffer.descriptor_format);
+	if (buffer.zero_stride_oob) {
+		return format.type != Format::ComponentType::Unknown && selector == 1u
+		           ? Format::FormattedConstantBits(format, Format::FormattedSourceKind::One)
+		           : 0u;
+	}
+	const auto source = Format::ResolveFormattedSource(format, selector);
+	if (source.kind == Format::FormattedSourceKind::Invalid) return std::nullopt;
+	return Format::FormattedConstantBits(format, source.kind);
+}
+
+bool EmptyBufferServes(const ResourcePlan& program, const ResourceSnapshot& snapshot, uint32_t index,
+                       const ResourceSpecialization::Buffer& requested,
+                       const ResourceSpecialization::Buffer& candidate) {
+	if (!SharesEmptyBuffers() || index >= snapshot.buffers.size() || snapshot.buffers[index].dword_count != 4u ||
+	    snapshot.buffers[index].dwords[2] != 0u ||
+	    !DirectBufferSlot(program, index, requested) || !DirectBufferSlot(program, index, candidate) ||
+	    requested.indirect_mapping_offset != candidate.indirect_mapping_offset ||
+	    requested.indirect_search_iterations != candidate.indirect_search_iterations) {
+		return false;
+	}
+	const auto components = FormattedReadComponents(program, index);
+	for (uint32_t component = 0; component < 4u; component++) {
+		if (((components >> component) & 1u) == 0u) continue;
+		const auto wanted = EmptyBufferReadBits(requested, component);
+		const auto served = EmptyBufferReadBits(candidate, component);
+		if (!wanted || !served || *wanted != *served) return false;
+	}
+	return true;
+}
+
+bool EmptyBuffersServe(const ResourcePlan& program, const ResourceSnapshot& snapshot,
+                       const ResourceSpecialization& requested, const ResourceSpecialization& candidate) {
+	if (requested.buffers.size() != candidate.buffers.size() || requested.images != candidate.images ||
+	    requested.samplers != candidate.samplers) {
+		return false;
+	}
+	bool served = false;
+	for (uint32_t i = 0; i < requested.buffers.size(); i++) {
+		if (requested.buffers[i] == candidate.buffers[i]) continue;
+		if (!EmptyBufferServes(program, snapshot, i, requested.buffers[i], candidate.buffers[i])) return false;
+		served = true;
+	}
+	return served;
+}
+#endif
+
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
 	t_record_blocks.clear();
@@ -2429,6 +2537,11 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		if (runtime.runtime_stride && ReadsStrideAtRunTime(program, i, buffer)) {
 			buffer.packed_stride |= RuntimeBufferStride;
 		}
+#if defined(ANYPS5_KYTY)
+		if (descriptor.NumRecords() == 0u && SharesEmptyBuffers()) {
+			ShareEmptyBuffer(program, i, runtime.runtime_stride, buffer);
+		}
+#endif
 	}
 	snapshot.images.resize(program.info.images.size());
 	specialization.images.resize(program.info.images.size());

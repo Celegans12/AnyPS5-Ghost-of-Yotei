@@ -1126,6 +1126,63 @@ void PipelineCache::Program::NoteFailed(uint32_t push_data_cursor) {
 	                           .push_data_cursor = push_data_cursor,
 	                           .function_code    = {code.begin(), code.end()}});
 }
+
+ShaderModule* PipelineCache::Program::ShareModule(const ShaderRecompiler::IR::ResourceSpecialization& requested,
+                                                  const ShaderRecompiler::IR::ResourceSnapshot&       snapshot,
+                                                  uint32_t push_data_cursor, bool calls) {
+	if (!ShaderRecompiler::IR::SharesEmptyBuffers()) return nullptr;
+	const auto code = FunctionCode();
+	for (const auto& candidate: modules) {
+		const auto& layout = candidate.info.bindings;
+		if (candidate.shared_variant ||
+		    layout.push_data_start_dword !=
+		        ShaderRecompiler::IR::PushData::StartFor(push_data_cursor, layout.ShaderDataDwords()) ||
+		    (calls && !std::ranges::equal(candidate.function_code, code)) ||
+		    !ShaderRecompiler::IR::EmptyBuffersServe(resource_plan, snapshot, requested, candidate.specialization)) {
+			continue;
+		}
+		auto& shared          = modules.emplace_back(candidate);
+		shared.specialization = requested;
+		shared.shared_variant = true;
+		static const bool logged = [] {
+			const char* value = std::getenv("KYTY_SHADER_VARIANT_LOG");
+			return value != nullptr && std::strcmp(value, "1") == 0;
+		}();
+		if (logged) {
+			PipelineCacheLog("[kyty-variant] share stage={} shader={:016x} module={:016x} @{}",
+			                 ShaderRecompiler::StageName(resource_plan.stage), resource_plan.shader_hash, shared.id,
+			                 std::chrono::steady_clock::now().time_since_epoch().count());
+		}
+		return &shared;
+	}
+	return nullptr;
+}
+
+void PipelineCache::Program::PromoteEmptyBuffers(const ShaderRecompiler::IR::ResourceSnapshot& snapshot,
+                                                 ShaderRecompiler::IR::ResourceSpecialization& specialization,
+                                                 uint32_t push_data_cursor) const {
+	if (!ShaderRecompiler::IR::SharesEmptyBuffers()) return;
+	auto promoted = specialization;
+	bool changed  = false;
+	for (const auto& module: modules) {
+		const auto& candidate = module.specialization.buffers;
+		if (module.shared_variant || candidate.size() != promoted.buffers.size()) continue;
+		for (uint32_t i = 0; i < candidate.size(); i++) {
+			const auto& form = candidate[i];
+			if (form.zero_stride_oob || form.scalar_empty || form == specialization.buffers[i] ||
+			    promoted.buffers[i] != specialization.buffers[i] ||
+			    !ShaderRecompiler::IR::EmptyBufferServes(resource_plan, snapshot, i, specialization.buffers[i],
+			                                             form)) {
+				continue;
+			}
+			promoted.buffers[i] = form;
+			changed             = true;
+		}
+	}
+	if (changed && !Failed(promoted, push_data_cursor)) {
+		specialization = std::move(promoted);
+	}
+}
 #endif
 
 bool PipelineCache::Program::RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime) {
@@ -1168,6 +1225,12 @@ ShaderModule* PipelineCache::Program::MatchModule(uint32_t push_data_cursor) {
 	}
 	const auto found = std::ranges::find_if(modules, matches);
 	if (found == modules.end()) {
+#if defined(ANYPS5_KYTY)
+		if (auto* shared = ShareModule(specialization, resources, push_data_cursor, HasCalls)) {
+			last = modules.size() - 1;
+			return shared;
+		}
+#endif
 		return nullptr;
 	}
 	last = static_cast<size_t>(found - modules.begin());
@@ -1445,8 +1508,18 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 #endif
 	if (m_queue_only) {
 		if (!m_in_flight.contains(m_lookup_key)) {
+#if defined(ANYPS5_KYTY)
+			std::optional<ShaderRecompiler::IR::ResourceSpecialization> promoted;
+			if (entry != m_program_cache.end()) {
+				promoted = entry->second.specialization;
+				entry->second.PromoteEmptyBuffers(entry->second.resources, *promoted, push_data_cursor);
+			}
+			QueueCompile(m_lookup_key, params, input_info, push_data_cursor,
+			             promoted ? &*promoted : nullptr, m_guest_traversal);
+#else
 			QueueCompile(m_lookup_key, params, input_info, push_data_cursor,
 			             entry != m_program_cache.end() ? &entry->second.specialization : nullptr, m_guest_traversal);
+#endif
 			m_queued = true;
 		}
 		return nullptr;
@@ -1520,6 +1593,9 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		}
 		if (failed) return skip_failure();
 	}
+#if defined(ANYPS5_KYTY)
+	entry->second.PromoteEmptyBuffers(entry->second.resources, entry->second.specialization, push_data_cursor);
+#endif
 	return bind(CompileModule(entry->second, entry->first, options, std::move(translated),
 	                          push_data_cursor, params.code));
 #if defined(ANYPS5_KYTY)
@@ -1633,6 +1709,9 @@ PipelineCache::~PipelineCache() {
 	}
 	for (const auto& program: m_program_cache | std::views::values) {
 		for (const auto& module: program.modules) {
+#if defined(ANYPS5_KYTY)
+			if (module.shared_variant) continue;
+#endif
 			DestroyModule(module);
 		}
 	}
@@ -2362,6 +2441,9 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 	                    ? modules.begin() + static_cast<std::ptrdiff_t>(last)
 	                    : std::ranges::find_if(modules, matches);
 #if defined(ANYPS5_KYTY)
+	if (module == modules.end() && program->ShareModule(specialization, resources, push_data_cursor, false)) {
+		module = modules.end() - 1;
+	}
 	if (module != modules.end() && module->info.info.uses_image_heap) {
 		ahead.reads.Fail();
 		return nullptr;
@@ -2375,9 +2457,13 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 		}
 #endif
 		if (!ahead.reads.MayHaveReadGpuWrites() && !t_ahead_unread_load) {
-			QueueCompile(key, params, input_info, push_data_cursor, &specialization);
 #if defined(ANYPS5_KYTY)
+			auto promoted = specialization;
+			program->PromoteEmptyBuffers(resources, promoted, push_data_cursor);
+			QueueCompile(key, params, input_info, push_data_cursor, &promoted);
 			t_ahead_missing = true;
+#else
+			QueueCompile(key, params, input_info, push_data_cursor, &specialization);
 #endif
 		}
 		ahead.reads.Fail();
@@ -2759,13 +2845,17 @@ const ShaderModule* PipelineCache::ChainModule(const ShaderParams& params, Input
 		}
 #endif
 		if (program != nullptr) {
-			const auto module = std::ranges::find_if(program->modules, [&](const ShaderModule& candidate) {
+			auto module = std::ranges::find_if(program->modules, [&](const ShaderModule& candidate) {
 				const auto& layout = candidate.info.bindings;
 				return layout.push_data_start_dword ==
 				           ShaderRecompiler::IR::PushData::StartFor(push_data_cursor, layout.ShaderDataDwords()) &&
 				       candidate.specialization == specialization;
 			});
 #if defined(ANYPS5_KYTY)
+			if (module == program->modules.end() && materialized &&
+			    program->ShareModule(specialization, resources, push_data_cursor, false)) {
+				module = program->modules.end() - 1;
+			}
 			if (module != program->modules.end() && module->info.info.uses_image_heap) {
 				UnlockPrograms();
 				return nullptr;
@@ -2782,6 +2872,11 @@ const ShaderModule* PipelineCache::ChainModule(const ShaderParams& params, Input
 			continue;
 		}
 		m_in_flight[key]++;
+#if defined(ANYPS5_KYTY)
+		if (program != nullptr && materialized) {
+			program->PromoteEmptyBuffers(resources, specialization, push_data_cursor);
+		}
+#endif
 		UnlockPrograms();
 		CompileJob job {.key = key, .params = params, .push_data_cursor = push_data_cursor};
 		if (materialized) {

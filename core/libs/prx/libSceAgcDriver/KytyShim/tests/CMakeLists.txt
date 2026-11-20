@@ -111,6 +111,20 @@ target_link_libraries(kyty_shim_occlusion_segments_tests PRIVATE Kyty::gpu)
 add_test(NAME kyty_shim_occlusion_segments COMMAND kyty_shim_occlusion_segments_tests)
 set_tests_properties(kyty_shim_occlusion_segments PROPERTIES TIMEOUT 20)
 
+add_test_executable(kyty_shim_empty_buffer_variants_tests ${CMAKE_CURRENT_SOURCE_DIR}/EmptyBufferVariants.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+target_include_directories(kyty_shim_empty_buffer_variants_tests PRIVATE ${LIBS_INCLUDE_DIR})
+configure_host_test_executable(kyty_shim_empty_buffer_variants_tests)
+if(MINGW)
+    target_link_libraries(kyty_shim_empty_buffer_variants_tests PRIVATE stdc++ gcc_eh)
+endif()
+target_link_libraries(kyty_shim_empty_buffer_variants_tests PRIVATE Kyty::gpu libkernel libc)
+add_test(NAME kyty_shim_empty_buffer_variants COMMAND kyty_shim_empty_buffer_variants_tests)
+set_tests_properties(kyty_shim_empty_buffer_variants PROPERTIES TIMEOUT 20
+        PASS_REGULAR_EXPRESSION "kyty_shim_empty_buffer_variants: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+add_test(NAME kyty_shim_empty_buffer_variants_off COMMAND kyty_shim_empty_buffer_variants_tests)
+set_tests_properties(kyty_shim_empty_buffer_variants_off PROPERTIES TIMEOUT 20 ENVIRONMENT "KYTY_SHARE_EMPTY_BUFFERS=0"
+        PASS_REGULAR_EXPRESSION "kyty_shim_empty_buffer_variants_off: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+
 add_test_executable(kyty_shim_merged_hull_tests ${CMAKE_CURRENT_SOURCE_DIR}/MergedHull.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
 target_include_directories(kyty_shim_merged_hull_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_include_directories(kyty_shim_merged_hull_tests SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/3rdparty/SPIRV-Tools/include)
@@ -194,3 +208,17 @@ add_dependencies(kyty_shim_buffer_null_range_tests agc_frame_replay)
 add_test(NAME kyty_shim_buffer_null_range COMMAND kyty_shim_buffer_null_range_tests $<TARGET_FILE:agc_frame_replay>)
 set_tests_properties(kyty_shim_buffer_null_range PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
         PASS_REGULAR_EXPRESSION "kyty_shim_buffer_null_range: ok")
+
+add_test_executable(kyty_shim_empty_buffer_replay_tests ${CMAKE_CURRENT_SOURCE_DIR}/EmptyBufferReplay.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../Execution/src/FrameCapture.cpp)
+target_include_directories(kyty_shim_empty_buffer_replay_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/3rdparty/zstd/lib)
+target_link_libraries(kyty_shim_empty_buffer_replay_tests PRIVATE libzstd_static)
+set_target_properties(kyty_shim_empty_buffer_replay_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_host_test_executable(kyty_shim_empty_buffer_replay_tests)
+add_dependencies(kyty_shim_empty_buffer_replay_tests agc_frame_replay)
+add_test(NAME kyty_shim_empty_buffer_replay COMMAND kyty_shim_empty_buffer_replay_tests $<TARGET_FILE:agc_frame_replay>)
+set_tests_properties(kyty_shim_empty_buffer_replay PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "kyty_shim_empty_buffer_replay: ok")
+add_test(NAME kyty_shim_empty_buffer_replay_off COMMAND kyty_shim_empty_buffer_replay_tests $<TARGET_FILE:agc_frame_replay>)
+set_tests_properties(kyty_shim_empty_buffer_replay_off PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+        ENVIRONMENT "KYTY_SHARE_EMPTY_BUFFERS=0" PASS_REGULAR_EXPRESSION "kyty_shim_empty_buffer_replay_off: ok")
