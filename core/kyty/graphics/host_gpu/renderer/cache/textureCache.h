@@ -210,11 +210,7 @@ private:
 		bool    bound_depth = false;
 	};
 
-	struct WriteBack {
-		GuestRange range;
-		uint64_t   tick;
-		bool       operator==(const WriteBack&) const = default;
-	};
+	struct WriteBack;
 
 	struct BucketEntry {
 		uint64_t address;
@@ -425,6 +421,7 @@ private:
 
 	[[nodiscard]] bool DownloadImageMemory(ImageId id);
 	[[nodiscard]] bool DownloadQueuedImages();
+	void               ProtectPendingImageWriteBacks(uint64_t address, uint64_t size);
 	void               ArmLazyReadback(Image& image);
 	void               DisarmLazyReadback(Image& image);
 	void               FlushLazyImages(std::span<const std::pair<ImageId, uint64_t>> images);
@@ -455,8 +452,8 @@ private:
 	RegisteredPageCounts                              m_registered_pages;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache KYTY_GUARDED_BY(m_lock);
 	std::unordered_set<ImageId>                       m_download_images KYTY_GUARDED_BY(m_lock);
-	std::mutex                                        m_write_back_mutex;
-	std::vector<WriteBack>                            m_write_backs;
+	Common::AnnotatedMutex                            m_write_back_mutex;
+	std::vector<std::shared_ptr<WriteBack>>           m_write_backs KYTY_GUARDED_BY(m_write_back_mutex);
 	std::unordered_set<uint64_t>                      m_readback_consumers;
 	std::atomic<uint32_t>                             m_lazy_images {0};
 	struct DiscardedTarget {

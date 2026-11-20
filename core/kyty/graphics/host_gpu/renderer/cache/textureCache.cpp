@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #if defined(ANYPS5_KYTY)
 #include "graphics/host_gpu/renderer/cache/compareWriteBack.h"
@@ -42,6 +43,15 @@
 #include <vulkan/vulkan_format_traits.hpp>
 
 namespace Libs::Graphics {
+
+struct TextureCache::WriteBack {
+	WriteBack(GuestRange range, uint64_t tick): range(range), tick(tick) {}
+
+	const GuestRange range;
+	const uint64_t tick;
+	Common::AnnotatedMutex publication_mutex;
+	RangeSet superseded KYTY_GUARDED_BY(publication_mutex);
+};
 
 namespace {
 
@@ -3256,40 +3266,51 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
-	const WriteBack write_back {range, m_scheduler.CurrentTick()};
+	auto write_back = std::make_shared<WriteBack>(range, m_scheduler.CurrentTick());
+	{
+		Common::ScopedLock write_back_lock {m_write_back_mutex};
+		m_write_backs.push_back(write_back);
+	}
 	if (m_readback_storage_images) {
-		{
-			std::scoped_lock write_back_lock {m_write_back_mutex};
-			m_write_backs.push_back(write_back);
-		}
 		m_page_manager.UpdatePageWatchers<true, true>(range.address, range.size);
 	}
 	m_scheduler.DeferPriorityOperation(
-	    [this, download = std::move(download), write_back, trapped = m_readback_storage_images
+	    [this, download = std::move(download), write_back = std::move(write_back),
+	     trapped = m_readback_storage_images
 #if defined(ANYPS5_KYTY)
 	     , snapshot = std::move(snapshot)
 #endif
 	] {
-		    download.buffer->Invalidate(download.offset, write_back.range.size);
+		    const auto range = write_back->range;
+		    download.buffer->Invalidate(download.offset, range.size);
+		    {
+			    Common::ScopedLock publication_lock {write_back->publication_mutex};
+			    uint64_t cursor = range.address;
+			    const auto publish_until = [&](uint64_t end) {
+				    if (end == cursor) {
+					    return;
+				    }
+				    const auto offset = cursor - range.address;
+				    const auto size = end - cursor;
 #if defined(ANYPS5_KYTY)
-		    if (snapshot) {
-			    WriteBackChanged(write_back.range.address, download.mapped, snapshot.Data(),
-			                     write_back.range.size);
-		    } else {
-			    LibKernel::Memory::WriteBacking(write_back.range.address, download.mapped,
-			                                    write_back.range.size);
-		    }
-#else
-		    LibKernel::Memory::WriteBacking(write_back.range.address, download.mapped,
-		                                    write_back.range.size);
+				    if (snapshot) {
+					    WriteBackChanged(cursor, download.mapped + offset, snapshot.Data() + offset, size);
+					    return;
+				    }
 #endif
-		    if (trapped) {
-			    m_page_manager.UpdatePageWatchers<false, true>(write_back.range.address,
-			                                                   write_back.range.size);
-			    std::scoped_lock write_back_lock {m_write_back_mutex};
-			    m_write_backs.erase(std::ranges::find_if(
-			        m_write_backs, [&](const WriteBack& pending) { return pending == write_back; }));
+				    LibKernel::Memory::WriteBacking(cursor, download.mapped + offset, size);
+			    };
+			    write_back->superseded.ForEach([&](uint64_t begin, uint64_t end) {
+				    publish_until(begin);
+				    cursor = end;
+			    });
+			    publish_until(range.End());
 		    }
+		    if (trapped) {
+			    m_page_manager.UpdatePageWatchers<false, true>(range.address, range.size);
+		    }
+		    Common::ScopedLock write_back_lock {m_write_back_mutex};
+		    std::erase(m_write_backs, write_back);
 	    },
 	    range.address, range.size);
 	return true;
@@ -3303,13 +3324,32 @@ uint64_t TextureCache::WriteBackTick(uint64_t address, uint64_t size) {
 	const auto end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);
 	uint64_t   tick  = 0;
 
-	std::scoped_lock write_back_lock {m_write_back_mutex};
+	Common::ScopedLock write_back_lock {m_write_back_mutex};
 	for (const auto& write_back: m_write_backs) {
-		if (write_back.range.address < end && begin < write_back.range.End()) {
-			tick = std::max(tick, write_back.tick);
+		if (write_back->range.address < end && begin < write_back->range.End()) {
+			tick = std::max(tick, write_back->tick);
 		}
 	}
 	return tick;
+}
+
+void TextureCache::ProtectPendingImageWriteBacks(uint64_t address, uint64_t size) {
+	std::vector<std::shared_ptr<WriteBack>> overlaps;
+	const auto end = address + size;
+	{
+		Common::ScopedLock write_back_lock {m_write_back_mutex};
+		for (const auto& write_back: m_write_backs) {
+			if (address < write_back->range.End() && write_back->range.address < end) {
+				overlaps.push_back(write_back);
+			}
+		}
+	}
+	for (const auto& write_back: overlaps) {
+		const auto first = std::max(address, write_back->range.address);
+		const auto last = std::min(end, write_back->range.End());
+		Common::ScopedLock publication_lock {write_back->publication_mutex};
+		write_back->superseded.Add(first, last - first);
+	}
 }
 
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {

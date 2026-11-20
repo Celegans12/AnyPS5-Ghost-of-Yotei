@@ -2074,6 +2074,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 
 	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
 	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
+	m_texture_cache.ProtectPendingImageWriteBacks(vaddr, size);
 	dst->Fill(dst_offset, size, value);
 }
 
@@ -2142,6 +2143,9 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	                                    : std::pair {&m_gds_buffer, src_vaddr};
 	auto [dst, dst_offset] = dst_memory ? ObtainBuffer(dst_vaddr, size, true, true, dst_id)
 	                                    : std::pair {&m_gds_buffer, dst_vaddr};
+	if (dst_memory) {
+		m_texture_cache.ProtectPendingImageWriteBacks(dst_vaddr, size);
+	}
 	dst->CopyFrom(command, *src, src_offset, dst_offset, size);
 }
 

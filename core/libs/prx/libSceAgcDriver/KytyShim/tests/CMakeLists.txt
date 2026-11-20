@@ -130,6 +130,17 @@ target_include_directories(kyty_shim_compare_write_back_tests PRIVATE ${CMAKE_SO
 add_test(NAME kyty_shim_compare_write_back COMMAND kyty_shim_compare_write_back_tests)
 set_tests_properties(kyty_shim_compare_write_back PROPERTIES TIMEOUT 20 PASS_REGULAR_EXPRESSION "kyty_shim_compare_write_back: ok")
 
+if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
+    target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/ImageWriteBackAlias.cpp)
+    add_test_executable(kyty_shim_image_write_back_alias_tests ${CMAKE_CURRENT_SOURCE_DIR}/ImageWriteBackAliasMain.cpp)
+    configure_host_test_executable(kyty_shim_image_write_back_alias_tests)
+    target_link_libraries(kyty_shim_image_write_back_alias_tests PRIVATE libSceAgcDriver libkernel libc)
+    add_test(NAME kyty_shim_image_write_back_alias COMMAND kyty_shim_image_write_back_alias_tests)
+    set_tests_properties(kyty_shim_image_write_back_alias PROPERTIES TIMEOUT 25 SKIP_RETURN_CODE 77
+            ENVIRONMENT "KYTY_GPU_PIPELINE=0;KYTY_WRITE_BACK_IMAGES=1;KYTY_COMPARE_WRITE_BACK=1"
+            PASS_REGULAR_EXPRESSION "kyty_shim_image_write_back_alias: ok" FAIL_REGULAR_EXPRESSION "FAILED")
+endif()
+
 if(WIN32)
     add_test_executable(kyty_shim_emutls_tests ${CMAKE_CURRENT_SOURCE_DIR}/EmuTlsThreadExit.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/EmuTls.cpp)
     set_target_properties(kyty_shim_emutls_tests PROPERTIES CXX_EXTENSIONS OFF)
