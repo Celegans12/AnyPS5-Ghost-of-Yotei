@@ -2,6 +2,7 @@
 #include "prx/libc/include/specifics/linux/GuestFaultCopy.hpp"
 
 #include <atomic>
+#include <cerrno>
 #include <csignal>
 #include <cstdlib>
 #include <sys/syscall.h>
@@ -114,7 +115,9 @@ void Chain(int signal, siginfo_t* info, void* context) {
 
 void OnCopyFault(int signal, siginfo_t* info, void* context) {
     if (GuestFaultCopy::Resume(info, context)) return;
+    const int savedErrno = errno;
     Chain(signal, info, context);
+    errno = savedErrno;
 }
 
 bool InstallOwned(unsigned slots) {

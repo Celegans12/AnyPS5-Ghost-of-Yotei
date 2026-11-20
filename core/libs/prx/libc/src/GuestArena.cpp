@@ -23,6 +23,7 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <system_error>
@@ -67,6 +68,7 @@ constexpr std::size_t ProtectedBuckets = ProtectedSpaceEnd >> ProtectedBucketShi
 std::array<std::atomic<std::atomic<std::uint64_t>*>, ProtectedBuckets> protectedPages{};
 std::atomic<bool> protectionsNoted{false};
 std::atomic<bool> protectedBeyondTable{false};
+std::atomic<bool> protectedUntracked{false};
 constinit thread_local std::atomic<unsigned> preparingHostWrite{0};
 
 class HostWritePreparation {
@@ -98,12 +100,40 @@ void forEachProtectedWord(std::uintptr_t first, std::uintptr_t last, TVisit visi
     }
 }
 
+constexpr std::size_t ProtectedBucketBytes = ProtectedBucketWords * sizeof(std::atomic<std::uint64_t>);
+
+std::atomic<std::uint64_t>* mapProtectedBucket() {
+#ifdef _WIN32
+    void* memory = VirtualAlloc(nullptr, ProtectedBucketBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    const int savedErrno = errno;
+    void* memory = mmap(nullptr, ProtectedBucketBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    errno = savedErrno;
+    if (memory == MAP_FAILED) memory = nullptr;
+#endif
+    if (memory == nullptr) return nullptr;
+    auto* words = static_cast<std::atomic<std::uint64_t>*>(memory);
+    std::uninitialized_value_construct_n(words, ProtectedBucketWords);
+    return words;
+}
+
+void unmapProtectedBucket(std::atomic<std::uint64_t>* words) {
+#ifdef _WIN32
+    VirtualFree(words, 0, MEM_RELEASE);
+#else
+    const int savedErrno = errno;
+    munmap(words, ProtectedBucketBytes);
+    errno = savedErrno;
+#endif
+}
+
 std::atomic<std::uint64_t>* protectedBucket(std::size_t bucket, bool create) {
     auto* words = protectedPages[bucket].load(std::memory_order_acquire);
     if (words != nullptr || !create) return words;
-    auto* created = new std::atomic<std::uint64_t>[ProtectedBucketWords]{};
+    auto* created = mapProtectedBucket();
+    if (created == nullptr) return nullptr;
     if (protectedPages[bucket].compare_exchange_strong(words, created, std::memory_order_acq_rel)) return created;
-    delete[] created;
+    unmapProtectedBucket(created);
     return words;
 }
 
@@ -118,7 +148,10 @@ void noteHostProtection(std::uintptr_t address, std::size_t bytes, bool writable
     const auto last = std::min<std::uintptr_t>(ProtectedSpaceEnd - 1, end);
     forEachProtectedWord(address, last, [writable](std::size_t bucket, std::size_t word, std::uint64_t mask) {
         auto* words = protectedBucket(bucket, !writable);
-        if (words == nullptr) return true;
+        if (words == nullptr) {
+            if (!writable) protectedUntracked.store(true, std::memory_order_seq_cst);
+            return true;
+        }
         if (writable) words[word].fetch_and(~mask, std::memory_order_release);
         else words[word].fetch_or(mask, std::memory_order_release);
         return true;
@@ -136,7 +169,7 @@ bool mayBeHostProtected(std::uintptr_t address, std::size_t bytes) {
     bool found = false;
     forEachProtectedWord(address, std::min<std::uintptr_t>(last, ProtectedSpaceEnd - 1), [&found](std::size_t bucket, std::size_t word, std::uint64_t mask) {
         const auto* words = protectedPages[bucket].load(std::memory_order_acquire);
-        if (words != nullptr && (words[word].load(std::memory_order_acquire) & mask) != 0) found = true;
+        if (words == nullptr ? protectedUntracked.load(std::memory_order_acquire) : (words[word].load(std::memory_order_acquire) & mask) != 0) found = true;
         return !found;
     });
     return found;
