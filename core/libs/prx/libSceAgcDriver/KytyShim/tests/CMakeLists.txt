@@ -601,6 +601,15 @@ add_test(NAME kyty_shim_cross_queue_recycled_label_own_tick
 set_tests_properties(kyty_shim_cross_queue_recycled_label_own_tick PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77
         LABELS "cross_queue_order;expected_failure" ENVIRONMENT "KYTY_LABELS_AFTER_DUMPS=0"
         PASS_REGULAR_EXPRESSION "kyty_shim_cross_queue_recycled_label: order broken: ")
+if(WIN32)
+    set_property(TEST kyty_shim_buffer_null_range kyty_shim_empty_buffer_replay kyty_shim_empty_buffer_replay_off
+            kyty_shim_generic_compute_replay kyty_shim_generic_compute_replay_wide kyty_shim_bda_submission_sync
+            kyty_shim_cross_queue_compute_waits_graphics_data kyty_shim_cross_queue_graphics_waits_compute_data
+            kyty_shim_cross_queue_dma_wait kyty_shim_cross_queue_compute_waits_graphics_clock
+            kyty_shim_cross_queue_graphics_waits_compute_clock kyty_shim_cross_queue_recycled_label
+            kyty_shim_cross_queue_early_label kyty_shim_cross_queue_recycled_label_own_tick
+            APPEND PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAgcDriver>")
+endif()
 endif()
 
 add_test_executable(kyty_shim_wave_split_written_reads_tests ${CMAKE_CURRENT_SOURCE_DIR}/WaveSplitWrittenReads.cpp
