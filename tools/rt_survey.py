@@ -1,5 +1,6 @@
 import argparse
 import datetime
+import ipaddress
 import json
 import os
 import platform
@@ -14,6 +15,9 @@ FORMAT = "rt-survey/1"
 CACHE_NAME = re.compile(r"^([A-Z]{4}[0-9]{5})(?:_([0-9A-Za-z.\-]+))?\.code$")
 PROBE_NAME = "kyty_rt_probe.exe" if os.name == "nt" else "kyty_rt_probe"
 IPV4 = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+IPV6 = re.compile(
+    r"(?<![\w:.])\[?((?:[0-9A-Fa-f:]*:(?:\d{1,3}\.){3}\d{1,3})|(?:[0-9A-Fa-f:]*:[0-9A-Fa-f:]*))(?:%[\w.-]+)?(?:\](?::\d+)?|(?![\w:]))"
+)
 HEX_RUN = re.compile(r"[0-9A-Fa-f]{5,}")
 CLASSES = ("native", "oracle", "lane", "empty", "emulated")
 DIAGNOSTICS = {
@@ -65,6 +69,20 @@ def identity():
     return {"home": str(Path.home()), "names": {name for name in names if len(name) >= 3}, "host": host if len(host) >= 3 else ""}
 
 
+def redact_ipv6(text):
+    def replace(match):
+        candidate = match.group(1)
+        if not re.search(r"[0-9A-Fa-f]", candidate) or candidate.count(":") < 2:
+            return match.group(0)
+        try:
+            ipaddress.IPv6Address(candidate)
+        except ValueError:
+            return match.group(0)
+        return "<ip>"
+
+    return IPV6.sub(replace, text)
+
+
 def clean_text(text, who=None, limit=200):
     if not isinstance(text, str):
         return None
@@ -77,6 +95,7 @@ def clean_text(text, who=None, limit=200):
         text = re.sub(r"(?<![\w-])" + re.escape(name) + r"(?![\w-])", "<user>", text, flags=re.IGNORECASE)
     if who["host"]:
         text = re.sub(r"(?<![\w-])" + re.escape(who["host"]) + r"(?![\w-])", "<host>", text, flags=re.IGNORECASE)
+    text = redact_ipv6(text)
     text = IPV4.sub("<ip>", text)
     text = re.sub(r"[A-Za-z]:[\\/][^\s]*|(?<![\w.])/[^\s]+", "<path>", text)
     return text[:limit]

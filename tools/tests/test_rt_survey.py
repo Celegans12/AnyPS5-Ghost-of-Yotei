@@ -35,7 +35,7 @@ if "--fail" in args:
 def value(name):
     return args[args.index(name) + 1] if name in args else "none"
 print("rt-survey 1 build=abc123def456+modified oracle=1 subgroup=%s lds_limit=%s" % (value("--subgroup"), value("--lds-limit")))
-print("note a note from the probe")
+print("note __NOTE__")
 for line in __ROWS__:
     print(line)
 print("summary records=9 manifest_modules=4 manifest_skipped=0 code_only=3 programs=5 intersections=24 missing_code=1 "
@@ -49,9 +49,9 @@ REPORT = {
 }
 
 
-def make_probe(directory, rows=ROWS):
+def make_probe(directory, rows=ROWS, note="a note from the probe"):
     script = directory / "fake_probe.py"
-    script.write_text(FAKE_PROBE.replace("__ROWS__", repr(rows)), encoding="utf-8")
+    script.write_text(FAKE_PROBE.replace("__ROWS__", repr(rows)).replace("__NOTE__", note), encoding="utf-8")
     if os.name == "nt":
         launcher = directory / "kyty_rt_probe.cmd"
         launcher.write_text(f'@"{sys.executable}" "{script}" %*\r\n', encoding="utf-8")
@@ -211,6 +211,22 @@ class SurveyTests(unittest.TestCase):
             self.assertNotIn("_PipelineCache", content)
             self.assertNotIn(".code", content)
 
+    def test_an_ipv6_address_in_a_note_is_written_to_neither_format(self):
+        address = "2001:db8:85a3::8a2e:370:7334"
+        note = f"peer [{address}]:8080 link fe80::1%eth0 kept C++20 shader:phase 00:11"
+        self.probe = make_probe(self.root, note=note)
+        code, output, error = self.run_main("--report", str(self.report))
+        self.assertEqual(code, 0, error)
+        written = (self.out / "rt-survey-PPSA00001-01.000.000.json").read_text(encoding="utf-8")
+        written += (self.out / "rt-survey-PPSA00001-01.000.000.txt").read_text(encoding="utf-8")
+        for text in (written, output):
+            self.assertNotIn("2001:db8", text)
+            self.assertNotIn("fe80", text)
+            self.assertNotIn("eth0", text)
+        document = json.loads((self.out / "rt-survey-PPSA00001-01.000.000.json").read_text(encoding="utf-8"))
+        self.assertEqual(document["notes"], ["peer <ip> link <ip> kept C++20 shader:phase 00:11"])
+        self.assertIn("peer <ip> link <ip> kept C++20 shader:phase 00:11", written)
+
     def test_host_settings_reach_the_probe(self):
         self.run_main("--report", str(self.report), "--subgroup", "64", "--lds-limit", "65536")
         document = json.loads((self.out / "rt-survey-PPSA00001-01.000.000.json").read_text(encoding="utf-8"))
@@ -329,6 +345,25 @@ class TextCleaningTests(unittest.TestCase):
         self.assertNotIn("ana/", text)
         self.assertNotIn("serverfestivo", text)
         self.assertNotIn("192.168", text)
+
+    def test_ipv6_addresses_are_replaced_in_every_written_form(self):
+        who = {"home": "/home/ana", "names": set(), "host": ""}
+        cases = {
+            "peer 2001:db8::1 up": "peer <ip> up",
+            "peer 2001:0db8:85a3:0000:0000:8a2e:0370:7334.": "peer <ip>.",
+            "bracketed [2001:db8::1]:8080 and [fe80::1]": "bracketed <ip> and <ip>",
+            "zone fe80::1%eth0 and fe80::a:b%12": "zone <ip> and <ip>",
+            "loopback ::1 and mapped ::ffff:192.168.1.20 and 64:ff9b::192.0.2.33": "loopback <ip> and mapped <ip> and <ip>",
+            "mixed 10.0.0.1 and 2001:db8::2": "mixed <ip> and <ip>",
+        }
+        for text, expected in cases.items():
+            self.assertEqual(rt_survey.clean_text(text, who), expected, text)
+
+    def test_text_that_only_looks_like_an_address_is_kept(self):
+        who = {"home": "/home/ana", "names": set(), "host": ""}
+        for text in ("C++20", "shader:phase", "00:11", "10:30:45", "12:34:56.789", "std::string", "Foo::Bar", "a:b", "ratio 1:2",
+                     "MAC aa:bb:cc:dd:ee:ff", "::", "hash=0x00112233aabbccdd", "driver 595.99.02", "RTX 4080: ok"):
+            self.assertEqual(rt_survey.clean_text(text, who), text)
 
     def test_stop_text_keeps_the_source_file_name_only(self):
         self.assertEqual(rt_survey.clean_stop("a_/x/y/File.cpp:12_b"), "a_File.cpp:12_b")
