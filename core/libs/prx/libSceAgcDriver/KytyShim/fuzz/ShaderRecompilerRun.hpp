@@ -71,8 +71,11 @@ inline void ReportInvalid(const std::string& message, std::span<const uint32_t> 
 	}
 }
 
-inline void Run(std::span<const uint32_t> code, uint8_t mode, uint8_t shape) {
+inline void Run(std::span<const uint32_t> original, uint8_t mode, uint8_t shape) {
 	static const auto profile = Profile();
+	std::vector<uint32_t> storage(original.begin(), original.end());
+	if (std::getenv("KYTY_FUZZ_PAD") != nullptr) storage.resize(original.size() + 16u, 0u);
+	const std::span<const uint32_t> code(storage.data(), original.size());
 	Recompiler::CompileOptions options;
 	options.shader_hash        = 0x1234567812345678ull;
 	options.dump_ir            = false;
