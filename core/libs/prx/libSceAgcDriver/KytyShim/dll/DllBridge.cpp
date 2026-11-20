@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/KytyShim/dll/Trampoline.hpp"
 #include "prx/libSceAgcDriver/KytyShim/include/KytyDll.h"
 
 #include "SceShaders.hpp"
@@ -111,7 +112,7 @@ KytyDllStatus Guard(Function&& function) noexcept {
     }
 }
 
-std::size_t TakeError(char* message, std::size_t capacity) {
+std::size_t TakeError(char* message, std::size_t capacity) noexcept {
     const auto bytes = t_error.size();
     if (message != nullptr && capacity != 0) std::memcpy(message, t_error.data(), std::min(bytes, capacity));
     return bytes;
@@ -249,6 +250,32 @@ struct FilterBridge {
     KernelFilter filter;
 };
 
+struct ViewObserver {
+    static constexpr const char* kName = "the memory view observer";
+};
+
+struct ProtectionObserver {
+    static constexpr const char* kName = "the memory protection observer";
+};
+
+struct GpuFaultHandler {
+    static constexpr const char* kName = "the GPU fault handler";
+};
+
+struct HostWriteFilter {
+    static constexpr const char* kName = "the host-write filter";
+};
+
+struct HostWritePreparer {
+    static constexpr const char* kName = "the host-write preparer";
+};
+
+struct ShutdownCallback {
+    static constexpr const char* kName = "a shutdown callback";
+};
+
+constexpr std::size_t kShutdownCallbacks = 8;
+
 KernelEvent ToOurs(const KytyDllKernelEvent& event) {
     KernelEvent ours;
     ours.ident = event.ident;
@@ -373,7 +400,7 @@ const KytyDllApi* MakeApi() {
                 bridge.filter.deleteEventFunc(eq, &event);
             });
         };
-        table.event_filter_release = [](KytyDllEventFilter* filter) { delete reinterpret_cast<FilterBridge*>(filter); };
+        table.event_filter_release = [](KytyDllEventFilter* filter) noexcept { delete reinterpret_cast<FilterBridge*>(filter); };
         return table;
     }();
     return &api;
@@ -382,6 +409,10 @@ const KytyDllApi* MakeApi() {
 }
 
 namespace KytyShim {
+
+std::FILE* TrampolineLog() noexcept {
+    return HostStandardErrorFile_nid_no_patch();
+}
 
 bool DllHostReportSetting() {
     bool enabled = false;
@@ -395,25 +426,33 @@ void DllReportHost(const void* properties, const void* driver, const void* memor
 
 }
 
-extern "C" KytyDllStatus KytyDllCreate(const KytyDllHost* host, const KytyDllApi** api) {
+extern "C" KytyDllStatus KytyDllCreate(const KytyDllHost* host, const KytyDllApi** api) noexcept {
     if (api == nullptr || !KytyDllHostMatches(host)) return KYTY_DLL_ABI_MISMATCH;
     g_host = host;
-    static std::once_flag view;
-    std::call_once(view, [] { Libs::LibKernel::Memory::Shim::EnableView(); });
-    *api = MakeApi();
-    static std::once_flag pgo;
-    std::call_once(pgo, [] { KytyShim::StartPgoWriter(); });
-    return KYTY_DLL_OK;
+    const auto status = Guard([&] {
+        static std::once_flag view;
+        std::call_once(view, [] { Libs::LibKernel::Memory::Shim::EnableView(); });
+        const auto* table = MakeApi();
+        static std::once_flag pgo;
+        std::call_once(pgo, [] { KytyShim::StartPgoWriter(); });
+        *api = table;
+    });
+    if (status != KYTY_DLL_OK) {
+        std::FILE* error = HostStandardErrorFile_nid_no_patch();
+        std::fprintf(error, "kyty_gpu: KytyDllCreate failed: %s\n", t_error.c_str());
+        std::fflush(error);
+    }
+    return status;
 }
 
 extern "C" {
 
 bool DirectMemoryEnableView_nid_no_patch(DirectMemoryViewObserver observer, std::uint8_t** view, std::size_t* guestBytes, std::size_t* viewBytes) {
-    return Host(__func__)->direct_memory_enable_view(observer, view, guestBytes, viewBytes);
+    return Host(__func__)->direct_memory_enable_view(KytyShim::Trampoline<ViewObserver, void(std::uintptr_t, std::size_t, std::uint64_t)>::Bind(observer), view, guestBytes, viewBytes);
 }
 
 void DirectMemoryWatchProtections_nid_no_patch(DirectMemoryProtectionObserver observer) {
-    Host(__func__)->direct_memory_watch_protections(observer);
+    Host(__func__)->direct_memory_watch_protections(KytyShim::Trampoline<ProtectionObserver, void(std::uintptr_t, std::size_t, int)>::Bind(observer));
 }
 
 std::size_t DirectMemorySize_nid_no_patch() {
@@ -461,15 +500,15 @@ void GuestArenaCloseHostWrite_nid_no_patch(void* pointer, std::size_t bytes, std
 }
 
 void GuestArenaSetGpuFaultHandler_nid_no_patch(bool (*handler)(void* exceptionPointers)) {
-    Host(__func__)->guest_arena_set_gpu_fault_handler(handler);
+    Host(__func__)->guest_arena_set_gpu_fault_handler(KytyShim::Trampoline<GpuFaultHandler, bool(void*)>::Bind(handler));
 }
 
 void GuestArenaSetHostWriteFilter_nid_no_patch(bool (*filter)(std::uintptr_t address, std::size_t bytes)) {
-    Host(__func__)->guest_arena_set_host_write_filter(filter);
+    Host(__func__)->guest_arena_set_host_write_filter(KytyShim::Trampoline<HostWriteFilter, bool(std::uintptr_t, std::size_t)>::Bind(filter));
 }
 
 void GuestArenaSetHostWritePreparer_nid_no_patch(bool (*prepare)(std::uintptr_t address, std::size_t bytes)) {
-    Host(__func__)->guest_arena_set_host_write_preparer(prepare);
+    Host(__func__)->guest_arena_set_host_write_preparer(KytyShim::Trampoline<HostWritePreparer, bool(std::uintptr_t, std::size_t)>::Bind(prepare));
 }
 
 void* GuestAllocationsBegin_nid_postfix() {
@@ -555,7 +594,7 @@ std::FILE* HostStandardErrorFile_nid_no_patch() {
 }
 
 void LibcRegisterShutdown_nid_postfix(void (*callback)()) {
-    Host(__func__)->register_shutdown(callback);
+    Host(__func__)->register_shutdown(KytyShim::TrampolinePool<ShutdownCallback, kShutdownCallbacks, void()>::Bind(callback));
 }
 
 std::stop_token LibcShutdownToken_nid_postfix() {
