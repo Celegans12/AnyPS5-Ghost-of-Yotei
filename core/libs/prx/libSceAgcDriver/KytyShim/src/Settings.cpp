@@ -100,6 +100,7 @@ constexpr std::string_view Names[] = {
     "KYTY_TABLE_RESOLUTIONS",
     "KYTY_TABLE_XPR",
     "KYTY_TESSELLATION",
+    "KYTY_TILED_DIAG",
     "KYTY_TILE_VIA_VRAM",
     "KYTY_TRINITY",
     "KYTY_URGENT_WRITEBACK_WAIT",

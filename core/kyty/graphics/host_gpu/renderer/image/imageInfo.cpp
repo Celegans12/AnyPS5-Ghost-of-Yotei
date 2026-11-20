@@ -2,6 +2,9 @@
 
 #include "common/alignment.h"
 
+#include <cstdlib>
+#include <string>
+
 namespace Libs::Graphics {
 namespace {
 
@@ -66,6 +69,14 @@ uint32_t CompactMipSize(const ImageInfo& info) {
 	           : 0;
 }
 
+}
+
+bool ImageLayoutDiagEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_TILED_DIAG");
+		return value != nullptr && value[0] != 0 && value[0] != '0';
+	}();
+	return enabled;
 }
 
 vk::Extent3D ImageInfo::MipExtent(uint32_t level) const {
@@ -192,11 +203,25 @@ void ImageInfo::UpdateSize() {
 		                                          resources.layers};
 #if defined(ANYPS5_KYTY)
 		if (!TileGetTiledTextureLayout(description, surface)) {
+			std::string origin_text;
+			if (const auto& origin = CurrentImageLayoutOrigin();
+			    ImageLayoutDiagEnabled() && origin.path != nullptr) {
+				origin_text = ::fmt::sprintf(
+				    "; [kyty-tiled-diag] path %s, shader 0x%016llx, source %u, descriptor index %u, "
+				    "first use pc 0x%x, indirect root %u, descriptor at 0x%llx, base 0x%llx, "
+				    "words %08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x",
+				    origin.path, static_cast<unsigned long long>(origin.shader), origin.source,
+				    origin.descriptor_index, origin.first_use_pc, origin.indirect_root,
+				    static_cast<unsigned long long>(origin.address),
+				    static_cast<unsigned long long>(data.address), origin.words[0], origin.words[1],
+				    origin.words[2], origin.words[3], origin.words[4], origin.words[5],
+				    origin.words[6], origin.words[7]);
+			}
 			EXIT("Not implemented (!TileGetTiledTextureLayout(description, surface)): format %u, tile mode %u, %s %ux%ux%u, "
-			     "%u levels, %u layers, %u samples, pitch %u, size 0x%llx",
+			     "%u levels, %u layers, %u samples, pitch %u, size 0x%llx%s",
 			     static_cast<uint32_t>(guest_format), static_cast<uint32_t>(tile_mode), IsVolume() ? "3D" : "2D",
 			     extent.width, extent.height, extent.depth, resources.levels, resources.layers, samples, pitch,
-			     static_cast<unsigned long long>(data.size));
+			     static_cast<unsigned long long>(data.size), origin_text.c_str());
 		}
 #else
 		EXIT_NOT_IMPLEMENTED(!TileGetTiledTextureLayout(description, surface));
