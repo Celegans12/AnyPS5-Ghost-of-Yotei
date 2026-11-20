@@ -333,7 +333,11 @@ Replay replay(const std::filesystem::path& tool, const std::filesystem::path& ro
     }
     command += " > " + quote(log) + " 2>&1";
     std::fflush(nullptr);
+#ifdef _WIN32
+    const int status = std::system(('"' + command + '"').c_str());
+#else
     const int status = std::system(command.c_str());
+#endif
     Replay result;
     result.log = readFile(log);
     result.output = items<std::uint32_t>(directory / "output", Regions[0].bytes);
