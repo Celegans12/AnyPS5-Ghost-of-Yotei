@@ -408,8 +408,11 @@ private:
 	void                  StencilPlanesChanged(const Image& depth);
 	void                  DiscardParkedImages(uint64_t address, uint64_t size);
 	[[nodiscard]] ImageId FindStencilCopy(ImageId association, const ImageInfo& requested);
+	[[nodiscard]] ImageId FindLiveStencilStorageCopy(ImageId association, const ImageDesc& desc);
 	void                  RefreshStencilCopy(ImageId copy_id);
+	[[nodiscard]] bool    WriteBackStencilCopy(ImageId copy_id);
 	void                  WriteBackStencilCopies(ImageId depth_id);
+	void                  FinishStencilStorageWrite(ImageId copy_id);
 	void                  ReleaseStencilCopies(ImageId association);
 	[[nodiscard]] bool CopyD16(Image& destination, Image& source);
 	[[nodiscard]] bool CopyDepthColor(Image& destination, Image& source);

@@ -1129,7 +1129,11 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	}
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
-	if (stencil_association) {
+	if (stencil_association && storage) {
+		id = texture_cache.FindLiveStencilStorageCopy(id, desc);
+		ValidateStorageColorView(texture_cache.GetImage(id).info.pixel_format, view_format,
+		                         descriptor.DstSelXYZW());
+	} else if (stencil_association) {
 		id    = image->depth_id;
 		image = &texture_cache.GetImage(id);
 	} else if (image->info.IsDepth()) {
@@ -2174,8 +2178,13 @@ void RenderExecutor::ResetBindings() {
 	if ((++m_table_stats.resets & 255u) == 0) {
 		LogTableSummary();
 	}
+	auto& texture_cache = m_context.GetTextureCache();
 	for (const auto id: m_bound_images) {
-		m_context.GetTextureCache().m_slot_images[id].binding = {};
+		auto& image = texture_cache.m_slot_images[id];
+		if (image.is_stencil_copy && image.binding.shader_write) {
+			texture_cache.FinishStencilStorageWrite(id);
+		}
+		image.binding = {};
 	}
 	m_bound_images.clear();
 	if (m_clear_texture_descs) {
