@@ -61,13 +61,15 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_
             PASS_REGULAR_EXPRESSION "kyty_shim_signal_safety: ok" FAIL_REGULAR_EXPRESSION "FAILED")
 endif()
 
-add_test_executable(kyty_shim_write_fault_tracking_tests ${CMAKE_CURRENT_SOURCE_DIR}/WriteFaultTracking.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
-target_include_directories(kyty_shim_write_fault_tracking_tests PRIVATE ${LIBS_INCLUDE_DIR})
-target_link_libraries(kyty_shim_write_fault_tracking_tests PRIVATE Kyty::gpu libkernel libc)
-add_test(NAME kyty_shim_write_fault_tracking COMMAND kyty_shim_write_fault_tracking_tests)
-set_tests_properties(kyty_shim_write_fault_tracking PROPERTIES TIMEOUT 60
-        PASS_REGULAR_EXPRESSION "kyty_shim_write_fault_tracking: ok" FAIL_REGULAR_EXPRESSION "FAILED")
+if(NOT WIN32)
+    add_test_executable(kyty_shim_write_fault_tracking_tests ${CMAKE_CURRENT_SOURCE_DIR}/WriteFaultTracking.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+    target_include_directories(kyty_shim_write_fault_tracking_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(kyty_shim_write_fault_tracking_tests PRIVATE Kyty::gpu libkernel libc)
+    add_test(NAME kyty_shim_write_fault_tracking COMMAND kyty_shim_write_fault_tracking_tests)
+    set_tests_properties(kyty_shim_write_fault_tracking PROPERTIES TIMEOUT 60
+            PASS_REGULAR_EXPRESSION "kyty_shim_write_fault_tracking: ok" FAIL_REGULAR_EXPRESSION "FAILED")
+endif()
 
 if(NOT WIN32)
     add_test_executable(kyty_shim_table_resolution_cache_tests ${CMAKE_CURRENT_SOURCE_DIR}/TableResolutionCache.cpp
