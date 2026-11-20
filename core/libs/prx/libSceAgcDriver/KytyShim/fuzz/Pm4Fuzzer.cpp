@@ -69,20 +69,18 @@ struct Op {
 	bool     exact;
 };
 
-constexpr std::array<Op, 22> Ops = {{
+constexpr std::array<Op, 20> Ops = {{
     {Pm4::IT_NOP, 1, false},
     {Pm4::IT_SET_BASE, 3, true},
     {Pm4::IT_CLEAR_STATE, 1, true},
     {Pm4::IT_INDEX_BUFFER_SIZE, 1, true},
-    {Pm4::IT_DISPATCH_DIRECT, 3, true},
-    {Pm4::IT_DISPATCH_INDIRECT, 2, true},
+    {Pm4::IT_DISPATCH_DIRECT, 4, true},
+    {Pm4::IT_DISPATCH_INDIRECT, 3, true},
     {Pm4::IT_DRAW_INDIRECT, 4, true},
     {Pm4::IT_DRAW_INDEX_INDIRECT, 4, true},
     {Pm4::IT_INDEX_BASE, 2, true},
     {Pm4::IT_DRAW_INDEX_2, 5, true},
     {Pm4::IT_INDEX_TYPE, 1, true},
-    {Pm4::IT_DRAW_INDIRECT_MULTI, 9, true},
-    {Pm4::IT_DRAW_INDEX_INDIRECT_MULTI, 9, true},
     {Pm4::IT_DRAW_INDEX_AUTO, 2, true},
     {Pm4::IT_NUM_INSTANCES, 1, true},
     {Pm4::IT_WRITE_DATA, 4, false},
@@ -130,10 +128,27 @@ void FixAddresses(uint32_t code, uint32_t* body, uint32_t length, uint32_t seed)
 			body[2] = (body[2] & ~0xfffffu) | (4u + (seed & 0x3fu));
 			break;
 		case Pm4::IT_DISPATCH_INDIRECT:
+			SetAddress(body, 0, seed, DataOffset, DataSpan);
+			body[2] = 1;
+			break;
+		case Pm4::IT_DISPATCH_DIRECT:
+			body[0] &= 3u;
+			body[1] &= 3u;
+			body[2] &= 3u;
+			body[3] = 1;
+			break;
 		case Pm4::IT_DRAW_INDIRECT:
 		case Pm4::IT_DRAW_INDEX_INDIRECT:
-		case Pm4::IT_DRAW_INDIRECT_MULTI:
-		case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI: body[0] &= 0x3fffu; break;
+			body[0] &= 0x3fffu;
+			body[3] = code == Pm4::IT_DRAW_INDEX_INDIRECT ? 0u : 2u;
+			break;
+		case Pm4::IT_CLEAR_STATE: body[0] &= 0xfu; break;
+		case Pm4::IT_DRAW_INDEX_AUTO: body[1] &= 0x22u; break;
+		case Pm4::IT_DRAW_INDEX_2:
+			SetAddress(body, 1, seed, DataOffset, DataSpan);
+			body[3] = body[3] % (body[0] + 1u);
+			body[4] &= 0x20u;
+			break;
 		case Pm4::IT_SET_SH_REG_INDIRECT:
 		case Pm4::IT_SET_CONTEXT_REG_INDIRECT: SetAddress(body, 1, seed, DataOffset, DataSpan); break;
 		default: break;
