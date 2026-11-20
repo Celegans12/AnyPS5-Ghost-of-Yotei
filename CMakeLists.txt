@@ -907,6 +907,9 @@ if(BUILD_TESTING)
         add_test(NAME ab_split_csv COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_ab_split_csv.py)
         set_tests_properties(ab_split_csv PROPERTIES TIMEOUT 20)
+        add_test(NAME kyty_ab_report COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_kyty_ab_report.py)
+        set_tests_properties(kyty_ab_report PROPERTIES TIMEOUT 20)
         add_test(NAME conventions_agent_files COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_conventions_agent_files.py)
         set_tests_properties(conventions_agent_files PROPERTIES TIMEOUT 20)
