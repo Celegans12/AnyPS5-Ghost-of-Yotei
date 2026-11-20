@@ -1063,8 +1063,10 @@ Dump parseDump(std::string_view text) {
 void writeDump(const Dump& dump) {
     auto* const pointer = reinterpret_cast<const std::byte*>(static_cast<std::uintptr_t>(dump.address));
     GuestArena::GuestArenaPrepareHostRead_nid_no_patch(pointer, static_cast<std::size_t>(dump.bytes));
+    std::vector<char> bytes(static_cast<std::size_t>(dump.bytes));
+    std::memcpy(bytes.data(), pointer, bytes.size());
     std::ofstream file(dump.path, std::ios::binary | std::ios::trunc);
-    file.write(reinterpret_cast<const char*>(pointer), static_cast<std::streamsize>(dump.bytes));
+    file.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
     if (!file.good()) throw std::runtime_error("frame replay: cannot write " + dump.path.string());
 }
 
