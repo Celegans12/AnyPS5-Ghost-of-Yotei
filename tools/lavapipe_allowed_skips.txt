@@ -1,0 +1,2 @@
+kyty_shim_rt_corpus	needs KYTY_RT_CORPUS_DIR, a private folder of ray tracing shaders that no CI job has
+kyty_shim_hot_write_watch	needs asynchronous userfaultfd write protection, which unprivileged containers refuse

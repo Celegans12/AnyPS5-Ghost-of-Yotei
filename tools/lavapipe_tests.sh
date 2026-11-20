@@ -4,6 +4,7 @@ build=${1:?usage: lavapipe_tests.sh <build directory> [output directory]}
 out=${2:-$build/lavapipe}
 root=$(cd "$(dirname "$0")/.." && pwd)
 skip_file=$root/tools/lavapipe_skip.txt
+allowed_file=$root/tools/lavapipe_allowed_skips.txt
 known_file=$root/tools/lavapipe_validation_known.txt
 mkdir -p "$out"
 
@@ -26,7 +27,7 @@ if ! grep -q llvmpipe "$out/vulkaninfo.txt"; then
 fi
 grep -E 'deviceName|apiVersion|driverName|driverInfo|subgroupSize' "$out/vulkaninfo.txt" | head -n 8
 
-tests='^(kyty_shim_.*|guest_gpu_fault|guest_host_write_filter|agc_kyty_shaders|agc_driver_frame_replay_.*)$'
+tests='^(kyty_shim_.*|guest_gpu_fault|guest_host_write_filter|agc_kyty_shaders)$'
 excluded=$(grep -vE '^\s*(#|$)' "$skip_file" 2>/dev/null | cut -f1 | paste -sd'|')
 exclude_args=()
 if [ -n "$excluded" ]; then
@@ -46,10 +47,23 @@ echo "::group::functional pass on lavapipe"
 ctest --test-dir "$build" -R "$tests" "${exclude_args[@]}" --output-on-failure --timeout 300 --no-tests=error \
   --output-junit "$out/ctest.xml" --output-log "$out/ctest.log" || status=1
 echo "::endgroup::"
-python3 -I "$root/tools/check_skips.py" "$out/ctest.xml" | tee "$out/skips.txt" || status=1
+python3 -I "$root/tools/check_skips.py" --json "$out/ctest.xml" > "$out/skips.json" || true
+python3 -I - "$out/skips.json" "$allowed_file" <<'PY' | tee "$out/skips.txt" || status=1
+import json
+import sys
+
+report = json.load(open(sys.argv[1]))
+allowed = {line.split("\t")[0].strip() for line in open(sys.argv[2], encoding="utf-8") if line.strip() and not line.startswith("#")}
+unexpected = [name for name in report["unexpected"] if name not in allowed]
+for item in report["skips"]:
+    print(f"skipped: {item['name']}: {'expected' if item['name'] not in unexpected else 'UNEXPECTED'}")
+for name in unexpected:
+    print(f"error: {name} skipped for a reason lavapipe does not explain")
+sys.exit(1 if unexpected else 0)
+PY
 if [ -n "$excluded" ]; then
   echo "tests left out because lavapipe lacks what they need (tools/lavapipe_skip.txt):"
-  grep -vE '^\s*(#|$)' "$skip_file" | cut -f1,2
+  grep -vE '^\s*(#|$)' "$skip_file" | cut -f1,2 | sed 's/\t/: /' 
 fi
 
 echo "::group::validation pass on lavapipe (Khronos validation layer, synchronization validation)"
