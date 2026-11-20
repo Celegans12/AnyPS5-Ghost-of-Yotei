@@ -11,6 +11,7 @@
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cstddef>
@@ -19,12 +20,15 @@
 #include <cstdlib>
 #include <deque>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#ifndef _WIN32
+#include <sys/mman.h>
+#endif
 #ifdef __APPLE__
-#include <new>
 #include <typeinfo>
 #endif
 #if defined(__linux__) && defined(__x86_64__)
@@ -59,9 +63,18 @@ struct ThreadSignals {
     std::atomic<std::uint32_t> blocked[4]{};
     std::atomic<std::uint64_t> holds[MaxSignal + 1]{};
 };
+ThreadSignals* NewThreadSignals() {
+#ifndef _WIN32
+    const int savedErrno = errno;
+    void* memory = mmap(nullptr, sizeof(ThreadSignals), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    errno = savedErrno;
+    if (memory != MAP_FAILED) return ::new (memory) ThreadSignals();
+#endif
+    return new ThreadSignals();
+}
 ThreadSignals& CurrentSignals() {
     thread_local ThreadSignals* signals = nullptr;
-    if (signals == nullptr) signals = new ThreadSignals();
+    if (signals == nullptr) signals = NewThreadSignals();
     return *signals;
 }
 constexpr std::uint64_t HoldCount = 0xffffffffu;
@@ -140,6 +153,18 @@ PendingSignals& Pending() {
     static auto* state = new PendingSignals();
     return *state;
 }
+const bool g_pendingReady = (Pending(), true);
+
+class PreservedErrno {
+public:
+    PreservedErrno() : saved(errno) {}
+    ~PreservedErrno() { errno = saved; }
+    PreservedErrno(const PreservedErrno&) = delete;
+    PreservedErrno& operator=(const PreservedErrno&) = delete;
+
+private:
+    int saved;
+};
 
 void MarkPending(int guest, std::int32_t code) {
     auto& pending = Pending();
@@ -218,6 +243,7 @@ int NativeSignal(int guest) {
 #if defined(__linux__) && defined(__x86_64__)
 std::atomic<void (*)(int)> faultDisposition{SIG_DFL};
 void HostFault(int native, siginfo_t* info, void* context) {
+    const PreservedErrno preserved;
     if (GuestCopyRecoverFault_nid_no_patch(native, info, context)) return;
     const auto disposition = faultDisposition.load(std::memory_order_acquire);
     if (disposition == SIG_IGN) {
@@ -286,6 +312,7 @@ void RunHandler(int guest, GuestHandler handler) {
     }
 }
 void Dispatch(int native) {
+    const PreservedErrno preserved;
     int guest = 0;
     for (int candidate : {2, 4, 6, 8, 11, 13, 15})
         if (NativeSignal(candidate) == native) { guest = candidate; break; }

@@ -1056,6 +1056,17 @@ void InstallFaultDelivery() {
 constexpr int HostSignal = SIGUSR1;
 constexpr std::size_t FxsaveRegisterBytes = 416;
 
+class PreservedErrno {
+public:
+    PreservedErrno() : saved(errno) {}
+    ~PreservedErrno() { errno = saved; }
+    PreservedErrno(const PreservedErrno&) = delete;
+    PreservedErrno& operator=(const PreservedErrno&) = delete;
+
+private:
+    int saved;
+};
+
 #ifdef __APPLE__
 using HostFloatState = decltype(std::declval<mcontext_t>()->__fs);
 
@@ -1433,6 +1444,7 @@ void StartRetries() {
 #endif
 
 void Deliver(int signum, siginfo_t*, void* context) {
+    const PreservedErrno preserved;
 #ifdef __linux__
     auto* const self = CurrentGuestThreadForDelivery();
     if (!Outstanding(self)) return;
@@ -1546,6 +1558,7 @@ void ChainFault(int hostSignal, siginfo_t* info, void* context) {
 }
 
 void DeliverFault(int hostSignal, siginfo_t* info, void* context) {
+    const PreservedErrno preserved;
     if (GuestCopyRecoverFault_nid_no_patch(hostSignal, info, context)) return;
     auto& host = static_cast<ucontext_t*>(context)->uc_mcontext;
     Fault fault{};
@@ -1710,6 +1723,7 @@ void RunAtReturn(ReturnFrame& frame, unsigned char* fx) {
 }
 
 extern "C" [[gnu::visibility("hidden"), gnu::used]] void Aps5ReturnDelivery(ReturnFrame* frame, unsigned char* fx) {
+    const PreservedErrno preserved;
     sigset_t blocked;
     sigset_t previous;
     sigemptyset(&blocked);
