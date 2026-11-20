@@ -104,6 +104,7 @@ struct WriteBlockStats {
 
 WriteBlockStats g_write_block_stats;
 
+
 struct ReadbackReplay {
 	bool     allowed   = false;
 	bool     published = false;
@@ -360,6 +361,22 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	return true;
 }
 
+static bool WriteFaultBlocks() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_WRITE_FAULT_BLOCKS");
+		return value == nullptr || value[0] != '0';
+	}();
+	return on;
+}
+
+static bool WriteFaultFastPath() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_WRITE_FAULT_FAST_PATH");
+		return value == nullptr || value[0] != '0';
+	}();
+	return on;
+}
+
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                          PageManager& page_manager, TextureCache& texture_cache, RenderContext* resources)
     : m_graphics(graphics), m_scheduler(scheduler), m_resources(resources),
@@ -373,6 +390,8 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache) {
+	(void)WriteFaultBlocks();
+	(void)WriteFaultFastPath();
 	if (InPlaceMemory::Requested()) {
 		m_in_place = std::make_unique<InPlaceMemory>();
 	}
@@ -494,22 +513,6 @@ void BufferCache::InvalidateUnlessGpuModified(uint64_t vaddr, uint64_t size) noe
 	if (GuestRange {vaddr, size}.Valid()) {
 		m_memory_tracker.InvalidateRegion(vaddr, size, [] {});
 	}
-}
-
-static bool WriteFaultBlocks() {
-	static const bool on = [] {
-		const char* value = std::getenv("KYTY_WRITE_FAULT_BLOCKS");
-		return value == nullptr || value[0] != '0';
-	}();
-	return on;
-}
-
-static bool WriteFaultFastPath() {
-	static const bool on = [] {
-		const char* value = std::getenv("KYTY_WRITE_FAULT_FAST_PATH");
-		return value == nullptr || value[0] != '0';
-	}();
-	return on;
 }
 
 BufferCache::WriteFaultOwner BufferCache::InvalidateGuestWriteFault(uint64_t vaddr) {

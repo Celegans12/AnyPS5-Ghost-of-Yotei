@@ -1,3 +1,5 @@
+#include "graphics/host_gpu/bdaDirtyRegions.h"
+#include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionManager.h"
 
@@ -13,10 +15,12 @@ namespace {
 
 using Libs::Graphics::CpuWriteConsumer;
 using Libs::Graphics::DirtySource;
+using Libs::Graphics::MemoryTracker;
 using Libs::Graphics::PageManager;
 using Libs::Graphics::RegionManager;
 using Libs::Graphics::SpinLockClass;
 using Libs::Graphics::TRACKER_PAGE_SIZE;
+using Libs::Graphics::TRACKER_REGION_SIZE;
 using Libs::Graphics::TrackingSpinLock;
 using namespace std::chrono_literals;
 
@@ -137,6 +141,23 @@ void ConcurrentFaultsOnOpenPagesTakeNoLock(RegionManager& region) {
 	Check(TrackingSpinLock::TakeContention(SpinLockClass::Tracker).waits == 0, "concurrent: the region lock was contended");
 }
 
+void OpenPageFaultStillSignalsTheWrite(PageManager& pages) {
+	namespace Bda = Libs::Graphics::BdaDirtyRegions;
+	MemoryTracker  tracker(pages);
+	const uint64_t vaddr = RegionBase + 64 * TRACKER_REGION_SIZE + 3 * TRACKER_PAGE_SIZE;
+	const uint64_t index = vaddr / TRACKER_REGION_SIZE;
+	const uint64_t bit   = uint64_t {1} << (index % 64);
+	Check(tracker.IsRegionCpuModified(vaddr, TRACKER_PAGE_SIZE), "signal: a fresh region is not written by the CPU");
+	Bda::g_pending[index / 64].fetch_and(~bit);
+	const auto region = tracker.RegionCpuDirtyEpoch(index);
+	const auto global = RegionManager::CpuDirtyEpoch();
+	bool       gpu    = true;
+	Check(tracker.WriteFaultFindsOpen(vaddr, Block, false, TRACKER_PAGE_SIZE, &gpu), "signal: the open page took the lock");
+	Check(tracker.RegionCpuDirtyEpoch(index) > region, "signal: the region CPU write epoch did not move");
+	Check(RegionManager::CpuDirtyEpoch() > global, "signal: the global CPU write epoch did not move");
+	Check((Bda::g_pending[index / 64].load() & bit) != 0, "signal: the region was not marked for device address reads");
+}
+
 }
 
 int main() {
@@ -147,6 +168,7 @@ int main() {
 	DirtyPagesNeedNoLockedWork(region);
 	PagesInPlaceAreNeverTracked(region);
 	ConcurrentFaultsOnOpenPagesTakeNoLock(region);
+	OpenPageFaultStillSignalsTheWrite(pages);
 	if (g_failures != 0) {
 		std::fprintf(stderr, "kyty_shim_write_fault_tracking: %d failure(s)\n", g_failures);
 		return 1;

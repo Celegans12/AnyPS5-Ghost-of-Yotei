@@ -130,15 +130,21 @@ public:
 	}
 
 	[[nodiscard]] bool WriteFaultFindsOpen(uint64_t vaddr, uint64_t block_size, bool open_block, uint64_t mark_size,
-	                                       bool* gpu) const {
+	                                       bool* gpu) {
 		*gpu             = false;
 		const auto index = vaddr / TRACKER_REGION_SIZE;
 		if (index >= REGION_COUNT) {
 			return false;
 		}
-		const auto* manager = m_regions[index].load(std::memory_order_acquire);
-		return manager == nullptr ||
-		       manager->WriteFaultFindsOpen(vaddr % TRACKER_REGION_SIZE, block_size, open_block, mark_size, gpu);
+		auto* manager = m_regions[index].load(std::memory_order_acquire);
+		if (manager == nullptr) {
+			return true;
+		}
+		if (!manager->WriteFaultFindsOpen(vaddr % TRACKER_REGION_SIZE, block_size, open_block, mark_size, gpu)) {
+			return false;
+		}
+		manager->NoteCpuWriteOnOpenPage();
+		return true;
 	}
 
 	uint64_t SetInPlace(uint64_t vaddr, uint64_t size) {

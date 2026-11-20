@@ -313,6 +313,12 @@ public:
 		return closed.None();
 	}
 
+	void NoteCpuWriteOnOpenPage() noexcept {
+		m_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
+		s_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
+		BdaDirtyRegions::Mark(m_cpu_addr / TRACKER_REGION_SIZE);
+	}
+
 	[[nodiscard]] static uint64_t TakeOpenedUploadBytes() noexcept {
 		return s_opened_upload_bytes.exchange(0, std::memory_order_relaxed);
 	}
