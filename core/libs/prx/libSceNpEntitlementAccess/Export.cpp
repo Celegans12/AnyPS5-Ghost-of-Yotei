@@ -73,7 +73,16 @@ std::string EntitlementsName() {
     return "anyps5-entitlements.ini";
 }
 
-void ReportUnlisted(const std::string& label) {
+bool GrantsUnlisted() {
+#if defined(ANYPS5_KYTY)
+    static const bool grants = !AnyPS5::Entitlements::HasExplicitList();
+    return grants;
+#else
+    return false;
+#endif
+}
+
+void ReportQuery(const std::string& label, bool granted) {
     constexpr std::size_t reportLimit = 64;
     static std::mutex reportMutex;
     static std::set<std::string> reported;
@@ -82,10 +91,12 @@ void ReportUnlisted(const std::string& label) {
     if (reported.contains(label)) return;
     if (reported.size() < reportLimit) {
         reported.insert(label);
-        std::fprintf(stderr, "[entitlements] the title asked for the add-on %s, which %s does not list, so it is reported as not installed\n", PrintableLabel(label).c_str(), EntitlementsName().c_str());
+        if (granted) std::fprintf(stderr, "[entitlements] the title asked for the add-on %s; no anyps5-entitlements.ini lists the add-ons you own, so it is reported as installed (create the file to list them, empty to refuse them all)\n", PrintableLabel(label).c_str());
+        else std::fprintf(stderr, "[entitlements] the title asked for the add-on %s, which %s does not list, so it is reported as not installed\n", PrintableLabel(label).c_str(), EntitlementsName().c_str());
     } else if (!capped) {
         capped = true;
-        std::fprintf(stderr, "[entitlements] the title asked for more than %zu add-ons that %s does not list; further ones are reported as not installed without a line\n", reportLimit, EntitlementsName().c_str());
+        if (granted) std::fprintf(stderr, "[entitlements] the title asked for more than %zu add-ons; further ones are reported as installed without a line\n", reportLimit);
+        else std::fprintf(stderr, "[entitlements] the title asked for more than %zu add-ons that %s does not list; further ones are reported as not installed without a line\n", reportLimit, EntitlementsName().c_str());
     }
 }
 
@@ -105,7 +116,17 @@ int APS5_VABI sceNpEntitlementAccessGetAddcontEntitlementInfo(uint32_t service_l
             return 0;
         }
     }
-    ReportUnlisted(std::string(label.data, strnlen(label.data, sizeof(label.data))));
+    const std::string requested(label.data, strnlen(label.data, sizeof(label.data)));
+    if (!requested.empty() && GrantsUnlisted()) {
+        NpEntitlementAccessAddcontEntitlementInfo granted{};
+        std::memcpy(granted.entitlement_label.data, requested.data(), requested.size());
+        granted.package_type = 3;
+        granted.download_status = 4;
+        ReportQuery(requested, true);
+        if (!CopyGuestOutPreservingErrno_nid_no_patch(info, &granted, sizeof(granted))) return SCE_NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
+        return 0;
+    }
+    ReportQuery(requested, false);
     return SCE_NP_ENTITLEMENT_ACCESS_ERROR_NOT_FOUND;
 }
 

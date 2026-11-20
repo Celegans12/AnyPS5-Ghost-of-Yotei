@@ -46,6 +46,12 @@ inline std::filesystem::path EntitlementsPath() {
 #endif
 }
 
+inline bool HasExplicitList() {
+    if (const auto* configured = ConfiguredEntitlements(); configured != nullptr && configured[0] != 0) return true;
+    std::error_code error;
+    return std::filesystem::exists(EntitlementsPath(), error);
+}
+
 struct ParsedEntry {
     std::string label;
     std::string target;

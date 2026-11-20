@@ -95,10 +95,85 @@ static void SetEntitlements(const std::filesystem::path& file) {
 #endif
 }
 
+static void ClearEntitlements() {
+#ifdef _WIN32
+    Require(_wputenv_s(L"ANYPS5_ENTITLEMENTS", L"") == 0);
+#else
+    Require(::unsetenv("ANYPS5_ENTITLEMENTS") == 0);
+#endif
+}
+
+static void QueryGrantedTwice() {
+    NpEntitlementAccessAddcontEntitlementInfo info{};
+    NpUnifiedEntitlementLabel label{};
+    std::memcpy(label.data, "GRANTEDADDON", 12);
+    Require(sceNpEntitlementAccessGetAddcontEntitlementInfo(0, &label, &info) == 0);
+    Require(sceNpEntitlementAccessGetAddcontEntitlementInfo(0, &label, &info) == 0);
+}
+
+static int RunDefault() {
+    ClearEntitlements();
+    NpEntitlementAccessAddcontEntitlementInfo info{};
+    NpUnifiedEntitlementLabel label{};
+    std::memcpy(label.data, "OTHERADDON", 10);
+    Require(sceNpEntitlementAccessGetAddcontEntitlementInfo(0, &label, &info) == 0);
+    Require(std::strcmp(info.entitlement_label.data, "OTHERADDON") == 0 && info.package_type == 3 && info.download_status == 4);
+    NpUnifiedEntitlementLabel sixteen{};
+    std::memcpy(sixteen.data, "SIXTEENCHARLABEL", 16);
+    NpEntitlementAccessAddcontEntitlementInfo sixteenInfo{};
+    Require(sceNpEntitlementAccessGetAddcontEntitlementInfo(0, &sixteen, &sixteenInfo) == 0);
+    Require(std::memcmp(sixteenInfo.entitlement_label.data, "SIXTEENCHARLABEL", 16) == 0);
+    NpEntitlementAccessAddcontEntitlementInfo individual{};
+    Require(sceNpEntitlementAccessGetAddcontEntitlementInfoIndividual(1, 0, &label, &individual) == 0);
+    Require(std::memcmp(&individual, &info, sizeof(info)) == 0);
+    Require(sceNpEntitlementAccessGetAddcontEntitlementInfoIndividual(-1, 0, &label, &individual) == static_cast<int>(0x80558003));
+    NpUnifiedEntitlementLabel empty{};
+    NpEntitlementAccessAddcontEntitlementInfo untouched{};
+    std::memset(&untouched, 0x5a, sizeof(untouched));
+    const auto original = untouched;
+    Require(sceNpEntitlementAccessGetAddcontEntitlementInfo(0, &empty, &untouched) == static_cast<int>(0x80558007));
+    Require(std::memcmp(&untouched, &original, sizeof(original)) == 0);
+    Require(sceNpEntitlementAccessGetAddcontEntitlementInfo(0, nullptr, &info) == static_cast<int>(0x80558003));
+    Require(sceNpEntitlementAccessGetAddcontEntitlementInfo(0, &label, nullptr) == static_cast<int>(0x80558003));
+    errno = 71;
+    Require(sceNpEntitlementAccessGetAddcontEntitlementInfo(0, &label, reinterpret_cast<NpEntitlementAccessAddcontEntitlementInfo*>(0x10)) == static_cast<int>(0x80558003));
+    Require(errno == 71);
+    std::uint32_t hits = 7;
+    Require(sceNpEntitlementAccessGetAddcontEntitlementInfoList(0, nullptr, 0, &hits) == 0 && hits == 0);
+    const auto log = CaptureStderr(QueryGrantedTwice);
+    Require(Occurrences(log, "[entitlements] the title asked for the add-on GRANTEDADDON; ") == 1);
+    Require(log.find("reported as installed") != std::string::npos);
+    Require(Occurrences(log, "[entitlements]") == 1);
+    std::puts("Guest entitlements granted every add-on without a list");
+    return 0;
+}
+
+static int RunRefused(const std::filesystem::path& root, const std::filesystem::path& directory, const std::filesystem::path& file) {
+    std::filesystem::create_directories(directory);
+    {
+        std::ofstream ini(file, std::ios::binary);
+        ini << "# no add-on owned\n";
+        Require(static_cast<bool>(ini));
+    }
+    SetEntitlements(file);
+    NpEntitlementAccessAddcontEntitlementInfo info{};
+    NpUnifiedEntitlementLabel label{};
+    std::memcpy(label.data, "OTHERADDON", 10);
+    Require(sceNpEntitlementAccessGetAddcontEntitlementInfo(0, &label, &info) == static_cast<int>(0x80558007));
+    Require(sceNpEntitlementAccessGetAddcontEntitlementInfoIndividual(1, 0, &label, &info) == static_cast<int>(0x80558007));
+    std::uint32_t hits = 7;
+    Require(sceNpEntitlementAccessGetAddcontEntitlementInfoList(0, nullptr, 0, &hits) == 0 && hits == 0);
+    std::filesystem::remove_all(root);
+    std::puts("Guest entitlements refused every add-on of an empty list");
+    return 0;
+}
+
 int main(int argc, char** argv) {
     const auto root = std::filesystem::temp_directory_path() / ("anyps5_guest_entitlements-" + std::to_string(std::random_device{}()));
     const auto directory = root / std::filesystem::path(u8"dlc-a\u00e7\u00e3o-\u65e5\u672c");
     const auto file = directory / "anyps5-entitlements.ini";
+    if (argc == 2 && std::string_view(argv[1]) == "default") return RunDefault();
+    if (argc == 2 && std::string_view(argv[1]) == "refused") return RunRefused(root, directory, file);
     if (argc == 2 && std::string_view(argv[1]) == "missing") {
         std::uint32_t skuFlag = 0;
     Require(sceNpEntitlementAccessGetSkuFlag(nullptr) == static_cast<int>(0x80558003));

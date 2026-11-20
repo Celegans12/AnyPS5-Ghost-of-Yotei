@@ -1237,8 +1237,14 @@ if(BUILD_TESTING)
     configure_windows_unwind(guest_entitlements_tests)
     add_test(NAME guest_entitlements COMMAND guest_entitlements_tests)
     add_test(NAME guest_entitlements_missing COMMAND guest_entitlements_tests missing)
+    add_test(NAME guest_entitlements_refused COMMAND guest_entitlements_tests refused)
+    set(guestEntitlementsTests guest_entitlements guest_entitlements_missing guest_entitlements_refused)
+    if(ANYPS5_GPU_BACKEND STREQUAL "kyty")
+        add_test(NAME guest_entitlements_default COMMAND guest_entitlements_tests default)
+        list(APPEND guestEntitlementsTests guest_entitlements_default)
+    endif()
     if(WIN32)
-        set_tests_properties(guest_entitlements guest_entitlements_missing PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(${guestEntitlementsTests} PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceNpEntitlementAccess>")
     endif()
 
