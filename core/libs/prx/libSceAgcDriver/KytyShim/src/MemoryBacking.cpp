@@ -916,8 +916,9 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	if (!ValidRange(vaddr, size)) {
 		Shim::Fail("KytyShim memory: attempted to access invalid address 0x%016" PRIx64 " with size 0x%016" PRIx64 "\n", vaddr, size);
 	}
-	if (IsFullyMapped(vaddr, size)) return size;
+	if (Shim::IsBacked(vaddr, size)) return size;
 	const auto clamped = MappedPrefix(vaddr, size);
+	if (clamped == size) return size;
 	if (clamped == 0) {
 		Shim::Fail("KytyShim memory: attempted to access invalid address 0x%016" PRIx64 " with size 0x%016" PRIx64 "\n", vaddr, size);
 	}

@@ -709,6 +709,15 @@ void TestUnreportedPrivateMemory() {
     Require(reprobed > afterReset);
     for (int i = 0; i < 8; ++i) Require(!Memory::IsFullyMapped(address, bytes));
     Require(Libs::LibKernel::Memory::Shim::ProbeCalls() == reprobed);
+
+    constexpr auto offset = 11u;
+    GuestArena::GuestArenaCommit_nid_postfix(heap, Page, 0x04, Page);
+    Require(Memory::ClampRangeSize(address + offset, bytes - offset) == Page - offset);
+    GuestArena::GuestArenaCommit_nid_postfix(heap, bytes, 0x04, bytes);
+    Require(Memory::ClampRangeSize(address + offset, bytes - offset) == bytes - offset);
+    GuestArena::GuestArenaReset_nid_postfix(heap, bytes);
+    Require(Memory::ClampRangeSizeOrZero(address + offset, bytes - offset) == 0);
+
     std::printf("arena memory 0x%llx mapped without telling libkernel: no second view, read as private memory, probed %llu time(s) then remembered until libkernel reports a change\n",
         static_cast<unsigned long long>(address), static_cast<unsigned long long>(probed - firstProbe));
 }
