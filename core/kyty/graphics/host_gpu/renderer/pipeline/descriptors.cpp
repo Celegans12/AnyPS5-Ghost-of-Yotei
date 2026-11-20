@@ -1129,8 +1129,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	}
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
-	if (stencil_association && storage) {
-		id = texture_cache.FindLiveStencilStorageCopy(id, desc);
+	const ImageId live_stencil_copy =
+	    stencil_association && storage ? texture_cache.FindLiveStencilStorageCopy(id, desc) : ImageId {};
+	if (live_stencil_copy) {
+		id = live_stencil_copy;
 		ValidateStorageColorView(texture_cache.GetImage(id).info.pixel_format, view_format,
 		                         descriptor.DstSelXYZW());
 	} else if (stencil_association) {

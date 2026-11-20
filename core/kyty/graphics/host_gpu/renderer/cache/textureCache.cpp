@@ -2246,14 +2246,14 @@ ImageId TextureCache::FindLiveStencilStorageCopy(ImageId association, const Imag
 	Common::ScopedLock lock {m_lock};
 	const auto& plane = m_slot_images[association];
 	const auto& depth = m_slot_images[plane.depth_id];
-	EXIT_NOT_IMPLEMENTED(desc.heap || !depth.registered || depth.info.stencil != plane.info.data ||
-	                     depth.info.metadata.stencil_compressed || depth.backing.samples != 1 ||
-	                     desc.info.pixel_format != vk::Format::eR8Uint ||
-	                     desc.info.data != plane.info.data || desc.info.type != plane.info.type ||
-	                     desc.info.extent != plane.info.extent ||
-	                     desc.info.resources != plane.info.resources ||
-	                     desc.info.tile_mode != plane.info.tile_mode ||
-	                     desc.info.pitch != plane.info.pitch);
+	if (desc.heap || !depth.registered || depth.info.stencil != plane.info.data ||
+	    depth.info.metadata.stencil_compressed || depth.backing.samples != 1 ||
+	    desc.info.pixel_format != vk::Format::eR8Uint || desc.info.data != plane.info.data ||
+	    desc.info.type != plane.info.type || desc.info.extent != plane.info.extent ||
+	    desc.info.resources != plane.info.resources || desc.info.tile_mode != plane.info.tile_mode ||
+	    desc.info.pitch != plane.info.pitch) {
+		return {};
+	}
 	return FindStencilCopy(association, desc.info);
 }
 
