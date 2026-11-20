@@ -291,8 +291,8 @@ public:
 		return probe;
 	}
 
-	[[nodiscard]] bool WriteFaultFindsOpen(uint64_t offset, uint64_t block_size, bool open_block, bool* gpu) const
-	    KYTY_NO_THREAD_SAFETY_ANALYSIS {
+	[[nodiscard]] bool WriteFaultFindsOpen(uint64_t offset, uint64_t block_size, bool open_block, uint64_t mark_size,
+	                                       bool* gpu) const KYTY_NO_THREAD_SAFETY_ANALYSIS {
 		const auto page  = static_cast<size_t>(offset / TRACKER_PAGE_SIZE);
 		const auto first = static_cast<size_t>(offset / block_size * block_size / TRACKER_PAGE_SIZE);
 		const auto last  = first + static_cast<size_t>(block_size / TRACKER_PAGE_SIZE);
@@ -301,7 +301,10 @@ public:
 		}
 		*gpu = m_gpu_written.Any(first, last);
 		if (!open_block) {
-			return true;
+			const auto [start, end] = GetPageRange(offset, mark_size);
+			RegionBits closed(~m_cpu_dirty, start, end);
+			closed &= RegionBits(~m_in_place, start, end);
+			return closed.None() && !m_gpu_dirty.Any(start, end);
 		}
 		RegionBits closed(~m_cpu_dirty, first, last);
 		closed &= RegionBits(~m_gpu_dirty, first, last);

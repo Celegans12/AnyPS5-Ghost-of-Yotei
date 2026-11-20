@@ -67,9 +67,9 @@ void ContentionIsCountedPerFamily() {
 
 void DirtyPagesNeedNoLockedWork(RegionManager& region) {
 	bool gpu = true;
-	Check(region.WriteFaultFindsOpen(0, Block, false, &gpu), "fresh region: a written page is not open");
+	Check(region.WriteFaultFindsOpen(0, Block, false, TRACKER_PAGE_SIZE, &gpu), "fresh region: a written page is not open");
 	Check(!gpu, "fresh region: a block reports a GPU page");
-	Check(region.WriteFaultFindsOpen(5 * TRACKER_PAGE_SIZE, Block, true, &gpu), "fresh region: a written block is not open");
+	Check(region.WriteFaultFindsOpen(5 * TRACKER_PAGE_SIZE, Block, true, TRACKER_PAGE_SIZE, &gpu), "fresh region: a written block is not open");
 	std::scoped_lock guard(region.lock);
 	const auto       page = region.FaultWrite(0, Block, false, TRACKER_PAGE_SIZE);
 	Check(page.done && !page.tracked && page.opened == 0, "fresh region: a page fault did not finish on the page");
@@ -84,7 +84,7 @@ void PagesInPlaceAreNeverTracked(RegionManager& region) {
 	Check(region.SetInPlace(begin, Block) == 0, "in place: pages counted twice");
 	Check(!region.IsModified<DirtySource::Cpu>(begin, Block), "in place: pages still written by the CPU");
 	bool gpu = true;
-	Check(region.WriteFaultFindsOpen(begin + TRACKER_PAGE_SIZE, Block, true, &gpu), "in place: a fault needs the lock");
+	Check(region.WriteFaultFindsOpen(begin + TRACKER_PAGE_SIZE, Block, true, TRACKER_PAGE_SIZE, &gpu), "in place: a fault needs the lock");
 	region.ChangeState<DirtySource::Cpu, true>(begin, Block);
 	Check(!region.IsModified<DirtySource::Cpu>(begin, Block), "in place: marked written by the CPU");
 	int noted = 0;
@@ -120,7 +120,7 @@ void ConcurrentFaultsOnOpenPagesTakeNoLock(RegionManager& region) {
 			for (int i = 0; i < Faults; i++) {
 				const auto offset = (static_cast<uint64_t>(t) * 16 + static_cast<uint64_t>(i % 16)) * TRACKER_PAGE_SIZE;
 				bool       gpu    = false;
-				if (region.WriteFaultFindsOpen(offset, Block, (i & 1) != 0, &gpu)) continue;
+				if (region.WriteFaultFindsOpen(offset, Block, (i & 1) != 0, TRACKER_PAGE_SIZE, &gpu)) continue;
 				locked.fetch_add(1, std::memory_order_relaxed);
 				std::scoped_lock guard(region.lock);
 				if (!region.FaultWrite(offset, Block, (i & 1) != 0, TRACKER_PAGE_SIZE).done) {

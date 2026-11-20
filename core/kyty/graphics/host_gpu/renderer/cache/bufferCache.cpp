@@ -526,18 +526,18 @@ BufferCache::WriteFaultOwner BufferCache::InvalidateGuestWriteFault(uint64_t vad
 		       : tracked ? WriteFaultOwner::Buffer
 		                 : WriteFaultOwner::Other;
 	};
-	auto& stats   = g_write_block_stats;
-	bool  gpu_any = false;
-	if (m_memory_tracker.WriteFaultFindsOpen(page, FaultBlockSize, open_block, &gpu_any)) {
-		stats.already_open.fetch_add(1, std::memory_order_relaxed);
-		return owner_of(gpu_any, false);
-	}
 	const auto end  = block + FaultBlockSize;
 	uint64_t   mark = TRACKER_PAGE_SIZE;
 	if (!open_block && page >= TRACKER_PAGE_SIZE && GuestRange {page - TRACKER_PAGE_SIZE, end - page}.Valid() &&
 	    m_memory_tracker.IsRegionCpuModified(page - TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE) &&
 	    !m_memory_tracker.IsRegionGpuModified(page, end - page)) {
 		mark = end - page;
+	}
+	auto& stats   = g_write_block_stats;
+	bool  gpu_any = false;
+	if (m_memory_tracker.WriteFaultFindsOpen(page, FaultBlockSize, open_block, mark, &gpu_any)) {
+		stats.already_open.fetch_add(1, std::memory_order_relaxed);
+		return owner_of(gpu_any, false);
 	}
 	const auto probe = m_memory_tracker.FaultWrite(page, FaultBlockSize, open_block, mark);
 	const auto owner = owner_of(probe.gpu, probe.tracked);
