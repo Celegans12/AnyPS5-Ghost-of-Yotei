@@ -11,6 +11,8 @@
 
 namespace {
 
+using Libs::Graphics::CpuWriteConsumer;
+using Libs::Graphics::DirtySource;
 using Libs::Graphics::PageManager;
 using Libs::Graphics::RegionManager;
 using Libs::Graphics::SpinLockClass;
@@ -75,6 +77,37 @@ void DirtyPagesNeedNoLockedWork(RegionManager& region) {
 	Check(block.done && block.opened == 0, "fresh region: a block fault opened written pages again");
 }
 
+void PagesInPlaceAreNeverTracked(RegionManager& region) {
+	std::scoped_lock guard(region.lock);
+	const auto       begin = 2 * Block;
+	Check(region.SetInPlace(begin, Block) == Block / TRACKER_PAGE_SIZE, "in place: wrong page count");
+	Check(region.SetInPlace(begin, Block) == 0, "in place: pages counted twice");
+	Check(!region.IsModified<DirtySource::Cpu>(begin, Block), "in place: pages still written by the CPU");
+	bool gpu = true;
+	Check(region.WriteFaultFindsOpen(begin + TRACKER_PAGE_SIZE, Block, true, &gpu), "in place: a fault needs the lock");
+	region.ChangeState<DirtySource::Cpu, true>(begin, Block);
+	Check(!region.IsModified<DirtySource::Cpu>(begin, Block), "in place: marked written by the CPU");
+	int noted = 0;
+	region.MarkGpuDirtyUnlessCpuDirty(begin, Block, [&](uint64_t, uint64_t) { noted++; });
+	Check(noted == 0 && !region.IsModified<DirtySource::Gpu>(begin, Block), "in place: marked written by the GPU");
+	region.ChangeState<DirtySource::Gpu, true>(begin, Block);
+	Check(!region.IsModified<DirtySource::Gpu>(begin, Block), "in place: a GPU write marked the pages");
+	uint64_t reported = 0;
+	region.ConsumeCpuWritten(CpuWriteConsumer::BufferTables, begin, Block,
+	                         [&](uint64_t, uint64_t bytes) { reported += bytes; });
+	Check(reported == Block, "in place: a consumer did not see the pages as written");
+	reported = 0;
+	region.ConsumeCpuWritten(CpuWriteConsumer::BufferTables, begin, Block,
+	                         [&](uint64_t, uint64_t bytes) { reported += bytes; });
+	Check(reported == Block, "in place: a consumer saw the pages unchanged");
+	const auto mixed = region.FaultWrite(begin - TRACKER_PAGE_SIZE, Block, false, 2 * TRACKER_PAGE_SIZE);
+	Check(mixed.done, "in place: a fault across the edge did not finish");
+	Check(!region.IsModified<DirtySource::Cpu>(begin, TRACKER_PAGE_SIZE), "in place: a neighbour fault wrote the page");
+	Check(region.ClearInPlace(begin, Block) == Block / TRACKER_PAGE_SIZE, "in place: wrong page count handed back");
+	Check(region.IsModified<DirtySource::Cpu>(begin, Block), "handed back: pages not written by the CPU");
+	Check(region.ClearInPlace(begin, Block) == 0, "handed back: pages handed back twice");
+}
+
 void ConcurrentFaultsOnOpenPagesTakeNoLock(RegionManager& region) {
 	constexpr int      Threads = 10;
 	constexpr int      Faults  = 20000;
@@ -112,6 +145,7 @@ int main() {
 	PageManager   pages;
 	RegionManager region(pages, RegionBase);
 	DirtyPagesNeedNoLockedWork(region);
+	PagesInPlaceAreNeverTracked(region);
 	ConcurrentFaultsOnOpenPagesTakeNoLock(region);
 	if (g_failures != 0) {
 		std::fprintf(stderr, "kyty_shim_write_fault_tracking: %d failure(s)\n", g_failures);
