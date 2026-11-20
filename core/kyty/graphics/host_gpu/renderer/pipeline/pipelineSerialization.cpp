@@ -57,15 +57,7 @@ uint64_t BuildStamp() {
 }
 
 size_t WarmUpThreads(size_t jobs) {
-	size_t threads = Common::ParallelThreads();
-	if (const char* value = std::getenv("KYTY_SHADER_CACHE_THREADS"); value != nullptr) {
-		char*      end    = nullptr;
-		const auto parsed = std::strtoul(value, &end, 10);
-		if (end != value && *end == '\0' && parsed != 0) {
-			threads = parsed;
-		}
-	}
-	return std::max<size_t>(1, std::min(threads, jobs));
+	return std::max<size_t>(1, std::min<size_t>(Common::ParallelThreads(), jobs));
 }
 
 bool WarmUpSharedCache(const GraphicContext& graphics) {

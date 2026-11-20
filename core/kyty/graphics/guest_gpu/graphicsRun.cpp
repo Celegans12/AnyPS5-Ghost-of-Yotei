@@ -215,17 +215,9 @@ void GuestGpu::SendUrgentCommandSync(Common::UniqueFunction<void>&& command, boo
 	PostUrgentCommandSync(std::move(command), drain_copies);
 }
 
-bool GuestGpu::OrderedReadbacks() noexcept {
-	static const bool on = [] {
-		const char* value = std::getenv("KYTY_CP_ORDERED_READBACK");
-		return value == nullptr || value[0] != '0';
-	}();
-	return on;
-}
-
 void GuestGpu::SendReadbackCommandSync(Common::UniqueFunction<void>&& command) {
 	EXIT_IF(!command);
-	if (m_pipelined && g_cp_thread && OrderedReadbacks()) {
+	if (m_pipelined && g_cp_thread) {
 		PostUrgentCommandSync(std::move(command), false);
 		return;
 	}
@@ -234,7 +226,7 @@ void GuestGpu::SendReadbackCommandSync(Common::UniqueFunction<void>&& command) {
 
 bool GuestGpu::PostReadbackCommand(Common::UniqueFunction<void>&& command) {
 	EXIT_IF(!command);
-	if (!m_pipelined || IsGpuThread() || (g_cp_thread && !OrderedReadbacks())) {
+	if (!m_pipelined || IsGpuThread()) {
 		return false;
 	}
 	{
@@ -1604,7 +1596,7 @@ const uint32_t* CommandProcessor::StageIndirectRegisters(uint32_t opcode, const 
                                                          uint32_t packet_dw) {
 	if ((opcode != Pm4::IT_SET_CONTEXT_REG_INDIRECT && opcode != Pm4::IT_SET_SH_REG_INDIRECT &&
 	     opcode != Pm4::IT_SET_UCONFIG_REG_INDIRECT) ||
-	    packet_dw < 5 || m_pipeline == nullptr || !GuestGpu::OrderedReadbacks()) {
+	    packet_dw < 5 || m_pipeline == nullptr) {
 		return packet;
 	}
 	const auto     address = (uint64_t {packet[1]} & 0xfffffffcu) | (uint64_t {packet[2]} << 32u);

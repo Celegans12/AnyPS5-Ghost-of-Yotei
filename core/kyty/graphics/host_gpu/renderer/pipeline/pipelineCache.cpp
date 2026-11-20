@@ -104,14 +104,6 @@ vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front,
 
 #if defined(ANYPS5_KYTY)
 
-bool PipelineChainWanted() {
-	static const bool wanted = [] {
-		const char* value = std::getenv("KYTY_PIPELINE_CHAIN");
-		return value == nullptr || std::string_view(value) != "0";
-	}();
-	return wanted;
-}
-
 static_assert(ShaderRecompiler::IR::ResourcePlan::ChainScratchSlots >= MaxPipelineChainThreads);
 
 const PipelineChainThreadSetting& PipelineChainThreads() {
@@ -1918,7 +1910,7 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 		m_workers.emplace_back([this] { CompileWorker(); });
 	}
 #if defined(ANYPS5_KYTY)
-	if (m_libraries != nullptr && PipelineLibrariesAhead() && PipelineChainWanted()) {
+	if (m_libraries != nullptr) {
 		const auto& chain = PipelineChainThreads();
 		for (uint32_t i = 0; i < chain.threads; i++) {
 			m_chain_threads.emplace_back([this, i] { ChainWorker(i); });
@@ -1927,8 +1919,7 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 			PipelineCacheLog("[kyty-gpl] KYTY_PIPELINE_CHAIN_THREADS={} is above {}: {} pipeline chain threads run",
 			                 chain.requested, MaxPipelineChainThreads, chain.threads);
 		}
-		PipelineCacheLog("[kyty-gpl] pipeline chains on: {} threads (KYTY_PIPELINE_CHAIN=0 to turn off)",
-		                 m_chain_threads.size());
+		PipelineCacheLog("[kyty-gpl] pipeline chains on: {} threads", m_chain_threads.size());
 	}
 #endif
 	if (Config::AsyncPipelinesEnabled()) {
@@ -4504,7 +4495,7 @@ void PipelineCache::ApplyOptimizedPipelines() {
 }
 
 bool PipelineCache::PreparesGraphicsLibraries() const {
-	return m_libraries != nullptr && m_libraries->Active() && PipelineLibrariesAhead();
+	return m_libraries != nullptr && m_libraries->Active();
 }
 
 void PipelineCache::PrepareGraphicsLibraries(const HW::Context& context, const HW::UserConfig& user_config,

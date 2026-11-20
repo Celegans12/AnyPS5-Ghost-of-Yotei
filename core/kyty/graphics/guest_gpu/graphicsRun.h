@@ -40,7 +40,6 @@ public:
 	[[nodiscard]] bool PostReadbackCommand(Common::UniqueFunction<void>&& command);
 	uint64_t WaitForOrderedOperations(uint64_t begin, uint64_t end);
 	void NoteOrderedSequence(uint64_t sequence) noexcept { m_cp_ordered = std::max(m_cp_ordered, sequence); }
-	[[nodiscard]] static bool OrderedReadbacks() noexcept;
 
 	void Submit(std::span<const uint32_t> commands);
 	void SubmitCompute(uint32_t queue, std::span<const uint32_t> commands);

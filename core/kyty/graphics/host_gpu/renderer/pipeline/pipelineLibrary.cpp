@@ -98,11 +98,6 @@ bool PipelineLibrariesWanted() {
 	return wanted;
 }
 
-bool PipelineLibrariesAhead() {
-	static const bool ahead = EnvironmentSwitch("KYTY_PIPELINE_LIBRARIES_AHEAD");
-	return ahead;
-}
-
 const char*& PipelineRouteNote() {
 	thread_local const char* note = nullptr;
 	return note;

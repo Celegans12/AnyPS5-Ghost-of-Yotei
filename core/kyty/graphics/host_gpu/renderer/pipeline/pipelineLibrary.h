@@ -30,7 +30,6 @@ enum class PipelineLibraryPart : uint32_t {
 };
 
 [[nodiscard]] bool PipelineLibrariesWanted();
-[[nodiscard]] bool PipelineLibrariesAhead();
 
 void       CreateGraphicsPipelineLayout(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                                         const GraphicsPipelineKey&                 key,

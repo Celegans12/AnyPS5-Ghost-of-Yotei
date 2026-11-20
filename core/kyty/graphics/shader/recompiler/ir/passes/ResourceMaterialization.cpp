@@ -1219,13 +1219,6 @@ bool TableExemplar(const ImageResource& root, const DescriptorValue& descriptor,
 
 class TableSlotIndex {
 public:
-	static bool Enabled() {
-		static const bool on = [] {
-			const char* value = std::getenv("KYTY_FLAT_TABLE_SLOTS");
-			return value == nullptr || value[0] != '0';
-		}();
-		return on;
-	}
 	void Reset(const uint32_t* words, size_t entries) {
 		const auto capacity = std::bit_ceil(std::max<size_t>(entries * 2u, 16u));
 		if (m_cells.size() < capacity) {
@@ -1330,12 +1323,8 @@ bool MaterializeImageTable(const ResourcePlan& program,
 			next.slots.push_back(DescriptorValue {.dword_count = 8u});
 			next.mapping.assign(static_cast<size_t>(entries) + 1u, 0u);
 			next.mapping[0] = static_cast<uint32_t>(entries);
-			const bool                                     flat_slots = TableSlotIndex::Enabled();
-			static thread_local TableSlotIndex             flat_slot_of;
-			std::unordered_map<std::string_view, uint32_t> slot_of;
-			if (flat_slots) {
-				flat_slot_of.Reset(next.raw.data(), static_cast<size_t>(entries));
-			}
+			static thread_local TableSlotIndex flat_slot_of;
+			flat_slot_of.Reset(next.raw.data(), static_cast<size_t>(entries));
 			for (uint32_t entry = 0; entry < entries; entry++) {
 				DescriptorValue candidate {.dword_count = 8u};
 				std::copy_n(next.raw.begin() + entry * 8u, 8u, candidate.dwords.begin());
@@ -1345,16 +1334,7 @@ bool MaterializeImageTable(const ResourcePlan& program,
 				const auto new_slot = static_cast<uint32_t>(next.slots.size());
 				uint32_t   slot     = new_slot;
 				bool       inserted = false;
-				if (flat_slots) {
-					std::tie(slot, inserted) = flat_slot_of.TryEmplace(entry, new_slot);
-				} else {
-					const std::string_view key(
-					    reinterpret_cast<const char*>(next.raw.data() + entry * 8u),
-					    8u * sizeof(uint32_t));
-					const auto [found_slot, emplaced] = slot_of.try_emplace(key, new_slot);
-					slot     = found_slot->second;
-					inserted = emplaced;
-				}
+				std::tie(slot, inserted) = flat_slot_of.TryEmplace(entry, new_slot);
 				if (inserted) {
 					next.slots.push_back(candidate);
 				}

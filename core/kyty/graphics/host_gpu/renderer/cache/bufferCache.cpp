@@ -799,7 +799,7 @@ void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_wr
 	uint64_t          pages_begin = 0;
 	uint64_t          pages_end   = 0;
 	ReadbackQueueRead queue_read;
-	const bool        ordered        = command_processor && GuestGpu::OrderedReadbacks();
+	const bool        ordered        = command_processor;
 	const bool        readback_queue = !command_processor || ordered;
 	if (ordered) {
 		const auto started = SteadyNs();
