@@ -547,7 +547,7 @@ def main():
             source = work / (name + ".elf")
             output = source.with_suffix(".exe")
             source.write_bytes(image)
-            result = subprocess.run([str(relinker), "--skip-sce-module", "--windows", str(source), str(output)],
+            result = subprocess.run([str(relinker), "--skip-sce-module", "--windows", "--no-frame-red-zone", str(source), str(output)],
                                     capture_output=True, text=True, timeout=30)
             if error is not None:
                 assert result.returncode == 2 and error in result.stderr and not output.exists(), result
@@ -623,7 +623,7 @@ def main():
                 source = work / (name + ".elf")
                 output = source.with_suffix(".exe")
                 source.write_bytes(image)
-                result = subprocess.run([str(relinker), "--skip-sce-module", "--windows", str(source), str(output)],
+                result = subprocess.run([str(relinker), "--skip-sce-module", "--windows", "--no-frame-red-zone", str(source), str(output)],
                                         capture_output=True, text=True, timeout=30)
                 assert result.returncode == 0, (name, result.stdout, result.stderr)
                 return output.read_bytes()
@@ -686,7 +686,7 @@ def main():
                         source = work / (case + ".elf")
                         output = source.with_suffix(".exe")
                         source.write_bytes(image)
-                        result = subprocess.run([str(relinker), "--skip-sce-module", "--windows", str(source), str(output)],
+                        result = subprocess.run([str(relinker), "--skip-sce-module", "--windows", "--no-frame-red-zone", str(source), str(output)],
                                                 capture_output=True, text=True, timeout=30)
                         assert result.returncode == 0, (case, result.stderr)
                         pe = output.read_bytes()
@@ -801,7 +801,7 @@ def main():
                 source = work / (name + ".elf")
                 output = source.with_suffix(".exe")
                 source.write_bytes(make_image("register", "unwind", body=instruction + b"\xc3"))
-                result = subprocess.run([str(relinker), "--skip-sce-module", "--windows", str(source), str(output)],
+                result = subprocess.run([str(relinker), "--skip-sce-module", "--windows", "--no-frame-red-zone", str(source), str(output)],
                                         capture_output=True, text=True, timeout=30)
                 assert result.returncode == 0, (name, result.stdout, result.stderr)
                 patched = pe_bytes_at(output.read_bytes(), 0x11240, len(instruction) + 1)
@@ -828,7 +828,7 @@ def main():
             source = work / "gs-without-pt-tls.elf"
             output = source.with_suffix(".exe")
             source.write_bytes(image)
-            result = subprocess.run([str(relinker), "--skip-sce-module", "--windows", str(source), str(output)],
+            result = subprocess.run([str(relinker), "--skip-sce-module", "--windows", "--no-frame-red-zone", str(source), str(output)],
                                     capture_output=True, text=True, timeout=30)
             assert result.returncode == 0, ("gs-without-pt-tls", result.stdout, result.stderr)
             patched = pe_bytes_at(output.read_bytes(), 0x11240, len(instruction) + 1)

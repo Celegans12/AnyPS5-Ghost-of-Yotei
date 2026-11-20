@@ -100,7 +100,7 @@ def main():
     relinker = Path(sys.argv[1]).resolve()
     with tempfile.TemporaryDirectory(prefix="anyps5-code-analysis-address-data-") as directory:
         work = Path(directory)
-        for system, flags in (("windows", ["--windows"]), ("macos", ["--macos"])):
+        for system, flags in (("windows", ["--windows", "--no-frame-red-zone"]), ("macos", ["--macos"])):
             code = convert(relinker, work, "table-read-through-register-" + system, module(GS_LOOKALIKE), flags)
             assert code[TABLE - FIRST:TABLE - FIRST + len(GS_LOOKALIKE)] == GS_LOOKALIKE, (system, code.hex())
             assert code[CALLBACK - FIRST:CALLBACK - FIRST + len(GS_TRAP)] == GS_TRAP, (system, code.hex())

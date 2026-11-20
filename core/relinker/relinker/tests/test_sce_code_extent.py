@@ -147,7 +147,7 @@ def run(relinker, work, name, built, expected_error=None, target="windows", expe
     source = work / (name + ".elf")
     output = work / (name + ".out")
     source.write_bytes(image)
-    result = subprocess.run([str(relinker), "--skip-sce-module", "--" + target, "--registry", str(source), str(output)],
+    result = subprocess.run([str(relinker), "--skip-sce-module", "--" + target, *(["--no-frame-red-zone"] if target == "windows" else []), "--registry", str(source), str(output)],
                             capture_output=True, text=True, timeout=20)
     if expected_error is None:
         assert result.returncode == 0 and output.exists(), (name, result.stdout, result.stderr)

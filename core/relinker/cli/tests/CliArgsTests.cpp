@@ -236,6 +236,26 @@ void frameRedZoneRequiresWindows() {
     require(ok.frameRedZone && ok.toWindows, "--frame-red-zone with --windows was rejected");
 }
 
+void frameRedZoneDefault() {
+    const auto windows = parse({"--windows", "input.elf", "output.exe"});
+#if defined(ANYPS5_KYTY)
+    require(windows.frameRedZone && !windows.noFrameRedZone, "--windows did not frame the red zone by default");
+#else
+    require(!windows.frameRedZone && !windows.noFrameRedZone, "--windows framed the red zone by default");
+#endif
+    require(!parse({"input.elf", "output.elf"}).frameRedZone, "a Linux conversion framed the red zone");
+    require(!parse({"--macos", "input.elf", "output.macho"}).frameRedZone, "a macOS conversion framed the red zone");
+    const auto off = parse({"--windows", "--no-frame-red-zone", "input.elf", "output.exe"});
+    require(off.noFrameRedZone && !off.frameRedZone, "--no-frame-red-zone did not turn the framing off");
+    const auto order = parse({"--no-frame-red-zone", "--windows", "input.elf", "output.exe"});
+    require(order.noFrameRedZone && !order.frameRedZone, "--no-frame-red-zone before --windows was ignored");
+    const auto on = parse({"--windows", "--frame-red-zone", "input.elf", "output.exe"});
+    require(on.frameRedZone && !on.noFrameRedZone, "--frame-red-zone was dropped");
+    expectThrows({"--no-frame-red-zone", "input.elf", "output.elf"}, "--no-frame-red-zone requires --windows");
+    expectThrows({"--macos", "--no-frame-red-zone", "input.elf", "output.elf"}, "--no-frame-red-zone requires --windows");
+    expectThrows({"--windows", "--frame-red-zone", "--no-frame-red-zone", "input.elf", "output.exe"}, "--frame-red-zone conflicts with --no-frame-red-zone");
+}
+
 void missingPositionals() {
     expectUsage({});
     expectUsage({"input.elf"});
@@ -371,7 +391,7 @@ void verifyMode() {
     expectThrows({"--verify-patches", "p.toml", "--verify-output", "out.elf", "--exclude-sce-module", "x.prx"}, noEffect);
     expectThrows({"--verify-patches", "p.toml", "--verify-output", "out.elf", "--skip-sce-module"}, noEffect);
     expectThrows({"--verify-patches", "p.toml", "in.elf", "extra"}, "unexpected argument: extra");
-    for (const auto* option : {"--windows", "--macos", "--to-intel", "--to-rosetta", "--frame-red-zone", "--trace-imports", "--lazy-binding", "--autorun", "--registry", "--skip-syscall-check", "--no-patches"})
+    for (const auto* option : {"--windows", "--macos", "--to-intel", "--to-rosetta", "--frame-red-zone", "--no-frame-red-zone", "--trace-imports", "--lazy-binding", "--autorun", "--registry", "--skip-syscall-check", "--no-patches"})
         expectThrows({"--verify-patches", "p.toml", option, "in.elf"}, std::string(option) + " cannot be used with --verify-patches");
     expectThrows({"--verify-patches", "p.toml", "--rpath", "x", "in.elf"}, "--rpath cannot be used with --verify-patches");
     expectThrows({"--verify-patches", "p.toml", "--patches", "q.toml", "in.elf"}, "--patches cannot be used with --verify-patches");
@@ -428,6 +448,7 @@ int main() {
         windowsDiagnosticsRequiresWindows();
         windowsGuiRequiresWindows();
         frameRedZoneRequiresWindows();
+        frameRedZoneDefault();
         missingPositionals();
         windowsFixedBase();
         linuxFixedBase();

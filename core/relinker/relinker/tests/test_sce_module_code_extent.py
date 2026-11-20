@@ -193,7 +193,7 @@ def main():
     relinker = Path(sys.argv[1]).resolve()
     with tempfile.TemporaryDirectory(prefix="anyps5-sce-module-code-extent-") as directory:
         work = Path(directory)
-        for system, flags in (("linux", []), ("windows", ["--windows"]), ("macos", ["--macos"])):
+        for system, flags in (("linux", []), ("windows", ["--windows", "--no-frame-red-zone"]), ("macos", ["--macos"])):
             run(relinker, work, "sce-loader-path-without-interp-header-" + system, fixture(rodata_address=False, interp_header=False), flags)
             run_module(relinker, work, "sce-module-data-after-code-" + system, sce_module(), flags)
             run_module(relinker, work, "sce-module-gap-embedded-data-" + system, sce_module(gap_embedded_data=True), flags)

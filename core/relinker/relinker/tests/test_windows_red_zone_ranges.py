@@ -108,7 +108,7 @@ def main():
         log, data = convert(work, "plain", build(True), ["--frame-red-zone"])
         assert "skipped" not in log and mark(data)[0] == b"APS5RZ01" and ".rzgap" not in sections(data), log
 
-        log, data = convert(work, "unmarked", build(True), ["--to-intel"])
+        log, data = convert(work, "unmarked", build(True), ["--to-intel", "--no-frame-red-zone"])
         assert mark(data)[0] == bytes(8) and ".rzgap" not in sections(data)
     print("Windows red-zone ranges test passed")
 

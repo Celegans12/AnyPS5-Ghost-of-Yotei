@@ -28,6 +28,8 @@ const char* Usage() {
            "  --frame-red-zone               Windows: frame the functions of the executable and of every guest module that keep\n"
            "                                 values below RSP, so an exception on a guest thread cannot overwrite them, and\n"
            "                                 mark each image where none is left. Page tracking and read traps need the mark.\n"
+           "                                 On by default for --windows in a build with the Kyty backend.\n"
+           "  --no-frame-red-zone            Windows: do not frame them, which is the default outside a build with the Kyty backend.\n"
            "  --rpath <path>                 System library search path. Default: $ORIGIN/libs.\n"
            "  --omit-unavailable-dependencies Linux: leave out a module dependency that no module provides, no import uses\n"
            "                                 and no run path directory holds at conversion time.\n"
@@ -76,7 +78,7 @@ namespace {
 constexpr std::string_view kVerifyRejectedOptions[] = {
     "--dry-run",
     "--windows", "--macos", "--windows-gui", "--windows-diagnostics", "--windows-fixed-base", "--trace-imports", "--linux-fixed-base", "--macos-fixed-base",
-    "--to-intel", "--to-rosetta", "--to-avx", "--frame-red-zone", "--skip-syscall-check", "--trap-sdk-syscall-stubs", "--function-symbol-roots", "unused-filter=",
+    "--to-intel", "--to-rosetta", "--to-avx", "--frame-red-zone", "--no-frame-red-zone", "--skip-syscall-check", "--trap-sdk-syscall-stubs", "--function-symbol-roots", "unused-filter=",
     "--rpath", "--registry", "--omit-unavailable-dependencies", "--lazy-binding", "--autorun", "--patches", "--no-patches",
 };
 
@@ -174,6 +176,8 @@ Args ParseArgs(int argc, char* argv[]) {
             args.toIntel = true;
         } else if (arg == "--frame-red-zone") {
             args.frameRedZone = true;
+        } else if (arg == "--no-frame-red-zone") {
+            args.noFrameRedZone = true;
         } else if (arg == "--to-rosetta") {
             args.toRosetta = true;
             args.toIntel = true;
@@ -268,6 +272,13 @@ Args ParseArgs(int argc, char* argv[]) {
         throw std::runtime_error("--windows-diagnostics requires --windows");
     if (args.frameRedZone && !args.toWindows)
         throw std::runtime_error("--frame-red-zone requires --windows");
+    if (args.noFrameRedZone && !args.toWindows)
+        throw std::runtime_error("--no-frame-red-zone requires --windows");
+    if (args.frameRedZone && args.noFrameRedZone)
+        throw std::runtime_error("--frame-red-zone conflicts with --no-frame-red-zone");
+#if defined(ANYPS5_KYTY)
+    if (args.toWindows && !args.noFrameRedZone) args.frameRedZone = true;
+#endif
 
     if (args.windowsGui && !args.toWindows)
         throw std::runtime_error("--windows-gui requires --windows");

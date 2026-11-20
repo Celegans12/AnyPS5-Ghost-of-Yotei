@@ -32,7 +32,7 @@ def main():
     count = 0
     with tempfile.TemporaryDirectory(prefix="anyps5-embedded-syscalls-") as directory:
         work = Path(directory)
-        for target, flags in (("linux", []), ("windows", ["--windows"]), ("macos", ["--macos"])):
+        for target, flags in (("linux", []), ("windows", ["--windows", "--no-frame-red-zone"]), ("macos", ["--macos"])):
             for name, opcode in (("syscall", b"\x0f\x05"), ("sysenter", b"\x0f\x34"),
                                  ("int80", b"\xcd\x80"), ("control", b"")):
                 for padding in (b"\x00", b"\x90", b"\xcc"):
