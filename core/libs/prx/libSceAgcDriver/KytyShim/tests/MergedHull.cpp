@@ -70,6 +70,7 @@ struct Variant {
 	bool                    local_barrier = false;
 	bool                    barrier_loop  = false;
 	bool                    call          = false;
+	bool                    implicit_handoff = false;
 	std::array<uint32_t, 3> factor_head {FactorMoves[0], FactorMoves[1], FactorMoves[2]};
 	std::array<uint32_t, 2> point_store {HullPoints[15], HullPoints[16]};
 	std::vector<uint32_t>   first_head;
@@ -114,7 +115,7 @@ std::vector<uint32_t> LocalPart(const Variant& variant) {
 	code.push_back(variant.local_write0);
 	Append(code, std::span(LocalWrites).subspan(1));
 	if (variant.local_barrier) code.push_back(Barrier);
-	code.push_back(WaitLds);
+	if (!variant.implicit_handoff) code.push_back(WaitLds);
 	return code;
 }
 
@@ -127,9 +128,9 @@ std::vector<uint32_t> Merged(const Variant& variant = {}) {
 	code.push_back(0xbf880000u | static_cast<uint32_t>(local.size()));
 	code.insert(code.end(), local.begin(), local.end());
 	code.push_back(SetExecAll);
-	code.push_back(WaitLds);
+	if (!variant.implicit_handoff) code.push_back(WaitLds);
 	Append(code, LaneIndex);
-	code.push_back(Barrier);
+	if (!variant.implicit_handoff) code.push_back(Barrier);
 	if (variant.barrier_loop) code.push_back(BranchScc1ToPrior);
 	const auto hull = HullPart(variant);
 	code.insert(code.end(), hull.begin(), hull.end());
@@ -492,6 +493,45 @@ void RequireMergedForm() {
 	        "after it");
 }
 
+void RequireWaveLocalLdsOrder() {
+	const auto compile = [](const Variant& variant, uint32_t points) {
+		const auto code = Merged(variant);
+		return Compile(ShaderType::TessellationControl, code, Analyzed(code, code, points, points, true));
+	};
+	const auto implicit = compile({.implicit_handoff = true}, 4u);
+	RequireValid(implicit.spirv, "the control stage with an implicit wave-local LDS handoff");
+	const auto control = Parse(implicit.spirv);
+	Require(control.output_vertices == 4u, "the wave-local hull lost its fourth control point");
+	const auto shared = Find(control, spv::StorageClassOutput, 2u, false);
+	uint32_t barriers = 0;
+	Require(shared.Is(7u, 4u), "the wave-local hull lost LDS traffic");
+	uint32_t peer_loads = 0;
+	for (const auto& [op, variable]: control.body) {
+		if (op == spv::OpControlBarrier) {
+			barriers++;
+		} else if (variable == shared.id && op == spv::OpStore) {
+			Require(barriers == 0u, "a wave-local LDS record is written after the host barrier");
+		} else if (variable == shared.id && op == spv::OpLoad && barriers != 0u) {
+			peer_loads++;
+		}
+	}
+	Require(peer_loads >= 3u && barriers == 1u, "the wave-local handoff does not order the peer LDS reads");
+
+	RequireRefusal([&] { static_cast<void>(compile({.implicit_handoff = true}, 3u)); },
+	               "no s_barrier has every LDS write before it and every such read after it",
+	               "a barrierless hull whose patches can span waves");
+	const Variant late_write {.implicit_handoff = true,
+	                          .factor_head = {0xd8340000u, 0x00000215u, FactorMoves[2]}};
+	const auto layout_code = Merged();
+	const auto layout = Analyzed(layout_code, layout_code, 4u, 4u, true);
+	RequireRefusal([&] {
+	                   static_cast<void>(Compile(ShaderType::TessellationControl, Merged(late_write),
+	                                             layout));
+	               },
+	               "no s_barrier has every LDS write before it and every such read after it",
+	               "a wave-local hull that writes LDS after a cross-control-point read");
+}
+
 void RequirePatchConstantRoutes() {
 	std::vector<uint32_t> shifted(HullStores.begin(), HullStores.end());
 	shifted[5] = 0x34161684u;
@@ -820,6 +860,8 @@ constexpr std::array<uint32_t, 72> Fill {
 
 constexpr uint32_t                Side = 64u;
 constexpr std::array<uint16_t, 6> PatchIndices {0x100u, 0x130u, 0x112u, 0x122u, 0x132u, 0x131u};
+constexpr std::array<uint16_t, 8> WaveLocalPatchIndices {0x100u, 0x130u, 0x112u, 0x112u,
+                                                        0x122u, 0x132u, 0x131u, 0x131u};
 
 template <class T>
 T Checked(vk::ResultValue<T> result, const char* what) {
@@ -859,6 +901,18 @@ int DrawMergedHull() {
 	    Compile(ShaderType::TessellationEvaluation, Domain, halves).spirv,
 	    {Fill.begin(), Fill.end()},
 	};
+	const auto wave_local_stages = [](const Variant& variant) -> Stages {
+		const auto shader = Merged(variant);
+		const auto info = Analyzed(shader, shader, 4u, 4u, true);
+		return {
+		    Compile(ShaderType::Local, shader, info).spirv,
+		    Compile(ShaderType::TessellationControl, shader, info).spirv,
+		    Compile(ShaderType::TessellationEvaluation, Domain, info).spirv,
+		    {Fill.begin(), Fill.end()},
+		};
+	};
+	const auto explicit_stages = wave_local_stages({});
+	const auto implicit_stages = wave_local_stages({.implicit_handoff = true});
 	RequireValid(merged_stages[2], "the evaluation stage");
 
 	const vk::detail::DynamicLoader loader;
@@ -959,7 +1013,7 @@ int DrawMergedHull() {
 
 	constexpr vk::DeviceSize PixelBytes = Side * Side * 4u;
 	vk::BufferCreateInfo     buffer_info;
-	buffer_info.size  = PixelBytes + sizeof(PatchIndices);
+	buffer_info.size  = PixelBytes + sizeof(WaveLocalPatchIndices);
 	buffer_info.usage = vk::BufferUsageFlagBits::eIndexBuffer | vk::BufferUsageFlagBits::eTransferDst;
 	const auto buffer        = Checked(device.createBuffer(buffer_info), "buffer creation");
 	const auto buffer_memory = allocate(
@@ -968,12 +1022,13 @@ int DrawMergedHull() {
 	Checked(device.bindBufferMemory(buffer, buffer_memory, 0), "buffer binding");
 	auto* bytes = static_cast<uint8_t*>(
 	    Checked(device.mapMemory(buffer_memory, 0, VK_WHOLE_SIZE), "buffer mapping"));
-	std::memcpy(bytes + PixelBytes, PatchIndices.data(), sizeof(PatchIndices));
 
 	constexpr std::array StageBits {
 	    vk::ShaderStageFlagBits::eVertex, vk::ShaderStageFlagBits::eTessellationControl,
 	    vk::ShaderStageFlagBits::eTessellationEvaluation, vk::ShaderStageFlagBits::eFragment};
-	const auto draw = [&](const Stages& spirv, const char* what) {
+	const auto draw = [&](const Stages& spirv, std::span<const uint16_t> indices,
+	                      uint32_t control_points, const char* what) {
+	std::memcpy(bytes + PixelBytes, indices.data(), indices.size_bytes());
 	std::array<vk::PipelineShaderStageCreateInfo, 4> stages;
 	for (size_t index = 0; index < stages.size(); index++) {
 		vk::ShaderModuleCreateInfo module_info;
@@ -994,7 +1049,7 @@ int DrawMergedHull() {
 	vk::PipelineInputAssemblyStateCreateInfo     assembly;
 	assembly.topology = vk::PrimitiveTopology::ePatchList;
 	vk::PipelineTessellationStateCreateInfo tessellation;
-	tessellation.patchControlPoints = 3;
+	tessellation.patchControlPoints = control_points;
 	const vk::Viewport                  viewport {0.0f, 0.0f, Side, Side, 0.0f, 1.0f};
 	const vk::Rect2D                    area {{0, 0}, {Side, Side}};
 	vk::PipelineViewportStateCreateInfo viewports;
@@ -1075,7 +1130,7 @@ int DrawMergedHull() {
 	const std::array<uint32_t, Recompiler::IR::NativePushConstantSize / 4u> push {};
 	command.pushConstants(layout, all_stages, 0, Recompiler::IR::NativePushConstantSize,
 	                      push.data());
-	command.drawIndexed(static_cast<uint32_t>(PatchIndices.size()), 2, 0, 0, 0);
+	command.drawIndexed(static_cast<uint32_t>(indices.size()), 2, 0, 0, 0);
 	command.endRendering();
 	move(vk::ImageLayout::eColorAttachmentOptimal, vk::ImageLayout::eTransferSrcOptimal,
 	     vk::AccessFlagBits::eColorAttachmentWrite, vk::AccessFlagBits::eTransferRead,
@@ -1109,8 +1164,14 @@ int DrawMergedHull() {
 	device.destroyCommandPool(pool);
 	return covered;
 	};
-	const auto merged_pixels = draw(merged_stages, "merged");
-	const auto split_pixels  = draw(split_stages, "split");
+	const auto merged_pixels = draw(merged_stages, PatchIndices, 3u, "merged");
+	const auto split_pixels  = draw(split_stages, PatchIndices, 3u, "split");
+	draw(explicit_stages, WaveLocalPatchIndices, 4u, "four-point explicit handoff");
+	std::array<uint8_t, PixelBytes> reference;
+	std::memcpy(reference.data(), bytes, reference.size());
+	draw(implicit_stages, WaveLocalPatchIndices, 4u, "four-point implicit handoff");
+	Require(std::memcmp(reference.data(), bytes, reference.size()) == 0,
+	        "a wave-local implicit handoff changed the draw's pixels");
 	device.destroyBuffer(buffer);
 	device.freeMemory(buffer_memory);
 	device.destroyImageView(view);
@@ -1128,6 +1189,7 @@ int DrawMergedHull() {
 int main(int argc, char** argv) {
 	if (argc > 1 && std::strcmp(argv[1], "draw") == 0) return DrawMergedHull();
 	RequireMergedForm();
+	RequireWaveLocalLdsOrder();
 	RequirePatchConstantRoutes();
 	RequireRingReadOrder();
 	RequireLimits();

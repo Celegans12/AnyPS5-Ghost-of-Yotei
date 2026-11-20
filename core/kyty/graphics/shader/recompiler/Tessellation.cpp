@@ -677,36 +677,15 @@ struct MergedHullTraffic {
 	const IR::Inst*  inst = nullptr;
 };
 
-void RequireMergedHullBarrierOrder(std::span<const MergedHullTraffic> barriers,
-                                   std::span<const MergedHullTraffic> writes,
-                                   std::span<const MergedHullTraffic> reads) {
-	if (reads.empty()) return;
-	for (const auto& barrier: barriers) {
-		std::unordered_set<const IR::Block*> after;
-		const auto                           first = barrier.block->ImmSuccessors();
-		std::vector<const IR::Block*>        pending(first.begin(), first.end());
-		while (!pending.empty()) {
-			const auto* block = pending.back();
-			pending.pop_back();
-			if (!after.insert(block).second) continue;
-			const auto next = block->ImmSuccessors();
-			pending.insert(pending.end(), next.begin(), next.end());
-		}
-		const auto later = [&](const MergedHullTraffic& access) {
-			return after.contains(access.block) ||
-			       (access.block == barrier.block && access.order > barrier.order);
-		};
-		if (std::ranges::none_of(writes, later) && std::ranges::all_of(reads, later)) return;
-	}
-	EXIT("the merged hull program reads another control point's LDS record at pc 0x%08x, but no "
-	     "s_barrier has every LDS write before it and every such read after it\n",
-	     reads.front().pc);
-}
+enum class MergedHullBarrierResult { Ordered, UnreachableRead, NoUniformPoint, LateWrite };
 
-void OrderMergedHullRingReads(IR::Program& program, std::span<const MergedHullTraffic> writes,
-                              std::span<const MergedHullTraffic> reads) {
+MergedHullBarrierResult InsertMergedHullBarrier(IR::Program& program,
+                                                std::span<const MergedHullTraffic> writes,
+                                                std::span<const MergedHullTraffic> reads,
+                                                bool require_acyclic_prefix,
+                                                uint32_t& late_write_pc) {
 	using namespace IR;
-	if (reads.empty()) return;
+	if (reads.empty()) return MergedHullBarrierResult::Ordered;
 	const auto reached = [](std::span<Block* const> from, const Block* avoided) {
 		std::unordered_set<const Block*> seen;
 		std::vector<const Block*>        pending(from.begin(), from.end());
@@ -728,9 +707,7 @@ void OrderMergedHullRingReads(IR::Program& program, std::span<const MergedHullTr
 	const std::span<Block* const> start(&entry, 1u);
 	const auto                     live = reached(start, nullptr);
 	if (reads_in(live, false)) {
-		EXIT("the merged hull program reads another control point's off-chip output in a block "
-		     "no control point reaches, at pc 0x%08x\n",
-		     reads.front().pc);
+		return MergedHullBarrierResult::UnreachableRead;
 	}
 	Block* barrier = nullptr;
 	for (auto* candidate: program.blocks) {
@@ -749,10 +726,28 @@ void OrderMergedHullRingReads(IR::Program& program, std::span<const MergedHullTr
 		}
 	}
 	if (barrier == nullptr) {
-		EXIT("the merged hull program reads another control point's off-chip output at pc "
-		     "0x%08x, but no block before the read is reached once by every invocation, so no "
-		     "barrier can order it after the writes\n",
-		     reads.front().pc);
+		return MergedHullBarrierResult::NoUniformPoint;
+	}
+	if (require_acyclic_prefix && barrier != entry) {
+		const auto                                 prefix = reached(start, barrier);
+		std::unordered_map<const Block*, uint32_t> incoming;
+		for (const auto* block: prefix) {
+			for (const auto* next: block->ImmSuccessors()) {
+				if (next != barrier) incoming[next]++;
+			}
+		}
+		if (incoming[entry] != 0u) return MergedHullBarrierResult::NoUniformPoint;
+		std::vector<const Block*> ready {entry};
+		size_t                   visited = 0;
+		while (!ready.empty()) {
+			const auto* block = ready.back();
+			ready.pop_back();
+			visited++;
+			for (const auto* next: block->ImmSuccessors()) {
+				if (next != barrier && --incoming.at(next) == 0u) ready.push_back(next);
+			}
+		}
+		if (visited != prefix.size()) return MergedHullBarrierResult::NoUniformPoint;
 	}
 	const auto               after = reached(barrier->ImmSuccessors(), nullptr);
 	const MergedHullTraffic* first = nullptr;
@@ -763,10 +758,8 @@ void OrderMergedHullRingReads(IR::Program& program, std::span<const MergedHullTr
 		if (!live.contains(write.block)) continue;
 		if (first != nullptr && write.block == barrier ? write.order > first->order
 		                                               : after.contains(write.block)) {
-			EXIT("the merged hull program reads another control point's off-chip output, but its "
-			     "control point store at pc 0x%08x comes after the last block every invocation "
-			     "reaches before the read\n",
-			     write.pc);
+			late_write_pc = write.pc;
+			return MergedHullBarrierResult::LateWrite;
 		}
 	}
 	auto position = barrier->end();
@@ -775,6 +768,67 @@ void OrderMergedHullRingReads(IR::Program& program, std::span<const MergedHullTr
 		                                [&](const Inst& inst) { return &inst == first->inst; });
 	}
 	barrier->PrependNewInst(position, ValueOpcode::Barrier);
+	return MergedHullBarrierResult::Ordered;
+}
+
+void RequireMergedHullBarrierOrder(IR::Program& program, const ShaderTessellationInputInfo& tess,
+                                   std::span<const MergedHullTraffic> barriers,
+                                   std::span<const MergedHullTraffic> writes,
+                                   std::span<const MergedHullTraffic> reads) {
+	if (reads.empty()) return;
+	for (const auto& barrier: barriers) {
+		std::unordered_set<const IR::Block*> after;
+		const auto                           first = barrier.block->ImmSuccessors();
+		std::vector<const IR::Block*>        pending(first.begin(), first.end());
+		while (!pending.empty()) {
+			const auto* block = pending.back();
+			pending.pop_back();
+			if (!after.insert(block).second) continue;
+			const auto next = block->ImmSuccessors();
+			pending.insert(pending.end(), next.begin(), next.end());
+		}
+		const auto later = [&](const MergedHullTraffic& access) {
+			return after.contains(access.block) ||
+			       (access.block == barrier.block && access.order > barrier.order);
+		};
+		if (std::ranges::none_of(writes, later) && std::ranges::all_of(reads, later)) return;
+	}
+	uint32_t late_write_pc = 0;
+	if (barriers.empty() && !program.dispatcher_fallback && tess.input_control_points != 0u &&
+	    tess.input_control_points == tess.output_control_points &&
+	    (program.wave_size == 32u || program.wave_size == 64u) &&
+	    program.wave_size % tess.input_control_points == 0u &&
+	    InsertMergedHullBarrier(program, writes, reads, true, late_write_pc) ==
+	        MergedHullBarrierResult::Ordered) {
+		LOGF("Merged hull wave-local LDS ordering: control_points=%u wave_size=%u first_read=0x%08x\n",
+		     tess.input_control_points, program.wave_size, reads.front().pc);
+		return;
+	}
+	EXIT("the merged hull program reads another control point's LDS record at pc 0x%08x, but no "
+	     "s_barrier has every LDS write before it and every such read after it\n",
+	     reads.front().pc);
+}
+
+void OrderMergedHullRingReads(IR::Program& program, std::span<const MergedHullTraffic> writes,
+                              std::span<const MergedHullTraffic> reads) {
+	uint32_t late_write_pc = 0;
+	switch (InsertMergedHullBarrier(program, writes, reads, false, late_write_pc)) {
+		case MergedHullBarrierResult::Ordered: return;
+		case MergedHullBarrierResult::UnreachableRead:
+			EXIT("the merged hull program reads another control point's off-chip output in a block "
+			     "no control point reaches, at pc 0x%08x\n",
+			     reads.front().pc);
+		case MergedHullBarrierResult::NoUniformPoint:
+			EXIT("the merged hull program reads another control point's off-chip output at pc "
+			     "0x%08x, but no block before the read is reached once by every invocation, so no "
+			     "barrier can order it after the writes\n",
+			     reads.front().pc);
+		case MergedHullBarrierResult::LateWrite:
+			EXIT("the merged hull program reads another control point's off-chip output, but its "
+			     "control point store at pc 0x%08x comes after the last block every invocation "
+			     "reaches before the read\n",
+			     late_write_pc);
+	}
 }
 
 bool MergedHullFirstInvocationOnly(IR::Value predicate, MergedHullAddresses& addresses,
@@ -997,6 +1051,9 @@ bool LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 			}
 			const auto&           memory = program.memory_info.at(inst.Flags<MemoryFlags>().index);
 			bool                  write  = false;
+#if defined(ANYPS5_KYTY)
+			bool                  cross_record_read = false;
+#endif
 			uint32_t              components = 0;
 			TessellationAttribute kind;
 			Value                 address, predicate;
@@ -1014,10 +1071,8 @@ bool LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 					const bool own = MergedHullAddresses(tess.output_control_points, {})
 					                     .Evaluate(inst.Arg(0))
 					                     .coefficient != 0u;
-					if (write || !own) {
-						(write ? record_writes : record_reads)
-						    .push_back({block, order, inst.Flags<MemoryFlags>().pc});
-					}
+					cross_record_read = !write && !own;
+					if (write) record_writes.push_back({block, order, inst.Flags<MemoryFlags>().pc});
 				} else
 #endif
 				if (memory.data_bits != 32u ||
@@ -1132,6 +1187,10 @@ bool LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 				inst.ReplaceUsesWith(replacement);
 			}
 #if defined(ANYPS5_KYTY)
+			if (cross_record_read) {
+				record_reads.push_back(
+				    {block, order, inst.Flags<MemoryFlags>().pc, values[0].TryInstruction()});
+			}
 			if (merged && kind == TessellationAttribute::ControlOutput &&
 			    tess.output_control_points != 1u) {
 				const auto pc = inst.Flags<MemoryFlags>().pc;
@@ -1148,7 +1207,7 @@ bool LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 		}
 	}
 #if defined(ANYPS5_KYTY)
-	RequireMergedHullBarrierOrder(barriers, record_writes, record_reads);
+	if (merged) RequireMergedHullBarrierOrder(program, tess, barriers, record_writes, record_reads);
 	OrderMergedHullRingReads(program, ring_writes, ring_reads);
 #endif
 	ConstantPropagationPass(program.blocks, program.wave_size);
