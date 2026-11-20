@@ -226,6 +226,11 @@ public:
 
 	KYTY_CLASS_NO_COPY(RegionManager);
 
+	[[nodiscard]] bool EverGpuWritten(uint64_t offset, uint64_t size) const KYTY_NO_THREAD_SAFETY_ANALYSIS {
+		const auto [start, end] = GetPageRange(offset, size);
+		return m_gpu_written.Any(start, end);
+	}
+
 	template <DirtySource source>
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const KYTY_REQUIRES(lock) {
 		const auto [start, end] = GetPageRange(offset, size);

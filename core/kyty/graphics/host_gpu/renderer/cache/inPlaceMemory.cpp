@@ -289,12 +289,12 @@ void InPlaceMemory::LogSummary(double seconds) {
 	const auto bounded = take(s_bounded_flips);
 	::Log::WriteToConsoleAndLog(fmt::format(
 	    "[kyty-command-memory] summary of the last {:.0f} s: {} buffers served in place ({:.1f} MiB), {} converted after a "
-	    "fault, refused: {} not one run of the second view, {} in the guest file, {} across chunks, {} chunk refused, {} at "
-	    "bind; {} live buffers in place ({:.1f} MiB), {} chunks ({} MiB pinned); {} pages served in place, {} handed back "
+	    "fault, refused: {} with a page the GPU wrote, {} not one run of the second view, {} in the guest file, {} across "
+	    "chunks, {} chunk refused, {} at bind; {} live buffers in place ({:.1f} MiB), {} chunks ({} MiB pinned); {} pages served in place, {} handed back "
 	    "to tracking; {} GPU writes noted, {} reads that waited for one; {} labels written at completion; {} flips that "
 	    "waited for the previous frame ({:.1f} ms)\n",
 	    seconds, take(s_imported), static_cast<double>(take(s_imported_bytes)) / static_cast<double>(MiB),
-	    take(s_conversions), take(s_refused_unbacked), take(s_refused_guest), take(s_refused_straddle),
+	    take(s_conversions), take(s_refused_gpu), take(s_refused_unbacked), take(s_refused_guest), take(s_refused_straddle),
 	    take(s_refused_chunk), take(s_refused_bind), s_live_buffers.load(std::memory_order_relaxed),
 	    static_cast<double>(s_live_bytes.load(std::memory_order_relaxed)) / static_cast<double>(MiB),
 	    s_chunks.load(std::memory_order_relaxed), s_pinned_bytes.load(std::memory_order_relaxed) / MiB, take(s_pages_in),

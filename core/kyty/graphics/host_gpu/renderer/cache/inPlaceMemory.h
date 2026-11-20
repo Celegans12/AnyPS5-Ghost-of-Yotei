@@ -33,6 +33,7 @@ public:
 		s_bounded_ns.fetch_add(waited_ns, std::memory_order_relaxed);
 	}
 	static void NoteConversion() noexcept { s_conversions.fetch_add(1, std::memory_order_relaxed); }
+	static void NoteGpuWrittenRefusal() noexcept { s_refused_gpu.fetch_add(1, std::memory_order_relaxed); }
 	static void LogSummary(double seconds);
 
 	[[nodiscard]] bool                    CanImport(GraphicContext& graphics, uint64_t vaddr, uint64_t size);
@@ -102,6 +103,7 @@ private:
 	inline static std::atomic<uint64_t> s_refused_straddle {0};
 	inline static std::atomic<uint64_t> s_refused_chunk {0};
 	inline static std::atomic<uint64_t> s_refused_bind {0};
+	inline static std::atomic<uint64_t> s_refused_gpu {0};
 	inline static std::atomic<uint64_t> s_chunks {0};
 	inline static std::atomic<uint64_t> s_pinned_bytes {0};
 	inline static std::atomic<uint64_t> s_pages_in {0};

@@ -158,6 +158,24 @@ public:
 		return pages;
 	}
 
+	[[nodiscard]] bool EverGpuWritten(uint64_t vaddr, uint64_t size) const {
+		if (size == 0 || !GuestRange {vaddr, size}.Valid()) {
+			return false;
+		}
+		for (auto index = vaddr / TRACKER_REGION_SIZE; index * TRACKER_REGION_SIZE < vaddr + size; ++index) {
+			const auto* manager = m_regions[index].load(std::memory_order_acquire);
+			if (manager == nullptr) {
+				continue;
+			}
+			const auto begin = std::max(vaddr, index * TRACKER_REGION_SIZE);
+			const auto end   = std::min(vaddr + size, (index + 1) * TRACKER_REGION_SIZE);
+			if (manager->EverGpuWritten(begin - index * TRACKER_REGION_SIZE, end - begin)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	[[nodiscard]] bool TouchesCommandMemory(uint64_t vaddr, uint64_t size) const noexcept {
 		if (size == 0) {
 			return false;

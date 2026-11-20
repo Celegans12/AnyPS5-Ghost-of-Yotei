@@ -1556,10 +1556,12 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	constexpr auto flags = AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress;
 	const auto     bytes = overlap.end - overlap.begin;
 	std::optional<InPlaceMemory::Imported> imported;
-	if (m_in_place && m_memory_tracker.TouchesCommandMemory(overlap.begin, bytes) &&
-	    !m_gpu_modified_ranges.Intersects(overlap.begin, bytes) &&
-	    !m_memory_tracker.IsRegionGpuModified(overlap.begin, bytes)) {
-		imported = m_in_place->Import(m_graphics, overlap.begin, bytes, flags);
+	if (m_in_place && m_memory_tracker.TouchesCommandMemory(overlap.begin, bytes)) {
+		if (m_gpu_modified_ranges.Intersects(overlap.begin, bytes) || m_memory_tracker.EverGpuWritten(overlap.begin, bytes)) {
+			InPlaceMemory::NoteGpuWrittenRefusal();
+		} else {
+			imported = m_in_place->Import(m_graphics, overlap.begin, bytes, flags);
+		}
 	}
 	const auto id = imported.has_value()
 	                    ? m_slot_buffers.insert(m_graphics, m_scheduler, overlap.begin, bytes, imported->buffer,
@@ -2672,8 +2674,12 @@ void BufferCache::ServeInPlaceConversions() {
 		}
 		const auto begin = buffer.CpuAddress();
 		const auto bytes = buffer.Size();
-		if (m_gpu_modified_ranges.Intersects(begin, bytes) || m_memory_tracker.IsRegionGpuModified(begin, bytes) ||
-		    !m_in_place->CanImport(m_graphics, begin, bytes)) {
+		if (m_gpu_modified_ranges.Intersects(begin, bytes) || m_memory_tracker.EverGpuWritten(begin, bytes)) {
+			InPlaceMemory::NoteGpuWrittenRefusal();
+			buffer.in_place_refused = true;
+			continue;
+		}
+		if (!m_in_place->CanImport(m_graphics, begin, bytes)) {
 			buffer.in_place_refused = true;
 			continue;
 		}
