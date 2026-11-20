@@ -3508,7 +3508,7 @@ bool TextureCache::CoversMeta(uint64_t address, uint64_t size) {
 		return true;
 	}
 	const auto& info = owner->info;
-	return size >= info.metadata.range.size / std::max(info.resources.layers, 1u);
+	return size >= info.metadata.range.size / std::max(info.resources.layers, 1u) && size <= info.metadata.range.size;
 }
 
 bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
