@@ -160,6 +160,7 @@ void OpenPageFaultStillSignalsTheWrite(PageManager& pages) {
 	const uint64_t vaddr = RegionBase + 64 * TRACKER_REGION_SIZE + 3 * TRACKER_PAGE_SIZE;
 	const uint64_t index = vaddr / TRACKER_REGION_SIZE;
 	const uint64_t bit   = uint64_t {1} << (index % 64);
+	tracker.ConsumeCpuWrites(CpuWriteConsumer::IndirectWriteTables, vaddr, TRACKER_PAGE_SIZE, [](uint64_t, uint64_t) {});
 	Check(tracker.IsRegionCpuModified(vaddr, TRACKER_PAGE_SIZE), "signal: a fresh region is not written by the CPU");
 	Bda::g_pending[index / 64].fetch_and(~bit);
 	const auto region = tracker.RegionCpuDirtyEpoch(index);

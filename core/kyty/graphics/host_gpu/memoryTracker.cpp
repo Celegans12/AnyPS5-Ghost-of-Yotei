@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/runtimeSwitches.h"
 
 namespace Libs::Graphics {
 
@@ -71,9 +72,25 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 }
 
 bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
-	return Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-		return manager->IsModifiedUnlocked<DirtySource::Cpu>(offset, bytes);
-	});
+	if (!Common::RuntimeSwitches::On(Common::RuntimeSwitches::Switch::TrackerLazyRegions)) {
+		return Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			return manager->IsModifiedUnlocked<DirtySource::Cpu>(offset, bytes);
+		});
+	}
+	ValidateRange(vaddr, size);
+	const auto last = (vaddr + size - 1) / TRACKER_REGION_SIZE;
+	for (auto index = vaddr / TRACKER_REGION_SIZE; index <= last; index++) {
+		const auto* manager = m_regions[index].load(std::memory_order_acquire);
+		if (manager == nullptr) {
+			return true;
+		}
+		const auto begin = std::max(vaddr, index * TRACKER_REGION_SIZE);
+		const auto end   = std::min(vaddr + size, (index + 1) * TRACKER_REGION_SIZE);
+		if (manager->IsModifiedUnlocked<DirtySource::Cpu>(begin - index * TRACKER_REGION_SIZE, end - begin)) {
+			return true;
+		}
+	}
+	return false;
 }
 
 bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {

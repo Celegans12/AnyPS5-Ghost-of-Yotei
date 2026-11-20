@@ -72,6 +72,16 @@ if(NOT WIN32)
 endif()
 
 if(NOT WIN32)
+    add_test_executable(kyty_shim_tracker_transitions_tests ${CMAKE_CURRENT_SOURCE_DIR}/TrackerTransitions.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+    target_include_directories(kyty_shim_tracker_transitions_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(kyty_shim_tracker_transitions_tests PRIVATE Kyty::gpu libkernel libc)
+    add_test(NAME kyty_shim_tracker_transitions COMMAND kyty_shim_tracker_transitions_tests)
+    set_tests_properties(kyty_shim_tracker_transitions PROPERTIES TIMEOUT 60
+            PASS_REGULAR_EXPRESSION "kyty_shim_tracker_transitions: ok" FAIL_REGULAR_EXPRESSION "FAILED")
+endif()
+
+if(NOT WIN32)
     add_test_executable(kyty_shim_table_resolution_cache_tests ${CMAKE_CURRENT_SOURCE_DIR}/TableResolutionCache.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
     target_include_directories(kyty_shim_table_resolution_cache_tests PRIVATE ${LIBS_INCLUDE_DIR})
