@@ -4,7 +4,7 @@
 #include <mutex>
 
 #if defined(__clang__)
-#define KYTY_THREAD_ANNOTATION(x) __attribute__((x))
+#define KYTY_THREAD_ANNOTATION(x) __attribute((x))
 #else
 #define KYTY_THREAD_ANNOTATION(x)
 #endif
