@@ -301,4 +301,14 @@ target_link_libraries(kyty_shim_packed_unorm_blend_tests PRIVATE Kyty::gpu libke
 set_target_properties(kyty_shim_packed_unorm_blend_tests PROPERTIES CXX_EXTENSIONS OFF)
 add_test(NAME kyty_shim_packed_unorm_blend COMMAND kyty_shim_packed_unorm_blend_tests)
 set_tests_properties(kyty_shim_packed_unorm_blend PROPERTIES TIMEOUT 120)
+add_test_executable(kyty_shim_wave64_cross_lane_tests ${CMAKE_CURRENT_SOURCE_DIR}/Wave64CrossLane.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../Execution/src/FrameCapture.cpp)
+target_include_directories(kyty_shim_wave64_cross_lane_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/3rdparty/zstd/lib)
+target_link_libraries(kyty_shim_wave64_cross_lane_tests PRIVATE libzstd_static)
+set_target_properties(kyty_shim_wave64_cross_lane_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_host_test_executable(kyty_shim_wave64_cross_lane_tests)
+add_dependencies(kyty_shim_wave64_cross_lane_tests agc_frame_replay)
+add_test(NAME kyty_shim_wave64_cross_lane COMMAND kyty_shim_wave64_cross_lane_tests $<TARGET_FILE:agc_frame_replay>)
+set_tests_properties(kyty_shim_wave64_cross_lane PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "kyty_shim_wave64_cross_lane: ok")
 endif()
