@@ -88,9 +88,6 @@ static bool TableMemoOn() {
 static uint32_t TableMemoVerifyEvery() {
 	return kyty_local_table_memo_verify.load(std::memory_order_relaxed);
 }
-static uint32_t TableSerialsMode() {
-	return kyty_local_table_serials.load(std::memory_order_relaxed);
-}
 
 template <typename T>
 struct TableRoleSide {
@@ -158,7 +155,6 @@ struct RenderExecutor::TableImageSet {
 		TextureCache::ImageDesc desc;
 		vk::AccessFlags2        access = vk::AccessFlagBits2::eShaderRead;
 		bool                    target  = false;
-		vk::AccessFlags2        target_read {};
 		bool                    storage = false;
 		bool                    whole   = false;
 		bool                    proven   = false;
@@ -190,10 +186,6 @@ struct RenderExecutor::TableImageSet {
 	uint64_t                  span_begin = 0, span_end = 0;
 	uint64_t                  transit_epoch = UINT64_MAX;
 	const NativeXprDrawState* transit_state = nullptr;
-	uint64_t                  transit_serials  = UINT64_MAX;
-	uint64_t                  transit_capture  = 0;
-	std::vector<ImageId>      image_ids;
-	bool                      holds_target = false;
 	bool                      read_after_write = false;
 	bool                  refused = false;
 	static constexpr uint64_t RetryFrames = 300;
@@ -456,7 +448,6 @@ void RenderExecutor::TableForgetStates() {
 				if (set->transit_state != nullptr) {
 					set->transit_state   = nullptr;
 					set->transit_epoch   = UINT64_MAX;
-					set->transit_serials = UINT64_MAX;
 				}
 }
 
@@ -885,27 +876,8 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 			                                                                &NativeXprDrawState::Target::id);
 			const auto* target  = draw_state == nullptr || found == draw_state->targets.end() ? nullptr : &*found;
 			const auto& view    = binding.desc.view_info;
-			const bool target_read = [&] {
-				if (target == nullptr || (target->access & vk::AccessFlagBits2::eShaderRead) ||
-				    kyty_local_table_target_read.load(std::memory_order_relaxed) == 0)
-					return false;
-				const auto layout = target->layout;
-				if (storage) return !image.info.IsDepth() && layout == vk::ImageLayout::eGeneral;
-				if (layout == vk::ImageLayout::eGeneral) return true;
-				const bool pixel_feedback = layout == vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT && stages == 2 && st == 1;
-				if (!image.info.IsDepth()) return pixel_feedback;
-				const auto aspect     = binding.desc.view_info.aspect;
-				const bool depth_read = pixel_feedback || layout == vk::ImageLayout::eDepthReadOnlyOptimal ||
-				                        layout == vk::ImageLayout::eDepthStencilReadOnlyOptimal ||
-				                        layout == vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal;
-				const bool stencil_read = layout == vk::ImageLayout::eStencilReadOnlyOptimal ||
-				                          layout == vk::ImageLayout::eDepthStencilReadOnlyOptimal ||
-				                          layout == vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal;
-				return (!(aspect & vk::ImageAspectFlagBits::eDepth) || depth_read) &&
-				       (!(aspect & vk::ImageAspectFlagBits::eStencil) || stencil_read);
-			}();
 			if (image.info.data.Empty()) return refuse("an image without data");
-			if (target != nullptr && !target_read && (storage || !(target->access & vk::AccessFlagBits2::eShaderRead)))
+			if (target != nullptr && (storage || !(target->access & vk::AccessFlagBits2::eShaderRead)))
 				return refuse("a target the shader reads");
 			if ((storage || (image.binding.force_general && image.binding.shader_write)) && !image.info.IsTiled())
 				return refuse("a linear image the shader writes");
@@ -917,11 +889,7 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 			             .desc   = binding.desc};
 			if (target != nullptr) {
 				dep.layout      = target->layout;
-				dep.target_read = target_read ? vk::AccessFlagBits2::eShaderRead |
-				                                    (storage || image.binding.shader_write ? vk::AccessFlagBits2::eShaderWrite
-				                                                                           : vk::AccessFlags2 {})
-				                              : vk::AccessFlags2 {};
-				dep.access      = target->access | dep.target_read;
+				dep.access      = target->access;
 				dep.target      = true;
 			} else if (image.binding.force_general && !image.info.IsDepth()) {
 				dep.layout  = vk::ImageLayout::eGeneral;
@@ -1005,8 +973,6 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 		for (const auto& dep: deps[st])
 			if (dep.layout != vk::ImageLayout::eUndefined) {
 				set->images.push_back(dep);
-				set->image_ids.push_back(dep.id);
-				set->holds_target |= dep.target;
 				set->read_after_write |= dep.whole && dep.storage;
 				if (dep.desc.info.metadata.kind != ImageMetadataKind::None)
 					textures.NoteMetaUse(dep.desc.info.metadata.range.address, dep.id.index);
@@ -1751,40 +1717,6 @@ void RenderExecutor::TablePrepareBda(const TablePair& pair, std::array<std::span
 	m_context.PrepareBda(writes, !reach_synchronized);
 }
 
-vk::AccessFlags2 RenderExecutor::TableTargetRead(const TableImageSet& set, ImageId id) {
-	vk::AccessFlags2 read {};
-	for (const auto& dep: set.images)
-		if (dep.target && dep.id == id) read |= dep.target_read;
-	return read;
-}
-
-static void TableSerialsUnsafe(const char* what) {
-	static std::atomic<uint32_t> count {0};
-	LiveCounters::Add(LiveCounters::SerialsUnsafe);
-	if (const auto n = count.fetch_add(1, std::memory_order_relaxed); n < 32)
-		std::printf("TABLE-SERIALS UNSAFE: %s (%u)\n", what, n + 1);
-}
-
-template<typename State>
-static uint64_t TableTargetSerials(const State& draw_state) {
-	uint64_t sum = ImageSerials::Unattributed();
-	for (const auto id: draw_state.target_ids) sum += ImageSerials::Read(id.index);
-	return sum;
-}
-template<typename Set>
-static uint64_t TableSetSerials(const Set& set) {
-	uint64_t sum = ImageSerials::Unattributed();
-	for (const auto id: set.image_ids) sum += ImageSerials::Read(id.index);
-	return sum;
-}
-template<typename Set, typename State>
-static bool TableSetApart(const Set& set, const State& draw_state) {
-	if (set.holds_target) return false;
-	for (const auto id: set.image_ids)
-		if (std::ranges::find(draw_state.target_ids, id) != draw_state.target_ids.end()) return false;
-	return true;
-}
-
 bool RenderExecutor::TableTransit(const TableImageSet& set, CommandRecorder vk_buffer,
                                   const NativeXprDrawState* draw_state) {
 	auto& textures = m_context.GetTextureCache();
@@ -1796,7 +1728,7 @@ bool RenderExecutor::TableTransit(const TableImageSet& set, CommandRecorder vk_b
 		                        : std::ranges::find(draw_state->targets, dep.id, &NativeXprDrawState::Target::id);
 		const bool is_target = draw_state != nullptr && target != draw_state->targets.end();
 		if (is_target != dep.target ||
-		    (is_target && (target->layout != dep.layout || (target->access | dep.target_read) != dep.access)))
+		    (is_target && (target->layout != dep.layout || target->access != dep.access)))
 			return false;
 		if (is_target) continue;
 		if ((dep.storage && !image->SafeToDownload()) || TableRefreshPending(*image, dep.desc)) return false;
@@ -1809,8 +1741,6 @@ bool RenderExecutor::TableTransit(const TableImageSet& set, CommandRecorder vk_b
 		if (!dep.target)
 			textures.m_slot_images[dep.id].Transit(dep.layout, dep.access, dep.whole ? std::nullopt : std::optional {dep.range},
 			                                       vk_buffer);
-		else if (dep.target_read)
-			textures.m_slot_images[dep.id].Transit(dep.layout, dep.access, std::nullopt, vk_buffer);
 	return true;
 }
 
@@ -2205,43 +2135,17 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	    set->read_after_write && kyty_local_draw_read_after_write.load(std::memory_order_relaxed) != 0;
 	const bool in_place      = same_command && emit.state == &draw_state && table.last_set == set &&
 	                      table.images_epoch == images_epoch && own && !read_after_write;
-	const auto serials = own ? TableSerialsMode() : 0u;
-	(void)serials;
 	if (!in_place) {
-		const bool epoch_targets = !own || draw_state.emitted_epoch != images_epoch;
-		const auto targets_sum   = serials != 0 ? TableTargetSerials(draw_state) : 0;
-		const bool sum_targets   = !own || draw_state.emitted_serials != targets_sum;
-		const bool due_targets   = serials == 1 ? sum_targets : epoch_targets;
-		if (serials != 0 && epoch_targets != sum_targets)
-			LiveCounters::Add(sum_targets ? LiveCounters::SerialsExtra : LiveCounters::SerialsSkipped);
-		if (due_targets && !NativeXprEmitTargets(draw_state, vk_buffer, set)) {
-			if (serials == 2 && !sum_targets) TableSerialsUnsafe("targets refused");
+		const bool due_targets = !own || draw_state.emitted_epoch != images_epoch;
+		if (due_targets && !NativeXprEmitTargets(draw_state, vk_buffer))
 			return LiveCounters::Add(LiveCounters::TableDrawNative), Spec::Refuse("table: targets"), TableResult::Native;
-		}
-		if (serials == 2 && due_targets && !sum_targets && TableTargetSerials(draw_state) != targets_sum)
-			TableSerialsUnsafe("targets moved");
-		const bool epoch_transit = !own || set->transit_epoch != images_epoch || set->transit_state != &draw_state;
-		const auto set_sum       = serials != 0 ? TableSetSerials(*set) : 0;
-		const bool sum_transit   = !own || set->transit_serials != set_sum ||
-		                         ((set->transit_state != &draw_state || set->transit_capture != draw_state.capture_id) &&
-		                          !TableSetApart(*set, draw_state));
-		const bool due_transit   = (serials == 1 ? sum_transit : epoch_transit) || read_after_write;
-		if (serials != 0 && epoch_transit != sum_transit)
-			LiveCounters::Add(sum_transit ? LiveCounters::SerialsExtra : LiveCounters::SerialsSkipped);
-		if (due_transit && !TableTransit(*set, vk_buffer, &draw_state)) {
-			if (serials == 2 && !sum_transit && !read_after_write) TableSerialsUnsafe("transit refused");
+		const bool due_transit = !own || set->transit_epoch != images_epoch || set->transit_state != &draw_state ||
+		                         read_after_write;
+		if (due_transit && !TableTransit(*set, vk_buffer, &draw_state))
 			return LiveCounters::Add(LiveCounters::TableDrawNative), Spec::Refuse("table: transit"), TableResult::Native;
-		}
-		if (serials == 2 && due_transit && !sum_transit && !read_after_write && TableSetSerials(*set) != set_sum)
-			TableSerialsUnsafe("transit moved");
 		if (own) {
 			draw_state.emitted_epoch = set->transit_epoch = texture_cache.ImagesEpoch();
 			set->transit_state       = &draw_state;
-			set->transit_capture     = draw_state.capture_id;
-			if (serials != 0) {
-				draw_state.emitted_serials = due_targets || due_transit ? TableTargetSerials(draw_state) : targets_sum;
-				set->transit_serials       = due_targets || due_transit ? TableSetSerials(*set) : set_sum;
-			}
 		}
 	}
 	if (variant.colors != draw_state.rendering.num_color_attachments ||
@@ -2627,11 +2531,9 @@ void TableLoadSwitches() {
 		load("KYTY_TABLE_STORE_BUDGET", kyty_local_table_store_budget);
 		load("KYTY_TABLE_SET_PROOFS", kyty_local_table_set_proofs);
 		load("KYTY_TABLE_MRU", kyty_local_table_mru);
-		load("KYTY_TABLE_TARGET_READ", kyty_local_table_target_read);
 		load("KYTY_TABLE_GATHER_MEMO", kyty_local_table_gather_memo);
 		load("KYTY_TABLE_MEMO", kyty_local_table_memo);
 		load("KYTY_TABLE_MEMO_VERIFY", kyty_local_table_memo_verify);
-		load("KYTY_TABLE_SERIALS", kyty_local_table_serials);
 		load("KYTY_DRAW_READ_AFTER_WRITE", kyty_local_draw_read_after_write);
 		return true;
 	}();

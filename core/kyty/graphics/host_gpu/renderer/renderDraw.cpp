@@ -72,7 +72,6 @@
 namespace Libs::Graphics {
 
 namespace {
-bool NativeXprVertexBuffersEnabled();
 uint32_t TableXprMode();
 }
 
@@ -2369,15 +2368,6 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		TableStore(buffer, state, state.topology, primitive_restart_enable, rendering, dynamic_state,
 		           !mesh_active && draw.indexed && (emit.indirect.address != 0 || index_source.host_data == nullptr) &&
 		               draw_dwords == 0 && vertex_bindings.count == 0);
-	}
-	if (std::exchange(m_native_xpr_store, false)) {
-		if (!mesh_active && draw.indexed && (emit.indirect.address != 0 || index_source.host_data == nullptr) &&
-		    (vertex_bindings.count == 0 || NativeXprVertexBuffersEnabled()) && draw_dwords == 0) {
-			NativeXprStore(buffer, state, state.topology, primitive_restart_enable, rendering, stages,
-			               dynamic_state);
-		} else {
-			NativeXprRefuseStore(buffer);
-		}
 	}
 }
 

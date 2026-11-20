@@ -662,7 +662,7 @@ void GuestGpu::ResolveThread() {
 		}
 		if ((operation->kind == GpuOperationKind::DrawIndex ||
 		     operation->kind == GpuOperationKind::DrawIndirect) &&
-		    (table_hint == 1u || executor.NativeXprLikely(*operation->state.shaders))) {
+		    table_hint == 1u) {
 		} else if (operation->kind == GpuOperationKind::DrawIndex ||
 		           operation->kind == GpuOperationKind::DrawAuto) {
 			if (helper && helper->Takes(*operation->state.shaders)) {
@@ -2024,8 +2024,7 @@ void CommandProcessor::ExecuteDrawIndex(const GpuOperation& operation, DrawIndex
 	}
 	auto& executor = m_renderer.GetRenderExecutor();
 	if (args.indirect.address == 0 &&
-	    (executor.TableXprTry(CurrentBuffer(), 0, 1, 0, 0, 0, vk::IndexType::eUint16, &args, operation.clean) ||
-	     (!executor.TableStoreRequested() && executor.NativeXprTryDirect(CurrentBuffer(), args)))) {
+	    executor.TableXprTry(CurrentBuffer(), 0, 1, 0, 0, 0, vk::IndexType::eUint16, &args, operation.clean)) {
 		return;
 	}
 	executor.DrawIndex(CurrentBuffer(), args);
@@ -2207,17 +2206,11 @@ void CommandProcessor::ExecuteDrawIndirect(const GpuOperation& operation) {
 		if (indirect.indexed && count_address == 0 && indirect.max_count <= 64 &&
 		    indirect.stride >= sizeof(vk::DrawIndexedIndirectCommand) && (indirect.stride & 3u) == 0 &&
 		    (indirect.index_type == 0 || indirect.index_type == 1) &&
-		    (executor.TableXprTry(CurrentBuffer(), args_addr, indirect.max_count, indirect.stride,
-		                          indirect.index_base,
-		                          uint64_t {indirect.index_buffer_size} * (indirect.index_type == 0 ? 2u : 4u),
-		                          indirect.index_type == 0 ? vk::IndexType::eUint16 : vk::IndexType::eUint32,
-		                          nullptr, operation.clean, records.offsets, indirect.run_offsets) ||
-		     (indirect.max_count == 1 && !executor.TableStoreRequested() &&
-		      executor.NativeXprTry(CurrentBuffer(), args_addr, indirect.index_base,
-		                            uint64_t {indirect.index_buffer_size} *
-		                                (indirect.index_type == 0 ? 2u : 4u),
-		                            indirect.index_type == 0 ? vk::IndexType::eUint16
-		                                                     : vk::IndexType::eUint32)))) {
+		    executor.TableXprTry(CurrentBuffer(), args_addr, indirect.max_count, indirect.stride,
+		                         indirect.index_base,
+		                         uint64_t {indirect.index_buffer_size} * (indirect.index_type == 0 ? 2u : 4u),
+		                         indirect.index_type == 0 ? vk::IndexType::eUint16 : vk::IndexType::eUint32,
+		                         nullptr, operation.clean, records.offsets, indirect.run_offsets)) {
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::IndirectDraws, indirect.max_count);
 			return;
 		}

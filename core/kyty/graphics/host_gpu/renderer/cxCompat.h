@@ -11,11 +11,9 @@ inline volatile std::atomic_uint32_t kyty_local_table_dispatch_mode {0};
 inline volatile std::atomic_uint32_t kyty_local_table_store_budget {32};
 inline volatile std::atomic_uint32_t kyty_local_table_set_proofs {1};
 inline volatile std::atomic_uint32_t kyty_local_table_mru {7};
-inline volatile std::atomic_uint32_t kyty_local_table_target_read {0};
 inline volatile std::atomic_uint32_t kyty_local_table_gather_memo {1};
 inline volatile std::atomic_uint32_t kyty_local_table_memo {1};
 inline volatile std::atomic_uint32_t kyty_local_table_memo_verify {0};
-inline volatile std::atomic_uint32_t kyty_local_table_serials {0};
 inline volatile std::atomic_uint32_t kyty_local_draw_read_after_write {1};
 inline volatile std::atomic_uint32_t kyty_local_speculate_mode {0};
 inline volatile std::atomic_uint32_t kyty_local_speculations_live {0};
@@ -43,7 +41,7 @@ inline void Refuse(const char*) noexcept {}
 namespace LiveCounters {
 enum Id : uint32_t {
 	TableDrawNative, TableStoreDeferred, TableStoreTargets, TableRingSharedBytes, TableRingShared, TableRegistered,
-	SerialsSkipped, SerialsExtra, SerialsUnsafe, TableStoreVariant, TableRingCopies, TableRingBytes, TableRefusedSets,
+	TableStoreVariant, TableRingCopies, TableRingBytes, TableRefusedSets,
 	TableProofMismatches, TableNoSet, TableMemoVerified, TableMemoMismatch, TableMemoHits, TableGatherMemoHits,
 	TableEvaluations, TableDraws, TableDispatches, TableContinued,
 	ScoutMissUnwalked, ScoutMissTicket, ScoutMissNotNative, ScoutMissContinuation, ScoutMissNotTable, ScoutMissConstant,
@@ -65,12 +63,6 @@ struct Scope {
 	Scope(const Scope&)            = delete;
 	Scope& operator=(const Scope&) = delete;
 };
-}
-
-namespace ImageSerials {
-inline std::atomic<bool> g_on {false};
-[[nodiscard]] inline uint64_t Unattributed() noexcept { return 0; }
-[[nodiscard]] inline uint64_t Read(uint32_t) noexcept { return 0; }
 }
 
 namespace LiveSwitch {

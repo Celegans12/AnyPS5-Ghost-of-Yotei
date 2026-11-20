@@ -199,9 +199,9 @@ AnyPS5 opens the window, so Kyty's window options do nothing; `ANYPS5_FULLSCREEN
 | `KYTY_LOCK_STATS` | `0` or `1`, else stops | `0` | Every period, `[lock-stats]` lines on stderr: wait and hold times of the lock per thread and per acquisition site, and the guest reads of `GetProgram` inside and outside the lock | debug | all | `6d40e04a28` |
 | `KYTY_LOCK_STATS_PERIOD` | whole seconds, 1 to 3600, else stops | `5` | Seconds between two `[lock-stats]` reports | debug | all | `6d40e04a28` |
 
-### Draws, tables, native records and shaders
+### Draws, tables and shaders
 
-The table draws are GPU-driven draws of a shader pair's table programs; the native XPR records are their older fallback, off by default. The sub-switches of the records matter only with `KYTY_NATIVE_XPR=1`, except where the effect says otherwise.
+The table draws are GPU-driven draws of a shader pair's table programs.
 
 | Variable | Values | Default | Effect | Category | Platform | Origin |
 |---|---|---|---|---|---|---|
@@ -212,29 +212,16 @@ The table draws are GPU-driven draws of a shader pair's table programs; the nati
 | `KYTY_TABLE_STORE_BUDGET` | number; `0` no limit | `32` | Table stores a frame asks for; the others are deferred to the normal path | perf | all | Kyty import |
 | `KYTY_TABLE_SET_PROOFS` | `0`, `1`, `2` | `1` | Checks of a table's image sets: `0` checks every use in full, `1` skips a use whose proof still holds, `2` does and counts the uses a proof held for that did not pass | perf | all | Kyty import |
 | `KYTY_TABLE_MRU` | bit mask | `7` | Bit `1` a larger pair cache, `2` variant hints, `4` reuse of the previous draw's set when its words match | perf | all | Kyty import |
-| `KYTY_TABLE_TARGET_READ` | number | `0` | A render target the shaders sample is held with the shader access added, as the normal path transits it | experimental | all | Kyty import |
 | `KYTY_TABLE_DESCRIPTOR_WRITES` | `0` or `1`; empty counts as unset, else stops | `1` when the device's `VkPhysicalDeviceDriverProperties::driverID` is `VK_DRIVER_ID_MESA_RADV`, else `0` | A draw whose image tables are reused but whose ring set is not current fills each table with descriptor writes from the table's host copy; a slot whose image view is not proven alive is still copied. `0` copies each table's whole capacity from its persistent set; on RADV those copies took most of the execute thread's time in a CPU profile, on NVIDIA the writes were slower | perf | all | AnyKyty |
 | `KYTY_TABLE_RESOLUTIONS` | `1` to `4096`; empty counts as unset, else stops | `256` | Entries of the cache that resolves the image tables of the normal draw path, one per table key, least recently used evicted. Evicting or renewing an entry invalidates only the table states that use it (one generation per entry), and the elements of all entries are kept under the 8 × 65,536 of the old cache by clearing the least recently used entries. Ignored with `KYTY_TABLE_RESOLUTION_LEGACY=1` | perf | all | AnyKyty |
 | `KYTY_TABLE_RESOLUTION_LEGACY` | `0` or `1`; empty counts as unset, else stops | `0` | `1` restores Kyty's cache of table resolutions: 8 entries, and creating, evicting or clearing any entry invalidates every table state (one generation for all), which then resolves its tables again | perf | all | AnyKyty |
 | `KYTY_TABLE_GATHER_MEMO` | number | `1` | Memoises the buffer descriptors a table gathers | perf | all | Kyty import |
 | `KYTY_TABLE_MEMO` | number | `1` | Remembers by shader pair and state key what a table draw drew with last | perf | all | Kyty import |
 | `KYTY_TABLE_MEMO_VERIFY` | number | `0` | Every Nth memo hit is checked against the full path, and a difference is counted | debug | all | Kyty import |
-| `KYTY_TABLE_SERIALS` | `0`, `1`, `2` | `0` | Decides the target and set checks by sums of image serials: `1` skips a check when the sums did not move, `2` runs the checks and reports those the sums would have skipped | experimental | all | Kyty import |
 | `KYTY_TABLE_STRIDES` | first character `0` is off | on | Table programs read an unswizzled buffer of any stride from the block, where otherwise they specialise on the stride | perf | all | Kyty import |
 | `KYTY_DRAW_READ_AFTER_WRITE` | number | `1` | A draw whose image set binds one image as texture and as written storage transits it at every draw, after the last draw's write | compat | all | Kyty import |
 | `KYTY_STATE_KEY_CACHE` | first character `0` is off | on | Hashes the draw-state registers again only for another snapshot of them; also used by table draws | perf | all | Kyty import |
 | `KYTY_ASYNC_XPR_PIPELINES` | first character `0` is off | on | Creates the pipeline of a record or table variant on a background thread; `0` does it on the execution thread; also used by table draws | perf | all | Kyty import |
-| `KYTY_NATIVE_XPR` | first character `1` is on | off | Native XPR records: an indexed indirect draw is replayed from a record of its object. Off because upstream saw Demon's Souls' walls drawn dark and another title slower with it | experimental | all | Kyty import |
-| `KYTY_NATIVE_XPR_RELOCATE` | first character `0` is off | on | Relocated records, which rebind buffers whose bases moved | experimental | all | Kyty import |
-| `KYTY_NATIVE_XPR_INSTANCES` | first character `1` is on | off | One relocated record per instance of a mesh; upstream's Demon's Souls crashed in the driver with it | experimental | all | Kyty import |
-| `KYTY_NATIVE_XPR_DIRECT` | first character `0` is off | on | Direct indexed draws use records; `0` sends them to the normal path | experimental | all | Kyty import |
-| `KYTY_NATIVE_XPR_VB` | first character `0` is off | on | Draws with vertex buffers are stored as records; `0` does not store them | experimental | all | Kyty import |
-| `KYTY_NATIVE_IMAGE_PROOF` | first character `0` is off | on | A record's sampled images are checked again only when their own registration changed; `0` checks them whenever any image was registered or unregistered | experimental | all | Kyty import |
-| `KYTY_NATIVE_XPR_STORE_BUDGET` | number; `0` no limit | `256` | Record stores asked for a frame | experimental | all | Kyty import |
-| `KYTY_NATIVE_XPR_KEEP_FRAMES` | number, at least `2` | `600` | Frames an unused record stays | experimental | all | Kyty import |
-| `KYTY_NATIVE_XPR_PREDICT` | first character `0` is off | on | Prefetches the record the next draw used last time | experimental | all | Kyty import |
-| `KYTY_NATIVE_XPR_STATS` | first character `1` is on | off | Prints record counters every 300 frames | debug | all | Kyty import |
-| `KYTY_XPR_RESOLVE_SKIP` | first character `0` is off | on | Skips the resolution ahead of a draw whose pair the last native try drew; `0` resolves them all | experimental | all | Kyty import |
 | `KYTY_BDA_REGIONS` | number, `0` off | `1` for Demon's Souls, else `0` | Synchronises device-address buffers by region requests with epoch proofs instead of a pass over every mapped range | perf | all | Kyty import |
 | `KYTY_BDA_DIRTY_REGIONS` | number, `0` off | `1` | With `KYTY_BDA_REGIONS`, a bounded preparation visits only the regions whose dirty bit is set | perf | all | Kyty import |
 | `KYTY_UNIFORM_BUFFERS` | first character `0` is off | on | Shaders read constants at small immediate offsets through uniform buffer views (needs `uniformBufferStandardLayout`); `0` reads them through the storage buffer | perf | all | Kyty import |

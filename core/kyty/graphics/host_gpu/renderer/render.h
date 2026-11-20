@@ -253,12 +253,8 @@ public:
 	                                            bool        table_candidate = false,
 	                                            GuestRange* examined        = nullptr);
 
-	[[nodiscard]] bool NativeXprTry(CommandBuffer& buffer, uint64_t args_addr, uint64_t index_base,
-	                                uint64_t index_bytes, vk::IndexType index_type);
-	[[nodiscard]] bool NativeXprTryDirect(CommandBuffer& buffer, const DrawIndexArgs& args);
 	void NativeXprEndDraw() noexcept {
-		m_native_xpr_store = false;
-		m_table_store      = false;
+		m_table_store = false;
 	}
 	[[nodiscard]] bool TableStoreRequested() const noexcept { return m_table_store; }
 	[[nodiscard]] bool TableLikely(const HW::Shader& shaders) const noexcept;
@@ -271,46 +267,21 @@ public:
 	                               uint64_t index_base, uint64_t index_bytes, vk::IndexType index_type,
 	                               const DrawIndexArgs* direct, bool clean,
 	                               const ShaderIndirectOffsets& offsets = {}, const uint32_t* run_offsets = nullptr);
-	[[nodiscard]] bool NativeXprLikely(const HW::Shader& shaders) const noexcept;
 
 private:
 	struct NativeXprCache;
-	struct NativeXprRecord;
 	struct NativeXprDrawState;
 	NativeXprCache&   NativeXprState();
 	vk::DescriptorSet NativeXprAllocateSet(vk::DescriptorSetLayout layout, vk::DescriptorPool& pool_out);
 	void              NativeXprRetireSet(vk::DescriptorPool pool, vk::DescriptorSet set);
-	void              NativeXprRetire(std::unique_ptr<NativeXprRecord> record);
 	void              NativeXprCollect();
 	bool              NativeXprSweepStates(NativeXprCache& cache, uint64_t frame);
-	bool              NativeXprLearn(const NativeXprRecord& stale, NativeXprRecord& fresh);
-	const char*       NativeXprBindResources(NativeXprRecord& record, std::span<PreparedBindings* const> stages,
-	                                         const PipelineCache::Pipeline& pipeline);
-	void NativeXprStore(CommandBuffer& buffer, const DrawRenderState& state, vk::PrimitiveTopology topology,
-	                    bool primitive_restart_enable, const RenderState& rendering,
-	                    std::span<PreparedBindings* const> stages, const DynamicState& dynamic_state);
-	bool NativeXprValidateResources(NativeXprRecord& record, uint64_t frame, bool mapping_moved);
-	bool NativeXprValidate(NativeXprRecord& record, uint64_t frame, bool& broken);
-	bool NativeXprRebindBuffers(NativeXprRecord& record, std::span<const std::pair<uint32_t, uint32_t>> slots);
-	NativeXprRecord* NativeXprRelocated(uint64_t frame, bool& store);
-	void             NativeXprRefuseStore(CommandBuffer& buffer);
-	void             NativeXprDropRelocated(NativeXprRecord& record);
-	void NativeXprStoreRecord(std::unique_ptr<NativeXprRecord> record, CommandBuffer& buffer,
-	                          const DrawRenderState& state, vk::PrimitiveTopology topology,
-	                          bool primitive_restart_enable, const RenderState& rendering,
-	                          std::span<PreparedBindings* const> stages, const DynamicState& dynamic_state,
-	                          const GuestReadLog* reads);
 	void NativeXprCaptureState(const DrawRenderState& state, const RenderState& rendering, uint64_t state_key,
 	                           const DynamicState& dynamic_state);
-	struct TableImageSet;
-	bool NativeXprEmitTargets(const NativeXprDrawState& draw_state, CommandRecorder vk_buffer,
-	                          const TableImageSet* reading = nullptr);
+	bool NativeXprEmitTargets(const NativeXprDrawState& draw_state, CommandRecorder vk_buffer);
 	bool NativeXprTargetsCurrent(const NativeXprDrawState& draw_state);
 	void NativeXprEmitDynamic(NativeXprCache& cache, CommandRecorder vk_buffer, const NativeXprDrawState& draw_state,
 	                          bool same_command, bool query_bias);
-	bool NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& record, NativeXprDrawState& draw_state,
-	                   const PipelineCache::Pipeline& pipeline, uint64_t args_addr, uint64_t index_base,
-	                   uint64_t index_bytes, vk::IndexType index_type);
 
 	bool DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args);
 	bool DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args);
@@ -732,7 +703,6 @@ private:
 	void ForgetStaleCatalog() {}
 	void TableForgetStates();
 	void TableSweepPairs();
-	const DrawIndexArgs* m_native_xpr_direct = nullptr;
 public:
 	struct NativeXprDirectDraw {
 		uint64_t index_address  = 0;
@@ -773,9 +743,6 @@ private:
 	void TableDispatchSpecial(const HW::ComputeShaderInfo& cs, bool thread_dimensions, const char* why);
 	bool TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uint32_t groups_y, uint32_t groups_z,
 	                   uint64_t indirect_args, bool thread_dimensions);
-	[[nodiscard]] static vk::AccessFlags2 TableTargetRead(const TableImageSet& set, ImageId id);
-	bool m_native_xpr_store = false;
-	std::array<std::atomic<uint64_t>, 65536> m_native_xpr_drawn {};
 	std::array<std::atomic<uint64_t>, 16384> m_table_drawn {};
 	std::atomic<bool>                        m_table_drew_draws {false};
 	std::array<std::atomic<uint64_t>, 4096> m_table_dispatched {};
