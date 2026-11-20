@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <new>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -196,6 +197,71 @@ void CallbacksKeepTheirOwnProtections(PageManager& pages) {
 		check(device_sync == 0 ? "callbacks (several ranges)" : "callbacks (several ranges kept busy)");
 	}
 }
+
+struct Seen {
+	size_t   range;
+	uint64_t address;
+	uint64_t size;
+	bool     operator==(const Seen&) const = default;
+};
+
+struct NoUpload {
+	void operator()() const noexcept {}
+};
+
+struct NestedRanges {
+	MemoryTracker*                                 tracker;
+	std::span<const std::pair<uint64_t, uint64_t>> inner;
+	std::vector<Seen>                              outer_seen;
+	std::vector<Seen>                              inner_seen;
+	bool                                           inside = false;
+	bool                                           nested = false;
+
+	void operator()(size_t range, uint64_t address, uint64_t size) noexcept {
+		(inside ? inner_seen : outer_seen).push_back({range, address, size});
+		if (!inside && !nested) {
+			nested = true;
+			inside = true;
+			tracker->ForEachUploadRanges(inner, *this, NoUpload {});
+			inside = false;
+		}
+	}
+};
+
+void NestedUploadsKeepTheirRanges(PageManager& pages) {
+	MemoryTracker  tracker(pages);
+	const uint64_t outer = RegionBase + 24 * TRACKER_REGION_SIZE;
+	const uint64_t inner = outer + TRACKER_REGION_SIZE;
+	std::vector<std::pair<uint64_t, uint64_t>> warm;
+	for (uint64_t page = 0; page < 8; page++) {
+		warm.emplace_back(inner + (16 + 2 * page) * TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE);
+	}
+	const std::pair<uint64_t, uint64_t> outer_ranges[] = {{outer + 2 * TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE},
+	                                                      {outer + 3 * TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE}};
+	const std::pair<uint64_t, uint64_t> inner_ranges[] = {{inner + 7 * TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE},
+	                                                      {inner + 9 * TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE}};
+	NestedRanges warm_up {.tracker = &tracker, .inner = {}, .nested = true};
+	tracker.ForEachUploadRanges(warm, warm_up, NoUpload {});
+	NestedRanges nesting {.tracker = &tracker, .inner = inner_ranges};
+	tracker.ForEachUploadRanges(outer_ranges, nesting, NoUpload {});
+	const std::vector<Seen> outer_expected {{0, outer_ranges[0].first, TRACKER_PAGE_SIZE},
+	                                        {1, outer_ranges[1].first, TRACKER_PAGE_SIZE}};
+	const std::vector<Seen> inner_expected {{0, inner_ranges[0].first, TRACKER_PAGE_SIZE},
+	                                        {1, inner_ranges[1].first, TRACKER_PAGE_SIZE}};
+	Check(nesting.nested, "nested uploads: the outer upload called no callback");
+	Check(nesting.inner_seen == inner_expected, "nested uploads: the inner upload reported other ranges");
+	Check(nesting.outer_seen == outer_expected,
+	      "nested uploads: an upload made by a callback changed the ranges of its caller");
+	Check(!tracker.IsRegionCpuModified(outer + 2 * TRACKER_PAGE_SIZE, 2 * TRACKER_PAGE_SIZE),
+	      "nested uploads: the outer upload left a page written");
+	tracker.MarkRegionAsCpuModified(outer + 2 * TRACKER_PAGE_SIZE, 2 * TRACKER_PAGE_SIZE);
+	for (const auto& [address, size]: inner_ranges) {
+		tracker.MarkRegionAsCpuModified(address, size);
+	}
+	for (const auto& [address, size]: warm) {
+		tracker.MarkRegionAsCpuModified(address, size);
+	}
+}
 }
 
 int main() {
@@ -203,6 +269,7 @@ int main() {
 	PageManager pages;
 	QuestionsCreateNoRegion(pages);
 	CallbacksKeepTheirOwnProtections(pages);
+	NestedUploadsKeepTheirRanges(pages);
 	if (g_failures != 0) {
 		std::fprintf(stderr, "kyty_shim_tracker_transitions: %d failure(s)\n", g_failures);
 		return 1;

@@ -391,8 +391,10 @@ public:
 			uint64_t size;
 			size_t   range;
 		};
-		static thread_local std::vector<Piece>                         pieces;
-		static thread_local std::vector<std::pair<uint64_t, uint64_t>> offsets;
+		static thread_local std::vector<Piece>                         spare_pieces;
+		static thread_local std::vector<std::pair<uint64_t, uint64_t>> spare_offsets;
+		auto pieces  = std::exchange(spare_pieces, {});
+		auto offsets = std::exchange(spare_offsets, {});
 		pieces.clear();
 		for (size_t index = 0; index < ranges.size(); index++) {
 			const auto [address, size] = ranges[index];
@@ -430,6 +432,10 @@ public:
 			}
 			first = last;
 		}
+		pieces.clear();
+		offsets.clear();
+		spare_pieces  = std::move(pieces);
+		spare_offsets = std::move(offsets);
 		upload_func();
 		ApplyDeferredProtections();
 	}
