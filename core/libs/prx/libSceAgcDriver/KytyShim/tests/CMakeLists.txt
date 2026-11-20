@@ -597,3 +597,14 @@ set_tests_properties(kyty_shim_cross_queue_recycled_label_own_tick PROPERTIES TI
         LABELS "cross_queue_order;expected_failure" ENVIRONMENT "KYTY_LABELS_AFTER_DUMPS=0"
         PASS_REGULAR_EXPRESSION "kyty_shim_cross_queue_recycled_label: order broken: ")
 endif()
+
+add_test_executable(kyty_shim_wave_split_written_reads_tests ${CMAKE_CURRENT_SOURCE_DIR}/WaveSplitWrittenReads.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../Execution/src/FrameCapture.cpp)
+target_include_directories(kyty_shim_wave_split_written_reads_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/3rdparty/zstd/lib)
+target_link_libraries(kyty_shim_wave_split_written_reads_tests PRIVATE libzstd_static)
+set_target_properties(kyty_shim_wave_split_written_reads_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_host_test_executable(kyty_shim_wave_split_written_reads_tests)
+add_dependencies(kyty_shim_wave_split_written_reads_tests agc_frame_replay)
+add_test(NAME kyty_shim_wave_split_written_reads COMMAND kyty_shim_wave_split_written_reads_tests $<TARGET_FILE:agc_frame_replay>)
+set_tests_properties(kyty_shim_wave_split_written_reads PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "kyty_shim_wave_split_written_reads: ok")
