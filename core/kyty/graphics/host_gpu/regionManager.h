@@ -54,9 +54,34 @@ public:
 			WakeSleeper();
 		}
 	}
+	[[nodiscard]] bool TryLockSpinning() noexcept {
+		const auto thread = CurrentThread();
+		for (uint32_t round = 0;; round++) {
+			if (m_state.load(std::memory_order_relaxed) == 0 &&
+			    m_state.exchange(1, std::memory_order_acquire) == 0) {
+				m_owner.store(thread, std::memory_order_relaxed);
+				return true;
+			}
+			EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) == thread);
+			if (round == SpinRounds) {
+				return false;
+			}
+			Relax();
+		}
+	}
 
 private:
 	static constexpr uint32_t SpinRounds = 4096;
+
+	static void Relax() noexcept {
+#if defined(__x86_64__) || defined(_M_X64)
+		_mm_pause();
+#elif defined(_M_ARM64)
+		__yield();
+#elif defined(__aarch64__)
+		asm volatile("yield");
+#endif
+	}
 
 #if defined(_MSC_VER) && !defined(__clang__)
 	__declspec(noinline)
@@ -68,13 +93,7 @@ private:
 		for (uint32_t round = 0;; round++) {
 			EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) == thread);
 			if (round < SpinRounds || own_core) {
-#if defined(__x86_64__) || defined(_M_X64)
-				_mm_pause();
-#elif defined(_M_ARM64)
-				__yield();
-#elif defined(__aarch64__)
-				asm volatile("yield");
-#endif
+				Relax();
 			} else {
 				m_sleepers.fetch_add(1, std::memory_order_seq_cst);
 				SleepWhileHeld();

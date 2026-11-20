@@ -15,6 +15,7 @@
 #if defined(ANYPS5_KYTY)
 #include "graphics/host_gpu/renderer/cache/compareWriteBack.h"
 #endif
+#include "graphics/host_gpu/renderer/cache/completionInvalidation.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
@@ -967,6 +968,25 @@ void TextureCache::DisarmLazyReadback(Image& image) {
 	m_page_manager.UpdatePageWatchers<false, true>(begin, end - begin);
 }
 
+bool TextureCache::ReadbackArmedIn(const Image& image, uint64_t address, uint64_t size) noexcept {
+	return image.readback_begin != 0 && image.readback_begin < address + size &&
+	       address < image.readback_end;
+}
+
+bool TextureCache::HasArmedReadback(uint64_t address, uint64_t size) {
+	if (m_lazy_images.load(std::memory_order_relaxed) == 0) {
+		return false;
+	}
+	const auto page_begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);
+	const auto page_end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);
+	bool       armed      = false;
+	ForEachImageInRegion(page_begin, page_end - page_begin, [&](ImageId, Image& image) {
+		armed = ReadbackArmedIn(image, address, size);
+		return armed;
+	});
+	return armed;
+}
+
 void TextureCache::FlushLazyReadback(uint64_t address, uint64_t size) {
 	if (m_lazy_images.load(std::memory_order_relaxed) == 0) {
 		return;
@@ -977,8 +997,7 @@ void TextureCache::FlushLazyReadback(uint64_t address, uint64_t size) {
 		const auto page_begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);
 		const auto page_end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);
 		ForEachImageInRegion(page_begin, page_end - page_begin, [&](ImageId id, Image& image) {
-			if (image.readback_begin != 0 && image.readback_begin < address + size &&
-			    address < image.readback_end) {
+			if (ReadbackArmedIn(image, address, size)) {
 				armed.emplace_back(id, image.serial);
 			}
 		});
@@ -3369,10 +3388,41 @@ bool TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	    !m_registered_pages.Any(pages.first, pages.last_exclusive)) {
 		return false;
 	}
+	if (CommandScheduler::InDeferredOperation() && !GuestGpu::IsGpuThread()) {
+		return InvalidateFromCompletion(address, size);
+	}
 	FlushLazyReadback(address, size);
 	std::scoped_lock lock {m_lock};
-	const auto       page_begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);
-	const auto       page_end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);
+	return InvalidateLocked(address, size);
+}
+
+bool TextureCache::InvalidateFromCompletion(uint64_t address, uint64_t size) {
+	auto& gpu = m_scheduler.Context().GetGpu();
+	if (gpu.IsStopping()) {
+		FlushLazyReadback(address, size);
+		std::scoped_lock lock {m_lock};
+		return InvalidateLocked(address, size);
+	}
+	bool       invalidated = false;
+	const auto path        = InvalidateWithoutWaiting(
+	    m_lock, [&] { return HasArmedReadback(address, size); },
+	    [&] { invalidated = InvalidateLocked(address, size); },
+	    [&] { DeferInvalidation(address, size); });
+	return path == CompletionInvalidation::Deferred || invalidated;
+}
+
+void TextureCache::DeferInvalidation(uint64_t address, uint64_t size) {
+	auto&      gpu        = m_scheduler.Context().GetGpu();
+	const auto invalidate = [this, address, size] { (void)InvalidateMemory(address, size); };
+	if (gpu.Pipelined() && gpu.PostReadbackCommand(invalidate)) {
+		return;
+	}
+	gpu.SendCommand(invalidate);
+}
+
+bool TextureCache::InvalidateLocked(uint64_t address, uint64_t size) {
+	const auto page_begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);
+	const auto page_end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);
 	Common::SmallVector<ImageId, 8> image_ids;
 	ForEachImageInRegion(page_begin, page_end - page_begin,
 	                     [&](ImageId id, Image&) { image_ids.push_back(id); });

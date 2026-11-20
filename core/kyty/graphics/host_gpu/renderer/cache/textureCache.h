@@ -424,6 +424,12 @@ private:
 	void               ArmLazyReadback(Image& image);
 	void               DisarmLazyReadback(Image& image);
 	void               FlushLazyImages(std::span<const std::pair<ImageId, uint64_t>> images);
+	[[nodiscard]] static bool ReadbackArmedIn(const Image& image, uint64_t address,
+	                                          uint64_t size) noexcept;
+	[[nodiscard]] bool        HasArmedReadback(uint64_t address, uint64_t size);
+	[[nodiscard]] bool        InvalidateLocked(uint64_t address, uint64_t size);
+	[[nodiscard]] bool        InvalidateFromCompletion(uint64_t address, uint64_t size);
+	void                      DeferInvalidation(uint64_t address, uint64_t size);
 	[[nodiscard]] static uint64_t ReadbackConsumerKey(const ImageInfo& info) noexcept;
 	void                      NoteDiscardedTarget(ImageId id, const Image& image);
 	[[nodiscard]] static bool IsTargetImage(const Image& image) noexcept;
