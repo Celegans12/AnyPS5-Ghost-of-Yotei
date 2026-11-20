@@ -78,6 +78,9 @@ struct SrtRuntime {
 	std::span<const uint32_t> call_words;
 	bool runtime_stride = false;
 	bool image_table_heap = false;
+#if defined(ANYPS5_KYTY)
+	bool defer_flat_loads = false;
+#endif
 };
 
 class SrtReadCapture {
@@ -111,6 +114,11 @@ struct SrtWalkerGuestMemory {
 	bool (*read)(uint64_t address, uint32_t& value, bool ahead, const uint8_t* backing) = nullptr;
 };
 void SetSrtWalkerGuestMemory(const SrtWalkerGuestMemory& memory);
+#if defined(ANYPS5_KYTY)
+enum class SrtFlatDefer : uint8_t { Off, On, Verify };
+[[nodiscard]] SrtFlatDefer           SrtFlatDeferMode();
+[[nodiscard]] std::vector<uint64_t>& SrtDeferredLoadsOfThread();
+#endif
 uint32_t SrtWalkerLoadLength(uint64_t rip);
 uint32_t SrtWalkerAheadLoadLength(uint64_t rip, uint64_t address);
 

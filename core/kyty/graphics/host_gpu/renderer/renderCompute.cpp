@@ -494,6 +494,11 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	if (!TakeResolvedDispatch(input_info, compute_module)) {
 		compute_module = m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info);
 	}
+#if defined(ANYPS5_KYTY)
+	if (m_flat_defer_check != nullptr) {
+		CheckDeferredDispatch(cs_regs, pristine, input_info, compute_module);
+	}
+#endif
 	const bool fell_back = compute_module != nullptr && RtCheck().FallsBack(compute_module->info.shader_hash);
 	if (fell_back) {
 		input_info     = pristine;
@@ -785,6 +790,15 @@ void RenderExecutor::DispatchIndirectThreads(CommandBuffer& buffer, uint64_t arg
 		input_info.dispatch_indirect_threads  = true;
 		compute_module = m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info);
 	}
+#if defined(ANYPS5_KYTY)
+	if (m_flat_defer_check != nullptr) {
+		ShaderComputeInputInfo pristine {};
+		pristine.async_compute              = async_compute;
+		pristine.dispatch_thread_dimensions = true;
+		pristine.dispatch_indirect_threads  = true;
+		CheckDeferredDispatch(cs_regs, pristine, input_info, compute_module);
+	}
+#endif
 	if (compute_module == nullptr) {
 		return;
 	}
@@ -949,6 +963,11 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 		input_info     = pristine;
 		compute_module = m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info);
 	}
+#if defined(ANYPS5_KYTY)
+	if (m_flat_defer_check != nullptr) {
+		CheckDeferredDispatch(cs_regs, pristine, input_info, compute_module);
+	}
+#endif
 	const bool fell_back = compute_module != nullptr && RtCheck().FallsBack(compute_module->info.shader_hash);
 	if (fell_back) {
 		input_info     = pristine;

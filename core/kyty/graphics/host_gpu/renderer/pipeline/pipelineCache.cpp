@@ -772,8 +772,52 @@ void GuestReadLog::RecordLoads(std::span<const uint64_t> loads) {
 	m_bytes.resize(bytes_end);
 }
 
+#if defined(ANYPS5_KYTY)
+static bool FlatWordsReadOnCpu(const ShaderRecompiler::IR::CompiledShaderInfo& program, uint32_t slot, uint32_t count) {
+	const auto& info = program.info;
+	if (info.ray_query || info.bvh || !info.ray_query_reach.empty() ||
+	    program.bindings.ray_query_dword != ShaderRecompiler::IR::PushData::NoStart) {
+		return true;
+	}
+	const auto within = [&](uint32_t word) { return word >= slot && word - slot < count; };
+	for (const auto& [low, high]: info.address_bases) {
+		if (within(low) || within(high)) return true;
+	}
+	using ShaderRecompiler::IR::BdaReadWord;
+	for (const auto& span: program.bda_read_plan.spans) {
+		if ((span.low.kind == BdaReadWord::Kind::Flat && within(span.low.value)) ||
+		    (span.high.kind == BdaReadWord::Kind::Flat && within(span.high.value))) {
+			return true;
+		}
+	}
+	return false;
+}
+
+void GuestReadLog::NoteDeferredLoads(std::span<uint64_t> addresses) {
+	std::ranges::sort(addresses);
+	for (auto& load: m_flat_loads) {
+		if (load.stage != m_stage || load.deferred) continue;
+		const auto first = std::ranges::lower_bound(addresses, load.address);
+		if (first == addresses.end() || *first - load.address >= uint64_t {load.count} * sizeof(uint32_t)) continue;
+		load.deferred = true;
+		m_deferred_words += load.count;
+	}
+}
+
+void GuestReadLog::ReadGuestNow(uint64_t address, void* bytes, uint32_t size) {
+	if (!Libs::LibKernel::Memory::MayFaultOnGpuRead(address, size) ||
+	    !Libs::LibKernel::Memory::TryReadAroundGpuWrites(address, bytes, size)) {
+		std::memcpy(bytes, reinterpret_cast<const void*>(address), size);
+	}
+}
+
+void GuestReadLog::RefreshFlatLoads(std::span<ShaderRecompiler::IR::ResourceSnapshot> resources, bool gpu_copies_allowed,
+                                    const ShaderRecompiler::IR::CompiledShaderInfo* program) const {
+	m_deferred_gpu_words = 0;
+#else
 void GuestReadLog::RefreshFlatLoads(std::span<ShaderRecompiler::IR::ResourceSnapshot> resources,
                                     bool gpu_copies) const {
+#endif
 	for (auto& snapshot: resources) {
 		snapshot.gpu_flat_loads.clear();
 	}
@@ -783,6 +827,10 @@ void GuestReadLog::RefreshFlatLoads(std::span<ShaderRecompiler::IR::ResourceSnap
 		    uint64_t {load.slot} + load.count > resources[load.stage].flattened_srt.size()) {
 			continue;
 		}
+#if defined(ANYPS5_KYTY)
+		const bool gpu_copies = gpu_copies_allowed &&
+		                        (!load.deferred || (program != nullptr && !FlatWordsReadOnCpu(*program, load.slot, load.count)));
+#endif
 		const auto page_index = load.address >> 12u;
 		auto&      page       = checked[page_index % checked.size()];
 		if (page.page != page_index) {
@@ -796,6 +844,9 @@ void GuestReadLog::RefreshFlatLoads(std::span<ShaderRecompiler::IR::ResourceSnap
 		if (gpu_copies && page.owned && page.backing != nullptr &&
 		    Libs::LibKernel::Memory::HasGpuWrittenBytes(load.address, bytes)) {
 			resources[load.stage].gpu_flat_loads.push_back({load.address, load.slot, load.count});
+#if defined(ANYPS5_KYTY)
+			if (load.deferred) m_deferred_gpu_words += load.count;
+#endif
 			continue;
 		}
 		const bool around =
@@ -807,6 +858,9 @@ void GuestReadLog::RefreshFlatLoads(std::span<ShaderRecompiler::IR::ResourceSnap
 		if (!around) {
 			if (gpu_copies && page.owned && page.backing != nullptr) {
 				resources[load.stage].gpu_flat_loads.push_back({load.address, load.slot, load.count});
+#if defined(ANYPS5_KYTY)
+				if (load.deferred) m_deferred_gpu_words += load.count;
+#endif
 				continue;
 			}
 			std::memcpy(values, reinterpret_cast<const void*>(load.address), bytes);
@@ -2342,11 +2396,21 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 		runtime.runtime_stride        = RuntimeStride(params.hash);
 	}
 	t_ahead_unread_load = false;
+#if defined(ANYPS5_KYTY)
+	const bool defers = ShaderRecompiler::IR::SrtFlatDeferMode() != ShaderRecompiler::IR::SrtFlatDefer::Off;
+	runtime.defer_flat_loads = defers;
+	if (defers) ShaderRecompiler::IR::SrtDeferredLoadsOfThread().clear();
+#endif
 	if (!ShaderRecompiler::IR::MaterializeResources(program->resource_plan, runtime, resources,
 	                                                specialization)) {
 		ahead.reads.Fail();
 		return nullptr;
 	}
+#if defined(ANYPS5_KYTY)
+	if (defers && !ShaderRecompiler::IR::SrtDeferredLoadsOfThread().empty()) {
+		ahead.reads.NoteDeferredLoads(ShaderRecompiler::IR::SrtDeferredLoadsOfThread());
+	}
+#endif
 	NoteAheadWrites(program->resource_plan, resources);
 	const auto matches = [&](const ShaderModule& candidate) {
 		const auto& layout = candidate.info.bindings;
