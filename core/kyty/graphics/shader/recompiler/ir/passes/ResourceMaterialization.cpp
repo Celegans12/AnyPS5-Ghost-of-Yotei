@@ -1436,6 +1436,7 @@ bool MaterializeImageTableHeap(const ResourcePlan& program,
 		    view.kinds.size() != 1u || !ImageTableHeapExemplar(profile, view.kinds[0])) {
 			return false;
 		}
+		snapshot.specialization_reads.emplace_back(base, size);
 		exemplar = view.kinds[0];
 	} else {
 		static thread_local std::vector<uint32_t> words;
