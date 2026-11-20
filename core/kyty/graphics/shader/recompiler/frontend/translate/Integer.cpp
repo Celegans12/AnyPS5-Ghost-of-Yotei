@@ -285,21 +285,52 @@ void Translator::V_SAD_U32(const Decoder::Instruction& inst) {
 	WriteOperand(DestinationOperand(inst), result);
 }
 
-void Translator::V_MSAD_U8(const Decoder::Instruction& inst) {
-	const auto lhs    = ReadU32(inst.src0);
-	const auto rhs    = ReadU32(inst.src1);
-	auto       result = ReadU32(inst.src2);
-	for (uint32_t offset = 0; offset < 32u; offset += 8u) {
-		const auto byte = [&](IR::U32 value) {
+IR::U32 Translator::PackedSad(IR::U32 lhs, IR::U32 rhs, uint32_t field_bits, bool masked) {
+	IR::U32 sum(IR::Value(0u));
+	for (uint32_t offset = 0; offset < 32u; offset += field_bits) {
+		const auto field = [&](IR::U32 value) {
 			return IR::U32(ir.Emit(IR::ValueOpcode::BitFieldUExtract,
-			                       {value, IR::Value(offset), IR::Value(8u)}));
+			                       {value, IR::Value(offset), IR::Value(field_bits)}));
 		};
-		const auto reference = byte(rhs);
-		const auto difference =
-		    IR::U32(ir.Emit(IR::ValueOpcode::IAbs32, {ir.ISub(byte(lhs), reference)}));
-		const auto masked = ir.Select(ir.INotEqual(reference, IR::U32(IR::Value(0u))), difference,
-		                              IR::U32(IR::Value(0u)));
-		result = ir.IAdd(result, masked);
+		const auto value      = field(lhs);
+		const auto reference  = field(rhs);
+		const auto lo         = IR::U32(ir.Emit(IR::ValueOpcode::UMin32, {value, reference}));
+		const auto hi         = IR::U32(ir.Emit(IR::ValueOpcode::UMax32, {value, reference}));
+		const auto difference = ir.ISub(hi, lo);
+		sum = ir.IAdd(sum, masked ? ir.Select(ir.INotEqual(reference, IR::U32(IR::Value(0u))),
+		                                      difference, IR::U32(IR::Value(0u)))
+		                          : difference);
+	}
+	return sum;
+}
+
+void Translator::V_SAD_PACKED(const Decoder::Instruction& inst, uint32_t field_bits,
+                              uint32_t sum_shift) {
+	auto sum = PackedSad(ReadU32(inst.src0), ReadU32(inst.src1), field_bits, false);
+	if (sum_shift != 0u) {
+		sum = ir.ShiftLeftLogical(sum, IR::U32(IR::Value(sum_shift)));
+	}
+	WriteOperand(DestinationOperand(inst), ir.IAdd(sum, ReadU32(inst.src2)));
+}
+
+void Translator::V_MSAD_U8(const Decoder::Instruction& inst) {
+	const auto sum = PackedSad(ReadU32(inst.src0), ReadU32(inst.src1), 8u, true);
+	WriteOperand(DestinationOperand(inst), ir.IAdd(sum, ReadU32(inst.src2)));
+}
+
+void Translator::V_LERP_U8(const Decoder::Instruction& inst) {
+	const auto lhs      = ReadU32(inst.src0);
+	const auto rhs      = ReadU32(inst.src1);
+	const auto rounding = ReadU32(inst.src2);
+	IR::U32    result(IR::Value(0u));
+	for (uint32_t offset = 0; offset < 32u; offset += 8u) {
+		const auto bits = [&](IR::U32 value, uint32_t count) {
+			return IR::U32(ir.Emit(IR::ValueOpcode::BitFieldUExtract,
+			                       {value, IR::Value(offset), IR::Value(count)}));
+		};
+		const auto sum     = ir.IAdd(ir.IAdd(bits(lhs, 8u), bits(rhs, 8u)), bits(rounding, 1u));
+		const auto average = ir.ShiftRightLogical(sum, IR::U32(IR::Value(1u)));
+		result = ir.BitwiseOr(result, ir.ShiftLeftLogical(average, IR::U32(IR::Value(offset))));
 	}
 	WriteOperand(DestinationOperand(inst), result);
 }
