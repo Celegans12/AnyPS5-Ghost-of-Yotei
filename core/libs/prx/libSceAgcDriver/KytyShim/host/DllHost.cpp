@@ -318,7 +318,7 @@ KytyDllHost MakeHost() {
     };
     host.flip_fail = [](KytyDllFlipRequest* request, const char* message) { reinterpret_cast<RequestHolder*>(request)->request->Fail(Failure(message)); };
     host.flip_release = [](KytyDllFlipRequest* request) { delete reinterpret_cast<RequestHolder*>(request); };
-    host.host_report_setting = [](bool* enabled) { return Guard([&] { *enabled = AgcDriver::ParseHostReportSetting(std::getenv("ANYPS5_HOST_REPORT")); }); };
+    host.host_report_setting = [](bool* enabled) { return Guard([&] { const char* setting = std::getenv("ANYPS5_HOST_REPORT"); *enabled = setting == nullptr || AgcDriver::ParseHostReportSetting(setting); }); };
     host.report_host = [](const void* properties, const void* driver, const void* memory, std::uint32_t subgroupSize, const char* shaderStorePath) {
         return Guard([&] {
             const auto store = std::filesystem::u8path(shaderStorePath != nullptr ? shaderStorePath : "");

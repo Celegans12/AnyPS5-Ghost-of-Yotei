@@ -136,7 +136,8 @@ void Initialize() {
 #if defined(ANYPS5_KYTY_DLL)
     const bool hostReport = KytyShim::DllHostReportSetting();
 #else
-    const bool hostReport = AgcDriver::ParseHostReportSetting(std::getenv("ANYPS5_HOST_REPORT"));
+    const char* hostReportSetting = std::getenv("ANYPS5_HOST_REPORT");
+    const bool hostReport = hostReportSetting == nullptr || AgcDriver::ParseHostReportSetting(hostReportSetting);
 #endif
     KytyShim::InstallFaultChain();
     GuestArena::GuestArenaSetHostWriteFilter_nid_no_patch(&KytyShim::Entry::HostWriteWatched);
