@@ -59,11 +59,16 @@ static void NTAPI KeepNewThreadOffReservedCores(PVOID , DWORD reason, PVOID ) {
 	}
 }
 
+#if defined(ANYPS5_KYTY)
+extern "C" [[gnu::section(".CRT$XLK"), gnu::used]] PIMAGE_TLS_CALLBACK kyty_keep_new_thread_off_reserved_cores =
+    KeepNewThreadOffReservedCores;
+#else
 #pragma section(".CRT$XLK", read)
 extern "C" __declspec(allocate(".CRT$XLK")) const PIMAGE_TLS_CALLBACK kyty_keep_new_thread_off_reserved_cores =
     KeepNewThreadOffReservedCores;
 #pragma comment(linker, "/INCLUDE:_tls_used")
 #pragma comment(linker, "/INCLUDE:kyty_keep_new_thread_off_reserved_cores")
+#endif
 
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
