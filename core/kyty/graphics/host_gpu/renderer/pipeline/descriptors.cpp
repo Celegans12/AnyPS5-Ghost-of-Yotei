@@ -20,6 +20,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/execHelpers.h"
+#include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/lodStats.h"
@@ -1047,6 +1048,15 @@ static void ReportDeclinedTiling(const ShaderRecompiler::IR::ImageResource&   re
 	             info.extent.width, info.extent.height, info.extent.depth, info.resources.levels,
 	             value.dwords[0], value.dwords[1], value.dwords[2], value.dwords[3],
 	             value.dwords[4], value.dwords[5], value.dwords[6], value.dwords[7]);
+	if (ImageLayoutDiagEnabled()) {
+		std::fprintf(stderr,
+		             "[kyty-tiled-diag] declined candidate: source %u, descriptor index %u, first "
+		             "use pc 0x%x, indirect root %u, descriptor at 0x%llx, base 0x%llx\n",
+		             resource.source, resource.descriptor_index, resource.first_use_pc,
+		             resource.indirect_root,
+		             static_cast<unsigned long long>(CurrentImageLayoutOrigin().address),
+		             static_cast<unsigned long long>(info.data.address));
+	}
 }
 
 static TextureBinding DeclineTableView(TextureCache::ImageDesc& desc, vk::Format image_format,
@@ -1079,11 +1089,27 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	const auto key    = MakeTextureDescKey(resource, value);
 	auto       cached = m_texture_descs.find(key);
 	if (cached == m_texture_descs.end()) {
+		auto& origin = CurrentImageLayoutOrigin();
+		if (ImageLayoutDiagEnabled()) {
+			origin.path = table_candidate ? "table candidate"
+			              : resource.heap ? "image heap"
+			              : resource.indirect_root !=
+			                        ShaderRecompiler::IR::ImageResource::NoIndirectImage
+			                    ? "indirect image"
+			                    : "direct";
+			origin.shader           = Common::HackNotice::CurrentShaderSlot();
+			origin.source           = resource.source;
+			origin.descriptor_index = resource.descriptor_index;
+			origin.first_use_pc     = resource.first_use_pc;
+			origin.indirect_root    = resource.indirect_root;
+			origin.words            = value.dwords;
+		}
 		auto derived = DeriveTextureDesc(resource, descriptor);
 		if (derived.unknown_tiling) {
 			ReportDeclinedTiling(resource, value, table_candidate, derived.desc.info);
 			derived.desc = {};
 		}
+		origin.path = nullptr;
 		if (m_texture_descs.size() >= MaxTextureDescs) {
 			m_clear_texture_descs = true;
 		}
