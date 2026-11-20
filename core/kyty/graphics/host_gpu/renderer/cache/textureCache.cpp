@@ -3505,7 +3505,7 @@ bool TextureCache::CoversMeta(uint64_t address, uint64_t size) {
 	}
 	const auto* owner = m_slot_images.try_get(found->second.owner);
 	if (owner == nullptr || owner->info.metadata.range.address != address) {
-		return true;
+		return false;
 	}
 	const auto& info = owner->info;
 	return size >= info.metadata.range.size / std::max(info.resources.layers, 1u) && size <= info.metadata.range.size;
