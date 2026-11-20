@@ -88,22 +88,25 @@ void WriteText(const std::filesystem::path& path, const std::string& content) {
 void WriteSurveyFixture(const std::filesystem::path& directory) {
     constexpr std::array driven{0xf19c8f01u, 0x00000008u, 0xe0700000u, 0x80000000u, 0xbf810000u};
     constexpr std::array cacheOnly{0xf19c8f01u, 0x00000010u, 0xe0700000u, 0x80000000u, 0xbf810000u};
+    constexpr std::array stopping{0x7e100500u, 0xf4080100u, 0x10000000u, 0xf19c8f01u, 0x00000018u, 0xe0600000u, 0x80010000u, 0xbf810000u};
     constexpr std::array plain{0xbf810000u};
     constexpr std::array absent{0xbf800000u, 0xbf810000u};
     constexpr std::array metadata{0xffffffffu, 2u};
     const auto drivenHash = XXH3_64bits(driven.data(), sizeof(driven));
     const auto cacheOnlyHash = XXH3_64bits(cacheOnly.data(), sizeof(cacheOnly));
+    const auto stoppingHash = XXH3_64bits(stopping.data(), sizeof(stopping));
     const auto plainHash = XXH3_64bits(plain.data(), sizeof(plain));
     const auto absentHash = XXH3_64bits(absent.data(), sizeof(absent));
     const auto cache = "KTYCODE1" + Record(0, metadata) + Record(drivenHash, driven) + Record(plainHash, plain) +
-                       Record(cacheOnlyHash, cacheOnly);
+                       Record(stoppingHash, stopping) + Record(cacheOnlyHash, cacheOnly);
     WriteText(directory / "survey.code", cache);
     WriteText(directory / "survey.kpm",
               "# kyty pipeline manifest v1\n"
               "M 000000000001 cs code=" + HexText(drivenHash) + " ud=11 t=32,1,1 wave=32 tid=1 wgr=11 gx sb=-\n"
               "M 000000000002 cs code=" + HexText(plainHash) + " ud=11 t=64,1,1 tid=1 wgr=11 gx sb=-\n"
               "M 000000000003 cs code=" + HexText(absentHash) + " ud=11 t=64,1,1 tid=1 wgr=11 gx sb=-\n");
-    std::printf("%s %s %s\n", HexText(drivenHash).c_str(), HexText(cacheOnlyHash).c_str(), HexText(plainHash).c_str());
+    std::printf("%s %s %s %s\n", HexText(drivenHash).c_str(), HexText(cacheOnlyHash).c_str(), HexText(plainHash).c_str(),
+                HexText(stoppingHash).c_str());
 }
 
 void CheckIndex() {

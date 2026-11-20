@@ -107,6 +107,10 @@ if(ANYPS5_GPU_BACKEND STREQUAL "kyty")
         target_include_directories(kyty_rt_probe PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/3rdparty/zstd/lib ${CMAKE_CURRENT_BINARY_DIR}/generated)
         target_include_directories(kyty_rt_probe SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/3rdparty/SPIRV-Tools/include)
         target_link_libraries(kyty_rt_probe PRIVATE Kyty::gpu)
+        if(MINGW)
+            target_compile_options(kyty_rt_probe PRIVATE -fasynchronous-unwind-tables)
+            set_target_properties(kyty_rt_probe PROPERTIES ANYPS5_KYTY_HOST_RUNTIME "stdc++;gcc_s")
+        endif()
         if(WIN32 AND NOT CMAKE_VERSION VERSION_LESS 3.21)
             add_custom_command(TARGET kyty_rt_probe POST_BUILD
                     COMMAND "${CMAKE_COMMAND}" "-DDEST_DIR=$<TARGET_FILE_DIR:kyty_rt_probe>"
