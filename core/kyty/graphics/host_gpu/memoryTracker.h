@@ -352,7 +352,8 @@ public:
 				DeferScope deferred(defer, manager);
 				if (manager->ConsumeCpuDirtyRangesKeepingBusy(
 				        std::span(&range, 1), device_sync,
-				        [&](size_t, uint64_t address, uint64_t run) noexcept { range_func(address, run); })) {
+				        [&](size_t, uint64_t address, uint64_t run) noexcept { range_func(address, run); },
+				        deferred.Sink())) {
 					m_kept_pages.store(true, std::memory_order_relaxed);
 				}
 				return;
@@ -360,7 +361,7 @@ public:
 			manager->lock.lock();
 			{
 				DeferScope deferred(defer, manager);
-				manager->ForEachModifiedRange<DirtySource::Cpu, true>(offset, bytes, range_func);
+				manager->ForEachModifiedRange<DirtySource::Cpu, true>(offset, bytes, range_func, deferred.Sink());
 			}
 			if (!is_written) {
 				manager->lock.unlock();
@@ -421,9 +422,9 @@ public:
 				};
 				const std::span<const std::pair<uint64_t, uint64_t>> region_ranges(offsets);
 				if (device_sync == 0) {
-					manager->ConsumeCpuDirtyRanges(region_ranges, piece_func);
-				} else if (manager->ConsumeCpuDirtyRangesKeepingBusy(region_ranges, device_sync,
-				                                                    piece_func)) {
+					manager->ConsumeCpuDirtyRanges(region_ranges, piece_func, deferred.Sink());
+				} else if (manager->ConsumeCpuDirtyRangesKeepingBusy(region_ranges, device_sync, piece_func,
+				                                                    deferred.Sink())) {
 					m_kept_pages.store(true, std::memory_order_relaxed);
 				}
 			}
@@ -461,12 +462,12 @@ private:
 	struct DeferScope {
 		RegionManager*                          manager = nullptr;
 		std::vector<PageManager::DeferredRange> ranges;
-		DeferScope(bool defer, RegionManager* region) noexcept: manager(defer ? region : nullptr) {
-			if (manager != nullptr) PageManager::SetDeferredWriteProtectSink(&ranges);
+		DeferScope(bool defer, RegionManager* region) noexcept: manager(defer ? region : nullptr) {}
+		[[nodiscard]] std::vector<PageManager::DeferredRange>* Sink() noexcept {
+			return manager != nullptr ? &ranges : nullptr;
 		}
 		~DeferScope() {
 			if (manager == nullptr) return;
-			PageManager::SetDeferredWriteProtectSink(nullptr);
 			for (const auto& range: ranges) {
 				manager->BeginDeferredProtection();
 				s_deferred.push_back({manager, range.address, range.size});

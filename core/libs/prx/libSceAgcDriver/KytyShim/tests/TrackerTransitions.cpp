@@ -11,6 +11,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <new>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -83,6 +85,12 @@ void Check(bool condition, const char* what) {
 	g_failures++;
 }
 
+void Check(bool condition, const char* where, const char* what) {
+	if (condition) return;
+	std::fprintf(stderr, "kyty_shim_tracker_transitions: FAILED %s: %s\n", where, what);
+	g_failures++;
+}
+
 struct Counting {
 	uint64_t before;
 	Counting(): before(g_allocations.load(std::memory_order_relaxed)) { g_counting = true; }
@@ -143,12 +151,58 @@ void QuestionsCreateNoRegion(PageManager& pages) {
 	tracker.MarkRegionAsCpuModified(next, TRACKER_PAGE_SIZE);
 }
 
+
+void CallbacksKeepTheirOwnProtections(PageManager& pages) {
+	MemoryTracker  tracker(pages);
+	const uint64_t start   = RegionBase + 16 * TRACKER_REGION_SIZE;
+	const uint64_t watched = start + TRACKER_REGION_SIZE + 5 * TRACKER_PAGE_SIZE;
+	std::vector<MemoryTracker::DeferredProtect> taken;
+	bool                                        watching = false;
+	const auto                                  watch    = [&]() noexcept {
+		if (!watching) {
+			pages.UpdatePageWatchers<true>(watched, TRACKER_PAGE_SIZE);
+			watching = true;
+		}
+	};
+	const auto take  = [&]() noexcept { taken = MemoryTracker::DeferredProtects(); };
+	const auto check = [&](const char* what) {
+		bool own     = false;
+		bool foreign = false;
+		for (const auto& item: taken) {
+			own     = own || (item.address == start && item.size == 2 * TRACKER_PAGE_SIZE);
+			foreign = foreign || (item.address < watched + TRACKER_PAGE_SIZE && watched < item.address + item.size);
+		}
+		Check(watching, what, "the upload called no callback");
+		Check(own, what, "the upload did not defer the protection of its own pages");
+		Check(!foreign, what, "a protection a callback asked for was deferred with the upload's");
+		Check(!tracker.DeferredProtectionPending(start), what, "a deferred protection was left pending");
+		pages.UpdatePageWatchers<false>(watched, TRACKER_PAGE_SIZE);
+		watching = false;
+		taken.clear();
+		tracker.MarkRegionAsCpuModified(start, 2 * TRACKER_PAGE_SIZE);
+	};
+	const std::pair<uint64_t, uint64_t> ranges[] = {{start, TRACKER_PAGE_SIZE}, {start + TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE}};
+	for (const uint32_t device_sync: {0u, 1u}) {
+		{
+			const MemoryTracker::UploadScope scope;
+			tracker.ForEachUploadRange(start, 2 * TRACKER_PAGE_SIZE, false, [&](uint64_t, uint64_t) noexcept { watch(); },
+			                           take, device_sync);
+		}
+		check(device_sync == 0 ? "callbacks (one range)" : "callbacks (one range kept busy)");
+		{
+			const MemoryTracker::UploadScope scope;
+			tracker.ForEachUploadRanges(ranges, [&](size_t, uint64_t, uint64_t) noexcept { watch(); }, take, device_sync);
+		}
+		check(device_sync == 0 ? "callbacks (several ranges)" : "callbacks (several ranges kept busy)");
+	}
+}
 }
 
 int main() {
 	Check(Switches::On(Switches::Switch::TrackerLazyRegions), "KYTY_TRACKER_LAZY_REGIONS is on without the variable");
 	PageManager pages;
 	QuestionsCreateNoRegion(pages);
+	CallbacksKeepTheirOwnProtections(pages);
 	if (g_failures != 0) {
 		std::fprintf(stderr, "kyty_shim_tracker_transitions: %d failure(s)\n", g_failures);
 		return 1;

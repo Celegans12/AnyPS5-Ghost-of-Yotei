@@ -171,16 +171,16 @@ void OpenPageFaultStillSignalsTheWrite(PageManager& pages) {
 	Check(RegionManager::CpuDirtyEpoch() > global, "signal: the global CPU write epoch did not move");
 	Check((Bda::g_pending[index / 64].load() & bit) != 0, "signal: the region was not marked for device address reads");
 
-	std::vector<PageManager::DeferredRange> deferred;
+	size_t     deferred = 0;
 	const auto consumed = [&](CpuWriteConsumer consumer, uint64_t address, uint64_t size) {
 		uint64_t bytes = 0;
 		tracker.ConsumeCpuWrites(consumer, address, size, [&](uint64_t, uint64_t run) { bytes += run; });
 		return bytes;
 	};
 	const auto upload = [&](uint64_t address, uint64_t size) {
-		PageManager::SetDeferredWriteProtectSink(&deferred);
-		tracker.ForEachUploadRange(address, size, false, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
-		PageManager::SetDeferredWriteProtectSink(nullptr);
+		const MemoryTracker::UploadScope scope;
+		tracker.ForEachUploadRange(address, size, false, [](uint64_t, uint64_t) noexcept {},
+		                           [&]() noexcept { deferred += MemoryTracker::DeferredProtects().size(); });
 	};
 	const struct {
 		uint64_t    address;
@@ -200,8 +200,8 @@ void OpenPageFaultStillSignalsTheWrite(PageManager& pages) {
 		      "the pages read by the tables took the lock");
 		upload(test.address, test.size);
 		Check(!tracker.IsRegionCpuModified(test.address, test.size), test.what, "the upload left the pages written");
-		Check(!deferred.empty(), test.what, "the upload did not protect the pages");
-		deferred.clear();
+		Check(deferred != 0, test.what, "the upload did not protect the pages");
+		deferred = 0;
 		Check(consumed(CpuWriteConsumer::BufferTables, test.address, test.size) == test.size, test.what,
 		      "the descriptor tables missed a write served without the lock");
 		Check(consumed(CpuWriteConsumer::IndirectWriteTables, test.address, test.size) == test.size, test.what,
@@ -215,12 +215,10 @@ void OpenPageFaultStillSignalsTheWrite(PageManager& pages) {
 void OpenPageFaultCountsForBusyPages(PageManager& pages) {
 	MemoryTracker  tracker(pages);
 	const uint64_t vaddr = RegionBase + 65 * TRACKER_REGION_SIZE + 7 * TRACKER_PAGE_SIZE;
-	std::vector<PageManager::DeferredRange> deferred;
 	const auto sync = [&](uint32_t device_sync) {
-		PageManager::SetDeferredWriteProtectSink(&deferred);
+		const MemoryTracker::UploadScope scope;
 		tracker.ForEachUploadRange(vaddr, TRACKER_PAGE_SIZE, false, [](uint64_t, uint64_t) noexcept {}, []() noexcept {},
 		                           device_sync);
-		PageManager::SetDeferredWriteProtectSink(nullptr);
 	};
 	sync(1);
 	Check(!tracker.IsRegionCpuModified(vaddr, TRACKER_PAGE_SIZE), "busy: the first upload kept the page");

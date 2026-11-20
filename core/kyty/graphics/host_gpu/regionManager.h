@@ -17,6 +17,7 @@
 #include <span>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #if defined(_MSC_VER)
 #include <intrin.h>
@@ -183,6 +184,8 @@ static_assert(std::atomic_uint32_t::is_always_lock_free);
 
 class RegionManager final {
 public:
+	using DeferredRanges = std::vector<PageManager::DeferredRange>;
+
 	RegionManager(PageManager& page_manager, uint64_t cpu_addr)
 	    : m_page_manager(page_manager), m_cpu_addr(cpu_addr) {
 		m_cpu_dirty.Fill();
@@ -388,7 +391,8 @@ public:
 	}
 
 	template <DirtySource source, bool clear, typename Func>
-	void ForEachModifiedRange(uint64_t offset, uint64_t size, Func&& func) KYTY_REQUIRES(lock) {
+	void ForEachModifiedRange(uint64_t offset, uint64_t size, Func&& func, DeferredRanges* deferred = nullptr)
+	    KYTY_REQUIRES(lock) {
 		const auto [start, end] = GetPageRange(offset, size);
 		auto&      bits         = GetBits<source>();
 		if (!bits.Any(start, end)) {
@@ -400,7 +404,7 @@ public:
 			if constexpr (source == DirtySource::Cpu) {
 				NoteOpenedUpload(&mask, mask);
 				m_has_cpu_dirty.store(!m_cpu_dirty.None(), std::memory_order_release);
-				UpdateProtection<true, false>(mask);
+				UpdateProtection<true, false>(mask, deferred);
 			} else {
 				m_gpu_clean_epoch.fetch_add(1, std::memory_order_acq_rel);
 				s_gpu_clean_epoch.fetch_add(1, std::memory_order_acq_rel);
@@ -413,7 +417,8 @@ public:
 	}
 
 	template <typename Func>
-	void ConsumeCpuDirtyRanges(std::span<const std::pair<uint64_t, uint64_t>> ranges, Func&& func) KYTY_REQUIRES(lock) {
+	void ConsumeCpuDirtyRanges(std::span<const std::pair<uint64_t, uint64_t>> ranges, Func&& func,
+	                           DeferredRanges* deferred = nullptr) KYTY_REQUIRES(lock) {
 		RegionBits mask;
 		for (const auto& [offset, size]: ranges) {
 			const auto [start, end] = GetPageRange(offset, size);
@@ -429,7 +434,7 @@ public:
 		}
 		NoteOpenedUpload(&mask, mask);
 		m_has_cpu_dirty.store(!m_cpu_dirty.None(), std::memory_order_release);
-		UpdateProtection<true, false>(mask);
+		UpdateProtection<true, false>(mask, deferred);
 		for (size_t index = 0; index < ranges.size(); index++) {
 			const auto [start, end] = GetPageRange(ranges[index].first, ranges[index].second);
 			for (const auto [first, last]: RegionBits(mask, start, end)) {
@@ -440,8 +445,8 @@ public:
 	}
 
 	template <typename Func>
-	bool ConsumeCpuDirtyRangesKeepingBusy(std::span<const std::pair<uint64_t, uint64_t>> ranges,
-	                                      uint32_t sync, Func&& func) KYTY_REQUIRES(lock) {
+	bool ConsumeCpuDirtyRangesKeepingBusy(std::span<const std::pair<uint64_t, uint64_t>> ranges, uint32_t sync,
+	                                      Func&& func, DeferredRanges* deferred = nullptr) KYTY_REQUIRES(lock) {
 		constexpr uint32_t MaxGap           = 3;
 		constexpr uint8_t  MinWrites        = 3;
 		constexpr uint32_t RevalidatePeriod = 12;
@@ -483,7 +488,7 @@ public:
 		}
 		NoteOpenedUpload(&mask, clean);
 		m_has_cpu_dirty.store(!m_cpu_dirty.None(), std::memory_order_release);
-		UpdateProtection<true, false>(clean);
+		UpdateProtection<true, false>(clean, deferred);
 		if (kept) {
 			m_kept_sync.store(sync, std::memory_order_relaxed);
 		}
@@ -656,14 +661,14 @@ private:
 	}
 
 	template <bool track, bool is_read>
-	void UpdateProtection(RegionBits& changed) KYTY_REQUIRES(lock) {
+	void UpdateProtection(RegionBits& changed, DeferredRanges* deferred = nullptr) KYTY_REQUIRES(lock) {
 		if (changed.None()) {
 			return;
 		}
 		if constexpr (is_read) {
 			m_has_gpu_dirty.store(!m_gpu_dirty.None(), std::memory_order_release);
 		}
-		m_page_manager.UpdatePageWatchersForRegion<track, is_read>(m_cpu_addr, changed);
+		m_page_manager.UpdatePageWatchersForRegion<track, is_read>(m_cpu_addr, changed, deferred);
 	}
 
 	template <DirtySource source>

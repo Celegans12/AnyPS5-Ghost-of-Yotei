@@ -73,8 +73,6 @@ constexpr uint64_t HOT_CLUSTER_GAP    = 1024 * 1024;
 
 using SpinGuard = Common::ScopedLock<TrackingSpinLock>;
 
-thread_local std::vector<PageManager::DeferredRange>* g_deferred_write_protect = nullptr;
-
 void ValidateRange(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		Fatal("invalid range vaddr=0x%016" PRIx64 ", size=0x%016" PRIx64, vaddr, size);
@@ -210,8 +208,8 @@ struct PageManager::Impl {
 	}
 
 	template <bool track, bool is_read, bool masked>
-	void UpdateRegionWatchers(Region& region, uint64_t base_addr, size_t first, size_t last,
-	                          const RegionBits* mask = nullptr) {
+	void UpdateRegionWatchers(Region& region, uint64_t base_addr, size_t first, size_t last, const RegionBits* mask,
+	                          std::vector<PageManager::DeferredRange>* deferred) {
 		SpinGuard lock(region.lock);
 		auto      perms                 = region.pages[first].Perms();
 		uint64_t  range_begin           = 0;
@@ -220,8 +218,8 @@ struct PageManager::Impl {
 
 		const auto release_pending = [&] {
 			if (range_bytes != 0) {
-				if (track && !is_read && g_deferred_write_protect != nullptr) {
-					g_deferred_write_protect->push_back({base_addr + range_begin * PAGE_SIZE, range_bytes});
+				if (track && !is_read && deferred != nullptr) {
+					deferred->push_back({base_addr + range_begin * PAGE_SIZE, range_bytes});
 				} else {
 					Protect(base_addr + range_begin * PAGE_SIZE, range_bytes, perms);
 				}
@@ -335,7 +333,7 @@ struct PageManager::Impl {
 	}
 
 	template <bool track, bool is_read>
-	void UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
+	void UpdatePageWatchers(uint64_t vaddr, uint64_t size, std::vector<PageManager::DeferredRange>* deferred) {
 		ValidateRange(vaddr, size);
 		const auto begin = Common::AlignDown(vaddr, PAGE_SIZE);
 		const auto end   = Common::AlignUp(vaddr + size, PAGE_SIZE);
@@ -348,7 +346,7 @@ struct PageManager::Impl {
 			}
 			const auto first = static_cast<size_t>((chunk_begin - region_base) / PAGE_SIZE);
 			const auto last  = static_cast<size_t>((chunk_end - region_base) / PAGE_SIZE);
-			UpdateRegionWatchers<track, is_read, false>(*region, region_base, first, last);
+			UpdateRegionWatchers<track, is_read, false>(*region, region_base, first, last, nullptr, deferred);
 			chunk_begin = chunk_end;
 		}
 	}
@@ -568,17 +566,13 @@ bool PageManager::AllowExecute(uint64_t vaddr) {
 	    static_cast<Mode>(static_cast<uint32_t>(perms) | static_cast<uint32_t>(Mode::Execute)));
 }
 
-void PageManager::SetDeferredWriteProtectSink(std::vector<DeferredRange>* sink) noexcept {
-	g_deferred_write_protect = sink;
-}
-
 void PageManager::ReapplyProtection(uint64_t vaddr, uint64_t size) {
 	m_impl->ReapplyProtection(vaddr, size);
 }
 
 template <bool track, bool is_read>
 void PageManager::UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
-	m_impl->UpdatePageWatchers<track, is_read>(vaddr, size);
+	m_impl->UpdatePageWatchers<track, is_read>(vaddr, size, nullptr);
 }
 
 template void PageManager::UpdatePageWatchers<true, true>(uint64_t, uint64_t);
@@ -587,14 +581,13 @@ template void PageManager::UpdatePageWatchers<false, true>(uint64_t, uint64_t);
 template void PageManager::UpdatePageWatchers<false, false>(uint64_t, uint64_t);
 
 template <bool track, bool is_read>
-void PageManager::UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask) {
+void PageManager::UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask, std::vector<DeferredRange>* deferred) {
 	const auto start_range = mask.FirstRange();
 	const auto end_range   = mask.LastRange();
 	const auto first       = start_range.first;
 	const auto last        = end_range.second;
 	if (start_range.second == end_range.second) {
-		m_impl->UpdatePageWatchers<track, is_read>(base_addr + first * PAGE_SIZE,
-		                                           (last - first) * PAGE_SIZE);
+		m_impl->UpdatePageWatchers<track, is_read>(base_addr + first * PAGE_SIZE, (last - first) * PAGE_SIZE, deferred);
 		return;
 	}
 
@@ -602,13 +595,13 @@ void PageManager::UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& ma
 	if (region == nullptr) {
 		Fatal("untracking unknown region 0x%016" PRIx64, base_addr);
 	}
-	m_impl->UpdateRegionWatchers<track, is_read, true>(*region, base_addr, first, last, &mask);
+	m_impl->UpdateRegionWatchers<track, is_read, true>(*region, base_addr, first, last, &mask, deferred);
 }
 
-template void PageManager::UpdatePageWatchersForRegion<true, true>(uint64_t, RegionBits&);
-template void PageManager::UpdatePageWatchersForRegion<true, false>(uint64_t, RegionBits&);
-template void PageManager::UpdatePageWatchersForRegion<false, true>(uint64_t, RegionBits&);
-template void PageManager::UpdatePageWatchersForRegion<false, false>(uint64_t, RegionBits&);
+template void PageManager::UpdatePageWatchersForRegion<true, true>(uint64_t, RegionBits&, std::vector<DeferredRange>*);
+template void PageManager::UpdatePageWatchersForRegion<true, false>(uint64_t, RegionBits&, std::vector<DeferredRange>*);
+template void PageManager::UpdatePageWatchersForRegion<false, true>(uint64_t, RegionBits&, std::vector<DeferredRange>*);
+template void PageManager::UpdatePageWatchersForRegion<false, false>(uint64_t, RegionBits&, std::vector<DeferredRange>*);
 
 bool PageManager::HotPagesEnabled() noexcept {
 	static const bool enabled = [] {
