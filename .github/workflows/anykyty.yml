@@ -2,7 +2,7 @@ name: AnyKyty
 
 on:
   push:
-    branches: [AnyKyty]
+    branches: [AnyKyty, 'test/**']
     paths-ignore:
       - '**.md'
       - LICENSE
