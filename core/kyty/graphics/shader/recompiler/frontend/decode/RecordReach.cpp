@@ -91,7 +91,7 @@ void ForEachWrite(const Instruction& inst, Func&& write) {
 			case Family::MTBUF:
 			case Family::FLAT: count = std::max(inst.data_dwords, 1u); break;
 			case Family::DS: count = std::max(inst.data_dwords, 1u) * 2u; break;
-			default: count = name.find("64") != std::string_view::npos ? 2u : 1u; break;
+			default: count = std::max(inst.data_dwords, name.find("64") != std::string_view::npos ? 2u : 1u); break;
 		}
 		for (uint32_t i = 0; i < count && inst.dst.reg + i < 256u; i++) {
 			write(true, inst.dst.reg + i);

@@ -58,7 +58,10 @@ bool WritesVgpr(const Instruction& inst, uint32_t reg) {
 		case Family::MTBUF:
 		case Family::FLAT: count = std::max(inst.data_dwords, 1u); break;
 		case Family::DS: count = std::max(inst.data_dwords, 1u) * 2u; break;
-		default: count = magic_enum::enum_name(inst.opcode).find("64") != std::string_view::npos ? 2u : 1u; break;
+		default:
+			count = std::max(inst.data_dwords,
+			                 magic_enum::enum_name(inst.opcode).find("64") != std::string_view::npos ? 2u : 1u);
+			break;
 	}
 	const auto covers = [&](const Operand& operand) {
 		return operand.kind == OperandKind::Vgpr && reg >= operand.reg && reg < operand.reg + count;

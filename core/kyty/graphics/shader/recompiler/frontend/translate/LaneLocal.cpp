@@ -63,6 +63,11 @@ bool NameHas64(Opcode opcode) {
 	return name.find("64") != std::string_view::npos;
 }
 
+uint32_t OperandDwords(const Instruction& inst) {
+	const auto pair = NameHas64(inst.opcode) ? 2u : 1u;
+	return inst.family == Family::VOP3 ? std::max(inst.data_dwords, pair) : pair;
+}
+
 bool ScalarDestination64(Opcode opcode) {
 	switch (opcode) {
 		case Opcode::S_MOV_B64:
@@ -345,7 +350,8 @@ private:
 		const auto index = ScalarIndex(operand);
 		if (index < 0) return;
 		mask = mask || state.mask.test(static_cast<size_t>(index));
-		if (NameHas64(inst.opcode) && index + 1 < 128) mask = mask || state.mask.test(static_cast<size_t>(index + 1));
+		for (uint32_t k = 1; k < OperandDwords(inst) && index + static_cast<int>(k) < 128; ++k)
+			mask = mask || state.mask.test(static_cast<size_t>(index) + k);
 	}
 
 	static void WriteScalar(const Operand& operand, uint32_t count, bool mask, State& state) {
@@ -378,7 +384,7 @@ private:
 				return s == 1 ? (inst.image_r128 ? 4u : 8u) : s == 2 ? (sampler ? 4u : 0u) : 1u;
 			}
 			case Family::FLAT: return 2u;
-			default: return static_cast<int>(s) == LaneSelectSource(inst) || NameHas64(inst.opcode) ? 2u : 1u;
+			default: return static_cast<int>(s) == LaneSelectSource(inst) ? std::max(2u, OperandDwords(inst)) : OperandDwords(inst);
 		}
 	}
 
@@ -411,7 +417,8 @@ private:
 			switch (source.kind) {
 				case OperandKind::Vgpr:
 					if (source.reg >= 256 || !state.uniform.test(source.reg)) return false;
-					if (NameHas64(inst.opcode) && (source.reg + 1 >= 256 || !state.uniform.test(source.reg + 1))) return false;
+					for (uint32_t k = 1; k < OperandDwords(inst); ++k)
+						if (source.reg + k >= 256 || !state.uniform.test(source.reg + k)) return false;
 					break;
 				case OperandKind::IntegerInlineConstant:
 				case OperandKind::FloatInlineConstant:
@@ -579,7 +586,7 @@ private:
 					const auto     name    = magic_enum::enum_name(inst.opcode);
 					const bool     partial = inst.dst.sdwa_sel != 6u ||
 					                     (name.find("16") != std::string_view::npos && !name.starts_with("V_PK_"));
-					const uint32_t count   = NameHas64(inst.opcode) ? 2u : 1u;
+					const uint32_t count   = OperandDwords(inst);
 					for (uint32_t k = 0; k < count && inst.dst.reg + k < 256; ++k)
 						state.uniform.set(inst.dst.reg + k, uniform && (!partial || before.uniform.test(inst.dst.reg + k)));
 				}
@@ -650,7 +657,9 @@ private:
 			const auto reg = ScalarIndex(operand);
 			if (reg < 0) return false;
 			if (state.mask.test(static_cast<size_t>(reg))) return true;
-			return NameHas64(inst.opcode) && reg + 1 < 128 && state.mask.test(static_cast<size_t>(reg + 1));
+			for (uint32_t k = 1; k < OperandDwords(inst) && reg + static_cast<int>(k) < 128; ++k)
+				if (state.mask.test(static_cast<size_t>(reg) + k)) return true;
+			return false;
 		};
 		switch (inst.family) {
 			case Family::SOP1:
