@@ -64,43 +64,44 @@ constexpr uint64_t IndirectOffset = 8u << 20;
 struct Op {
 	uint32_t code;
 	uint32_t minimum;
+	bool     exact;
 };
 
 constexpr std::array<Op, 34> Ops = {{
-    {Pm4::IT_NOP, 1},
-    {Pm4::IT_SET_BASE, 3},
-    {Pm4::IT_CLEAR_STATE, 1},
-    {Pm4::IT_INDEX_BUFFER_SIZE, 1},
-    {Pm4::IT_DISPATCH_DIRECT, 3},
-    {Pm4::IT_DISPATCH_INDIRECT, 2},
-    {Pm4::IT_SET_PREDICATION, 4},
-    {Pm4::IT_COND_EXEC, 4},
-    {Pm4::IT_DRAW_INDIRECT, 3},
-    {Pm4::IT_INDEX_BASE, 2},
-    {Pm4::IT_DRAW_INDEX_2, 4},
-    {Pm4::IT_CONTEXT_CONTROL, 2},
-    {Pm4::IT_INDEX_TYPE, 1},
-    {Pm4::IT_DRAW_INDIRECT_MULTI, 6},
-    {Pm4::IT_DRAW_INDEX_AUTO, 2},
-    {Pm4::IT_NUM_INSTANCES, 1},
-    {Pm4::IT_DRAW_INDEX_OFFSET_2, 4},
-    {Pm4::IT_WRITE_DATA, 4},
-    {Pm4::IT_DRAW_INDEX_MULTI_INST, 3},
-    {Pm4::IT_INDIRECT_BUFFER, 3},
-    {Pm4::IT_COPY_DATA, 5},
-    {Pm4::IT_PFP_SYNC_ME, 1},
-    {Pm4::IT_EVENT_WRITE, 1},
-    {Pm4::IT_RELEASE_MEM, 7},
-    {Pm4::IT_DMA_DATA, 6},
-    {Pm4::IT_ACQUIRE_MEM, 6},
-    {Pm4::IT_SET_CONFIG_REG, 2},
-    {Pm4::IT_SET_CONTEXT_REG, 2},
-    {Pm4::IT_SET_SH_REG, 2},
-    {Pm4::IT_SET_UCONFIG_REG, 2},
-    {Pm4::IT_SET_UCONFIG_REG_INDEX, 2},
-    {Pm4::IT_SET_SH_REG_INDIRECT, 3},
-    {Pm4::IT_SET_CONTEXT_REG_INDIRECT, 3},
-    {Pm4::IT_GET_LOD_STATS, 4},
+    {Pm4::IT_NOP, 1, false},
+    {Pm4::IT_SET_BASE, 3, true},
+    {Pm4::IT_CLEAR_STATE, 1, true},
+    {Pm4::IT_INDEX_BUFFER_SIZE, 1, true},
+    {Pm4::IT_DISPATCH_DIRECT, 3, true},
+    {Pm4::IT_DISPATCH_INDIRECT, 2, true},
+    {Pm4::IT_SET_PREDICATION, 4, false},
+    {Pm4::IT_COND_EXEC, 4, false},
+    {Pm4::IT_DRAW_INDIRECT, 3, false},
+    {Pm4::IT_INDEX_BASE, 2, true},
+    {Pm4::IT_DRAW_INDEX_2, 4, false},
+    {Pm4::IT_CONTEXT_CONTROL, 2, true},
+    {Pm4::IT_INDEX_TYPE, 1, true},
+    {Pm4::IT_DRAW_INDIRECT_MULTI, 6, false},
+    {Pm4::IT_DRAW_INDEX_AUTO, 2, true},
+    {Pm4::IT_NUM_INSTANCES, 1, true},
+    {Pm4::IT_DRAW_INDEX_OFFSET_2, 4, false},
+    {Pm4::IT_WRITE_DATA, 4, false},
+    {Pm4::IT_DRAW_INDEX_MULTI_INST, 3, false},
+    {Pm4::IT_INDIRECT_BUFFER, 3, false},
+    {Pm4::IT_COPY_DATA, 5, true},
+    {Pm4::IT_PFP_SYNC_ME, 1, true},
+    {Pm4::IT_EVENT_WRITE, 1, false},
+    {Pm4::IT_RELEASE_MEM, 7, true},
+    {Pm4::IT_DMA_DATA, 6, true},
+    {Pm4::IT_ACQUIRE_MEM, 6, true},
+    {Pm4::IT_SET_CONFIG_REG, 2, false},
+    {Pm4::IT_SET_CONTEXT_REG, 2, false},
+    {Pm4::IT_SET_SH_REG, 2, false},
+    {Pm4::IT_SET_UCONFIG_REG, 2, false},
+    {Pm4::IT_SET_UCONFIG_REG_INDEX, 2, false},
+    {Pm4::IT_SET_SH_REG_INDIRECT, 3, false},
+    {Pm4::IT_SET_CONTEXT_REG_INDIRECT, 3, false},
+    {Pm4::IT_GET_LOD_STATS, 4, false},
 }};
 
 uint8_t* g_arena = nullptr;
@@ -130,7 +131,10 @@ void FixAddresses(uint32_t code, uint32_t* body, uint32_t length, uint32_t seed)
 		case Pm4::IT_RELEASE_MEM: SetAddress(body, 2, seed, DataOffset, DataSpan); break;
 		case Pm4::IT_COND_EXEC: SetAddress(body, 0, seed, DataOffset, DataSpan); break;
 		case Pm4::IT_SET_BASE:
-		case Pm4::IT_INDEX_BASE: SetAddress(body, code == Pm4::IT_SET_BASE ? 1 : 0, seed, DataOffset, DataSpan); break;
+			body[0] = 1;
+			SetAddress(body, 1, seed, DataOffset, DataSpan);
+			break;
+		case Pm4::IT_INDEX_BASE: SetAddress(body, 0, seed, DataOffset, DataSpan); break;
 		case Pm4::IT_INDIRECT_BUFFER:
 			SetAddress(body, 0, seed, IndirectOffset, 1u << 20);
 			body[2] = (body[2] & ~0xfffffu) | (4u + (seed & 0x3fu));
@@ -150,7 +154,7 @@ size_t Build(const uint8_t* data, size_t size, uint32_t* out, size_t capacity) {
 	size_t at   = 0;
 	while (at + 3 <= size && used + 24 < capacity) {
 		const Op&      op       = Ops[data[at] % Ops.size()];
-		const uint32_t length   = std::max<uint32_t>(op.minimum, 1u + (data[at + 1] % 12u));
+		const uint32_t length   = op.exact ? op.minimum : std::max<uint32_t>(op.minimum, 1u + (data[at + 1] % 12u));
 		const uint32_t seed     = data[at + 2] | (static_cast<uint32_t>(data[at + 1]) << 8);
 		at += 3;
 		uint32_t* body = out + used + 1;
