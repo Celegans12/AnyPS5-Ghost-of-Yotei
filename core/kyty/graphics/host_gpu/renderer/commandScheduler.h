@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_COMMANDSCHEDULER_H_
 
 #include "common/common.h"
+#include "common/threadSafety.h"
 #include "common/uniqueFunction.h"
 #include "graphics/host_gpu/renderer/dynamicState.h"
 #include "graphics/host_gpu/renderer/hostCopyQueue.h"
@@ -153,33 +154,33 @@ private:
 	CommandStream                m_stream;
 	CommandBuffer                m_command;
 	DynamicState                 m_dynamic_state;
-	std::queue<PendingOperation> m_pending_operations;
+	std::queue<PendingOperation> m_pending_operations KYTY_GUARDED_BY(m_operation_mutex);
 	std::atomic<uint64_t>        m_pending_front_tick {UINT64_MAX};
 	std::atomic<uint64_t>        m_submitted_tick {0};
 	std::atomic<uint32_t>        m_pending_skips {0};
-	std::queue<PendingOperation> m_priority_operations;
-	std::mutex                   m_operation_mutex;
+	std::queue<PendingOperation> m_priority_operations KYTY_GUARDED_BY(m_operation_mutex);
+	Common::AnnotatedMutex       m_operation_mutex;
 	std::condition_variable      m_operation_available;
 	std::jthread                 m_priority_thread;
-	OperationState               m_operation_state      = OperationState::Open;
-	uint64_t                     m_priority_active_tick = 0;
+	OperationState               m_operation_state KYTY_GUARDED_BY(m_operation_mutex) = OperationState::Open;
+	uint64_t                     m_priority_active_tick KYTY_GUARDED_BY(m_operation_mutex) = 0;
 	struct GuestWrite {
 		uint64_t id    = 0;
 		uint64_t begin = 0;
 		uint64_t end   = 0;
 	};
-	std::mutex                   m_guest_writes_mutex;
-	std::vector<GuestWrite>      m_guest_writes;
-	uint64_t                     m_next_guest_write     = 0;
+	Common::AnnotatedMutex       m_guest_writes_mutex;
+	std::vector<GuestWrite>      m_guest_writes KYTY_GUARDED_BY(m_guest_writes_mutex);
+	uint64_t                     m_next_guest_write KYTY_GUARDED_BY(m_guest_writes_mutex) = 0;
 	std::unique_ptr<HostCopyQueue> m_host_copies;
 	SubmitHook                     m_submit_hook      = nullptr;
 	void*                          m_submit_hook_data = nullptr;
 #if defined(ANYPS5_KYTY)
-	std::mutex                  m_flip_mutex;
+	Common::AnnotatedMutex      m_flip_mutex;
 	std::condition_variable_any m_flip_changed;
-	std::deque<FlipCompletion>  m_flip_completions;
+	std::deque<FlipCompletion>  m_flip_completions KYTY_GUARDED_BY(m_flip_mutex);
 	std::atomic<bool>           m_flips_pending {false};
-	bool                        m_flip_running   = false;
+	bool                        m_flip_running KYTY_GUARDED_BY(m_flip_mutex) = false;
 	uint64_t                    m_last_flip_tick = 0;
 	std::once_flag              m_flip_thread_once;
 	std::jthread                m_flip_thread;

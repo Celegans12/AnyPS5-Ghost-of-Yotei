@@ -165,7 +165,7 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 }
 
 TextureCache::~TextureCache() {
-	m_slot_images.ForEach([&](ImageId id, const Image& image) {
+	m_slot_images.ForEach([&](ImageId id, const Image& image) KYTY_NO_THREAD_SAFETY_ANALYSIS {
 		if (image.registered) {
 			UnregisterImage(id);
 		}
@@ -289,7 +289,7 @@ bool TextureCache::RegisteredPageCounts::Any(size_t first, size_t last_exclusive
 }
 
 bool TextureCache::IsSampledImageCurrent(ImageId id, const ImageDesc& desc) {
-	std::scoped_lock lock {m_lock};
+	Common::ScopedLock lock {m_lock};
 	if (m_scheduler.Current().IsInvalid() || desc.type != BindingType::Texture ||
 	    desc.info.data.Empty() || desc.info.IsDepth() || desc.info.HasMetadata() ||
 	    desc.info.HasStencil() || desc.info.tile_mode == Prospero::TileMode::kDepth) {
@@ -306,7 +306,7 @@ bool TextureCache::IsSampledImageCurrent(ImageId id, const ImageDesc& desc) {
 }
 
 bool TextureCache::IsSampledImageCurrent(ImageId id, const ImageDesc& desc, bool storage_dcc) {
-	std::scoped_lock lock {m_lock};
+	Common::ScopedLock lock {m_lock};
 	const bool dcc = (desc.type == BindingType::Texture || (storage_dcc && desc.type == BindingType::Storage)) &&
 	                 desc.info.metadata.kind == ImageMetadataKind::Dcc;
 	if (m_scheduler.Current().IsInvalid() || (desc.type != BindingType::Texture && desc.type != BindingType::Storage) ||
@@ -434,7 +434,7 @@ void TextureCache::ForgetSettledMetadata(uint64_t vaddr, uint64_t size) {
 }
 
 bool TextureCache::IsTargetCurrent(ImageId id, const ImageInfo& requested) {
-	std::scoped_lock lock {m_lock};
+	Common::ScopedLock lock {m_lock};
 	ImageId last {};
 	ForEachImageInRegion(requested.data.address, requested.data.size, [&](ImageId candidate, Image& image) {
 		if (SameBacking(image.info, requested, false)) {
@@ -449,7 +449,7 @@ bool TextureCache::IsTargetCurrent(ImageId id, const ImageInfo& requested) {
 }
 
 bool TextureCache::HasImageStartingAt(uint64_t address) {
-	std::scoped_lock lock {m_lock};
+	Common::ScopedLock lock {m_lock};
 	bool found = false;
 	ForEachImageInRegion(address, 1, [&](ImageId, Image& image) {
 		found = found || (image.registered && image.info.data.address == address);
@@ -521,7 +521,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 }
 
 uint64_t TextureCache::ImageEpochInRegion(uint64_t address, uint64_t size) {
-	std::scoped_lock lock {m_lock};
+	Common::ScopedLock lock {m_lock};
 	return ImageEpochInRegionUnlocked(address, size);
 }
 
@@ -993,7 +993,7 @@ void TextureCache::FlushLazyReadback(uint64_t address, uint64_t size) {
 	}
 	std::vector<std::pair<ImageId, uint64_t>> armed;
 	{
-		std::scoped_lock lock {m_lock};
+		Common::ScopedLock lock {m_lock};
 		const auto page_begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);
 		const auto page_end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);
 		ForEachImageInRegion(page_begin, page_end - page_begin, [&](ImageId id, Image& image) {
@@ -1012,7 +1012,7 @@ void TextureCache::FlushLazyReadback(uint64_t address, uint64_t size) {
 void TextureCache::FlushLazyImages(std::span<const std::pair<ImageId, uint64_t>> images) {
 	bool downloaded = false;
 	{
-		std::scoped_lock lock {m_lock};
+		Common::ScopedLock lock {m_lock};
 		for (const auto& [id, serial]: images) {
 			auto* image = m_slot_images.try_get(id);
 			if (image == nullptr || image->serial != serial || image->readback_begin == 0) {
@@ -1029,7 +1029,7 @@ void TextureCache::FlushLazyImages(std::span<const std::pair<ImageId, uint64_t>>
 		m_scheduler.Wait(tick);
 		m_scheduler.WaitPriorityOperations(tick);
 	}
-	std::scoped_lock lock {m_lock};
+	Common::ScopedLock lock {m_lock};
 	for (const auto& [id, serial]: images) {
 		if (auto* image = m_slot_images.try_get(id); image != nullptr && image->serial == serial) {
 			DisarmLazyReadback(*image);
@@ -1429,7 +1429,7 @@ bool Publish(TextureCache& cache, Image& image) {
 	return true;
 }
 
-void Resolve(TextureCache& cache, ImageId cached_id, ImageId merged_id) {
+void Resolve(TextureCache& cache, ImageId cached_id, ImageId merged_id) KYTY_REQUIRES(cache.m_lock) {
 	auto& cached = cache.m_slot_images[cached_id];
 	auto* merged = merged_id ? &cache.m_slot_images[merged_id] : nullptr;
 	if (cached.SafeToDownload()) {
@@ -1793,7 +1793,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	const auto  range = desc.info.metadata.range;
 	const auto& view  = desc.view_info;
 	{
-		std::scoped_lock lock {m_lock};
+		Common::ScopedLock lock {m_lock};
 		auto& image         = m_slot_images[id];
 		image.info.metadata = desc.info.metadata;
 		m_surface_metas.erase(range.address);
@@ -1850,7 +1850,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			return;
 		}
 		{
-			std::scoped_lock lock {m_lock};
+			Common::ScopedLock lock {m_lock};
 			auto&            image = m_slot_images[id];
 			const bool native_current = (image.usage.render_target || image.IsGpuModified()) &&
 			                            !image.IsBufferModified() && !image.IsCpuDirty();
@@ -1906,7 +1906,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			(void)LibKernel::Memory::TryReadBacking(run(slice), &code, sizeof(code));
 			candidate_keys = (candidate_keys ^ code) * 0x100000001b3ull;
 		}
-		std::scoped_lock lock {m_lock};
+		Common::ScopedLock lock {m_lock};
 		const auto&      image = m_slot_images[id];
 		if (image.candidate_clear_key == ((candidate_keys ^ image.write_count) * 0x9e3779b97f4a7c15ull | 1u)) {
 			return;
@@ -1930,7 +1930,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			continue;
 		}
 		{
-			std::scoped_lock lock {m_lock};
+			Common::ScopedLock lock {m_lock};
 			const auto& image = m_slot_images[id];
 			const bool depth = image.info.IsDepth();
 			if (depth) {
@@ -1949,7 +1949,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		}
 	}
 	if (desc.candidate) {
-		std::scoped_lock lock {m_lock};
+		Common::ScopedLock lock {m_lock};
 		auto&            image = m_slot_images[id];
 		image.candidate_clear_key = (candidate_keys ^ image.write_count) * 0x9e3779b97f4a7c15ull | 1u;
 	}
@@ -2053,7 +2053,7 @@ ImageId TextureCache::FindImageSpeculative(ImageDesc& desc, bool exact_format,
 }
 
 ImageId TextureCache::FindDepthCopy(ImageId source_id, const ImageInfo& requested) {
-	std::scoped_lock lock {m_lock};
+	Common::ScopedLock lock {m_lock};
 	return FindDepthCopyLocked(source_id, requested);
 }
 
@@ -2215,7 +2215,7 @@ void TextureCache::DiscardParkedImage(ImageId id) {
 
 void TextureCache::DiscardParkedImages(uint64_t address, uint64_t size) {
 	const auto tick = m_scheduler.CurrentTick();
-	std::erase_if(m_parked_images, [&](const std::pair<ImageId, uint64_t>& parked) {
+	std::erase_if(m_parked_images, [&](const std::pair<ImageId, uint64_t>& parked) KYTY_REQUIRES(m_lock) {
 		const auto& data = m_slot_images[parked.first].info.data;
 		const bool  discard =
 		    size == 0 ? tick - std::min(tick, parked.second) > ParkedImageTicks
@@ -2250,7 +2250,7 @@ ImageId TextureCache::FindStencilCopy(ImageId association, const ImageInfo& requ
 }
 
 ImageId TextureCache::FindLiveStencilStorageCopy(ImageId association, const ImageDesc& desc) {
-	std::scoped_lock lock {m_lock};
+	Common::ScopedLock lock {m_lock};
 	const auto& plane = m_slot_images[association];
 	const auto& depth = m_slot_images[plane.depth_id];
 	EXIT_NOT_IMPLEMENTED(desc.heap || !depth.registered || depth.info.stencil != plane.info.data ||
@@ -2372,7 +2372,7 @@ bool TextureCache::WriteBackStencilCopy(ImageId copy_id) {
 }
 
 void TextureCache::FinishStencilStorageWrite(ImageId copy_id) {
-	std::scoped_lock lock {m_lock};
+	Common::ScopedLock lock {m_lock};
 	const auto association_id = m_slot_images[copy_id].depth_copy_source;
 	if (!association_id) {
 		return;
@@ -2411,7 +2411,7 @@ ImageId TextureCache::FindImageImpl(ImageDesc& desc, bool exact_format, bool spe
 
 	ImageId result {};
 	{
-		std::scoped_lock lock {m_lock};
+		Common::ScopedLock lock {m_lock};
 		auto& exact = (*m_exact_lookups)[ExactLookupSlot(desc.info)];
 		if (exact.valid && exact.exact_format == exact_format &&
 		    desc.type != BindingType::VideoOut &&
@@ -2432,7 +2432,7 @@ ImageId TextureCache::FindImageImpl(ImageDesc& desc, bool exact_format, bool spe
 	}
 	ImageOps::Validate(desc.info);
 	{
-		std::scoped_lock lock {m_lock};
+		Common::ScopedLock lock {m_lock};
 		Common::SmallVector<ImageId, 8> candidates;
 		ForEachImageInRegion(desc.info.data.address, desc.info.data.size,
 		                     [&](ImageId id, Image&) { candidates.push_back(id); });
@@ -2572,7 +2572,7 @@ ImageId TextureCache::FindImageImpl(ImageDesc& desc, bool exact_format, bool spe
 	MaterializeColorClear(result, desc, metadata_base_layer);
 	if (desc.type == BindingType::VideoOut &&
 	    desc.info.metadata.compression != VideoOutCompression::Uncompressed) {
-		std::scoped_lock lock {m_lock};
+		Common::ScopedLock lock {m_lock};
 		const auto& image = m_slot_images[result];
 		const bool guest_dirty = image.IsBufferModified() || image.IsCpuDirty();
 		const bool native_current =
@@ -2586,14 +2586,14 @@ ImageId TextureCache::FindImageImpl(ImageDesc& desc, bool exact_format, bool spe
 }
 
 void TextureCache::UpdateImage(ImageId id) {
-	std::scoped_lock lock {m_lock};
+	Common::ScopedLock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	TouchImage(image);
 	RefreshImage(id);
 }
 
 ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool ensure_valid) {
-	std::scoped_lock lock {m_lock};
+	Common::ScopedLock lock {m_lock};
 	Common::SmallVector<ImageId, 4> matches;
 	ForEachImageWithAddress(address, [&](ImageId id, Image& image) {
 		const auto* owner = &image;
@@ -2630,7 +2630,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	if (desc.type == BindingType::Storage) {
 		CollectHotPagesOf(id);
 	}
-	std::scoped_lock lock {m_lock};
+	Common::ScopedLock lock {m_lock};
 	if (m_slot_images[id].is_depth_copy && desc.type == BindingType::Texture) {
 		RefreshDepthCopy(id);
 		return m_slot_images[id].FindView(desc.view_info);
@@ -2683,7 +2683,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 
 vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) {
 	CollectHotPagesOf(id);
-	std::scoped_lock lock {m_lock};
+	Common::ScopedLock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
 		EXIT("TextureCache: color target requires rediscovery before final acquisition\n");
@@ -2701,7 +2701,7 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 
 vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc, ImageId* stencil) {
 	CollectHotPagesOf(id);
-	std::scoped_lock lock {m_lock};
+	Common::ScopedLock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
 		EXIT("TextureCache: depth target requires rediscovery before final acquisition "
@@ -2754,7 +2754,7 @@ void TextureCache::CollectHotPagesOf(ImageId id) {
 	uint64_t begin = 0;
 	uint64_t end   = 0;
 	{
-		std::scoped_lock lock {m_lock};
+		Common::ScopedLock lock {m_lock};
 		const auto&      info = m_slot_images[id].info;
 		begin                 = info.data.address;
 		end                   = info.data.End();
@@ -2770,7 +2770,7 @@ void TextureCache::CollectHotPagesOf(ImageId id) {
 
 void TextureCache::MarkGpuWritten(ImageId id) {
 	CollectHotPagesOf(id);
-	std::scoped_lock lock {m_lock};
+	Common::ScopedLock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	if (!image.registered || image.depth_id) {
 		EXIT("TextureCache: cannot mark an unavailable image GPU-written\n");
@@ -2806,7 +2806,7 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 	if (command.IsInvalid() || !GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid image clear\n");
 	}
-	std::scoped_lock      lock {m_lock};
+	Common::ScopedLock      lock {m_lock};
 	ImageId               selected {};
 	ImageId               stencil_id {};
 	vk::ImageAspectFlags  aspect {};
@@ -3078,7 +3078,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 		return false;
 	}
 
-	std::scoped_lock lock {m_texture_cache.m_lock};
+	Common::ScopedLock lock {m_texture_cache.m_lock};
 	auto& image = m_texture_cache.m_slot_images[selected];
 	if (!image.SafeToDownload()) {
 		return false;
@@ -3330,7 +3330,7 @@ uint64_t TextureCache::WriteBackTick(uint64_t address, uint64_t size) {
 }
 
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
-	std::scoped_lock lock {m_lock};
+	Common::ScopedLock lock {m_lock};
 	ForEachImageInRegion(address, size, [&](ImageId, Image& image) {
 		if (image.info.data.address != address) {
 			return;
@@ -3341,7 +3341,7 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 }
 
 bool TextureCache::CopyToImage(uint64_t address, uint64_t source, uint64_t size) {
-	std::scoped_lock lock {m_lock};
+	Common::ScopedLock lock {m_lock};
 	Common::SmallVector<ImageId, 8> targets;
 	ForEachImageInRegion(address, size, [&](ImageId id, Image&) { targets.push_back(id); });
 	if (targets.size() != 1) {
@@ -3412,7 +3412,7 @@ bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		return false;
 	}
-	std::scoped_lock lock {m_lock};
+	Common::ScopedLock lock {m_lock};
 	bool             modified = false;
 	ForEachImageInRegion(address, size, [&](ImageId, Image& image) {
 		modified = !image.depth_id && image.IsGpuModified() && !image.IsDefinitelyCpuDirty();
@@ -3431,7 +3431,7 @@ bool TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 		return InvalidateFromCompletion(address, size);
 	}
 	FlushLazyReadback(address, size);
-	std::scoped_lock lock {m_lock};
+	Common::ScopedLock lock {m_lock};
 	return InvalidateLocked(address, size);
 }
 
@@ -3439,13 +3439,13 @@ bool TextureCache::InvalidateFromCompletion(uint64_t address, uint64_t size) {
 	auto& gpu = m_scheduler.Context().GetGpu();
 	if (gpu.IsStopping()) {
 		FlushLazyReadback(address, size);
-		std::scoped_lock lock {m_lock};
+		Common::ScopedLock lock {m_lock};
 		return InvalidateLocked(address, size);
 	}
 	bool       invalidated = false;
 	const auto path        = InvalidateWithoutWaiting(
-	    m_lock, [&] { return HasArmedReadback(address, size); },
-	    [&] { invalidated = InvalidateLocked(address, size); },
+	    m_lock, [&]() KYTY_REQUIRES(m_lock) { return HasArmedReadback(address, size); },
+	    [&]() KYTY_REQUIRES(m_lock) { invalidated = InvalidateLocked(address, size); },
 	    [&] { DeferInvalidation(address, size); });
 	return path == CompletionInvalidation::Deferred || invalidated;
 }
@@ -3489,13 +3489,13 @@ bool TextureCache::InvalidateLocked(uint64_t address, uint64_t size) {
 }
 
 bool TextureCache::IsMeta(uint64_t address) {
-	std::scoped_lock lock {m_lock};
+	Common::ScopedLock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
 	return found != m_surface_metas.end();
 }
 
 bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
-	std::scoped_lock lock {m_lock};
+	Common::ScopedLock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
 	if (found == m_surface_metas.end() || slice >= found->second.clear_mask.size()) {
 		return false;
@@ -3504,7 +3504,7 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
 }
 
 bool TextureCache::ClearMeta(uint64_t address) {
-	std::scoped_lock lock {m_lock};
+	Common::ScopedLock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
 	if (found == m_surface_metas.end()) {
 		return false;
@@ -3515,7 +3515,7 @@ bool TextureCache::ClearMeta(uint64_t address) {
 }
 
 bool TextureCache::CoversMeta(uint64_t address, uint64_t size) {
-	std::scoped_lock lock {m_lock};
+	Common::ScopedLock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
 	if (found == m_surface_metas.end()) {
 		return false;
@@ -3529,7 +3529,7 @@ bool TextureCache::CoversMeta(uint64_t address, uint64_t size) {
 }
 
 bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
-	std::scoped_lock lock {m_lock};
+	Common::ScopedLock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
 	if (found == m_surface_metas.end() || slice >= found->second.clear_mask.size()) {
 		return false;
@@ -3540,9 +3540,9 @@ bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 }
 
 bool TextureCache::HasGpuWrittenImages(uint64_t address, uint64_t size) {
-	std::scoped_lock lock {m_lock};
+	Common::ScopedLock lock {m_lock};
 	bool             written = false;
-	ForEachImageInRegion(address, size, [&](ImageId id, Image& image) {
+	ForEachImageInRegion(address, size, [&](ImageId id, Image& image) KYTY_REQUIRES(m_lock) {
 		written = image.IsGpuModified() || image.readback_begin != 0 ||
 		          m_download_images.contains(id);
 		return written;
@@ -3551,7 +3551,7 @@ bool TextureCache::HasGpuWrittenImages(uint64_t address, uint64_t size) {
 }
 
 bool TextureCache::IsRegionRegistered(uint64_t address, uint64_t size) {
-	std::scoped_lock lock {m_lock};
+	Common::ScopedLock lock {m_lock};
 	bool             registered = false;
 	ForEachImageInRegion(address, size, [&](ImageId, Image&) {
 		registered = true;
@@ -3561,7 +3561,7 @@ bool TextureCache::IsRegionRegistered(uint64_t address, uint64_t size) {
 }
 
 void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
-	std::scoped_lock lock {m_lock};
+	Common::ScopedLock lock {m_lock};
 	DiscardParkedImages(address, size);
 	m_surface_metas.erase(m_surface_metas.lower_bound(address),
 	                      m_surface_metas.lower_bound(address + size));
@@ -3583,7 +3583,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 }
 
 void TextureCache::MapMemory(uint64_t address, uint64_t size) {
-	std::scoped_lock lock {m_lock};
+	Common::ScopedLock lock {m_lock};
 	Common::SmallVector<ImageId, 8> mapped_images;
 	ForEachImageInRegion(address, size, [&](ImageId id, Image& image) {
 		if (image.partial_candidate && image.Overlaps(address, size)) {
@@ -3601,7 +3601,7 @@ void TextureCache::MapMemory(uint64_t address, uint64_t size) {
 }
 
 void TextureCache::RunGarbageCollector() {
-	std::scoped_lock lock {m_lock};
+	Common::ScopedLock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
 	DiscardParkedImages(0, 0);
 	if (m_graphics.CanReportMemoryUsage()) {
@@ -3610,7 +3610,7 @@ void TextureCache::RunGarbageCollector() {
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
-	const auto collect = [&](bool allow_aggressive) {
+	const auto collect = [&](bool allow_aggressive) KYTY_REQUIRES(m_lock) {
 		bool     pressured  = m_total_used_memory >= m_pressure_gc_memory;
 		bool     aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
 		uint64_t age        = 16;
@@ -3676,7 +3676,7 @@ bool TextureCache::WriteBackImages() {
 }
 
 bool TextureCache::DownloadQueuedImages() {
-	std::scoped_lock lock {m_lock};
+	Common::ScopedLock lock {m_lock};
 	bool             downloaded = false;
 	for (const auto id: m_download_images) {
 		if (m_slot_images[id].IsGpuModified()) {

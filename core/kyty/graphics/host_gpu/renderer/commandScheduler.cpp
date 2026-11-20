@@ -120,7 +120,7 @@ CommandScheduler::~CommandScheduler() {
 
 void CommandScheduler::Shutdown() {
 	{
-		std::unique_lock lock(m_operation_mutex);
+		Common::UniqueLock lock(m_operation_mutex);
 		if (m_operation_state == OperationState::Closed) {
 			return;
 		}
@@ -130,7 +130,7 @@ void CommandScheduler::Shutdown() {
 		}
 		if (m_operation_state == OperationState::Draining) {
 			m_operation_available.wait(
-			    lock, [this] { return m_operation_state == OperationState::Closed; });
+			    lock.Native(), [this]() KYTY_REQUIRES(m_operation_mutex) { return m_operation_state == OperationState::Closed; });
 			return;
 		}
 		m_operation_state = OperationState::Draining;
@@ -158,7 +158,7 @@ void CommandScheduler::Shutdown() {
 		m_priority_thread.join();
 	}
 	{
-		std::lock_guard lock(m_operation_mutex);
+		Common::ScopedLock lock(m_operation_mutex);
 		EXIT_IF(!m_pending_operations.empty() || !m_priority_operations.empty() ||
 		        m_priority_active_tick != 0);
 		m_operation_state = OperationState::Closed;
@@ -173,7 +173,7 @@ void CommandScheduler::Begin(const HW::Context& registers, const HW::UserConfig&
 		return;
 	}
 	{
-		std::lock_guard lock(m_operation_mutex);
+		Common::ScopedLock lock(m_operation_mutex);
 		EXIT_IF(m_operation_state != OperationState::Open);
 	}
 	m_command.Bind(registers, user_config, shaders);
@@ -235,7 +235,7 @@ void CommandScheduler::PopPendingOperations() {
 	for (;;) {
 		PendingOperation operation;
 		{
-			std::lock_guard lock(m_operation_mutex);
+			Common::ScopedLock lock(m_operation_mutex);
 			if (m_pending_operations.empty()) {
 				return;
 			}
@@ -283,7 +283,7 @@ void CommandScheduler::DeferPriorityOperationAfter(uint64_t tick, Common::Unique
 	EXIT_IF(tick == 0 || tick > CurrentTick());
 	auto tracked = TrackGuestOperation(std::move(operation), address, size);
 	{
-		std::unique_lock lock(m_operation_mutex);
+		Common::UniqueLock lock(m_operation_mutex);
 		if (m_operation_state == OperationState::Open) {
 			if (!m_priority_operations.empty()) {
 				tick = std::max(tick, m_priority_operations.back().tick);
@@ -333,7 +333,7 @@ void CommandScheduler::DeferFlipCompletion(Common::UniqueFunction<void>&& comple
 		m_flip_thread =
 		    std::jthread([this](std::stop_token stop) { FlipCompletionThread(stop); });
 	});
-	std::lock_guard lock(m_flip_mutex);
+	Common::ScopedLock lock(m_flip_mutex);
 	m_flip_completions.push_back({std::move(complete), m_last_flip_tick, previous});
 	m_flips_pending.store(true, std::memory_order_release);
 }
@@ -342,8 +342,8 @@ void CommandScheduler::FlipCompletionThread(std::stop_token stop) {
 	for (;;) {
 		FlipCompletion flip;
 		{
-			std::unique_lock lock(m_flip_mutex);
-			if (!m_flip_changed.wait(lock, stop, [this] {
+			Common::UniqueLock lock(m_flip_mutex);
+			if (!m_flip_changed.wait(lock, stop, [this]() KYTY_REQUIRES(m_flip_mutex) {
 				    return !m_flip_completions.empty() &&
 				           SubmittedTick() >= m_flip_completions.front().submitted_tick;
 			    })) {
@@ -360,7 +360,7 @@ void CommandScheduler::FlipCompletionThread(std::stop_token stop) {
 		}
 		RunOperation(std::move(flip.complete));
 		{
-			std::lock_guard lock(m_flip_mutex);
+			Common::ScopedLock lock(m_flip_mutex);
 			m_flip_running = false;
 		}
 		m_flip_changed.notify_all();
@@ -368,8 +368,8 @@ void CommandScheduler::FlipCompletionThread(std::stop_token stop) {
 }
 
 void CommandScheduler::DrainFlipCompletions() {
-	std::unique_lock lock(m_flip_mutex);
-	m_flip_changed.wait(lock, [this] { return m_flip_completions.empty() && !m_flip_running; });
+	Common::UniqueLock lock(m_flip_mutex);
+	m_flip_changed.wait(lock, [this]() KYTY_REQUIRES(m_flip_mutex) { return m_flip_completions.empty() && !m_flip_running; });
 }
 #endif
 
@@ -379,14 +379,14 @@ CommandScheduler::TrackGuestOperation(Common::UniqueFunction<void>&& operation, 
 	EXIT_IF(!operation);
 	uint64_t id = 0;
 	{
-		std::lock_guard lock(m_guest_writes_mutex);
+		Common::ScopedLock lock(m_guest_writes_mutex);
 		id = ++m_next_guest_write;
 		m_guest_writes.push_back(
 		    {id, address, size > UINT64_MAX - address ? UINT64_MAX : address + size});
 	}
 	return [this, id, operation = std::move(operation)]() mutable {
 		operation();
-		std::lock_guard lock(m_guest_writes_mutex);
+		Common::ScopedLock lock(m_guest_writes_mutex);
 		const auto it = std::find_if(m_guest_writes.begin(), m_guest_writes.end(),
 		                             [id](const GuestWrite& write) { return write.id == id; });
 		EXIT_IF(it == m_guest_writes.end());
@@ -400,7 +400,7 @@ CommandScheduler::TrackGuestOperation(Common::UniqueFunction<void>&&            
 	EXIT_IF(!operation);
 	uint64_t id = 0;
 	{
-		std::lock_guard lock(m_guest_writes_mutex);
+		Common::ScopedLock lock(m_guest_writes_mutex);
 		id = ++m_next_guest_write;
 		for (const auto& [address, size]: ranges) {
 			m_guest_writes.push_back(
@@ -409,7 +409,7 @@ CommandScheduler::TrackGuestOperation(Common::UniqueFunction<void>&&            
 	}
 	return [this, id, operation = std::move(operation)]() mutable {
 		operation();
-		std::lock_guard lock(m_guest_writes_mutex);
+		Common::ScopedLock lock(m_guest_writes_mutex);
 		std::erase_if(m_guest_writes, [id](const GuestWrite& write) { return write.id == id; });
 	};
 }
@@ -418,7 +418,7 @@ CommandScheduler::TrackGuestOperation(Common::UniqueFunction<void>&&            
 uint64_t CommandScheduler::NewestPendingGuestOperation(uint64_t address, uint64_t size,
                                                         uint64_t after) {
 	const auto      end = size > UINT64_MAX - address ? UINT64_MAX : address + size;
-	std::lock_guard lock(m_guest_writes_mutex);
+	Common::ScopedLock lock(m_guest_writes_mutex);
 	for (auto it = m_guest_writes.rbegin(); it != m_guest_writes.rend() && it->id > after; ++it) {
 		if (it->begin < end && address < it->end) {
 			return it->id;
@@ -430,7 +430,7 @@ uint64_t CommandScheduler::NewestPendingGuestOperation(uint64_t address, uint64_
 
 bool CommandScheduler::HasPendingGuestOperations(uint64_t address, uint64_t size) {
 	const auto      end = size > UINT64_MAX - address ? UINT64_MAX : address + size;
-	std::lock_guard lock(m_guest_writes_mutex);
+	Common::ScopedLock lock(m_guest_writes_mutex);
 	return std::any_of(m_guest_writes.begin(), m_guest_writes.end(), [&](const GuestWrite& write) {
 		return write.begin < end && address < write.end;
 	});
@@ -439,7 +439,7 @@ bool CommandScheduler::HasPendingGuestOperations(uint64_t address, uint64_t size
 void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation) {
 	CheckActive();
 	EXIT_IF(!operation);
-	std::unique_lock lock(m_operation_mutex);
+	Common::UniqueLock lock(m_operation_mutex);
 	if (m_operation_state == OperationState::Open) {
 		m_pending_operations.push({std::move(operation), CurrentTick()});
 		if (m_pending_operations.size() == 1) {
@@ -453,8 +453,8 @@ void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation) 
 		operation();
 		return;
 	}
-	m_operation_available.wait(lock,
-	                           [this] { return m_operation_state == OperationState::Closed; });
+	m_operation_available.wait(lock.Native(),
+	                           [this]() KYTY_REQUIRES(m_operation_mutex) { return m_operation_state == OperationState::Closed; });
 	lock.unlock();
 	operation();
 }
@@ -462,7 +462,7 @@ void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation) 
 void CommandScheduler::QueuePriorityOperation(Common::UniqueFunction<void>&& operation) {
 	CheckActive();
 	EXIT_IF(!operation);
-	std::unique_lock lock(m_operation_mutex);
+	Common::UniqueLock lock(m_operation_mutex);
 	if (m_operation_state == OperationState::Open) {
 		m_priority_operations.push({std::move(operation), CurrentTick()});
 		lock.unlock();
@@ -474,14 +474,14 @@ void CommandScheduler::QueuePriorityOperation(Common::UniqueFunction<void>&& ope
 		operation();
 		return;
 	}
-	m_operation_available.wait(lock,
-	                           [this] { return m_operation_state == OperationState::Closed; });
+	m_operation_available.wait(lock.Native(),
+	                           [this]() KYTY_REQUIRES(m_operation_mutex) { return m_operation_state == OperationState::Closed; });
 	lock.unlock();
 	operation();
 }
 
 bool CommandScheduler::HasPendingPriorityOperations() {
-	std::lock_guard lock(m_operation_mutex);
+	Common::ScopedLock lock(m_operation_mutex);
 	return !m_priority_operations.empty() || m_priority_active_tick != 0;
 }
 
@@ -489,8 +489,8 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 	while (!stop.stop_requested()) {
 		PendingOperation operation;
 		{
-			std::unique_lock lock(m_operation_mutex);
-			m_operation_available.wait(lock, [this, &stop] {
+			Common::UniqueLock lock(m_operation_mutex);
+			m_operation_available.wait(lock.Native(), [this, &stop]() KYTY_REQUIRES(m_operation_mutex) {
 				return stop.stop_requested() || !m_priority_operations.empty();
 			});
 			if (stop.stop_requested()) {
@@ -505,7 +505,7 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 			RunOperation(std::move(operation.callback));
 		}
 		{
-			std::lock_guard lock(m_operation_mutex);
+			Common::ScopedLock lock(m_operation_mutex);
 			m_priority_active_tick = 0;
 		}
 		m_operation_available.notify_all();
@@ -514,9 +514,9 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 
 void CommandScheduler::DrainPriorityOperations() {
 	EXIT_IF(g_deferred_callback_scheduler == this);
-	std::unique_lock lock(m_operation_mutex);
+	Common::UniqueLock lock(m_operation_mutex);
 	m_operation_available.wait(
-	    lock, [this] { return m_priority_operations.empty() && m_priority_active_tick == 0; });
+	    lock.Native(), [this]() KYTY_REQUIRES(m_operation_mutex) { return m_priority_operations.empty() && m_priority_active_tick == 0; });
 }
 
 
@@ -529,8 +529,8 @@ void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
 		Flush();
 	}
 #endif
-	std::unique_lock lock(m_operation_mutex);
-	m_operation_available.wait(lock, [this, tick] {
+	Common::UniqueLock lock(m_operation_mutex);
+	m_operation_available.wait(lock.Native(), [this, tick]() KYTY_REQUIRES(m_operation_mutex) {
 		const bool active_before_or_at =
 		    m_priority_active_tick != 0 && m_priority_active_tick <= tick;
 		const bool queued_before_or_at =
@@ -633,7 +633,7 @@ void CommandScheduler::QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit,
 #if defined(ANYPS5_KYTY)
 	if (m_flips_pending.load(std::memory_order_acquire)) {
 		{
-			std::lock_guard lock(m_flip_mutex);
+			Common::ScopedLock lock(m_flip_mutex);
 		}
 		m_flip_changed.notify_all();
 	}

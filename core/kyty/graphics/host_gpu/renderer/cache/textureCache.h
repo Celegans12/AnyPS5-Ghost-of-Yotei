@@ -178,7 +178,7 @@ public:
 	static constexpr uint32_t ImagePageBits = 20;
 	template <typename Function>
 	[[nodiscard]] bool ForEachImageSetChangeSince(uint64_t epoch, Function&& function) {
-		std::scoped_lock lock {m_lock};
+		Common::ScopedLock lock {m_lock};
 		if (m_image_set_epoch - epoch > ImageSetChangeHistory) {
 			return false;
 		}
@@ -295,7 +295,7 @@ private:
 	}
 
 	template <typename Func>
-	void ForEachImageInRegion(uint64_t address, size_t size, Func&& func) {
+	void ForEachImageInRegion(uint64_t address, size_t size, Func&& func) KYTY_REQUIRES(m_lock) {
 		static constexpr bool BOOL_BREAK =
 		    std::is_same_v<std::invoke_result_t<Func, ImageId, Image&>, bool>;
 		ImagePageTable::PageRange pages {};
@@ -303,7 +303,7 @@ private:
 			return;
 		}
 		const uint64_t first_page = address >> ImagePageTable::kPageBits;
-		ForEachPage(address, size, [&](uint64_t page) {
+		ForEachPage(address, size, [&](uint64_t page) KYTY_NO_THREAD_SAFETY_ANALYSIS {
 			const auto* bucket = m_image_page_table.Find(page);
 			if (bucket == nullptr) {
 				if constexpr (BOOL_BREAK) {
@@ -348,13 +348,13 @@ private:
 		}
 	}
 
-	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info);
-	void                      RegisterImage(ImageId id);
-	void                      UnregisterImage(ImageId id);
-	void                      DeleteImage(ImageId id);
+	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info) KYTY_REQUIRES(m_lock);
+	void                      RegisterImage(ImageId id) KYTY_REQUIRES(m_lock);
+	void                      UnregisterImage(ImageId id) KYTY_REQUIRES(m_lock);
+	void                      DeleteImage(ImageId id) KYTY_REQUIRES(m_lock);
 	void                      ReleaseDepthFeedbackCopy(ImageId depth_id);
-	void                      FreeImage(ImageId id);
-	void                      TouchImage(Image& image);
+	void                      FreeImage(ImageId id) KYTY_REQUIRES(m_lock);
+	void                      TouchImage(Image& image) KYTY_NO_THREAD_SAFETY_ANALYSIS;
 	void                      TrackImage(ImageId id);
 	void                      TrackImageHead(ImageId id);
 	void                      TrackImageTail(ImageId id);
@@ -368,21 +368,22 @@ private:
 	void                      RetrackHoles(Image& image);
 	[[nodiscard]] bool        UploadImageLayers(Image& image);
 	void                      MarkAsMaybeDirty(ImageId id, Image& image);
-	void                      TrackImageDownload(ImageId id, Image& image);
+	void                      TrackImageDownload(ImageId id, Image& image) KYTY_REQUIRES(m_lock);
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
 	                                      bool exact_format);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
 
 	[[nodiscard]] OverlapResult ResolveOverlap(const ImageInfo& requested, BindingType binding,
 	                                           ImageId cached, ImageId merged,
-	                                           bool speculative = false, bool candidate = false);
+	                                           bool speculative = false, bool candidate = false)
+	    KYTY_REQUIRES(m_lock);
 	[[nodiscard]] ImageId       FindImageImpl(ImageDesc& desc, bool exact_format, bool speculative,
 	                                          ImageId* depth_source = nullptr);
 	[[nodiscard]] static bool   DepthOverlapNeedsRecreate(const ImageInfo& requested,
 	                                                      BindingType binding, const Image& cached);
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
-	                                                ImageId cached);
-	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
+	                                                ImageId cached) KYTY_REQUIRES(m_lock);
+	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source) KYTY_REQUIRES(m_lock);
 	void                        RefreshImage(ImageId id);
 	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
@@ -394,7 +395,7 @@ private:
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);
 	void CommitGpuWrite(Image& image);
 	void ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
-	                const vk::ImageSubresourceRange& range, const vk::ClearValue& clear);
+	                const vk::ImageSubresourceRange& range, const vk::ClearValue& clear) KYTY_REQUIRES(m_lock);
 	vk::Rect2D BeginColorRendering(Image& image, vk::Format format, uint32_t level,
 	                               uint32_t layer, uint32_t layers, const vk::ClearValue* clear,
 	                               const CommandRecorder& command);
@@ -402,11 +403,11 @@ private:
 	[[nodiscard]] ImageId FindDepthCopyLocked(ImageId source_id, const ImageInfo& requested);
 	void RefreshDepthCopy(ImageId copy_id);
 	void ReleaseDepthCopies(ImageId color_id);
-	void                  ParkImage(ImageId id);
-	[[nodiscard]] ImageId UnparkImage(const ImageInfo& info);
-	void                  DiscardParkedImage(ImageId id);
+	void                  ParkImage(ImageId id) KYTY_REQUIRES(m_lock);
+	[[nodiscard]] ImageId UnparkImage(const ImageInfo& info) KYTY_REQUIRES(m_lock);
+	void                  DiscardParkedImage(ImageId id) KYTY_REQUIRES(m_lock);
 	void                  StencilPlanesChanged(const Image& depth);
-	void                  DiscardParkedImages(uint64_t address, uint64_t size);
+	void                  DiscardParkedImages(uint64_t address, uint64_t size) KYTY_REQUIRES(m_lock);
 	[[nodiscard]] ImageId FindStencilCopy(ImageId association, const ImageInfo& requested);
 	[[nodiscard]] ImageId FindLiveStencilStorageCopy(ImageId association, const ImageDesc& desc);
 	void                  RefreshStencilCopy(ImageId copy_id);
@@ -418,7 +419,7 @@ private:
 	[[nodiscard]] bool CopyDepthColor(Image& destination, Image& source);
 	void               CopyImage(ImageId destination, ImageId source);
 	[[nodiscard]] ImageId FindStencilPlane(const Image& depth, GuestRange range) const;
-	[[nodiscard]] ImageId AssociateStencil(ImageId depth, GuestRange stencil);
+	[[nodiscard]] ImageId AssociateStencil(ImageId depth, GuestRange stencil) KYTY_REQUIRES(m_lock);
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
 	void ValidateImageViewDesc(const ImageDesc& desc) const;
 
@@ -429,12 +430,12 @@ private:
 	void               FlushLazyImages(std::span<const std::pair<ImageId, uint64_t>> images);
 	[[nodiscard]] static bool ReadbackArmedIn(const Image& image, uint64_t address,
 	                                          uint64_t size) noexcept;
-	[[nodiscard]] bool        HasArmedReadback(uint64_t address, uint64_t size);
-	[[nodiscard]] bool        InvalidateLocked(uint64_t address, uint64_t size);
+	[[nodiscard]] bool        HasArmedReadback(uint64_t address, uint64_t size) KYTY_REQUIRES(m_lock);
+	[[nodiscard]] bool        InvalidateLocked(uint64_t address, uint64_t size) KYTY_REQUIRES(m_lock);
 	[[nodiscard]] bool        InvalidateFromCompletion(uint64_t address, uint64_t size);
 	void                      DeferInvalidation(uint64_t address, uint64_t size);
 	[[nodiscard]] static uint64_t ReadbackConsumerKey(const ImageInfo& info) noexcept;
-	void                      NoteDiscardedTarget(ImageId id, const Image& image);
+	void                      NoteDiscardedTarget(ImageId id, const Image& image) KYTY_REQUIRES(m_lock);
 	[[nodiscard]] static bool IsTargetImage(const Image& image) noexcept;
 	[[nodiscard]] bool        WasDiscardedTarget(const Image& image) const;
 
@@ -452,8 +453,8 @@ private:
 	                    ImagePageTable::kFirstLevelBits>
 	    m_image_page_epochs;
 	RegisteredPageCounts                              m_registered_pages;
-	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
-	std::unordered_set<ImageId>                       m_download_images;
+	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache KYTY_GUARDED_BY(m_lock);
+	std::unordered_set<ImageId>                       m_download_images KYTY_GUARDED_BY(m_lock);
 	std::mutex                                        m_write_back_mutex;
 	std::vector<WriteBack>                            m_write_backs;
 	std::unordered_set<uint64_t>                      m_readback_consumers;

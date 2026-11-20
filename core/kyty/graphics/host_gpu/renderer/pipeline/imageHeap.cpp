@@ -516,7 +516,7 @@ void ImageHeap::TakeChanges() {
 
 ImageId ImageHeap::CurrentImage(const Image::HeapChange& change) {
 	auto&            textures = m_context.GetTextureCache();
-	std::scoped_lock lock {textures.m_lock};
+	Common::ScopedLock lock {textures.m_lock};
 	ImageId          current;
 	textures.ForEachImageWithAddress(change.data.address, [&](ImageId id, const Image& image) {
 		if (image.serial == change.serial && !image.depth_id) current = id;

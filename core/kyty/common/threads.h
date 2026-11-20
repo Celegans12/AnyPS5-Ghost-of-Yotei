@@ -2,6 +2,7 @@
 #define KYTY_COMMON_THREADS_H_
 
 #include "common/common.h"
+#include "common/threadSafety.h"
 
 #include <span>
 
@@ -36,22 +37,22 @@ void KeepCurrentOnLargestCache();
 
 }
 
-class Mutex {
+class KYTY_CAPABILITY("mutex") Mutex {
 public:
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	Mutex();
 	~Mutex();
 
-	void Lock();
-	void Unlock();
+	void Lock() KYTY_ACQUIRE();
+	void Unlock() KYTY_RELEASE();
 
 	KYTY_CLASS_NO_COPY(Mutex);
 
 private:
 	alignas(8) unsigned char m_cs[40];
 #else
-	void Lock() { m_mutex.lock(); }
-	void Unlock() { m_mutex.unlock(); }
+	void Lock() KYTY_ACQUIRE() KYTY_NO_THREAD_SAFETY_ANALYSIS { m_mutex.lock(); }
+	void Unlock() KYTY_RELEASE() KYTY_NO_THREAD_SAFETY_ANALYSIS { m_mutex.unlock(); }
 
 private:
 	std::recursive_mutex m_mutex;
@@ -64,8 +65,8 @@ class CondVar {
 public:
 	CondVar() = default;
 
-	void Wait(Mutex* mutex);
-	bool WaitFor(Mutex* mutex, uint32_t micros);
+	void Wait(Mutex* mutex) KYTY_NO_THREAD_SAFETY_ANALYSIS;
+	bool WaitFor(Mutex* mutex, uint32_t micros) KYTY_NO_THREAD_SAFETY_ANALYSIS;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	void Signal();
 	void SignalAll();
@@ -86,13 +87,13 @@ private:
 #endif
 };
 
-class LockGuard {
+class KYTY_SCOPED_CAPABILITY LockGuard {
 public:
 	using mutex_type = Mutex;
 
-	explicit LockGuard(mutex_type& m): m_mutex(m) { m_mutex.Lock(); }
+	explicit LockGuard(mutex_type& m) KYTY_ACQUIRE(m) KYTY_NO_THREAD_SAFETY_ANALYSIS: m_mutex(m) { m_mutex.Lock(); }
 
-	~LockGuard() { m_mutex.Unlock(); }
+	~LockGuard() KYTY_RELEASE() KYTY_NO_THREAD_SAFETY_ANALYSIS { m_mutex.Unlock(); }
 
 	KYTY_CLASS_NO_COPY(LockGuard);
 

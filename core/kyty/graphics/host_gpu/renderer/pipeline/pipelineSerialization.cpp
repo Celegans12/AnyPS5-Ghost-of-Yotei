@@ -170,6 +170,7 @@ struct PipelineCache::StoreRecord {
 
 void PipelineCache::WarmUp(const std::filesystem::path& path,
                            [[maybe_unused]] bool driver_cache_restored) {
+	AssumeProgramsConfined();
 	if (path.empty()) {
 		return;
 	}

@@ -49,7 +49,7 @@ public:
 		static_assert(std::is_invocable_v<Flush&>);
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			const bool should_flush = [&] {
-				std::scoped_lock lock(manager->lock);
+				Common::ScopedLock lock(manager->lock);
 				if (manager->IsModified<DirtySource::Gpu>(offset, bytes)) {
 					return true;
 				}
@@ -75,7 +75,7 @@ public:
 	void ForEachDownloadRange(uint64_t vaddr, uint64_t size, Func&& func) {
 		static_assert(std::is_nothrow_invocable_v<Func&, uint64_t, uint64_t>);
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-			std::scoped_lock lock(manager->lock);
+			Common::ScopedLock lock(manager->lock);
 			manager->ForEachModifiedRange<DirtySource::Gpu, false>(offset, bytes, func);
 			if constexpr (clear) {
 				manager->ChangeState<DirtySource::Gpu, false>(offset, bytes);
@@ -97,7 +97,7 @@ public:
 			return;
 		}
 		if (auto* manager = m_regions[index].load(std::memory_order_acquire); manager != nullptr) {
-			std::scoped_lock lock(manager->lock);
+			Common::ScopedLock lock(manager->lock);
 			manager->NoteGuestWriteFault(vaddr % TRACKER_REGION_SIZE);
 		}
 	}
@@ -111,7 +111,7 @@ public:
 		if (manager == nullptr) {
 			return {};
 		}
-		std::scoped_lock lock(manager->lock);
+		Common::ScopedLock lock(manager->lock);
 		return manager->OpenWriteBlock(vaddr % TRACKER_REGION_SIZE, block_size, open_block);
 	}
 
@@ -191,7 +191,7 @@ public:
 			if (!manager->HasCpuDirty()) {
 				continue;
 			}
-			std::scoped_lock lock(manager->lock);
+			Common::ScopedLock lock(manager->lock);
 			manager->ForEachModifiedRange<DirtySource::Cpu, false>(
 			    start - index * TRACKER_REGION_SIZE, finish - start,
 			    [&](uint64_t address, uint64_t bytes) { add(address, address + bytes); });
@@ -213,7 +213,7 @@ public:
 		if (!manager->HasCpuDirty()) {
 			return false;
 		}
-		std::scoped_lock lock(manager->lock);
+		Common::ScopedLock lock(manager->lock);
 		return manager->CopyCpuDirty(pages);
 	}
 
@@ -221,7 +221,7 @@ public:
 	void ConsumeCpuWrites(CpuWriteConsumer consumer, uint64_t vaddr, uint64_t size, Func&& func) {
 		std::vector<std::pair<uint64_t, uint64_t>> runs;
 		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-			std::scoped_lock lock(manager->lock);
+			Common::ScopedLock lock(manager->lock);
 			manager->ConsumeCpuWritten(consumer, offset, bytes,
 			                           [&](uint64_t address, uint64_t length) {
 				                           if (!runs.empty() &&
@@ -246,7 +246,7 @@ public:
 	void MarkRegionAsGpuModifiedUnlessCpuDirty(uint64_t vaddr, uint64_t size, Func&& func) {
 		std::vector<std::pair<uint64_t, uint64_t>> runs;
 		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-			std::scoped_lock lock(manager->lock);
+			Common::ScopedLock lock(manager->lock);
 			manager->MarkGpuDirtyUnlessCpuDirty(
 			    offset, bytes,
 			    [&](uint64_t address, uint64_t length) { runs.emplace_back(address, length); });
@@ -262,14 +262,14 @@ public:
 		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
 		const bool defer = !is_written && DeferProtections();
-		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) KYTY_NO_THREAD_SAFETY_ANALYSIS {
 			if (!is_written && (!manager->HasCpuDirty() ||
-			                    !manager->IsModified<DirtySource::Cpu>(offset, bytes))) {
+			                    !manager->IsModifiedUnlocked<DirtySource::Cpu>(offset, bytes))) {
 				return;
 			}
 			if (!is_written && device_sync != 0) {
 				const std::pair<uint64_t, uint64_t> range {offset, bytes};
-				std::scoped_lock                    lock(manager->lock);
+				Common::ScopedLock                    lock(manager->lock);
 				DeferScope deferred(defer, manager);
 				if (manager->ConsumeCpuDirtyRangesKeepingBusy(
 				        std::span(&range, 1), device_sync,
@@ -291,7 +291,7 @@ public:
 		ApplyDeferredProtections();
 		if (is_written) {
 			Iterate<false>(vaddr, size,
-			               [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			               [](RegionManager* manager, uint64_t offset, uint64_t bytes) KYTY_NO_THREAD_SAFETY_ANALYSIS {
 				               manager->ChangeState<DirtySource::Gpu, true>(offset, bytes);
 				               manager->lock.unlock();
 			               });
@@ -335,7 +335,7 @@ public:
 				for (auto piece = first; piece < last; piece++) {
 					offsets.emplace_back(pieces[piece].offset, pieces[piece].size);
 				}
-				std::scoped_lock lock(manager->lock);
+				Common::ScopedLock lock(manager->lock);
 				DeferScope       deferred(defer, manager);
 				const auto piece_func = [&](size_t piece, uint64_t address, uint64_t bytes) noexcept {
 					range_func(pieces[first + piece].range, address, bytes);

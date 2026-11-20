@@ -46,3 +46,12 @@ With `APS5_PAGE_TRACK=1` on Windows, a reader that keeps a copy of guest memory 
 A host-only test executable (one that links no guest library) whose sources inherit the `-fno-asynchronous-unwind-tables` policy of `core/libs/CMakeLists.txt`, and that is built for MinGW, must call `configure_host_test_executable(<target>)` (root `CMakeLists.txt`) after `add_test_executable`. On MinGW only, it adds `-fasynchronous-unwind-tables` to the executable's compile options and `-static -static-libgcc -static-libstdc++` to its link options, and nothing else.
 
 The guest `libc` provides `__gxx_personality_v0`; a host-only link doesn't get it. On a DWARF-exception MinGW toolchain an object with a landing pad then fails to link. Test executables defined in the root `CMakeLists.txt` do not inherit that policy, so they do not need the helper; nor do test executables that link a guest library, or non-MinGW hosts.
+
+### Thread safety annotations of the Kyty core
+
+The Kyty core in `core/kyty/` is built by Clang with `-Wthread-safety` on Linux (`KYTY_THREAD_SAFETY`, on by default). The files listed in [KytyThreadSafety.cmake](../../core/kyty/cmake/KytyThreadSafety.cmake) build with `-Werror=thread-safety`; every other file reports the same findings as warnings.
+
+- The macros are in [threadSafety.h](../../core/kyty/common/threadSafety.h), prefixed `KYTY_` (`KYTY_GUARDED_BY`, `KYTY_REQUIRES`, `KYTY_ACQUIRE`, `KYTY_RELEASE`, `KYTY_CAPABILITY`, `KYTY_SCOPED_CAPABILITY`, `KYTY_NO_THREAD_SAFETY_ANALYSIS`…) and empty outside Clang.
+- libstdc++ does not annotate `std::mutex`, `std::scoped_lock` or `std::unique_lock`, so a lock that guards data uses the annotated types: `Common::AnnotatedMutex` with `Common::ScopedLock` or `Common::UniqueLock` (their `Native()` is what `std::condition_variable::wait` takes), `Common::Mutex` with `Common::LockGuard`, `TrackingSpinLock` with `Common::ScopedLock`.
+- A member that a lock protects carries `KYTY_GUARDED_BY(<lock>)`; a function that expects the lock held carries `KYTY_REQUIRES(<lock>)`; the predicate lambda of a `wait` that reads guarded data carries it too.
+- `KYTY_NO_THREAD_SAFETY_ANALYSIS` is for the code the analysis cannot follow: a lock taken conditionally, handed from one lambda to another, or a read that is lock-free on purpose. Give such a read a named function (`RegionManager::IsModifiedUnlocked`) so a search finds it.

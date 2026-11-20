@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "common/threads.h"
+#include "common/threadSafety.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/bdaDirtyRegions.h"
@@ -37,16 +38,16 @@
 
 namespace Libs::Graphics {
 
-class TrackingSpinLock final {
+class KYTY_CAPABILITY("spin lock") TrackingSpinLock final {
 public:
-	void lock() noexcept {
+	void lock() noexcept KYTY_ACQUIRE() KYTY_NO_THREAD_SAFETY_ANALYSIS {
 		const auto thread = CurrentThread();
 		if (m_state.exchange(1, std::memory_order_acquire) != 0) [[unlikely]] {
 			LockSlow(thread);
 		}
 		m_owner.store(thread, std::memory_order_relaxed);
 	}
-	void unlock() noexcept {
+	void unlock() noexcept KYTY_RELEASE() KYTY_NO_THREAD_SAFETY_ANALYSIS {
 		EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) != CurrentThread());
 		m_owner.store(0, std::memory_order_relaxed);
 		m_state.store(0, std::memory_order_seq_cst);
@@ -54,7 +55,7 @@ public:
 			WakeSleeper();
 		}
 	}
-	[[nodiscard]] bool TryLockSpinning() noexcept {
+	[[nodiscard]] bool TryLockSpinning() noexcept KYTY_TRY_ACQUIRE(true) KYTY_NO_THREAD_SAFETY_ANALYSIS {
 		const auto thread = CurrentThread();
 		for (uint32_t round = 0;; round++) {
 			if (m_state.load(std::memory_order_relaxed) == 0 &&
@@ -190,7 +191,13 @@ public:
 	KYTY_CLASS_NO_COPY(RegionManager);
 
 	template <DirtySource source>
-	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {
+	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const KYTY_REQUIRES(lock) {
+		const auto [start, end] = GetPageRange(offset, size);
+		return GetBits<source>().Any(start, end);
+	}
+
+	template <DirtySource source>
+	[[nodiscard]] bool IsModifiedUnlocked(uint64_t offset, uint64_t size) const KYTY_NO_THREAD_SAFETY_ANALYSIS {
 		const auto [start, end] = GetPageRange(offset, size);
 		return GetBits<source>().Any(start, end);
 	}
@@ -201,7 +208,7 @@ public:
 		bool     tracked = false;
 	};
 
-	[[nodiscard]] WriteBlockProbe OpenWriteBlock(uint64_t offset, uint64_t block_size, bool open_block) {
+	[[nodiscard]] WriteBlockProbe OpenWriteBlock(uint64_t offset, uint64_t block_size, bool open_block) KYTY_REQUIRES(lock) {
 		const auto page  = static_cast<size_t>(offset / TRACKER_PAGE_SIZE);
 		const auto first = static_cast<size_t>(offset / block_size * block_size / TRACKER_PAGE_SIZE);
 		const auto last  = first + static_cast<size_t>(block_size / TRACKER_PAGE_SIZE);
@@ -235,7 +242,7 @@ public:
 	}
 
 	template <DirtySource source, bool enable>
-	void ChangeState(uint64_t offset, uint64_t size) {
+	void ChangeState(uint64_t offset, uint64_t size) KYTY_REQUIRES(lock) {
 		const auto [start, end] = GetPageRange(offset, size);
 		if constexpr (source == DirtySource::Cpu && enable) {
 			if (m_gpu_dirty.Any(start, end)) {
@@ -275,7 +282,7 @@ public:
 	}
 
 	template <DirtySource source, bool clear, typename Func>
-	void ForEachModifiedRange(uint64_t offset, uint64_t size, Func&& func) {
+	void ForEachModifiedRange(uint64_t offset, uint64_t size, Func&& func) KYTY_REQUIRES(lock) {
 		const auto [start, end] = GetPageRange(offset, size);
 		auto&      bits         = GetBits<source>();
 		if (!bits.Any(start, end)) {
@@ -300,7 +307,7 @@ public:
 	}
 
 	template <typename Func>
-	void ConsumeCpuDirtyRanges(std::span<const std::pair<uint64_t, uint64_t>> ranges, Func&& func) {
+	void ConsumeCpuDirtyRanges(std::span<const std::pair<uint64_t, uint64_t>> ranges, Func&& func) KYTY_REQUIRES(lock) {
 		RegionBits mask;
 		for (const auto& [offset, size]: ranges) {
 			const auto [start, end] = GetPageRange(offset, size);
@@ -328,7 +335,7 @@ public:
 
 	template <typename Func>
 	bool ConsumeCpuDirtyRangesKeepingBusy(std::span<const std::pair<uint64_t, uint64_t>> ranges,
-	                                      uint32_t sync, Func&& func) {
+	                                      uint32_t sync, Func&& func) KYTY_REQUIRES(lock) {
 		constexpr uint32_t MaxGap           = 3;
 		constexpr uint8_t  MinWrites        = 3;
 		constexpr uint32_t RevalidatePeriod = 12;
@@ -383,7 +390,7 @@ public:
 		return kept;
 	}
 
-	void NoteGuestWriteFault(uint64_t offset) {
+	void NoteGuestWriteFault(uint64_t offset) KYTY_REQUIRES(lock) {
 		if (m_busy != nullptr) {
 			m_busy->faulted.Set(static_cast<size_t>(offset / TRACKER_PAGE_SIZE));
 		}
@@ -392,7 +399,7 @@ public:
 	[[nodiscard]] uint32_t KeptSync() const { return m_kept_sync.load(std::memory_order_relaxed); }
 
 	template <typename Func>
-	void ConsumeCpuWritten(CpuWriteConsumer consumer, uint64_t offset, uint64_t size, Func&& func) {
+	void ConsumeCpuWritten(CpuWriteConsumer consumer, uint64_t offset, uint64_t size, Func&& func) KYTY_REQUIRES(lock) {
 		const auto [start, end] = GetPageRange(offset, size);
 		auto&      written      = m_cpu_written[static_cast<size_t>(consumer)];
 		RegionBits mask(written, start, end);
@@ -404,7 +411,7 @@ public:
 	}
 
 	template <typename Func>
-	void MarkGpuDirtyUnlessCpuDirty(uint64_t offset, uint64_t size, Func&& func) {
+	void MarkGpuDirtyUnlessCpuDirty(uint64_t offset, uint64_t size, Func&& func) KYTY_REQUIRES(lock) {
 		const auto [start, end] = GetPageRange(offset, size);
 		m_gpu_written.SetRange(start, end);
 		m_gpu_noted.SetRange(start, end);
@@ -424,7 +431,7 @@ public:
 		}
 	}
 
-	bool CopyCpuDirty(RegionBits& pages) const {
+	bool CopyCpuDirty(RegionBits& pages) const KYTY_REQUIRES(lock) {
 		pages.Clear();
 		pages |= m_cpu_dirty;
 		return !pages.None();
@@ -441,7 +448,7 @@ public:
 	TrackingSpinLock lock;
 
 private:
-	void NoteOpenedUpload(const RegionBits* uploaded, const RegionBits& cleaned) {
+	void NoteOpenedUpload(const RegionBits* uploaded, const RegionBits& cleaned) KYTY_REQUIRES(lock) {
 		if (!m_any_block_opened) {
 			return;
 		}
@@ -461,7 +468,7 @@ private:
 	}
 
 	template <bool track, bool is_read>
-	void UpdateProtection(RegionBits& changed) {
+	void UpdateProtection(RegionBits& changed) KYTY_REQUIRES(lock) {
 		if (changed.None()) {
 			return;
 		}
@@ -472,7 +479,7 @@ private:
 	}
 
 	template <DirtySource source>
-	RegionBits& GetBits() {
+	RegionBits& GetBits() KYTY_REQUIRES(lock) {
 		if constexpr (source == DirtySource::Cpu) {
 			return m_cpu_dirty;
 		} else {
@@ -481,7 +488,7 @@ private:
 	}
 
 	template <DirtySource source>
-	const RegionBits& GetBits() const {
+	const RegionBits& GetBits() const KYTY_REQUIRES(lock) {
 		if constexpr (source == DirtySource::Cpu) {
 			return m_cpu_dirty;
 		} else {
@@ -496,9 +503,9 @@ private:
 
 	PageManager& m_page_manager;
 	uint64_t     m_cpu_addr = 0;
-	RegionBits   m_cpu_dirty;
-	std::array<RegionBits, CPU_WRITE_CONSUMERS> m_cpu_written;
-	RegionBits   m_gpu_dirty;
+	RegionBits   m_cpu_dirty KYTY_GUARDED_BY(lock);
+	std::array<RegionBits, CPU_WRITE_CONSUMERS> m_cpu_written KYTY_GUARDED_BY(lock);
+	RegionBits   m_gpu_dirty KYTY_GUARDED_BY(lock);
 	std::atomic_bool      m_has_cpu_dirty {true};
 	std::atomic_bool      m_has_gpu_dirty {false};
 	std::atomic<uint64_t> m_cpu_dirty_epoch {1};
@@ -509,11 +516,11 @@ private:
 		std::array<uint8_t, TRACKER_REGION_PAGES>  writes {};
 		RegionBits                                 faulted;
 	};
-	RegionBits                 m_gpu_written;
-	RegionBits                 m_gpu_noted;
-	RegionBits                 m_block_opened;
-	bool                       m_any_block_opened = false;
-	std::unique_ptr<BusyPages> m_busy;
+	RegionBits                 m_gpu_written KYTY_GUARDED_BY(lock);
+	RegionBits                 m_gpu_noted KYTY_GUARDED_BY(lock);
+	RegionBits                 m_block_opened KYTY_GUARDED_BY(lock);
+	bool                       m_any_block_opened KYTY_GUARDED_BY(lock) = false;
+	std::unique_ptr<BusyPages> m_busy KYTY_GUARDED_BY(lock);
 	std::atomic<uint32_t>      m_kept_sync {0};
 	std::atomic<uint64_t> m_host_write_epoch {0};
 	std::atomic<uint32_t> m_deferred_protects {0};

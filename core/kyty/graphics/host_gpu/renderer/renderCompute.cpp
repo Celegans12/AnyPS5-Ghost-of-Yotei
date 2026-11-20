@@ -297,7 +297,7 @@ bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 		const auto  binding     = ResolveTexture(resource, resources.images[0]);
 		const auto& destination = binding.desc.info.data;
 		if (!FillSourcesDisjoint(resources.buffers, destination)) return false;
-		std::scoped_lock lock {cache.m_lock};
+		Common::ScopedLock lock {cache.m_lock};
 		const auto&      image = cache.GetImage(binding.image_id);
 		const auto&      view  = binding.desc.view_info;
 		if (image.backing.format != vk::Format::eD32SfloatS8Uint || image.info.samples != 1 ||

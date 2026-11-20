@@ -72,7 +72,7 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 
 bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-		return manager->IsModified<DirtySource::Cpu>(offset, bytes);
+		return manager->IsModifiedUnlocked<DirtySource::Cpu>(offset, bytes);
 	});
 }
 
@@ -82,20 +82,20 @@ bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 		return false;
 	}
 	return Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-		return manager->IsModified<DirtySource::Gpu>(offset, bytes);
+		return manager->IsModifiedUnlocked<DirtySource::Gpu>(offset, bytes);
 	});
 }
 
 void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-		std::scoped_lock lock(manager->lock);
+		Common::ScopedLock lock(manager->lock);
 		manager->ChangeState<DirtySource::Cpu, true>(offset, bytes);
 	});
 }
 
 void MemoryTracker::UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-		std::scoped_lock lock(manager->lock);
+		Common::ScopedLock lock(manager->lock);
 		manager->ChangeState<DirtySource::Gpu, false>(offset, bytes);
 	});
 }

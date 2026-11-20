@@ -71,7 +71,7 @@ constexpr uint64_t HOT_CLUSTER_GAP    = 1024 * 1024;
 	std::_Exit(322);
 }
 
-using SpinGuard = std::lock_guard<TrackingSpinLock>;
+using SpinGuard = Common::ScopedLock<TrackingSpinLock>;
 
 thread_local std::vector<PageManager::DeferredRange>* g_deferred_write_protect = nullptr;
 
@@ -141,7 +141,7 @@ struct PageManager::Impl {
 
 	struct Region {
 		TrackingSpinLock                    lock;
-		std::array<PageState, REGION_PAGES> pages;
+		std::array<PageState, REGION_PAGES> pages KYTY_GUARDED_BY(lock);
 		std::array<std::atomic<uint8_t>, REGION_PAGES> read_hint {};
 	};
 
@@ -367,7 +367,7 @@ struct PageManager::Impl {
 		return false;
 	}
 
-	PageState* FindPage(uint64_t page, Region** region) const noexcept {
+	PageState* FindPage(uint64_t page, Region** region) const noexcept KYTY_NO_THREAD_SAFETY_ANALYSIS {
 		*region = FindRegion(page);
 		return *region == nullptr ? nullptr : &(*region)->pages[(page % REGION_SIZE) / PAGE_SIZE];
 	}

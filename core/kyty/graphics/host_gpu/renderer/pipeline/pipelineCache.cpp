@@ -385,19 +385,19 @@ void RecordAheadLoads(void* userdata, std::span<const uint64_t> loads) {
 	static_cast<GuestReadLog*>(userdata)->RecordLoads(loads);
 }
 
-class ProgramLockGuard {
+class ProgramLockMaybe {
 public:
 #if defined(ANYPS5_KYTY)
-	explicit ProgramLockGuard(std::atomic_flag& flag, bool take = true,
+	explicit ProgramLockMaybe(ProgramSpinLock& lock, bool take,
 	                          std::source_location where = std::source_location::current())
-	    : m_flag(take ? &flag : nullptr) {
+	    : m_flag(take ? &lock.flag : nullptr) {
 		if (m_flag != nullptr) ProgramLock::Acquire(*m_flag, where);
 	}
-	~ProgramLockGuard() {
+	~ProgramLockMaybe() {
 		if (m_flag != nullptr) ProgramLock::Release(*m_flag);
 	}
 #else
-	explicit ProgramLockGuard(std::atomic_flag& flag, bool take = true): m_flag(take ? &flag : nullptr) {
+	explicit ProgramLockMaybe(ProgramSpinLock& lock, bool take): m_flag(take ? &lock.flag : nullptr) {
 		if (m_flag == nullptr) return;
 		while (m_flag->test_and_set(std::memory_order_acquire)) {
 			while (m_flag->test(std::memory_order_relaxed)) {
@@ -405,9 +405,36 @@ public:
 			}
 		}
 	}
-	~ProgramLockGuard() {
+	~ProgramLockMaybe() {
 		if (m_flag != nullptr) m_flag->clear(std::memory_order_release);
 	}
+#endif
+	ProgramLockMaybe(const ProgramLockMaybe&)            = delete;
+	ProgramLockMaybe& operator=(const ProgramLockMaybe&) = delete;
+
+private:
+	std::atomic_flag* m_flag;
+};
+
+class KYTY_SCOPED_CAPABILITY ProgramLockGuard {
+public:
+#if defined(ANYPS5_KYTY)
+	explicit ProgramLockGuard(ProgramSpinLock& lock, std::source_location where = std::source_location::current())
+	    KYTY_ACQUIRE(lock) KYTY_NO_THREAD_SAFETY_ANALYSIS
+	    : m_flag(&lock.flag) {
+		ProgramLock::Acquire(*m_flag, where);
+	}
+	~ProgramLockGuard() KYTY_RELEASE() KYTY_NO_THREAD_SAFETY_ANALYSIS { ProgramLock::Release(*m_flag); }
+#else
+	explicit ProgramLockGuard(ProgramSpinLock& lock) KYTY_ACQUIRE(lock) KYTY_NO_THREAD_SAFETY_ANALYSIS
+	    : m_flag(&lock.flag) {
+		while (m_flag->test_and_set(std::memory_order_acquire)) {
+			while (m_flag->test(std::memory_order_relaxed)) {
+				Common::SpinPause();
+			}
+		}
+	}
+	~ProgramLockGuard() KYTY_RELEASE() KYTY_NO_THREAD_SAFETY_ANALYSIS { m_flag->clear(std::memory_order_release); }
 #endif
 	ProgramLockGuard(const ProgramLockGuard&)            = delete;
 	ProgramLockGuard& operator=(const ProgramLockGuard&) = delete;
@@ -1761,7 +1788,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 #if defined(ANYPS5_KYTY)
 	std::optional<std::pair<ShaderRecompiler::IR::ResourceSpecialization, ShaderRecompiler::IR::ResourceSnapshot>>
 	           natural;
-	const auto build = [&]() -> const ShaderModule* {
+	const auto build = [&]() KYTY_REQUIRES(m_program_lock) -> const ShaderModule* {
 #endif
 	options.shader_hash     = params.hash;
 	options.user_data       = user_data;
@@ -1837,7 +1864,8 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	};
 	const ShaderModule* built = nullptr;
 	if (Common::Fallback::Run("draw or dispatch skipped: the shader recompiler stopped",
-	                          "PipelineCache::GetProgram", params.hash, 0, [&] { built = build(); })) {
+	                          "PipelineCache::GetProgram", params.hash, 0,
+	                          [&]() KYTY_NO_THREAD_SAFETY_ANALYSIS { built = build(); })) {
 		return built;
 	}
 	if (const auto found = m_program_cache.find(m_lookup_key); found != m_program_cache.end()) {
@@ -2229,7 +2257,7 @@ struct PipelineCache::ChainJob {
 bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
                                             const HW::UserConfig& user_config,
                                             const HW::Shader& shaders, DrawRenderState& state,
-                                            ProgramResolution* ahead) {
+                                            ProgramResolution* ahead) KYTY_NO_THREAD_SAFETY_ANALYSIS {
 	const auto& sh                = context.GetShaderRegisters();
 	const auto& vertex_regs       = shaders.GetVs();
 	const auto& pixel_regs        = shaders.GetPs();
@@ -2613,7 +2641,7 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 	}
 	uint32_t push_data_cursor = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
 	    mesh_active, object_primitive_id, last_stage.user_clip_planes);
-	const ProgramLockGuard lock(m_program_lock, ahead == nullptr || !t_ahead_unlocked);
+	const ProgramLockMaybe lock(m_program_lock, ahead == nullptr || !t_ahead_unlocked);
 	if (ahead != nullptr) {
 #if defined(ANYPS5_KYTY)
 		const uint32_t first_cursor = push_data_cursor;
@@ -2696,7 +2724,7 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 	const bool unlocked = t_ahead_unlocked;
 	Program*   program  = nullptr;
 	{
-		const ProgramLockGuard lock(m_program_lock, unlocked);
+		const ProgramLockMaybe lock(m_program_lock, unlocked);
 		const auto             entry = m_program_cache.find(key);
 		if (entry == m_program_cache.end() && ahead.stages != ProgramResolution::MaxStages) {
 			QueueCompile(key, params, input_info, push_data_cursor, nullptr);
@@ -2762,7 +2790,7 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 		                                                    layout.ShaderDataDwords()) &&
 		       candidate.specialization == specialization;
 	};
-	const ProgramLockGuard lock(m_program_lock, unlocked);
+	const ProgramLockMaybe lock(m_program_lock, unlocked);
 	auto&                  modules = program->modules;
 	auto&                  last    = program->last_module[1];
 	auto                   module  = last < modules.size() && matches(modules[last])
@@ -2816,24 +2844,24 @@ struct PipelineCache::CompileJob {
 };
 
 #if defined(ANYPS5_KYTY)
-void PipelineCache::LockPrograms(std::source_location where) {
-	ProgramLock::Acquire(m_program_lock, where);
+void PipelineCache::LockPrograms(std::source_location where) KYTY_NO_THREAD_SAFETY_ANALYSIS {
+	ProgramLock::Acquire(m_program_lock.flag, where);
 }
 
-void PipelineCache::UnlockPrograms() {
-	ProgramLock::Release(m_program_lock);
+void PipelineCache::UnlockPrograms() KYTY_NO_THREAD_SAFETY_ANALYSIS {
+	ProgramLock::Release(m_program_lock.flag);
 }
 #else
-void PipelineCache::LockPrograms() {
-	while (m_program_lock.test_and_set(std::memory_order_acquire)) {
-		while (m_program_lock.test(std::memory_order_relaxed)) {
+void PipelineCache::LockPrograms() KYTY_NO_THREAD_SAFETY_ANALYSIS {
+	while (m_program_lock.flag.test_and_set(std::memory_order_acquire)) {
+		while (m_program_lock.flag.test(std::memory_order_relaxed)) {
 			Common::SpinPause();
 		}
 	}
 }
 
-void PipelineCache::UnlockPrograms() {
-	m_program_lock.clear(std::memory_order_release);
+void PipelineCache::UnlockPrograms() KYTY_NO_THREAD_SAFETY_ANALYSIS {
+	m_program_lock.flag.clear(std::memory_order_release);
 }
 #endif
 
@@ -3808,7 +3836,7 @@ void PipelineCache::RetireAheadGuestWrites(uint64_t executed) {
 
 const ShaderModule* PipelineCache::GetComputeProgramAhead(const HW::ComputeShaderInfo& regs,
                                                           ShaderComputeInputInfo&      input_info,
-                                                          ProgramResolution&           ahead) {
+                                                          ProgramResolution&           ahead) KYTY_NO_THREAD_SAFETY_ANALYSIS {
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 #if defined(ANYPS5_KYTY)
 	ShaderParams params;
@@ -3832,7 +3860,7 @@ const ShaderModule* PipelineCache::GetComputeProgramAhead(const HW::ComputeShade
 #if defined(ANYPS5_KYTY)
 	const ShaderModule* module = nullptr;
 	{
-		const ProgramLockGuard lock(m_program_lock, !t_ahead_unlocked);
+		const ProgramLockMaybe lock(m_program_lock, !t_ahead_unlocked);
 		module = GetAhead(params, input_info, push_data_cursor, ahead);
 	}
 	if (module != nullptr) {
@@ -3840,7 +3868,7 @@ const ShaderModule* PipelineCache::GetComputeProgramAhead(const HW::ComputeShade
 	}
 	return module;
 #else
-	const ProgramLockGuard lock(m_program_lock, !t_ahead_unlocked);
+	const ProgramLockMaybe lock(m_program_lock, !t_ahead_unlocked);
 	return GetAhead(params, input_info, push_data_cursor, ahead);
 #endif
 }

@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/file.h"
+#include "common/threadSafety.h"
 #include "common/uniqueFunction.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -42,6 +43,10 @@
 #include <vector>
 
 namespace Libs::Graphics {
+
+struct KYTY_CAPABILITY("programs lock") ProgramSpinLock {
+	std::atomic_flag flag;
+};
 
 class GuestReadLog {
 public:
@@ -548,12 +553,12 @@ private:
 
 	GraphicContext&                        m_graphics;
 	ShaderRecompiler::IR::ImageHeapSource* m_image_heap;
-	std::unordered_map<ProgramKey, Program, ProgramKeyHash> m_program_cache;
+	std::unordered_map<ProgramKey, Program, ProgramKeyHash> m_program_cache KYTY_GUARDED_BY(m_program_lock);
 	std::array<uint32_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> m_compiled {};
-	ProgramKey                             m_lookup_key;
-	bool                                   m_guest_traversal = false;
-	bool                                   m_queue_only      = false;
-	bool                                   m_queued          = false;
+	ProgramKey                             m_lookup_key KYTY_GUARDED_BY(m_program_lock);
+	bool                                   m_guest_traversal KYTY_GUARDED_BY(m_program_lock) = false;
+	bool                                   m_queue_only KYTY_GUARDED_BY(m_program_lock)      = false;
+	bool                                   m_queued KYTY_GUARDED_BY(m_program_lock)          = false;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
 	std::mutex                    m_driver_cache_mutex;
@@ -563,14 +568,14 @@ private:
 	std::unordered_map<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash> m_graphics_pipelines;
 	std::unordered_map<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash> m_native_graphics_pipelines;
 	std::unordered_map<uint64_t, Pipeline>                                     m_compute_pipelines;
-	std::unordered_map<uint64_t, ShaderTessellationInputInfo>                  m_tess_layouts;
+	std::unordered_map<uint64_t, ShaderTessellationInputInfo>                  m_tess_layouts KYTY_GUARDED_BY(m_program_lock);
 	GraphicsPipelineKey m_last_graphics_key {};
 	Pipeline*           m_last_graphics_pipeline = nullptr;
-	std::atomic_flag m_program_lock;
+	ProgramSpinLock m_program_lock;
 
 	struct CompileJob;
 	static constexpr uint32_t CompileWorkers = 6;
-	std::unordered_map<ProgramKey, uint32_t, ProgramKeyHash> m_in_flight;
+	std::unordered_map<ProgramKey, uint32_t, ProgramKeyHash> m_in_flight KYTY_GUARDED_BY(m_program_lock);
 	std::mutex                                               m_job_mutex;
 	std::condition_variable                                  m_job_available;
 	std::deque<std::unique_ptr<CompileJob>>                  m_jobs;
@@ -585,10 +590,11 @@ private:
 	                             ProgramResolution* ahead);
 	template <typename InputInfo>
 	const ShaderModule* GetProgram(const ShaderParams& params, InputInfo& input_info,
-	                               uint32_t& push_data_cursor);
+	                               uint32_t& push_data_cursor) KYTY_REQUIRES(m_program_lock);
 	template <typename InputInfo>
 	const ShaderModule* GetAhead(const ShaderParams& params, InputInfo& input_info,
-	                             uint32_t& push_data_cursor, ProgramResolution& ahead);
+	                             uint32_t& push_data_cursor, ProgramResolution& ahead)
+	    KYTY_NO_THREAD_SAFETY_ANALYSIS;
 	ShaderModule& CompileModule(Program& program, const ProgramKey& key,
 	                            ShaderRecompiler::CompileOptions  options,
 	                            ShaderRecompiler::TranslateResult translated,
@@ -605,17 +611,19 @@ private:
 	                 std::span<const uint32_t> code, uint32_t push_data_cursor);
 	void DestroyModule(const ShaderModule& module) const;
 #if defined(ANYPS5_KYTY)
-	void LockPrograms(std::source_location where = std::source_location::current());
+	void LockPrograms(std::source_location where = std::source_location::current()) KYTY_ACQUIRE(m_program_lock);
 #else
-	void LockPrograms();
+	void LockPrograms() KYTY_ACQUIRE(m_program_lock);
 #endif
-	void UnlockPrograms();
+	void UnlockPrograms() KYTY_RELEASE(m_program_lock);
+	void AssumeProgramsConfined() noexcept KYTY_ASSERT_CAPABILITY(m_program_lock) {}
 	template <typename InputInfo>
 	void QueueCompile(const ProgramKey& key, const ShaderParams& params, const InputInfo& input_info,
 	                  uint32_t                                            push_data_cursor,
 	                  const ShaderRecompiler::IR::ResourceSpecialization* specialization,
-	                  bool                                                guest_traversal = false);
-	bool WaitForCompile(const ProgramKey& key);
+	                  bool                                                guest_traversal = false)
+	    KYTY_REQUIRES(m_program_lock);
+	bool WaitForCompile(const ProgramKey& key) KYTY_REQUIRES(m_program_lock);
 	template <typename InputInfo>
 	void RunCompileJob(CompileJob& job, InputInfo& input_info);
 	void CompileWorker();
@@ -642,7 +650,7 @@ private:
 		std::optional<ShaderModule>                  module;
 		std::string                                  refusal;
 	};
-	std::unordered_map<ProgramKey, std::deque<TableVariant>, ProgramKeyHash> m_table_programs;
+	std::unordered_map<ProgramKey, std::deque<TableVariant>, ProgramKeyHash> m_table_programs KYTY_GUARDED_BY(m_program_lock);
 	template <typename InputInfo>
 	TableProgram GetTableProgram(const ShaderParams& params, const InputInfo& input_info,
 	                             const ShaderRecompiler::IR::ResourceSpecialization& specialization,
@@ -798,12 +806,12 @@ private:
 	void WarmUp(const std::filesystem::path& path, bool driver_cache_restored);
 	struct StoreRecord;
 	bool ReadRecord(std::span<const uint8_t> frame, StoreRecord& record) const;
-	bool AddRecord(StoreRecord& record);
+	bool AddRecord(StoreRecord& record) KYTY_REQUIRES(m_program_lock);
 	void StoreModule(const ProgramKey& key, const Program& program, const ShaderModule& module,
 	                 const std::vector<uint32_t>& spirv, const std::vector<uint32_t>& plain_spirv);
 	void StorePipeline(const GraphicsPipelineKey& key);
 	void StoreLayout(uint64_t key, const ShaderTessellationInputInfo& layout);
-	[[nodiscard]] ModuleMap MapModules() const;
+	[[nodiscard]] ModuleMap MapModules() const KYTY_REQUIRES(m_program_lock);
 	bool CreateGraphicsPipeline(Pipeline& pipeline, const GraphicsPipelineKey& key,
 	                            const ModuleMap& modules);
 
@@ -843,7 +851,7 @@ private:
 	void SetHostInput(ManifestModule& module) const;
 	const ShaderModule* FindCompiledModule(
 	    const ProgramKey& key, const ShaderRecompiler::IR::ResourceSpecialization& specialization,
-	    uint32_t push_data_cursor) const;
+	    uint32_t push_data_cursor) const KYTY_REQUIRES(m_program_lock);
 	void ManifestProgress(bool force);
 	void SaveManifestRecording();
 	struct ManifestBacklog {
