@@ -1,0 +1,100 @@
+name: AnyKyty game test
+description: How a title runs on AnyKyty on your machine, working or not. One issue per title and machine.
+title: "[game test] <title name> <title ID> <version>"
+labels: [game test]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing! The steps are in the pinned call to test. Run with the default settings: no `KYTY_*` or `APS5_*` override unless a field asks for it.
+        Never attach game files, save data, memory dumps or shader dumps. Hashes, logs and screenshots are fine.
+  - type: input
+    id: title
+    attributes:
+      label: Title ID and version
+      description: From `sce_sys/param.json` of the dump, for example PPSA12345 02.002.000.
+    validations:
+      required: true
+  - type: input
+    id: commit
+    attributes:
+      label: AnyKyty commit
+      description: The `AnyKyty` commit you built (`git rev-parse --short HEAD`), and any pull request on top.
+    validations:
+      required: true
+  - type: textarea
+    id: host
+    attributes:
+      label: Host report
+      description: The block printed once at start with `ANYPS5_HOST_REPORT=1` (OS, CPU, RAM, GPU, driver).
+      render: text
+    validations:
+      required: true
+  - type: dropdown
+    id: state
+    attributes:
+      label: How far it gets
+      options:
+        - Stops or crashes before the first image
+        - Stays on a logo or loading screen
+        - Reaches the menu
+        - In game, playable
+        - In game, with problems (described below)
+    validations:
+      required: true
+  - type: textarea
+    id: fps
+    attributes:
+      label: Frame rate
+      description: From the window title (`FPS:`). In the menu, standing still in game, and moving through a busy area. Name the place and the game's graphics mode.
+      placeholder: |
+        menu: 60
+        in game, standing, <place>: 24
+        in game, moving, <place>: 18
+        graphics mode: performance
+    validations:
+      required: true
+  - type: textarea
+    id: boot
+    attributes:
+      label: Start-up time
+      description: Time from start to the first in-game image. First boot with empty caches (delete `_PipelineCache` beside the game first), then a second boot.
+      placeholder: |
+        first boot (empty caches): 9 min 30 s
+        second boot: 1 min 10 s
+  - type: textarea
+    id: problems
+    attributes:
+      label: Problems seen
+      description: Wrong or flickering graphics, stutters, freezes, crashes, sound. When, where, how often. Press F12 in game for a PNG of the frame and attach it.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Kyty summary lines
+      description: The `[kyty-...]` lines the log prints every 10 s, from one 10 s window in game (the lines with the same time). Paste them as they are.
+      render: text
+  - type: textarea
+    id: crash
+    attributes:
+      label: Crash or hang
+      description: |
+        If it stops: the last 100 lines of the log, and the error box text.
+        GPU hang on Linux: the `Xid` or `amdgpu` lines of `sudo dmesg`. On AMD, run once more with `RADV_DEBUG=hang` and attach the report folder it names.
+        Silent exit on Windows: run with Sysinternals ProcDump attached (`procdump64 -accepteula -ma -e 1 -t <pid> C:\dumps`) and paste the call stack only, never the dump.
+      render: text
+  - type: textarea
+    id: rt
+    attributes:
+      label: Ray tracing survey
+      description: Optional. The summary that `python3 tools/rt_survey.py` prints after playing (see the RT survey issue). Paste the text and attach the JSON.
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: Default settings (no `KYTY_*` or `APS5_*` override), or the overrides are listed above
+          required: true
+        - label: "`anyps5-report.json` (written next to the game when it exits) is attached"
+        - label: No game files, save data or memory dumps are attached
+          required: true
