@@ -635,11 +635,12 @@ private:
 	void          SpecializeComputeVariant(const ProgramKey& key, Program& program, const ShaderParams& params,
 	                                       const ShaderComputeInputInfo&                       input_info,
 	                                       const ShaderRecompiler::IR::ResourceSpecialization& specialization,
-	                                       uint32_t push_data_cursor);
+	                                       uint32_t push_data_cursor) KYTY_REQUIRES(m_program_lock);
 	void          WidenComputeVariant(const ProgramKey& key, Program& program, const ShaderParams& params,
 	                                  const ShaderComputeInputInfo& input_info, uint32_t push_data_cursor,
 	                                  std::optional<std::pair<ShaderRecompiler::IR::ResourceSpecialization,
-	                                                          ShaderRecompiler::IR::ResourceSnapshot>>& natural);
+	                                                          ShaderRecompiler::IR::ResourceSnapshot>>& natural)
+	    KYTY_REQUIRES(m_program_lock);
 #endif
 
 	struct TableVariant {

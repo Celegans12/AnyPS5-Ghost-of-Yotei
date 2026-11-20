@@ -1878,7 +1878,8 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 				found->second.resources      = std::move(natural->second);
 				natural.reset();
 				if (Common::Fallback::Run("draw or dispatch skipped: the shader recompiler stopped",
-				                          "PipelineCache::GetProgram", params.hash, 0, [&] { built = build(); })) {
+				                          "PipelineCache::GetProgram", params.hash, 0,
+				                          [&]() KYTY_NO_THREAD_SAFETY_ANALYSIS { built = build(); })) {
 					return built;
 				}
 				found->second.NoteFailed(push_data_cursor);
