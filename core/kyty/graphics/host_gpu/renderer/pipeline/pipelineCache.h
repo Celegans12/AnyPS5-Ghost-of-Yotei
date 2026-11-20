@@ -26,6 +26,7 @@
 #include <optional>
 #include <queue>
 #include <functional>
+#include <iosfwd>
 #include <span>
 #if defined(ANYPS5_KYTY)
 #include <source_location>
@@ -867,6 +868,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
                             vk::PipelineCache                          driver_cache);
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderModule& module, vk::PipelineCache driver_cache);
+vk::Result CreateComputePipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                                 const ShaderModule& module, vk::PipelineCache driver_cache,
+                                 bool lookup, std::chrono::nanoseconds* driver_time = nullptr);
 bool FindComputePipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                          const ShaderModule& module, vk::PipelineCache cache);
 struct DriverCreations {
@@ -887,6 +891,13 @@ void DescribeDriverPipelineCreation(std::string& report);
                                       std::vector<uint8_t>&        record);
 bool DecodeComputeModule(std::span<const uint8_t> bytes, ShaderModule& module,
                          std::vector<uint32_t>& spirv);
+
+#if defined(ANYPS5_KYTY)
+[[nodiscard]] std::vector<uint8_t> ComputeShaderStoreHeader(const GraphicContext& graphics);
+bool LoadStoredComputeModule(std::istream& input, std::span<const uint8_t> expected_header,
+                             uint64_t id, ShaderModule& module, std::vector<uint32_t>& spirv,
+                             std::string& error);
+#endif
 
 }
 

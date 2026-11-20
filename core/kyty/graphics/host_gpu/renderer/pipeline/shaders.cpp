@@ -872,9 +872,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 #endif
 
-static vk::Result CreateComputePipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                                        const ShaderModule& module, vk::PipelineCache driver_cache,
-                                        bool lookup) {
+vk::Result CreateComputePipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                                 const ShaderModule& module, vk::PipelineCache driver_cache,
+                                 bool lookup, std::chrono::nanoseconds* driver_time) {
 	vk::PipelineShaderStageCreateInfo                     comp_shader_stage_info {};
 	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo comp_subgroup_size {};
 	comp_shader_stage_info.stage  = vk::ShaderStageFlagBits::eCompute;
@@ -904,8 +904,9 @@ static vk::Result CreateComputePipeline(GraphicContext& graphics, PipelineCache:
 	info.stage  = comp_shader_stage_info;
 	info.layout = pipeline.pipeline_layout;
 
-#if defined(ANYPS5_KYTY)
 	using Clock = std::chrono::steady_clock;
+	bool timing = driver_time != nullptr;
+#if defined(ANYPS5_KYTY)
 	static const auto log_ms = []() -> std::optional<int64_t> {
 		const char* value = std::getenv("KYTY_PIPELINE_STALL_LOG_MS");
 		if (value == nullptr) {
@@ -913,23 +914,23 @@ static vk::Result CreateComputePipeline(GraphicContext& graphics, PipelineCache:
 		}
 		return std::strtoll(value, nullptr, 10);
 	}();
+	timing = timing || log_ms.has_value();
+#endif
 	Clock::time_point finished {};
 	Clock::duration elapsed {};
-#endif
 	vk::Result result;
 	{
 		const ScopedDriverCreation creation({"cs", nullptr, nullptr, nullptr},
 		                                    {module.info.shader_hash, 0, 0, 0});
-#if defined(ANYPS5_KYTY)
-		const auto started = log_ms ? Clock::now() : Clock::time_point {};
-#endif
+		const auto started = timing ? Clock::now() : Clock::time_point {};
 		result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline.pipeline);
-#if defined(ANYPS5_KYTY)
-		if (log_ms) {
+		if (timing) {
 			finished = Clock::now();
 			elapsed  = finished - started;
 		}
-#endif
+	}
+	if (driver_time != nullptr) {
+		*driver_time = std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed);
 	}
 #if defined(ANYPS5_KYTY)
 	if (log_ms && std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() >= *log_ms) {

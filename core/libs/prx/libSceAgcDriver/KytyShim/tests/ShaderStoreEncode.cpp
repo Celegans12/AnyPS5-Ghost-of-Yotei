@@ -1,10 +1,12 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineStoreFormat.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
 
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <sstream>
 #include <vector>
 
 namespace {
@@ -125,6 +127,54 @@ void RefusedPlanAbandonsTheStoreEntry() {
     Require(after == record, "a refusal changed the encoding of the next program");
 }
 
+void StoredComputeModuleSelection() {
+    using namespace ShaderStoreFormat;
+
+    const auto frame = [](ShaderType stage, uint64_t id) {
+        ShaderStoreFormat::Key key {.stage = stage, .hash = id};
+        ShaderModule module;
+        module.id = id;
+        module.info.stage = stage;
+        const std::vector<uint8_t> plan;
+        const std::vector<uint32_t> spirv {0x07230203u, 0x00010300u, 0u, 1u, 0u};
+        const std::vector<uint32_t> plain;
+        Writer record;
+        IoAll(record, Record::Module);
+        IoStoreModule(record, key, module, plan, spirv, plain);
+        std::string compressed(ZSTD_compressBound(record.bytes.size()), '\0');
+        const auto size = ZSTD_compress(compressed.data(), compressed.size(), record.bytes.data(), record.bytes.size(), 1);
+        Require(!ZSTD_isError(size), "could not encode the synthetic store frame");
+        compressed.resize(size);
+        const Frame header {static_cast<uint32_t>(size), static_cast<uint32_t>(record.bytes.size()),
+                            XXH3_64bits(compressed.data(), size)};
+        return std::string(reinterpret_cast<const char*>(&header), sizeof(header)) + compressed;
+    };
+    const std::array<uint8_t, 3> expected {1, 2, 3};
+    const std::string header(reinterpret_cast<const char*>(expected.data()), expected.size());
+    const auto compute = frame(ShaderType::Compute, 42);
+    const auto pixel = frame(ShaderType::Pixel, 17);
+    ShaderModule module;
+    std::vector<uint32_t> spirv;
+    std::string error;
+    const auto load = [&](std::string contents, uint64_t id) {
+        std::istringstream stream(std::move(contents));
+        return LoadStoredComputeModule(stream, expected, id, module, spirv, error);
+    };
+    Require(load(header + pixel + compute, 42) && module.id == 42 && module.spirv_words == spirv.size() &&
+                spirv.size() == 5 && spirv.front() == 0x07230203u,
+            "replay did not select the requested compute record");
+    Require(!load(header + compute, 43) && error.find("not found") != std::string::npos,
+            "replay accepted a missing ID");
+    Require(!load(header + pixel, 17) && error.find("not a compute") != std::string::npos,
+            "replay accepted a graphics module");
+    Require(!load(header + compute + compute, 42) && error.find("duplicate") != std::string::npos,
+            "replay accepted duplicate IDs");
+    Require(!load("bad" + compute, 42) && error.find("incompatible") != std::string::npos,
+            "replay accepted an incompatible header");
+    Require(!load(header + compute + pixel.substr(0, pixel.size() - 1), 42),
+            "replay accepted a truncated frame after the selected module");
+}
+
 }
 
 int main() {
@@ -133,6 +183,7 @@ int main() {
     ImpossibleValueOutsideInstructionsRefusesThePlan();
     InstructionOutsideThePlanRefusesThePlan();
     RefusedPlanAbandonsTheStoreEntry();
+    StoredComputeModuleSelection();
     std::puts("kyty_shim_shader_store_encode: ok");
     return 0;
 }

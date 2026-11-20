@@ -319,6 +319,21 @@ On Windows MinGW frees `thread_local` objects before their destructors run, so t
 
 ## Compute pipeline replay
 
+### Replay one Kyty compute module
+
+Build `kyty_compute_pipeline_replay` in a Kyty build. Pass a `.shaders` store recorded with the same Kyty build and Vulkan device profile and the decimal `module=` ID from the `compute-driver` line emitted by `KYTY_PIPELINE_STALL_LOG_MS`. Use the same shader-affecting Kyty settings as the recording, including `KYTY_NATIVE_RT`, `KYTY_WAVE_SPLIT` and `KYTY_RELAXED_SHADER_FLOAT` if set. The existing `KYTY_SHADER_CACHE_STAMP` setting can select an earlier recording stamp when you know that both builds use compatible shader-store records and SPIR-V.
+
+```sh
+cmake --build build --target kyty_compute_pipeline_replay
+build/tests/kyty_compute_pipeline_replay capture.shaders 123456 --output replay.json
+```
+
+On Windows, use `build/tests/kyty_compute_pipeline_replay.exe`. The build refreshes the staged runtime libraries when you rebuild the tool.
+
+The tool opens the store read-only, validates the selected module with SPIRV-Tools, and builds its pipeline using Kyty's normal layouts and subgroup settings. The output path must be new. The JSON report records the Vulkan result, GPU and driver IDs, module size and time in `vkCreateComputePipelines`. The application pipeline cache starts empty. The report records the process's `__GL_SHADER_DISK_CACHE` setting, which does not establish the driver's actual disk-cache state. Run on the same GPU and control the driver cache when comparing timings. The tool creates only the selected pipeline and exits before any dispatch. Shader stores can contain proprietary shader code.
+
+### AnyPS5 compute captures
+
 Build `agc_compute_pipeline_replay` in the full build with `-DANYPS5_ENABLE_SPIRV_TOOLS=ON`; replay validates the captured module before calling Vulkan. Set `APS5_DUMP_COMPUTE_PIPELINES` to a dedicated empty directory before starting a title to save each uncached compute pipeline's final SPIR-V, descriptor layouts, push constant ranges, specialization values, subgroup size and creation flags before compilation. Files are named `compute-<identity>/capture.aps5cp`; identical records are deduplicated. The pipelines of the start-up f32 denormal flush, f16 conversion and f16 NaN probes are not captured. At 128 records or 256 MiB in total, capture turns itself off for the rest of the run after a `[compute-capture] optional capture disabled` line and the title keeps running; a single record over 36 MiB (at most 8,388,608 SPIR-V words, or 32 MiB of shader code) is an error. Capture files contain shader code and device metadata, but no guest buffers or textures; review them before sharing.
 
 Set `APS5_DUMP_COMPUTE_MIN_WORDS` to capture only modules at or above that SPIR-V word count, for example `100000` when investigating large NVIDIA compilations. The default is `0` (all modules); values outside `0` through `8388608` fail. The filter applies only when capture is enabled.

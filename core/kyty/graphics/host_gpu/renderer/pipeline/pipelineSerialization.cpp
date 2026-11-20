@@ -438,6 +438,13 @@ bool DecodeComputeModule(std::span<const uint8_t> bytes, ShaderModule& module,
 	return reader.ok && reader.bytes.empty() && module.info.stage == ShaderType::Compute;
 }
 
+#if defined(ANYPS5_KYTY)
+std::vector<uint8_t> ComputeShaderStoreHeader(const GraphicContext& graphics) {
+	return StoreHeader(graphics);
+}
+
+#endif
+
 PipelineCache::ModuleMap PipelineCache::MapModules() const {
 	ModuleMap modules {{0, nullptr}};
 	for (const auto& program: m_program_cache | std::views::values) {

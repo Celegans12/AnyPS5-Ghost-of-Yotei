@@ -1128,14 +1128,13 @@ VulkanDeviceIdentity GetVulkanDeviceIdentity(const GraphicContext& graphics) {
 
 bool CreateHeadlessVulkan(GraphicContext& graphics, const VulkanDeviceIdentity* identity,
                           std::string& error) {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	HMODULE library = ::LoadLibraryW(L"vulkan-1.dll");
-	if (library == nullptr) {
-		error = "vulkan-1.dll not found";
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS || KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	static const vk::detail::DynamicLoader loader;
+	if (!loader.success()) {
+		error = "Vulkan loader not found";
 		return false;
 	}
-	auto get_instance_proc_addr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
-	    reinterpret_cast<void*>(::GetProcAddress(library, "vkGetInstanceProcAddr")));
+	const auto get_instance_proc_addr = loader.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr");
 	if (get_instance_proc_addr == nullptr) {
 		error = "vkGetInstanceProcAddr not found";
 		return false;
