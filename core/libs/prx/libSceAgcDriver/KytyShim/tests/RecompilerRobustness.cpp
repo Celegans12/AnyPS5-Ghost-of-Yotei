@@ -5,6 +5,11 @@
 #include <string_view>
 #include <vector>
 
+#if !defined(_WIN32)
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
 namespace {
 
 struct Case {
@@ -30,6 +35,24 @@ int main(int argc, char** argv) {
 	for (const auto& entry: Cases) {
 		if (argc >= 2 ? std::string_view(argv[1]) != entry.name : entry.aborts) continue;
 		found = true;
+#if !defined(_WIN32)
+		if (entry.aborts) {
+			std::fflush(stdout);
+			const pid_t child = fork();
+			if (child == 0) {
+				KytyFuzz::Run(entry.words, entry.mode, entry.shape);
+				_exit(0);
+			}
+			int status = 0;
+			waitpid(child, &status, 0);
+			if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+				std::printf("%s: the recompiler still aborts\n", entry.name);
+				return 1;
+			}
+			std::printf("%s: ok\n", entry.name);
+			return 0;
+		}
+#endif
 		KytyFuzz::Run(entry.words, entry.mode, entry.shape);
 		std::printf("%s: ok\n", entry.name);
 	}

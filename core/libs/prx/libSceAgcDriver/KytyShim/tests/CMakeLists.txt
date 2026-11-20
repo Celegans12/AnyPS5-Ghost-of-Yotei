@@ -264,8 +264,10 @@ target_link_libraries(kyty_shim_recompiler_robustness_tests PRIVATE Kyty::gpu li
 add_test(NAME kyty_shim_recompiler_robustness COMMAND kyty_shim_recompiler_robustness_tests)
 set_tests_properties(kyty_shim_recompiler_robustness PROPERTIES TIMEOUT 60 PASS_REGULAR_EXPRESSION "kyty_shim_recompiler_robustness: ok"
         FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
-add_test(NAME kyty_shim_recompiler_stale_lane_spill COMMAND kyty_shim_recompiler_robustness_tests stale-lane-spill-after-read-lane-elimination)
-set_tests_properties(kyty_shim_recompiler_stale_lane_spill PROPERTIES TIMEOUT 60 WILL_FAIL TRUE)
+if(NOT WIN32)
+    add_test(NAME kyty_shim_recompiler_stale_lane_spill COMMAND kyty_shim_recompiler_robustness_tests stale-lane-spill-after-read-lane-elimination)
+    set_tests_properties(kyty_shim_recompiler_stale_lane_spill PROPERTIES TIMEOUT 60 WILL_FAIL TRUE)
+endif()
 
 add_test_executable(kyty_shim_compute_execution_tests ${CMAKE_CURRENT_SOURCE_DIR}/ComputeExecution.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
 target_include_directories(kyty_shim_compute_execution_tests PRIVATE ${LIBS_INCLUDE_DIR})
