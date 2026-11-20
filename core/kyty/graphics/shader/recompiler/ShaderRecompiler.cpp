@@ -837,8 +837,8 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	     ir.shader_hash);
 	std::vector<uint32_t> spirv;
 	if (const auto* group = options.stage == ShaderType::Compute ? options.input_info.compute : nullptr;
-	    group != nullptr && options.profile->wave_split && ir.wave_size == 64u && group->host_subgroup_size == 32u &&
-	    !ir.lane_local &&
+	    group != nullptr && options.profile->wave_split && !options.wave_lane_pairs && ir.wave_size == 64u &&
+	    group->host_subgroup_size == 32u && !ir.lane_local &&
 	    std::max(group->threads_num[0], 1u) * std::max(group->threads_num[1], 1u) *
 	            std::max(group->threads_num[2], 1u) ==
 	        64u) {

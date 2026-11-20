@@ -613,7 +613,10 @@ void SkipCallExpansionFailure(uint64_t hash, const ShaderRecompiler::ShaderSourc
 
 }
 
-void AppendNativeRayTracingKey(ShaderType stage, std::vector<uint32_t>& key, bool native) {
+void AppendNativeRayTracingKey(ShaderType stage, std::vector<uint32_t>& key, bool native, bool lane_pairs) {
+	if (lane_pairs) {
+		key.push_back(0x574c5052u);
+	}
 	if (native && stage == ShaderType::Pixel && RayTracing::NativeTraversals() && Config::RayTracingOracle() != 0) {
 		key.push_back(0x52544f00u | Config::RayTracingOracle());
 		if (Config::RayTracingStatsEnabled()) {
@@ -1759,7 +1762,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	m_lookup_key.hash            = params.hash;
 	m_lookup_key.user_data_count = params.user_data_count;
 	BuildStageStaticKey(input_info, m_lookup_key.static_state);
-	AppendNativeRayTracingKey(options.stage, m_lookup_key.static_state, !m_guest_traversal);
+	AppendNativeRayTracingKey(options.stage, m_lookup_key.static_state, !m_guest_traversal, m_lane_pairs);
 	auto entry = m_program_cache.find(m_lookup_key);
 	const auto bind = [&](const ShaderModule& module) {
 		input_info.stage = {.module = &module, .resources = &entry->second.resources};
@@ -1877,10 +1880,11 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 				entry->second.PromoteEmptyBuffers(entry->second.resources, *promoted, push_data_cursor);
 			}
 			QueueCompile(m_lookup_key, params, input_info, push_data_cursor,
-			             promoted ? &*promoted : nullptr, m_guest_traversal);
+			             promoted ? &*promoted : nullptr, m_guest_traversal, false, m_lane_pairs);
 #else
 			QueueCompile(m_lookup_key, params, input_info, push_data_cursor,
-			             entry != m_program_cache.end() ? &entry->second.specialization : nullptr, m_guest_traversal);
+			             entry != m_program_cache.end() ? &entry->second.specialization : nullptr, m_guest_traversal,
+			             false, m_lane_pairs);
 #endif
 			m_queued = true;
 		}
@@ -1903,6 +1907,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	options.native_ray_tracing = RayTracing::NativeTraversals() && !m_guest_traversal;
 	options.ray_stats          = options.native_ray_tracing && Config::RayTracingStatsEnabled();
 	options.rt_oracle          = options.native_ray_tracing ? Config::RayTracingOracle() : 0u;
+	options.wave_lane_pairs    = m_lane_pairs;
 	ShaderRecompiler::ShaderSource source;
 	if (entry == m_program_cache.end()) {
 		DumpShader(params.code, fmt::format("original/{}_{:016x}.bin",
@@ -2975,6 +2980,7 @@ struct PipelineCache::CompileJob {
 	TableVariant*                                               table = nullptr;
 	bool                                                        guest_traversal = false;
 	bool                                                        speculative     = false;
+	bool                                                        lane_pairs      = false;
 };
 
 #if defined(ANYPS5_KYTY)
@@ -3004,7 +3010,7 @@ void PipelineCache::QueueCompile(const ProgramKey& key, const ShaderParams& para
                                  const InputInfo&                                    input_info,
                                  uint32_t                                            push_data_cursor,
                                  const ShaderRecompiler::IR::ResourceSpecialization* specialization,
-                                 bool guest_traversal, bool speculative) {
+                                 bool guest_traversal, bool speculative, bool lane_pairs) {
 	if (m_in_flight.contains(key)) {
 		return;
 	}
@@ -3014,6 +3020,7 @@ void PipelineCache::QueueCompile(const ProgramKey& key, const ShaderParams& para
 	job->push_data_cursor = push_data_cursor;
 	job->guest_traversal  = guest_traversal;
 	job->speculative      = speculative;
+	job->lane_pairs       = lane_pairs;
 	if (specialization != nullptr) {
 		job->specialization = *specialization;
 	}
@@ -3085,6 +3092,7 @@ void PipelineCache::RunCompileJob(CompileJob& job, InputInfo& input_info) {
 		options.native_ray_tracing = RayTracing::NativeTraversals() && !job.guest_traversal;
 		options.ray_stats          = options.native_ray_tracing && Config::RayTracingStatsEnabled();
 		options.rt_oracle          = options.native_ray_tracing ? Config::RayTracingOracle() : 0u;
+		options.wave_lane_pairs    = job.lane_pairs;
 		auto source = ShaderRecompiler::PrepareShaderSource(job.params.code, options);
 		if (!source.calls.empty() || source.unsupported_call_pc != UINT32_MAX) {
 			return;
@@ -3898,6 +3906,34 @@ const ShaderModule* PipelineCache::GetGuestComputeProgramQueued(const HW::Comput
 	m_queued           = false;
 	const auto* module = GetProgram(params, input_info, push_data_cursor);
 	m_guest_traversal  = false;
+	m_queue_only       = false;
+	queued             = m_queued;
+	return module;
+}
+
+const ShaderModule* PipelineCache::GetLanePairsComputeProgramQueued(const HW::ComputeShaderInfo& regs,
+                                                                    ShaderComputeInputInfo& input_info, bool& queued) {
+	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
+#if defined(ANYPS5_KYTY)
+	ShaderParams params;
+	if (!Common::Fallback::Run("draw or dispatch skipped: its shader stage could not be prepared",
+	                           "PipelineCache::GetLanePairsComputeProgramQueued", 0, regs.cs_regs.data_addr,
+	                           [&] { params = PrepareProgram(regs, input_info); })) {
+		return nullptr;
+	}
+#else
+	const auto params = PrepareProgram(regs, input_info);
+#endif
+	input_info.lds_storage = input_info.lds_size_dwords * 4u >
+	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
+	uint32_t push_data_cursor =
+	    input_info.dispatch_indirect_threads ? ShaderRecompiler::IR::PushData::NoStart : 0u;
+	const ProgramLockGuard lock(m_program_lock);
+	m_lane_pairs       = true;
+	m_queue_only       = true;
+	m_queued           = false;
+	const auto* module = GetProgram(params, input_info, push_data_cursor);
+	m_lane_pairs       = false;
 	m_queue_only       = false;
 	queued             = m_queued;
 	return module;

@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/rayTracingCheck.h"
+#include "graphics/host_gpu/renderer/waveSplitCheck.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -413,6 +414,13 @@ RayTracingCheck& RenderExecutor::RtCheck() {
 	return *m_rt_check;
 }
 
+WaveSplitCheck& RenderExecutor::SplitCheck() {
+	if (m_split_check == nullptr) {
+		m_split_check = std::make_shared<WaveSplitCheck>(m_context);
+	}
+	return *m_split_check;
+}
+
 void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group_x,
                                     uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
                                     bool async_compute) {
@@ -580,6 +588,8 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		    PrepareNativeRayTracing(m_context, vk_buffer, cs_regs, bindings, rt_pass == 1, rt_pass != 2 && !fell_back);
 		if (rt_pass == 1) {
 			RtCheck().Before(bindings);
+		} else if (rt_pass == 3) {
+			SplitCheck().Before(bindings);
 		}
 		CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 		               std::span {&descriptor_stage, 1u});
@@ -679,6 +689,10 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 			RtCheck().AfterOracle(bindings, counted);
 		} else if (rt_pass == 2) {
 			RtCheck().AfterGuest(bindings);
+		} else if (rt_pass == 3) {
+			SplitCheck().AfterSplit(bindings);
+		} else if (rt_pass == 4) {
+			SplitCheck().AfterPairs(bindings);
 		}
 
 		m_deferred_barrier       = true;
@@ -699,6 +713,22 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 			record(input_info, 1);
 			if (RtCheck().Active()) {
 				record(guest, 2);
+			}
+			return;
+		}
+	} else if (SplitCheck().Sample(*compute_module, input_info, buffer)) {
+		ShaderComputeInputInfo pairs  = pristine;
+		bool                   queued = false;
+		const auto* pairs_module = m_context.GetPipelineCache().GetLanePairsComputeProgramQueued(cs_regs, pairs, queued);
+		if (pairs_module != nullptr) {
+			thread_dimensions(pairs);
+		}
+		if (pairs_module == nullptr || m_context.GetPipelineCache().TryGetComputePipeline(pairs) == nullptr) {
+			SplitCheck().Defer(compute_module->info.shader_hash, queued);
+		} else if (SplitCheck().Begin(*compute_module, *pairs_module)) {
+			record(input_info, 3);
+			if (SplitCheck().Active()) {
+				record(pairs, 4);
 			}
 			return;
 		}

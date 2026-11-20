@@ -42,6 +42,7 @@ class CommandScheduler;
 struct RenderExecutorTestAccess;
 struct IndirectThreadPass;
 class RayTracingCheck;
+class WaveSplitCheck;
 
 struct TextureDescDerivation {
 	TextureCache::ImageDesc desc;
@@ -200,6 +201,7 @@ public:
 	void DispatchIndirectThreads(CommandBuffer& buffer, uint64_t args_addr, uint32_t mode,
 	                             bool async_compute);
 	RayTracingCheck& RtCheck();
+	WaveSplitCheck&  SplitCheck();
 
 	struct ResolvedDraw;
 	[[nodiscard]] ResolvedDraw* ResolveDrawAhead(const HW::Context&    context,
@@ -603,6 +605,7 @@ private:
 	DrawTargets*                          m_draw_targets = &m_targets;
 	PreparedBindings                     m_compute_bindings;
 	std::shared_ptr<RayTracingCheck>     m_rt_check;
+	std::shared_ptr<WaveSplitCheck>      m_split_check;
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;

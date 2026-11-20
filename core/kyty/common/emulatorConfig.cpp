@@ -258,6 +258,10 @@ bool WaveSplitEnabled() {
 	return g_config->wave_split;
 }
 
+uint32_t WaveSplitCheckPeriod() {
+	return g_config->wave_split ? g_config->wave_split_check_period : 0u;
+}
+
 bool ImageTableHeapEnabled() {
 	return g_config->image_table_heap;
 }

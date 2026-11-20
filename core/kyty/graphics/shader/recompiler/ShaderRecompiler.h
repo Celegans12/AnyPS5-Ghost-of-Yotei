@@ -35,6 +35,7 @@ struct CompileOptions {
 	std::span<const uint32_t>   back_code;
 	ShaderStageInputInfo        input_info;
 	bool                        plain_mip_stats_variant    = false;
+	bool                        wave_lane_pairs            = false;
 };
 
 struct TranslateResult {

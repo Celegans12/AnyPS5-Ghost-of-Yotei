@@ -481,6 +481,8 @@ public:
 	                                      bool                         guest_traversal = false);
 	const ShaderModule* GetGuestComputeProgramQueued(const HW::ComputeShaderInfo& regs,
 	                                                 ShaderComputeInputInfo& input_info, bool& queued);
+	const ShaderModule* GetLanePairsComputeProgramQueued(const HW::ComputeShaderInfo& regs,
+	                                                     ShaderComputeInputInfo& input_info, bool& queued);
 	static void NoteAheadGuestWrite(uint64_t sequence, uint64_t address,
 	                                std::span<const uint32_t> data, bool one_address);
 	static void RetireAheadGuestWrites(uint64_t executed);
@@ -619,6 +621,7 @@ private:
 	std::array<uint32_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> m_compiled {};
 	ProgramKey                             m_lookup_key KYTY_GUARDED_BY(m_program_lock);
 	bool                                   m_guest_traversal KYTY_GUARDED_BY(m_program_lock) = false;
+	bool                                   m_lane_pairs KYTY_GUARDED_BY(m_program_lock)      = false;
 	bool                                   m_queue_only KYTY_GUARDED_BY(m_program_lock)      = false;
 	bool                                   m_queued KYTY_GUARDED_BY(m_program_lock)          = false;
 	vk::PipelineCache             m_driver_cache = nullptr;
@@ -692,7 +695,8 @@ private:
 	                  uint32_t                                            push_data_cursor,
 	                  const ShaderRecompiler::IR::ResourceSpecialization* specialization,
 	                  bool                                                guest_traversal = false,
-	                  bool                                                speculative     = false)
+	                  bool                                                speculative     = false,
+	                  bool                                                lane_pairs      = false)
 	    KYTY_REQUIRES(m_program_lock);
 	bool WaitForCompile(const ProgramKey& key) KYTY_REQUIRES(m_program_lock);
 	template <typename InputInfo>
@@ -951,7 +955,8 @@ private:
 	[[nodiscard]] uint32_t    UseRank(uint64_t program_hash) const;
 };
 
-void AppendNativeRayTracingKey(ShaderType stage, std::vector<uint32_t>& key, bool native = true);
+void AppendNativeRayTracingKey(ShaderType stage, std::vector<uint32_t>& key, bool native = true,
+                               bool lane_pairs = false);
 
 std::string PipelineCacheTitleId();
 std::filesystem::path ShaderStorePath();
