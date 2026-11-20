@@ -3098,4 +3098,503 @@ bool LoadResourcePlan(std::span<const uint8_t> bytes, ResourcePlan& plan) {
 	return DecodeResourcePlan(bytes, plan) && DerivePlanState(plan);
 }
 
+#if defined(ANYPS5_KYTY)
+bool GenericComputeVariants() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_GENERIC_COMPUTE_VARIANT");
+		return value == nullptr || std::string_view(value) != "0";
+	}();
+	return on;
+}
+
+namespace {
+
+enum class SlotLayout : uint8_t { Plain, Search, Heap };
+
+struct RootShape {
+	SlotLayout            layout     = SlotLayout::Plain;
+	uint32_t              offset     = 0;
+	uint32_t              words      = 0;
+	uint32_t              iterations = 0;
+	std::vector<uint32_t> children;
+};
+
+struct SrtRegion {
+	uint32_t offset = 0;
+	uint32_t words  = 0;
+};
+
+constexpr uint32_t MaxShapeIterations = 24u;
+
+ResourceSpecialization::Image SlotForm(ResourceSpecialization::Image image) {
+	image.indirect_root              = 0;
+	image.indirect_mapping_offset    = 0;
+	image.indirect_search_iterations = 0;
+	return image;
+}
+
+ResourceSpecialization::Sampler SlotForm(ResourceSpecialization::Sampler sampler) {
+	sampler.indirect_root              = 0;
+	sampler.indirect_mapping_offset    = 0;
+	sampler.indirect_search_iterations = 0;
+	return sampler;
+}
+
+uint32_t SearchWords(uint32_t iterations) {
+	return 1u + 2u * (1u << (iterations - 1u));
+}
+
+uint32_t RoomFor(uint32_t count) {
+	return static_cast<uint32_t>(std::bit_ceil(uint64_t {count} * 2u + 1u) - 1u);
+}
+
+bool SourceRelocates(const ResourcePlan& program, uint32_t source, bool& deferred) {
+	const auto* descriptor = Source(program, source);
+	deferred               = false;
+	if (descriptor == nullptr) return false;
+	if (!descriptor->indirect_descriptor) return true;
+	const auto& indirect = *descriptor->indirect_descriptor;
+	if (indirect.pointer_table && indirect.pointer_table->buffer) return false;
+	deferred = indirect.table_array;
+	return true;
+}
+
+bool ShapeRoot(RootShape& shape, uint32_t offset, uint32_t iterations, bool heap) {
+	shape.offset     = offset;
+	shape.iterations = iterations;
+	if (heap) {
+		if (iterations != 0u) return false;
+		shape.layout = SlotLayout::Heap;
+		shape.words  = 3u;
+		return true;
+	}
+	if (iterations == 0u || iterations > MaxShapeIterations) return false;
+	shape.layout = SlotLayout::Search;
+	shape.words  = SearchWords(iterations);
+	return true;
+}
+
+bool ImageShapes(const ResourcePlan& program, const std::vector<ResourceSpecialization::Image>& images,
+                 std::vector<RootShape>& shapes, std::vector<uint8_t>& deferred) {
+	const auto base = program.info.images.size();
+	if (images.size() < base) return false;
+	shapes.assign(base, {});
+	deferred.assign(base, 0u);
+	for (uint32_t index = 0; index < images.size(); ++index) {
+		const auto& image = images[index];
+		if (image.fmask || image.table != ImageResource::NoImageTable || image.table_capacity != 0u) return false;
+		if (index >= base) {
+			if (image.indirect_root >= base || shapes[image.indirect_root].layout == SlotLayout::Plain) return false;
+			shapes[image.indirect_root].children.push_back(index);
+			continue;
+		}
+		if (image.indirect_root == ImageResource::NoIndirectImage) {
+			if (image.heap) return false;
+			continue;
+		}
+		bool table = false;
+		if (image.indirect_root != index || !SourceRelocates(program, program.info.images[index].source, table) ||
+		    !ShapeRoot(shapes[index], image.indirect_mapping_offset, image.indirect_search_iterations, image.heap) ||
+		    (table && !image.heap)) {
+			return false;
+		}
+		deferred[index] = table ? 1u : 0u;
+	}
+	return std::ranges::none_of(shapes, [](const RootShape& shape) {
+		return shape.layout != SlotLayout::Plain && shape.children.empty();
+	});
+}
+
+bool SamplerShapes(const ResourcePlan& program, const std::vector<ResourceSpecialization::Sampler>& samplers,
+                   std::vector<RootShape>& shapes) {
+	const auto base = program.info.samplers.size();
+	if (samplers.size() < base) return false;
+	shapes.assign(base, {});
+	for (uint32_t index = 0; index < samplers.size(); ++index) {
+		const auto& sampler = samplers[index];
+		if (index >= base) {
+			if (sampler.indirect_root >= base || shapes[sampler.indirect_root].layout == SlotLayout::Plain) return false;
+			shapes[sampler.indirect_root].children.push_back(index);
+			continue;
+		}
+		if (sampler.indirect_root == SamplerResource::NoIndirectSampler) continue;
+		bool table = false;
+		if (sampler.indirect_root != index || !SourceRelocates(program, program.info.samplers[index].source, table) ||
+		    table || !ShapeRoot(shapes[index], sampler.indirect_mapping_offset, sampler.indirect_search_iterations, false)) {
+			return false;
+		}
+	}
+	return std::ranges::none_of(shapes, [](const RootShape& shape) {
+		return shape.layout != SlotLayout::Plain && shape.children.empty();
+	});
+}
+
+void AddRegions(const std::vector<RootShape>& shapes, std::vector<SrtRegion>& regions) {
+	for (const auto& shape: shapes) {
+		if (shape.layout != SlotLayout::Plain) regions.push_back({shape.offset, shape.words});
+	}
+}
+
+bool RegionsTile(std::vector<SrtRegion> regions, size_t end, size_t& prefix) {
+	std::ranges::sort(regions, {}, &SrtRegion::offset);
+	size_t total = 0;
+	for (const auto& region: regions) total += region.words;
+	if (total > end) return false;
+	prefix      = end - total;
+	auto cursor = prefix;
+	for (const auto& region: regions) {
+		if (region.offset != cursor) return false;
+		cursor += region.words;
+	}
+	return true;
+}
+
+bool RegionsFollow(std::vector<SrtRegion> regions, size_t prefix, size_t& end) {
+	std::ranges::sort(regions, {}, &SrtRegion::offset);
+	end = prefix;
+	if (!regions.empty() && regions.front().offset != prefix) return false;
+	for (const auto& region: regions) {
+		if (region.offset < end) return false;
+		end = size_t {region.offset} + region.words;
+	}
+	return true;
+}
+
+template <typename Slot>
+bool PlaceSearch(const RootShape& from, const RootShape& to, const std::vector<Slot>& wanted,
+                 const std::vector<Slot>& served, std::span<const DescriptorValue> descriptors,
+                 std::span<const uint32_t> source, std::vector<DescriptorValue>* placed,
+                 std::vector<uint32_t>* flat) {
+	if (from.layout == SlotLayout::Plain) return true;
+	const auto count = source[from.offset];
+	if (count > (from.words - 1u) / 2u || count > (to.words - 1u) / 2u) return false;
+	std::vector<uint32_t> remap(from.children.size() + 1u, 0u);
+	std::vector<uint8_t>  taken(to.children.size(), 0u);
+	for (uint32_t entry = 0; entry < count; ++entry) {
+		const auto ordinal = source[from.offset + 2u + entry * 2u];
+		if (ordinal > from.children.size()) return false;
+		if (ordinal == 0u || remap[ordinal] != 0u) continue;
+		const auto form     = SlotForm(wanted[from.children[ordinal - 1u]]);
+		size_t     position = 0;
+		while (position < to.children.size() &&
+		       (taken[position] != 0u || !(SlotForm(served[to.children[position]]) == form))) {
+			++position;
+		}
+		if (position == to.children.size()) return false;
+		taken[position] = 1u;
+		remap[ordinal]  = static_cast<uint32_t>(position + 1u);
+		if (placed != nullptr) (*placed)[to.children[position]] = descriptors[from.children[ordinal - 1u]];
+	}
+	if (flat != nullptr) {
+		(*flat)[to.offset] = count;
+		for (uint32_t entry = 0; entry < count; ++entry) {
+			(*flat)[to.offset + 1u + entry * 2u] = source[from.offset + 1u + entry * 2u];
+			(*flat)[to.offset + 2u + entry * 2u] = remap[source[from.offset + 2u + entry * 2u]];
+		}
+	}
+	return true;
+}
+
+template <typename Slot>
+bool PlaceHeap(const RootShape& from, const RootShape& to, const std::vector<Slot>& wanted,
+               const std::vector<Slot>& served, std::span<const DescriptorValue> descriptors,
+               std::span<const uint32_t> source, std::vector<DescriptorValue>* placed,
+               std::vector<uint32_t>* flat) {
+	if (from.children.size() > to.children.size()) return false;
+	for (size_t arm = 0; arm < from.children.size(); ++arm) {
+		if (!(SlotForm(wanted[from.children[arm]]) == SlotForm(served[to.children[arm]]))) return false;
+		if (placed != nullptr) (*placed)[to.children[arm]] = descriptors[from.children[arm]];
+	}
+	if (flat != nullptr) {
+		std::copy_n(source.begin() + from.offset, 3u, flat->begin() + to.offset);
+	}
+	return true;
+}
+
+template <typename Slot>
+bool PlaceRoots(const std::vector<RootShape>& from, const std::vector<RootShape>& to,
+                const std::vector<Slot>& wanted, const std::vector<Slot>& served,
+                std::span<const DescriptorValue> descriptors, std::span<const uint32_t> source,
+                std::vector<DescriptorValue>* placed, std::vector<uint32_t>* flat) {
+	for (uint32_t root = 0; root < from.size(); ++root) {
+		if (!(SlotForm(wanted[root]) == SlotForm(served[root]))) return false;
+		if (placed != nullptr) {
+			(*placed)[root] = descriptors[root];
+			for (const auto child: to[root].children) (*placed)[child] = {.dword_count = descriptors[root].dword_count};
+		}
+		const auto& origin = from[root];
+		const auto& target = to[root];
+		if (target.layout == SlotLayout::Plain) {
+			if (origin.layout != SlotLayout::Plain) return false;
+		} else if (target.layout == SlotLayout::Search) {
+			if (origin.layout == SlotLayout::Heap ||
+			    !PlaceSearch(origin, target, wanted, served, descriptors, source, placed, flat)) {
+				return false;
+			}
+		} else if (origin.layout != SlotLayout::Heap ||
+		           !PlaceHeap(origin, target, wanted, served, descriptors, source, placed, flat)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+template <typename Slot>
+struct RootPlan {
+	SlotLayout                                layout     = SlotLayout::Plain;
+	uint32_t                                  iterations = 0;
+	std::vector<std::pair<Slot, uint32_t>>    groups;
+};
+
+template <typename Slot>
+RootPlan<Slot> PlanOf(const RootShape& shape, const std::vector<Slot>& slots) {
+	RootPlan<Slot> plan {.layout = shape.layout, .iterations = shape.iterations};
+	for (const auto child: shape.children) {
+		const auto form = SlotForm(slots[child]);
+		if (shape.layout == SlotLayout::Search) {
+			const auto found = std::ranges::find_if(plan.groups, [&](const auto& group) {
+				return SlotForm(group.first) == form;
+			});
+			if (found != plan.groups.end()) {
+				++found->second;
+				continue;
+			}
+		}
+		plan.groups.emplace_back(slots[child], 1u);
+	}
+	return plan;
+}
+
+template <typename Slot>
+void MergePlan(RootPlan<Slot>& plan, const RootPlan<Slot>& other) {
+	if (other.layout == SlotLayout::Search &&
+	    (plan.layout == SlotLayout::Plain || plan.layout == SlotLayout::Search)) {
+		plan.layout     = SlotLayout::Search;
+		plan.iterations = std::max(plan.iterations, other.iterations);
+		for (const auto& [slot, count]: other.groups) {
+			const auto found = std::ranges::find_if(plan.groups, [&](const auto& group) {
+				return SlotForm(group.first) == SlotForm(slot);
+			});
+			if (found == plan.groups.end()) {
+				plan.groups.emplace_back(slot, count);
+			} else {
+				found->second = std::max(found->second, count);
+			}
+		}
+		return;
+	}
+	if (other.layout != SlotLayout::Heap || plan.layout != SlotLayout::Heap ||
+	    other.groups.size() <= plan.groups.size()) {
+		return;
+	}
+	for (size_t arm = 0; arm < plan.groups.size(); ++arm) {
+		if (!(SlotForm(plan.groups[arm].first) == SlotForm(other.groups[arm].first))) return;
+	}
+	plan.groups = other.groups;
+}
+
+template <typename Slot>
+uint32_t KnownCount(const std::vector<RootPlan<Slot>>& known, const Slot& form) {
+	uint32_t count = 0;
+	for (const auto& plan: known) {
+		if (plan.layout != SlotLayout::Search) continue;
+		for (const auto& [slot, slots]: plan.groups) {
+			if (SlotForm(slot) == SlotForm(form)) count = std::max(count, slots);
+		}
+	}
+	return count;
+}
+
+template <typename Slot>
+void PlaceRoot(uint32_t root, const RootPlan<Slot>& plan, const Slot& form, std::vector<Slot>& slots,
+               uint32_t& cursor) {
+	auto& base = slots[root];
+	base       = form;
+	if (plan.layout == SlotLayout::Plain) return;
+	base.indirect_root           = root;
+	base.indirect_mapping_offset = cursor;
+	if (plan.layout == SlotLayout::Search) {
+		base.indirect_search_iterations = plan.iterations;
+		cursor += SearchWords(plan.iterations);
+	} else {
+		base.indirect_search_iterations = 0u;
+		cursor += 3u;
+	}
+	const auto root_slot = base;
+	for (const auto& [slot, count]: plan.groups) {
+		auto child          = slot;
+		child.indirect_root = root;
+		if (plan.layout == SlotLayout::Heap) {
+			child.indirect_mapping_offset    = root_slot.indirect_mapping_offset;
+			child.indirect_search_iterations = 0u;
+		}
+		for (uint32_t copy = 0; copy < count; ++copy) slots.push_back(child);
+	}
+}
+
+}
+
+bool AlignResources(const ResourcePlan& program, const ResourceSnapshot& snapshot,
+                    const ResourceSpecialization& specialization, const ResourceSpecialization& target,
+                    ResourceSnapshot* aligned) {
+	if (!GenericComputeVariants() || program.stage != ShaderType::Compute ||
+	    !g_stable_indirect_layouts.load(std::memory_order_relaxed) || !snapshot.image_tables.empty() ||
+	    specialization.buffers.size() != target.buffers.size() ||
+	    snapshot.buffers.size() != specialization.buffers.size() ||
+	    snapshot.images.size() != specialization.images.size() ||
+	    snapshot.samplers.size() != specialization.samplers.size()) {
+		return false;
+	}
+	for (uint32_t index = 0; index < specialization.buffers.size(); ++index) {
+		const auto& wanted = specialization.buffers[index];
+		const auto& served = target.buffers[index];
+		if (wanted.indirect_root != BufferResource::NoIndirectBuffer ||
+		    served.indirect_root != BufferResource::NoIndirectBuffer ||
+		    (!(wanted == served) && !EmptyBufferServes(program, snapshot, index, wanted, served))) {
+			return false;
+		}
+	}
+	std::vector<RootShape> images_from, images_to, samplers_from, samplers_to;
+	std::vector<uint8_t>   deferred_from, deferred_to;
+	if (!ImageShapes(program, specialization.images, images_from, deferred_from) ||
+	    !ImageShapes(program, target.images, images_to, deferred_to) || deferred_from != deferred_to ||
+	    !SamplerShapes(program, specialization.samplers, samplers_from) ||
+	    !SamplerShapes(program, target.samplers, samplers_to)) {
+		return false;
+	}
+	std::vector<SrtRegion> regions_from, regions_to;
+	AddRegions(images_from, regions_from);
+	AddRegions(samplers_from, regions_from);
+	AddRegions(images_to, regions_to);
+	AddRegions(samplers_to, regions_to);
+	size_t prefix = 0;
+	size_t end    = 0;
+	if (!RegionsTile(regions_from, snapshot.flattened_srt.size(), prefix) ||
+	    !RegionsFollow(regions_to, prefix, end) ||
+	    std::ranges::any_of(snapshot.gpu_flat_loads, [&](const GpuFlatLoad& load) {
+		    return size_t {load.slot} + load.count > prefix;
+	    })) {
+		return false;
+	}
+	std::vector<DescriptorValue> images;
+	std::vector<DescriptorValue> samplers;
+	std::vector<uint32_t>        flat;
+	if (aligned != nullptr) {
+		images.assign(target.images.size(), {});
+		samplers.assign(target.samplers.size(), {});
+		flat.assign(end, 0u);
+		std::copy_n(snapshot.flattened_srt.begin(), prefix, flat.begin());
+	}
+	const std::span<const uint32_t> source(snapshot.flattened_srt);
+	if (!PlaceRoots(images_from, images_to, specialization.images, target.images,
+	                std::span<const DescriptorValue>(snapshot.images), source,
+	                aligned != nullptr ? &images : nullptr, aligned != nullptr ? &flat : nullptr) ||
+	    !PlaceRoots(samplers_from, samplers_to, specialization.samplers, target.samplers,
+	                std::span<const DescriptorValue>(snapshot.samplers), source,
+	                aligned != nullptr ? &samplers : nullptr, aligned != nullptr ? &flat : nullptr)) {
+		return false;
+	}
+	if (aligned != nullptr) {
+		aligned->buffers              = snapshot.buffers;
+		aligned->images               = std::move(images);
+		aligned->samplers             = std::move(samplers);
+		aligned->flattened_srt        = std::move(flat);
+		aligned->image_tables         = {};
+		aligned->user_data            = snapshot.user_data;
+		aligned->specialization_reads = snapshot.specialization_reads;
+		aligned->uniform_fill         = snapshot.uniform_fill;
+		aligned->gpu_flat_loads       = snapshot.gpu_flat_loads;
+	}
+	return true;
+}
+
+bool WidenSpecialization(const ResourcePlan& program, const ResourceSnapshot& snapshot,
+                         const ResourceSpecialization&                  specialization,
+                         std::span<const ResourceSpecialization* const> known, ResourceSpecialization& widened) {
+	if (!GenericComputeVariants() || program.stage != ShaderType::Compute ||
+	    !g_stable_indirect_layouts.load(std::memory_order_relaxed)) {
+		return false;
+	}
+	std::vector<RootShape> images, samplers;
+	std::vector<uint8_t>   deferred;
+	if (!ImageShapes(program, specialization.images, images, deferred) ||
+	    !SamplerShapes(program, specialization.samplers, samplers)) {
+		return false;
+	}
+	std::vector<SrtRegion> regions;
+	AddRegions(images, regions);
+	AddRegions(samplers, regions);
+	size_t prefix = 0;
+	if (!RegionsTile(regions, snapshot.flattened_srt.size(), prefix)) return false;
+	using Image   = ResourceSpecialization::Image;
+	using Sampler = ResourceSpecialization::Sampler;
+	std::vector<RootPlan<Image>>   image_plans;
+	std::vector<RootPlan<Sampler>> sampler_plans;
+	for (uint32_t root = 0; root < images.size(); ++root) image_plans.push_back(PlanOf(images[root], specialization.images));
+	for (uint32_t root = 0; root < samplers.size(); ++root) {
+		sampler_plans.push_back(PlanOf(samplers[root], specialization.samplers));
+	}
+	std::vector<Image>   image_forms(specialization.images.begin(),
+	                                 specialization.images.begin() + static_cast<std::ptrdiff_t>(images.size()));
+	std::vector<Sampler> sampler_forms(specialization.samplers.begin(),
+	                                   specialization.samplers.begin() + static_cast<std::ptrdiff_t>(samplers.size()));
+	std::vector<std::vector<RootPlan<Image>>>   known_images(images.size());
+	std::vector<std::vector<RootPlan<Sampler>>> known_samplers(samplers.size());
+	for (const auto* other: known) {
+		std::vector<RootShape> other_images, other_samplers;
+		std::vector<uint8_t>   other_deferred;
+		if (other == nullptr || !ImageShapes(program, other->images, other_images, other_deferred) ||
+		    other_deferred != deferred || !SamplerShapes(program, other->samplers, other_samplers)) {
+			continue;
+		}
+		for (uint32_t root = 0; root < images.size(); ++root) {
+			if (!(SlotForm(other->images[root]) == SlotForm(specialization.images[root]))) continue;
+			auto plan = PlanOf(other_images[root], other->images);
+			if (image_plans[root].layout == SlotLayout::Plain && plan.layout == SlotLayout::Search) {
+				image_forms[root] = other->images[root];
+			}
+			MergePlan(image_plans[root], plan);
+			known_images[root].push_back(std::move(plan));
+		}
+		for (uint32_t root = 0; root < samplers.size(); ++root) {
+			if (!(SlotForm(other->samplers[root]) == SlotForm(specialization.samplers[root]))) continue;
+			auto plan = PlanOf(other_samplers[root], other->samplers);
+			if (sampler_plans[root].layout == SlotLayout::Plain && plan.layout == SlotLayout::Search) {
+				sampler_forms[root] = other->samplers[root];
+			}
+			MergePlan(sampler_plans[root], plan);
+			known_samplers[root].push_back(std::move(plan));
+		}
+	}
+	const auto make_room = [](auto& plans, const auto& shapes, const auto& slots, const auto& known_plans) {
+		for (uint32_t root = 0; root < plans.size(); ++root) {
+			if (plans[root].layout != SlotLayout::Search || shapes[root].layout != SlotLayout::Search) continue;
+			const auto natural = PlanOf(shapes[root], slots);
+			for (const auto& [slot, count]: natural.groups) {
+				if (count <= KnownCount(known_plans[root], slot)) continue;
+				for (auto& group: plans[root].groups) {
+					if (SlotForm(group.first) == SlotForm(slot)) group.second = std::max(group.second, RoomFor(count));
+				}
+			}
+		}
+	};
+	make_room(image_plans, images, specialization.images, known_images);
+	make_room(sampler_plans, samplers, specialization.samplers, known_samplers);
+	widened = specialization;
+	widened.images.resize(images.size());
+	widened.samplers.resize(samplers.size());
+	auto cursor = static_cast<uint32_t>(prefix);
+	for (uint32_t root = 0; root < images.size(); ++root) {
+		if (deferred[root] == 0u) PlaceRoot(root, image_plans[root], image_forms[root], widened.images, cursor);
+	}
+	for (uint32_t root = 0; root < samplers.size(); ++root) {
+		PlaceRoot(root, sampler_plans[root], sampler_forms[root], widened.samplers, cursor);
+	}
+	for (uint32_t root = 0; root < images.size(); ++root) {
+		if (deferred[root] != 0u) PlaceRoot(root, image_plans[root], image_forms[root], widened.images, cursor);
+	}
+	return true;
+}
+#endif
+
 }

@@ -333,6 +333,34 @@ set_tests_properties(kyty_shim_empty_buffer_replay PROPERTIES TIMEOUT 120 SKIP_R
 add_test(NAME kyty_shim_empty_buffer_replay_off COMMAND kyty_shim_empty_buffer_replay_tests $<TARGET_FILE:agc_frame_replay>)
 set_tests_properties(kyty_shim_empty_buffer_replay_off PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
         ENVIRONMENT "KYTY_SHARE_EMPTY_BUFFERS=0" PASS_REGULAR_EXPRESSION "kyty_shim_empty_buffer_replay_off: ok")
+
+add_test_executable(kyty_shim_generic_compute_variants_tests ${CMAKE_CURRENT_SOURCE_DIR}/GenericComputeVariants.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+target_include_directories(kyty_shim_generic_compute_variants_tests PRIVATE ${LIBS_INCLUDE_DIR})
+configure_host_test_executable(kyty_shim_generic_compute_variants_tests)
+if(MINGW)
+    target_link_libraries(kyty_shim_generic_compute_variants_tests PRIVATE stdc++ gcc_eh)
+endif()
+target_link_libraries(kyty_shim_generic_compute_variants_tests PRIVATE Kyty::gpu libkernel libc)
+add_test(NAME kyty_shim_generic_compute_variants COMMAND kyty_shim_generic_compute_variants_tests)
+set_tests_properties(kyty_shim_generic_compute_variants PROPERTIES TIMEOUT 20
+        PASS_REGULAR_EXPRESSION "kyty_shim_generic_compute_variants: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+add_test(NAME kyty_shim_generic_compute_variants_off COMMAND kyty_shim_generic_compute_variants_tests)
+set_tests_properties(kyty_shim_generic_compute_variants_off PROPERTIES TIMEOUT 20 ENVIRONMENT "KYTY_GENERIC_COMPUTE_VARIANT=0"
+        PASS_REGULAR_EXPRESSION "kyty_shim_generic_compute_variants_off: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+
+add_test_executable(kyty_shim_generic_compute_replay_tests ${CMAKE_CURRENT_SOURCE_DIR}/GenericComputeReplay.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../Execution/src/FrameCapture.cpp)
+target_include_directories(kyty_shim_generic_compute_replay_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/3rdparty/zstd/lib)
+target_link_libraries(kyty_shim_generic_compute_replay_tests PRIVATE libzstd_static)
+set_target_properties(kyty_shim_generic_compute_replay_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_host_test_executable(kyty_shim_generic_compute_replay_tests)
+add_dependencies(kyty_shim_generic_compute_replay_tests agc_frame_replay)
+add_test(NAME kyty_shim_generic_compute_replay COMMAND kyty_shim_generic_compute_replay_tests $<TARGET_FILE:agc_frame_replay>)
+set_tests_properties(kyty_shim_generic_compute_replay PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "kyty_shim_generic_compute_replay: ok")
+add_test(NAME kyty_shim_generic_compute_replay_wide COMMAND kyty_shim_generic_compute_replay_tests $<TARGET_FILE:agc_frame_replay>)
+set_tests_properties(kyty_shim_generic_compute_replay_wide PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77
+        ENVIRONMENT "KYTY_GENERIC_COMPUTE_SPECIALIZE=0" PASS_REGULAR_EXPRESSION "kyty_shim_generic_compute_replay_wide: ok")
 add_test_executable(kyty_shim_packed_unorm_blend_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/PackedUnormBlend.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp

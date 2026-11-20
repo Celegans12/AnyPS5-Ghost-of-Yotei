@@ -1424,6 +1424,169 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	return module;
 }
 
+#if defined(ANYPS5_KYTY)
+namespace {
+
+bool SpecializesComputeInBackground() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_GENERIC_COMPUTE_SPECIALIZE");
+		return value == nullptr || std::string_view(value) != "0";
+	}();
+	return on;
+}
+
+bool ShaderVariantLog() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_SHADER_VARIANT_LOG");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return on;
+}
+
+uint64_t ResourceShapeFingerprint(const ShaderRecompiler::IR::ResourceSpecialization& specialization) {
+	ShaderRecompiler::IR::Writer writer;
+	ShaderRecompiler::IR::IoAll(writer, specialization.images, specialization.samplers);
+	return XXH3_64bits(writer.bytes.data(), writer.bytes.size());
+}
+
+const char* PipelineStateName(uint32_t state) {
+	return state == 2u ? "ready" : state == 1u ? "pending" : "none";
+}
+
+}
+
+uint32_t PipelineCache::ComputePipelineState(const ShaderModule& module) {
+	if (m_compute_pipelines.contains(module.id)) return 2u;
+	std::lock_guard lock(m_async_mutex);
+	if (m_async_ready_compute.contains(module.id)) return 2u;
+	return m_async_pending_compute.contains(module.id) || m_helper_jobs.contains(module.id) ? 1u : 0u;
+}
+
+ShaderModule* PipelineCache::ServeComputeVariant(Program& program, uint32_t push_data_cursor,
+                                                 const ShaderModule* exact, uint32_t least_state) {
+	if (program.call_source != nullptr || !ShaderRecompiler::IR::GenericComputeVariants()) return nullptr;
+	const auto& plan     = program.resource_plan;
+	const auto  eligible = [&](const ShaderModule& candidate) {
+		const auto& layout = candidate.info.bindings;
+		return &candidate != exact && !candidate.shared_variant && candidate.module != nullptr &&
+		       layout.push_data_start_dword ==
+		           ShaderRecompiler::IR::PushData::StartFor(push_data_cursor, layout.ShaderDataDwords());
+	};
+	ShaderModule* best       = nullptr;
+	size_t        best_index = SIZE_MAX;
+	uint32_t      best_state = 0;
+	size_t        best_slots = SIZE_MAX;
+	if (program.served_module < program.modules.size()) {
+		auto& last = program.modules[program.served_module];
+		if (eligible(last) && ComputePipelineState(last) == 2u &&
+		    ShaderRecompiler::IR::AlignResources(plan, program.resources, program.specialization, last.specialization,
+		                                         nullptr)) {
+			best       = &last;
+			best_index = program.served_module;
+			best_state = 2u;
+		}
+	}
+	const bool scan = best == nullptr;
+	for (size_t index = 0; scan && index < program.modules.size(); ++index) {
+		auto& candidate = program.modules[index];
+		if (!eligible(candidate)) continue;
+		const auto slots = candidate.specialization.images.size() + candidate.specialization.samplers.size();
+		const auto state = ComputePipelineState(candidate);
+		if (state < least_state ||
+		    (best != nullptr && (state < best_state || (state == best_state && slots >= best_slots)))) {
+			continue;
+		}
+		if (!ShaderRecompiler::IR::AlignResources(plan, program.resources, program.specialization,
+		                                          candidate.specialization, nullptr)) {
+			continue;
+		}
+		best       = &candidate;
+		best_index = index;
+		best_state = state;
+		best_slots = slots;
+	}
+	if (best == nullptr) return nullptr;
+	ShaderRecompiler::IR::ResourceSnapshot aligned;
+	if (!ShaderRecompiler::IR::AlignResources(plan, program.resources, program.specialization, best->specialization,
+	                                          &aligned)) {
+		return nullptr;
+	}
+	program.resources     = std::move(aligned);
+	program.served_module = best_index;
+	if (ShaderVariantLog()) {
+		const auto natural = ResourceShapeFingerprint(program.specialization);
+		if (const auto logged = natural ^ best->id; logged != program.served_logged) {
+			program.served_logged = logged;
+			PipelineCacheLog("[kyty-variant] serve stage=CS shader={:016x} module={:016x} natural={:016x} images={}/{} "
+			                 "samplers={}/{} pipeline={} @{}",
+			                 plan.shader_hash, best->id, natural, program.specialization.images.size(),
+			                 best->specialization.images.size(), program.specialization.samplers.size(),
+			                 best->specialization.samplers.size(), PipelineStateName(best_state),
+			                 std::chrono::steady_clock::now().time_since_epoch().count());
+		}
+	}
+	return best;
+}
+
+void PipelineCache::SpecializeComputeVariant(const ProgramKey& key, Program& program, const ShaderParams& params,
+                                             const ShaderComputeInputInfo&                       input_info,
+                                             const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+                                             uint32_t push_data_cursor) {
+	if (!SpecializesComputeInBackground() || program.call_source != nullptr || m_in_flight.contains(key) ||
+	    program.Failed(specialization, push_data_cursor)) {
+		return;
+	}
+	QueueCompile(key, params, input_info, push_data_cursor, &specialization, m_guest_traversal);
+	if (ShaderVariantLog()) {
+		PipelineCacheLog("[kyty-variant] specialize stage=CS shader={:016x} natural={:016x} @{}", params.hash,
+		                 ResourceShapeFingerprint(specialization),
+		                 std::chrono::steady_clock::now().time_since_epoch().count());
+	}
+}
+
+void PipelineCache::WidenComputeVariant(const ProgramKey& key, Program& program, const ShaderParams& params,
+                                        const ShaderComputeInputInfo& input_info, uint32_t push_data_cursor,
+                                        std::optional<std::pair<ShaderRecompiler::IR::ResourceSpecialization,
+                                                                ShaderRecompiler::IR::ResourceSnapshot>>& natural) {
+	if (program.call_source != nullptr || program.modules.empty() ||
+	    !ShaderRecompiler::IR::GenericComputeVariants()) {
+		return;
+	}
+	std::vector<const ShaderRecompiler::IR::ResourceSpecialization*> known;
+	for (const auto& module: program.modules) {
+		const auto& layout = module.info.bindings;
+		if (module.shared_variant ||
+		    layout.push_data_start_dword !=
+		        ShaderRecompiler::IR::PushData::StartFor(push_data_cursor, layout.ShaderDataDwords())) {
+			continue;
+		}
+		known.push_back(&module.specialization);
+	}
+	ShaderRecompiler::IR::ResourceSpecialization widened;
+	ShaderRecompiler::IR::ResourceSnapshot       aligned;
+	if (known.empty() ||
+	    !ShaderRecompiler::IR::WidenSpecialization(program.resource_plan, program.resources, program.specialization,
+	                                               known, widened) ||
+	    widened == program.specialization || program.Failed(widened, push_data_cursor) ||
+	    !ShaderRecompiler::IR::AlignResources(program.resource_plan, program.resources, program.specialization,
+	                                          widened, &aligned)) {
+		return;
+	}
+	natural.emplace(std::move(program.specialization), std::move(program.resources));
+	program.specialization = std::move(widened);
+	program.resources      = std::move(aligned);
+	if (ShaderVariantLog()) {
+		PipelineCacheLog("[kyty-variant] widen stage=CS shader={:016x} natural={:016x} images={}/{} samplers={}/{} "
+		                 "known={} @{}",
+		                 params.hash, ResourceShapeFingerprint(natural->first), natural->first.images.size(),
+		                 program.specialization.images.size(), natural->first.samplers.size(),
+		                 program.specialization.samplers.size(), known.size(),
+		                 std::chrono::steady_clock::now().time_since_epoch().count());
+	}
+	SpecializeComputeVariant(key, program, params, input_info, natural->first, push_data_cursor);
+}
+#endif
+
 template <typename InputInfo>
 const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputInfo& input_info,
                                               uint32_t& push_data_cursor) {
@@ -1533,6 +1696,20 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 #endif
 		}
 		if (failed) return skip_failure();
+#if defined(ANYPS5_KYTY)
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			const bool generic = specialized && !m_queue_only && ShaderRecompiler::IR::GenericComputeVariants();
+			if (generic && module != nullptr && ComputePipelineState(*module) != 2u) {
+				if (auto* served = ServeComputeVariant(cached, push_data_cursor, module, 2u)) return bind(*served);
+			} else if (generic && module == nullptr) {
+				if (auto* served = ServeComputeVariant(cached, push_data_cursor, nullptr, 0u)) {
+					SpecializeComputeVariant(entry->first, cached, params, input_info, cached.specialization,
+					                         push_data_cursor);
+					return bind(*served);
+				}
+			}
+		}
+#endif
 		if (module != nullptr) return bind(*module);
 #if defined(ANYPS5_KYTY)
 		if (specialized && !cached.failed_variants.empty() &&
@@ -1582,6 +1759,8 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	}
 
 #if defined(ANYPS5_KYTY)
+	std::optional<std::pair<ShaderRecompiler::IR::ResourceSpecialization, ShaderRecompiler::IR::ResourceSnapshot>>
+	           natural;
 	const auto build = [&]() -> const ShaderModule* {
 #endif
 	options.shader_hash     = params.hash;
@@ -1648,6 +1827,9 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	}
 #if defined(ANYPS5_KYTY)
 	entry->second.PromoteEmptyBuffers(entry->second.resources, entry->second.specialization, push_data_cursor);
+	if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+		WidenComputeVariant(entry->first, entry->second, params, input_info, push_data_cursor, natural);
+	}
 #endif
 	return bind(CompileModule(entry->second, entry->first, options, std::move(translated),
 	                          push_data_cursor, params.code));
@@ -1663,6 +1845,16 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 			found->second.skip_dispatch = true;
 		} else {
 			found->second.NoteFailed(push_data_cursor);
+			if (natural) {
+				found->second.specialization = std::move(natural->first);
+				found->second.resources      = std::move(natural->second);
+				natural.reset();
+				if (Common::Fallback::Run("draw or dispatch skipped: the shader recompiler stopped",
+				                          "PipelineCache::GetProgram", params.hash, 0, [&] { built = build(); })) {
+					return built;
+				}
+				found->second.NoteFailed(push_data_cursor);
+			}
 		}
 	} else {
 		m_program_cache.emplace(m_lookup_key, Program {.skip_dispatch = true});

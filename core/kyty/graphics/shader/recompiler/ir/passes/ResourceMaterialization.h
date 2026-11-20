@@ -93,6 +93,14 @@ bool EmptyBufferServes(const ResourcePlan& program, const ResourceSnapshot& snap
                        const ResourceSpecialization::Buffer& candidate);
 bool EmptyBuffersServe(const ResourcePlan& program, const ResourceSnapshot& snapshot,
                        const ResourceSpecialization& requested, const ResourceSpecialization& candidate);
+bool GenericComputeVariants();
+bool AlignResources(const ResourcePlan& program, const ResourceSnapshot& snapshot,
+                    const ResourceSpecialization& specialization, const ResourceSpecialization& target,
+                    ResourceSnapshot* aligned);
+bool WidenSpecialization(const ResourcePlan& program, const ResourceSnapshot& snapshot,
+                         const ResourceSpecialization&                       specialization,
+                         std::span<const ResourceSpecialization* const>      known,
+                         ResourceSpecialization&                             widened);
 #endif
 bool SpecializeDirectResources(const ResourcePlan& program, ResourceSnapshot& snapshot,
                                ResourceSpecialization& specialization);

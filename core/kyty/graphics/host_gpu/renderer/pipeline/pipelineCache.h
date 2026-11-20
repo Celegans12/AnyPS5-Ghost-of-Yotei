@@ -502,6 +502,8 @@ private:
 			std::vector<uint32_t>                        function_code;
 		};
 		std::vector<FailedVariant> failed_variants;
+		size_t                     served_module = SIZE_MAX;
+		uint64_t                   served_logged = 0;
 
 		[[nodiscard]] bool Failed(const ShaderRecompiler::IR::ResourceSpecialization& candidate,
 		                          uint32_t push_data_cursor) const;
@@ -618,6 +620,19 @@ private:
 	void RunCompileJob(CompileJob& job, InputInfo& input_info);
 	void CompileWorker();
 	void StopWorkers();
+#if defined(ANYPS5_KYTY)
+	uint32_t      ComputePipelineState(const ShaderModule& module);
+	ShaderModule* ServeComputeVariant(Program& program, uint32_t push_data_cursor, const ShaderModule* exact,
+	                                  uint32_t least_state);
+	void          SpecializeComputeVariant(const ProgramKey& key, Program& program, const ShaderParams& params,
+	                                       const ShaderComputeInputInfo&                       input_info,
+	                                       const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	                                       uint32_t push_data_cursor);
+	void          WidenComputeVariant(const ProgramKey& key, Program& program, const ShaderParams& params,
+	                                  const ShaderComputeInputInfo& input_info, uint32_t push_data_cursor,
+	                                  std::optional<std::pair<ShaderRecompiler::IR::ResourceSpecialization,
+	                                                          ShaderRecompiler::IR::ResourceSnapshot>>& natural);
+#endif
 
 	struct TableVariant {
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
