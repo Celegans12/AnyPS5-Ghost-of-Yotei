@@ -435,4 +435,29 @@ add_dependencies(kyty_shim_bda_submission_sync_tests agc_frame_replay)
 add_test(NAME kyty_shim_bda_submission_sync COMMAND kyty_shim_bda_submission_sync_tests $<TARGET_FILE:agc_frame_replay>)
 set_tests_properties(kyty_shim_bda_submission_sync PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
         PASS_REGULAR_EXPRESSION "kyty_shim_bda_submission_sync: ok")
+add_test_executable(kyty_shim_cross_queue_order_tests ${CMAKE_CURRENT_SOURCE_DIR}/CrossQueueOrder.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../Execution/src/FrameCapture.cpp)
+target_include_directories(kyty_shim_cross_queue_order_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/3rdparty/zstd/lib)
+target_link_libraries(kyty_shim_cross_queue_order_tests PRIVATE libzstd_static)
+set_target_properties(kyty_shim_cross_queue_order_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_host_test_executable(kyty_shim_cross_queue_order_tests)
+add_dependencies(kyty_shim_cross_queue_order_tests agc_frame_replay)
+foreach(scenario compute_waits_graphics_data graphics_waits_compute_data dma_wait)
+    add_test(NAME kyty_shim_cross_queue_${scenario}
+            COMMAND kyty_shim_cross_queue_order_tests $<TARGET_FILE:agc_frame_replay> ${scenario})
+    set_tests_properties(kyty_shim_cross_queue_${scenario} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77
+            LABELS "cross_queue_order" PASS_REGULAR_EXPRESSION "kyty_shim_cross_queue_${scenario}: ok")
+endforeach()
+foreach(scenario compute_waits_graphics_clock graphics_waits_compute_clock recycled_label early_label)
+    add_test(NAME kyty_shim_cross_queue_${scenario}
+            COMMAND kyty_shim_cross_queue_order_tests $<TARGET_FILE:agc_frame_replay> ${scenario})
+    set_tests_properties(kyty_shim_cross_queue_${scenario} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77
+            LABELS "cross_queue_order;expected_failure"
+            PASS_REGULAR_EXPRESSION "kyty_shim_cross_queue_${scenario}: order broken: ")
+endforeach()
+add_test(NAME kyty_shim_cross_queue_recycled_label_own_tick
+        COMMAND kyty_shim_cross_queue_order_tests $<TARGET_FILE:agc_frame_replay> recycled_label)
+set_tests_properties(kyty_shim_cross_queue_recycled_label_own_tick PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77
+        LABELS "cross_queue_order;expected_failure" ENVIRONMENT "KYTY_LABELS_AFTER_DUMPS=0"
+        PASS_REGULAR_EXPRESSION "kyty_shim_cross_queue_recycled_label: order broken: ")
 endif()
