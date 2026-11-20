@@ -41,6 +41,29 @@ add_test(NAME kyty_shim_completion_invalidation COMMAND kyty_shim_completion_inv
 set_tests_properties(kyty_shim_completion_invalidation PROPERTIES TIMEOUT 60
         PASS_REGULAR_EXPRESSION "kyty_shim_completion_invalidation: ok" FAIL_REGULAR_EXPRESSION "FAILED")
 
+if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
+    add_test_executable(kyty_shim_cross_queue_label_order_tests ${CMAKE_CURRENT_SOURCE_DIR}/CrossQueueLabelOrder.cpp)
+    target_include_directories(kyty_shim_cross_queue_label_order_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    configure_host_test_executable(kyty_shim_cross_queue_label_order_tests)
+    if(WIN32)
+        target_include_directories(kyty_shim_cross_queue_label_order_tests PRIVATE
+                $<TARGET_PROPERTY:Kyty::gpu,INTERFACE_INCLUDE_DIRECTORIES>)
+        target_compile_definitions(kyty_shim_cross_queue_label_order_tests PRIVATE
+                $<TARGET_PROPERTY:Kyty::gpu,INTERFACE_COMPILE_DEFINITIONS>)
+        if(MINGW)
+            target_link_libraries(kyty_shim_cross_queue_label_order_tests PRIVATE stdc++ gcc_eh)
+        endif()
+    else()
+        target_link_libraries(kyty_shim_cross_queue_label_order_tests PRIVATE Kyty::gpu)
+        target_link_options(kyty_shim_cross_queue_label_order_tests PRIVATE LINKER:--no-as-needed)
+    endif()
+    target_link_libraries(kyty_shim_cross_queue_label_order_tests PRIVATE libSceAgcDriver libkernel libc)
+    add_test(NAME kyty_shim_cross_queue_label_order COMMAND kyty_shim_cross_queue_label_order_tests)
+    set_tests_properties(kyty_shim_cross_queue_label_order PROPERTIES TIMEOUT 25 SKIP_RETURN_CODE 77
+            ENVIRONMENT "KYTY_LABELS_AFTER_DUMPS=0;KYTY_GPU_PIPELINE=0"
+            PASS_REGULAR_EXPRESSION "kyty_shim_cross_queue_label_order: ok" FAIL_REGULAR_EXPRESSION "FAILED")
+endif()
+
 if(NOT WIN32)
     add_test_executable(kyty_shim_table_resolution_cache_tests ${CMAKE_CURRENT_SOURCE_DIR}/TableResolutionCache.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
