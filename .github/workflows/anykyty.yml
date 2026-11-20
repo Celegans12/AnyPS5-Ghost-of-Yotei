@@ -12,6 +12,8 @@ on:
     paths-ignore:
       - '**.md'
       - LICENSE
+  schedule:
+    - cron: '17 4 * * *'
   workflow_dispatch:
     inputs:
       pr:
@@ -33,6 +35,7 @@ concurrency:
 
 jobs:
   conventions:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -66,6 +69,7 @@ jobs:
 
   linux:
     name: Linux ${{ matrix.name }}
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     strategy:
@@ -218,8 +222,148 @@ jobs:
         if: ${{ !cancelled() && steps.ccache.outcome == 'success' }}
         run: ccache -s
 
+  sanitize:
+    name: Linux ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: tsan
+            option: ANYPS5_ENABLE_TSAN
+            sanitizer: thread
+          - name: asan
+            option: ANYPS5_ENABLE_ASAN
+            sanitizer: address
+    env:
+      GPU_TESTS: >-
+        ^(kyty_shim_(packed_unorm_blend|compute_execution|wave64_cross_lane|empty_buffer_replay|empty_buffer_replay_off|depth_target_alias|buffer_null_range|descriptor_tables_draw|merged_hull_draw))$
+      CPU_TESTS: ^(kyty_shim_.*|guest_gpu_fault|guest_host_write_filter|agc_kyty_shaders)$
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.pr && format('refs/pull/{0}/merge', inputs.pr) || '' }}
+          persist-credentials: false
+      - id: submodules
+        name: Key the submodules on their commits
+        run: |
+          echo "key=$(git ls-files -s | awk '$1 == "160000" { print $2, $4 }' | cat - .gitmodules | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          echo "ffmpeg=$(git rev-parse HEAD:3rdparty/ffmpeg-core)" >> "$GITHUB_OUTPUT"
+      - id: submodule-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/submodule-gitdirs.tar
+          key: submodule-gitdirs-${{ runner.os }}-${{ steps.submodules.outputs.key }}
+      - name: Check out the submodules
+        run: |
+          if [ -f "$RUNNER_TEMP/submodule-gitdirs.tar" ]; then tar -xf "$RUNNER_TEMP/submodule-gitdirs.tar"; fi
+          git submodule update --init --recursive --depth 1 --jobs 8
+      - if: steps.submodule-cache.outputs.cache-hit != 'true'
+        run: tar -cf "$RUNNER_TEMP/submodule-gitdirs.tar" .git/modules
+      - if: steps.submodule-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/submodule-gitdirs.tar
+          key: submodule-gitdirs-${{ runner.os }}-${{ steps.submodules.outputs.key }}
+      - id: apt-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/apt-archives
+          key: apt-${{ runner.os }}-kyty-${{ hashFiles('.github/workflows/anykyty.yml') }}
+          restore-keys: apt-${{ runner.os }}-kyty-
+      - name: Install the build dependencies
+        run: |
+          packages=(gcc-14 g++-14 ninja-build pkg-config ccache
+            libx11-dev libxext-dev libxrandr-dev libxkbcommon-dev libwayland-dev libegl-dev libdecor-0-dev
+            libxcursor-dev libxi-dev libxfixes-dev libxinerama-dev libxss-dev libxxf86vm-dev libudev-dev libdrm-dev libgbm-dev
+            libasound2-dev libpulse-dev libpipewire-0.3-dev libvulkan1 libvulkan-dev mesa-vulkan-drivers)
+          sudo curl -fsSL --retry 3 -o /etc/apt/trusted.gpg.d/apt.llvm.org.asc https://apt.llvm.org/llvm-snapshot.gpg.key
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list
+          packages+=(clang-21 lld-21 llvm-21)
+          echo /usr/lib/llvm-21/bin >> "$GITHUB_PATH"
+          mkdir -p "$RUNNER_TEMP/apt-archives/partial"
+          apt=(sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o Dir::Cache::Archives="$RUNNER_TEMP/apt-archives" -o APT::Keep-Downloaded-Packages=true)
+          "${apt[@]}" update
+          "${apt[@]}" install -y -q --no-install-recommends "${packages[@]}"
+          sudo rm -rf "$RUNNER_TEMP/apt-archives/partial" "$RUNNER_TEMP/apt-archives/lock"
+      - if: steps.apt-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/apt-archives
+          key: ${{ steps.apt-cache.outputs.cache-primary-key }}
+      - name: Show the toolchain
+        run: |
+          g++-14 --version | head -1
+          clang++ --version | head -1
+          cmake --version | head -1
+      - id: ccache
+        uses: hendrikmuhs/ccache-action@v1.2.24
+        with:
+          key: linux-${{ matrix.name }}
+          max-size: 3G
+          evict-old-files: job
+      - id: ffmpeg-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: build/externals
+          key: ffmpeg-${{ runner.os }}-${{ steps.submodules.outputs.ffmpeg }}
+      - name: Configure
+        env:
+          OPTION: ${{ matrix.option }}
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_TESTING=ON \
+            -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DANYPS5_GPU_BACKEND=kyty -DANYPS5_KYTY_JOBS="$(nproc)" -DANYPS5_KYTY_THIN_LTO=OFF -DANYPS5_KYTY_PGO= \
+            "-D$OPTION=ON"
+      - if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        continue-on-error: true
+        with:
+          path: build/externals
+          key: ${{ steps.ffmpeg-cache.outputs.cache-primary-key }}
+      - name: Build the Kyty core and the CPU shim tests
+        run: |
+          mapfile -t tests < <(ninja -C build -t targets all | grep -oE '^(kyty_shim_[A-Za-z0-9_]+_tests|guest_gpu_fault_tests|guest_host_write_filter_tests|agc_kyty_shaders_tests):' | tr -d ':' | sort -u)
+          echo "Test targets: ${tests[*]}"
+          cmake --build build --target kyty_gpu "${tests[@]}" --parallel "$(nproc)"
+      - name: Run the CPU tests under the sanitizer
+        working-directory: build
+        env:
+          SANITIZER: ${{ matrix.sanitizer }}
+        run: |
+          sudo sysctl -w vm.mmap_rnd_bits=28 vm.unprivileged_userfaultfd=1 vm.max_map_count=2147483642 kernel.core_pattern=core
+          ulimit -c 0
+          export ASAN_OPTIONS=detect_leaks=0:abort_on_error=0
+          export TSAN_OPTIONS="suppressions=$GITHUB_WORKSPACE/tools/tsan-suppressions.txt:second_deadlock_stack=1:history_size=4"
+          ctest -R "$CPU_TESTS" -E "$GPU_TESTS" --output-on-failure --timeout 600 --no-tests=error \
+            --output-log ctest.log --output-junit ctest.xml || true
+      - name: Summarize the sanitizer findings
+        if: ${{ !cancelled() }}
+        env:
+          SANITIZER: ${{ matrix.sanitizer }}
+        run: >-
+          python3 tools/sanitizer_report.py build/ctest.xml --title "Kyty CPU tests under ${{ matrix.name }}"
+          --known .github/sanitizer-known-failures.txt --sanitizer "$SANITIZER"
+          --summary "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: sanitizer-${{ matrix.name }}
+          path: |
+            build/ctest.log
+            build/ctest.xml
+          if-no-files-found: ignore
+      - name: Show the ccache statistics
+        if: ${{ !cancelled() && steps.ccache.outcome == 'success' }}
+        run: ccache -s
+
   windows:
     name: Windows kyty
+    if: github.event_name != 'schedule'
     runs-on: windows-latest
     timeout-minutes: 150
     env:
