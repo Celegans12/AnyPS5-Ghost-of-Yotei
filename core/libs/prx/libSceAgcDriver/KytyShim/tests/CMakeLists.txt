@@ -287,8 +287,9 @@ if(NOT WIN32)
     set_tests_properties(kyty_shim_rt_corpus PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
 endif()
 
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    set(kytyThreadSafetyCompile ${ANYPS5_KYTY_CXX_COMPILER} -std=c++20 -fsyntax-only -Wthread-safety -Werror=thread-safety
+find_program(kytyThreadSafetyClang NAMES clang++)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND kytyThreadSafetyClang)
+    set(kytyThreadSafetyCompile ${kytyThreadSafetyClang} -std=c++20 -fsyntax-only -Wthread-safety -Werror=thread-safety
             -I${CMAKE_SOURCE_DIR}/core/kyty)
     add_test(NAME kyty_shim_thread_safety_accepts COMMAND ${kytyThreadSafetyCompile}
             ${CMAKE_CURRENT_SOURCE_DIR}/ThreadSafetyGuarded.cpp)
