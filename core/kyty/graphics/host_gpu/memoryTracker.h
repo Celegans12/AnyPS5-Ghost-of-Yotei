@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_MEMORYTRACKER_H_
 
 #include "common/assert.h"
+#include "common/runtimeSwitches.h"
 #include "graphics/host_gpu/commandBlocks.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/rangeSet.h"
@@ -341,6 +342,14 @@ public:
 	                        UploadFunc&& upload_func, uint32_t device_sync = 0) {
 		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
+		if (is_written) {
+			s_written_uploads.fetch_add(1, std::memory_order_relaxed);
+			if (Common::RuntimeSwitches::On(Common::RuntimeSwitches::Switch::WrittenUploadUnlocked)) {
+				UploadWritten(vaddr, size, range_func, upload_func);
+				return;
+			}
+			s_written_locked.fetch_add(1, std::memory_order_relaxed);
+		}
 		const bool defer = !is_written && DeferProtections();
 		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) KYTY_NO_THREAD_SAFETY_ANALYSIS {
 			if (!is_written && !manager->IsModifiedUnlocked<DirtySource::Cpu>(offset, bytes)) {
@@ -440,6 +449,17 @@ public:
 		ApplyDeferredProtections();
 	}
 
+	struct WrittenUploadStats {
+		uint64_t uploads = 0;
+		uint64_t again   = 0;
+		uint64_t locked  = 0;
+	};
+	[[nodiscard]] static WrittenUploadStats TakeWrittenUploadStats() noexcept {
+		return {.uploads = s_written_uploads.exchange(0, std::memory_order_relaxed),
+		        .again   = s_written_again.exchange(0, std::memory_order_relaxed),
+		        .locked  = s_written_locked.exchange(0, std::memory_order_relaxed)};
+	}
+
 	struct DeferredProtect {
 		RegionManager* manager = nullptr;
 		uint64_t       address = 0, size = 0;
@@ -482,6 +502,58 @@ private:
 		DeferScope(const DeferScope&)            = delete;
 		DeferScope& operator=(const DeferScope&) = delete;
 	};
+	static constexpr uint32_t WrittenUploadPasses = 4;
+
+	inline static std::atomic<uint64_t> s_written_uploads {0};
+	inline static std::atomic<uint64_t> s_written_again {0};
+	inline static std::atomic<uint64_t> s_written_locked {0};
+
+	template <bool create, typename RangeFunc>
+	bool TakeWrittenOrHandOver(uint64_t vaddr, uint64_t size, RangeFunc& range_func) {
+		bool written = false;
+		Iterate<create>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			Common::ScopedLock lock(manager->lock);
+			if (manager->IsModified<DirtySource::Cpu>(offset, bytes)) {
+				manager->ForEachModifiedRange<DirtySource::Cpu, true>(offset, bytes, range_func);
+				written = true;
+			} else {
+				manager->ChangeState<DirtySource::Gpu, true>(offset, bytes);
+			}
+		});
+		return written;
+	}
+
+	template <typename RangeFunc, typename UploadFunc>
+	void UploadWritten(uint64_t vaddr, uint64_t size, RangeFunc& range_func, UploadFunc& upload_func) {
+		bool written = TakeWrittenOrHandOver<true>(vaddr, size, range_func);
+		upload_func();
+		ApplyDeferredProtections();
+		for (uint32_t pass = 1; written; pass++) {
+			if (pass == WrittenUploadPasses) {
+				s_written_locked.fetch_add(1, std::memory_order_relaxed);
+				Iterate<false>(vaddr, size,
+				               [&](RegionManager* manager, uint64_t offset, uint64_t bytes) KYTY_NO_THREAD_SAFETY_ANALYSIS {
+					               manager->lock.lock();
+					               manager->ForEachModifiedRange<DirtySource::Cpu, true>(offset, bytes, range_func);
+				               });
+				upload_func();
+				ApplyDeferredProtections();
+				Iterate<false>(vaddr, size,
+				               [](RegionManager* manager, uint64_t offset, uint64_t bytes) KYTY_NO_THREAD_SAFETY_ANALYSIS {
+					               manager->ChangeState<DirtySource::Gpu, true>(offset, bytes);
+					               manager->lock.unlock();
+				               });
+				return;
+			}
+			written = TakeWrittenOrHandOver<false>(vaddr, size, range_func);
+			if (written) {
+				s_written_again.fetch_add(1, std::memory_order_relaxed);
+				upload_func();
+				ApplyDeferredProtections();
+			}
+		}
+	}
+
 	static void ApplyDeferredProtections() {
 		for (const auto& deferred: s_deferred) deferred.manager->ApplyDeferredProtection(deferred.address, deferred.size);
 		s_deferred.clear();

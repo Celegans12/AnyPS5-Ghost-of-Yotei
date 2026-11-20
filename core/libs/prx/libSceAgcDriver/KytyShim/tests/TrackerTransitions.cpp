@@ -5,13 +5,16 @@
 #include "graphics/host_gpu/regionManager.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <new>
 #include <span>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -262,14 +265,127 @@ void NestedUploadsKeepTheirRanges(PageManager& pages) {
 		tracker.MarkRegionAsCpuModified(address, size);
 	}
 }
+
+constexpr uint64_t UploadPages = 4;
+
+struct GuestPages {
+	MemoryTracker*                                 tracker;
+	uint64_t                                       start;
+	std::array<std::atomic<uint32_t>, UploadPages> guest {};
+	std::array<std::atomic<uint32_t>, UploadPages> device {};
+	std::vector<std::pair<uint64_t, uint64_t>>    copies;
+
+	void Take(uint64_t address, uint64_t size) noexcept { copies.emplace_back(address, size); }
+
+	void Copy() noexcept {
+		for (const auto& [address, size]: copies) {
+			for (auto page = (address - start) / TRACKER_PAGE_SIZE; page < (address + size - start) / TRACKER_PAGE_SIZE; page++) {
+				device[page].store(guest[page].load(std::memory_order_acquire), std::memory_order_release);
+			}
+		}
+		copies.clear();
+	}
+
+	void Write(uint64_t page, uint32_t value) {
+		const auto address = start + page * TRACKER_PAGE_SIZE;
+		bool       gpu     = false;
+		tracker->InvalidateRegion(address, 1, [&] { gpu = true; });
+		if (gpu) {
+			guest[page].store(device[page].load(std::memory_order_acquire), std::memory_order_release);
+			tracker->UnmarkRegionAsGpuModified(address, TRACKER_PAGE_SIZE);
+			tracker->MarkRegionAsCpuModified(address, TRACKER_PAGE_SIZE);
+		}
+		guest[page].store(value, std::memory_order_release);
+	}
+
+	void CheckNoWriteLost(const char* what) {
+		for (uint64_t page = 0; page < UploadPages; page++) {
+			const auto address = start + page * TRACKER_PAGE_SIZE;
+			const bool cpu     = tracker->IsRegionCpuModified(address, TRACKER_PAGE_SIZE);
+			const bool gpu     = tracker->IsRegionGpuModified(address, TRACKER_PAGE_SIZE);
+			Check(!(cpu && gpu), what, "a page is written by both the CPU and the GPU");
+			Check(cpu || device[page].load() == guest[page].load(), what,
+			      "a page the tracking no longer sees written by the CPU lost a guest write");
+			Check(gpu, what, "the upload did not hand every page of a buffer the GPU writes to the GPU");
+		}
+	}
+
+	void Reset() {
+		for (uint64_t page = 0; page < UploadPages; page++) {
+			const auto address = start + page * TRACKER_PAGE_SIZE;
+			if (tracker->IsRegionGpuModified(address, TRACKER_PAGE_SIZE)) {
+				tracker->UnmarkRegionAsGpuModified(address, TRACKER_PAGE_SIZE);
+			}
+			tracker->MarkRegionAsCpuModified(address, TRACKER_PAGE_SIZE);
+		}
+	}
+};
+
+void WrittenUploadLosesNoGuestWrite(PageManager& pages) {
+	using namespace std::chrono_literals;
+	MemoryTracker    tracker(pages);
+	GuestPages       memory {.tracker = &tracker, .start = RegionBase + 32 * TRACKER_REGION_SIZE};
+	constexpr auto   Written = 2;
+	std::atomic<int> stage {0};
+	for (auto& value: memory.guest) value.store(1);
+	std::thread game([&] {
+		while (stage.load(std::memory_order_acquire) == 0) std::this_thread::yield();
+		memory.Write(Written, 2);
+		stage.store(2, std::memory_order_release);
+	});
+	uint32_t uploads = 0;
+	bool     waited  = false;
+	tracker.ForEachUploadRange(
+	    memory.start, UploadPages * TRACKER_PAGE_SIZE, true,
+	    [&](uint64_t address, uint64_t size) noexcept { memory.Take(address, size); },
+	    [&]() noexcept {
+		    memory.Copy();
+		    if (uploads++ != 0) return;
+		    stage.store(1, std::memory_order_release);
+		    const auto deadline = std::chrono::steady_clock::now() + 2s;
+		    while (stage.load(std::memory_order_acquire) != 2) {
+			    if (std::chrono::steady_clock::now() > deadline) {
+				    waited = true;
+				    break;
+			    }
+			    std::this_thread::yield();
+		    }
+	    });
+	game.join();
+	Check(!waited, "written upload: a guest write fault waited for the whole copy");
+	Check(uploads >= 2, "written upload: a page the guest wrote during the copy was not copied again");
+	Check(memory.guest[Written].load() == 2, "written upload: the guest write did not land");
+	memory.CheckNoWriteLost("written upload");
+	memory.Reset();
+}
+
+void FaultOnTheUploadingThread(PageManager& pages) {
+	MemoryTracker tracker(pages);
+	GuestPages    memory {.tracker = &tracker, .start = RegionBase + 40 * TRACKER_REGION_SIZE};
+	for (auto& value: memory.guest) value.store(1);
+	uint32_t uploads = 0;
+	tracker.ForEachUploadRange(
+	    memory.start, UploadPages * TRACKER_PAGE_SIZE, true,
+	    [&](uint64_t address, uint64_t size) noexcept { memory.Take(address, size); },
+	    [&]() noexcept {
+		    memory.Copy();
+		    if (uploads++ == 0) memory.Write(1, 3);
+	    });
+	Check(memory.guest[1].load() == 3, "uploading thread: its own write did not land");
+	memory.CheckNoWriteLost("uploading thread");
+	memory.Reset();
+}
 }
 
 int main() {
 	Check(Switches::On(Switches::Switch::TrackerLazyRegions), "KYTY_TRACKER_LAZY_REGIONS is on without the variable");
+	Check(Switches::On(Switches::Switch::WrittenUploadUnlocked), "KYTY_WRITTEN_UPLOAD_UNLOCKED is on without the variable");
 	PageManager pages;
 	QuestionsCreateNoRegion(pages);
 	CallbacksKeepTheirOwnProtections(pages);
 	NestedUploadsKeepTheirRanges(pages);
+	WrittenUploadLosesNoGuestWrite(pages);
+	FaultOnTheUploadingThread(pages);
 	if (g_failures != 0) {
 		std::fprintf(stderr, "kyty_shim_tracker_transitions: %d failure(s)\n", g_failures);
 		return 1;

@@ -715,6 +715,7 @@ void BufferCache::LogWriteBlockSummary() {
 	const auto open     = stats.already_open.exchange(0, std::memory_order_relaxed);
 	const auto cmd_img  = stats.command_image.exchange(0, std::memory_order_relaxed);
 	const auto opened   = RegionManager::TakeOpenedUploadBytes();
+	const auto written  = MemoryTracker::TakeWrittenUploadStats();
 	const auto tracker  = TrackingSpinLock::TakeContention(SpinLockClass::Tracker);
 	const auto pagelock = TrackingSpinLock::TakeContention(SpinLockClass::Pages);
 	const auto textures = TrackingSpinLock::TakeContention(SpinLockClass::Textures);
@@ -730,7 +731,7 @@ void BufferCache::LogWriteBlockSummary() {
 		    static_cast<double>(pagelock.ns) / 1e6, textures.waits, static_cast<double>(textures.ns) / 1e6, others.waits,
 		    static_cast<double>(others.ns) / 1e6));
 	}
-	if (faults == 0 && uploaded == 0) {
+	if (faults == 0 && uploaded == 0 && written.uploads == 0) {
 		return;
 	}
 	::Log::WriteToConsoleAndLog(fmt::format(
@@ -738,10 +739,12 @@ void BufferCache::LogWriteBlockSummary() {
 	    "marked written with them), {} left to the page path; {:.1f} MiB of buffer uploads; faults by owner, first match: {} in "
 	    "a command buffer the CP read, {} elsewhere in a command buffer segment, {} in a block with a page the GPU wrote, {} "
 	    "watched by an image or texture, {} in a buffer of the cache, {} other; {:.1f} MiB of pages opened with a block handed "
-	    "to uploads; {} found their page already open, {} in command memory also watched by an image or table\n",
+	    "to uploads; {} found their page already open, {} in command memory also watched by an image or table; {} uploads of "
+	    "buffers the GPU writes, {} copies made again for pages the guest wrote during the copy, {} uploads that kept the "
+	    "region locks through the copy\n",
 	    seconds, faults, blocks, pages, faults - std::min(faults, blocks),
 	    static_cast<double>(uploaded) / (1024.0 * 1024.0), command, segment, gpu, image, buffer, other,
-	    static_cast<double>(opened) / (1024.0 * 1024.0), open, cmd_img));
+	    static_cast<double>(opened) / (1024.0 * 1024.0), open, cmd_img, written.uploads, written.again, written.locked));
 }
 
 void BufferCache::LogReadbackSummary() {
@@ -1592,7 +1595,6 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	}
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
-	vk::Buffer                  source;
 	const MemoryTracker::UploadScope upload_scope;
 	m_memory_tracker.ForEachUploadRange(
 	    vaddr, size, is_written,
@@ -1601,8 +1603,12 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    total_size += bytes;
 		    NoteUpload(address, bytes);
 	    },
-	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); }, m_device_sync_pass);
-	RecordBufferUpload(buffer, copies, source);
+	    [&]() noexcept {
+		    RecordBufferUpload(buffer, copies, UploadCopies(buffer, copies, total_size));
+		    copies.clear();
+		    total_size = 0;
+	    },
+	    m_device_sync_pass);
 	if (is_texel_buffer && !is_written && !NoImageStartsAt(vaddr)) {
 		return SynchronizeBufferFromImage(buffer, vaddr, size);
 	}
