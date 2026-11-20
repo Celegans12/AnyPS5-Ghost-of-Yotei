@@ -1678,7 +1678,7 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
     : m_graphics(graphics), m_image_heap(image_heap),
       m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
-	InitializeDriverCache();
+	const bool driver_cache_restored = InitializeDriverCache();
 #if defined(ANYPS5_KYTY)
 	if (m_graphics.pipeline_library_enabled) {
 		m_libraries = std::make_unique<PipelineLibraries>(
@@ -1688,9 +1688,9 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 #endif
 	if (Config::PipelineManifestRecord() && !shader_store.empty()) {
 		PipelineCacheLog("Shader cache: not used while the pipeline manifest records");
-		WarmUp({});
+		WarmUp({}, driver_cache_restored);
 	} else {
-		WarmUp(shader_store);
+		WarmUp(shader_store, driver_cache_restored);
 	}
 	StartHelpers();
 	OpenManifest();
@@ -1782,14 +1782,14 @@ PipelineCache::~PipelineCache() {
 	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 }
 
-void PipelineCache::InitializeDriverCache() {
+bool PipelineCache::InitializeDriverCache() {
 	const auto title_id = PipelineCacheTitleId();
 	if (title_id.empty()) {
-		return;
+		return false;
 	}
 	if (KYTY_BUILD != KYTY_BUILD_RELEASE) {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (non-Release build)");
-		return;
+		return false;
 	}
 #if defined(ANYPS5_KYTY)
 	if (m_graphics.pipeline_cache_persistent) {
@@ -1853,7 +1853,7 @@ void PipelineCache::InitializeDriverCache() {
 	if (result != vk::Result::eSuccess) {
 		PipelineCacheLog("Vulkan pipeline cache: disabled ({})", vk::to_string(result));
 		m_driver_cache = nullptr;
-		return;
+		return false;
 	}
 	if (!initial_data.empty()) {
 		PipelineCacheLog("Vulkan pipeline cache: loaded {:.2f} MB from {}",
@@ -1862,7 +1862,7 @@ void PipelineCache::InitializeDriverCache() {
 		PipelineCacheLog("Vulkan pipeline cache: initialized empty");
 	}
 	if (m_driver_cache_path.empty()) {
-		return;
+		return false;
 	}
 	m_driver_cache_posted = std::chrono::steady_clock::now();
 	m_driver_cache_timer = std::jthread([this](const std::stop_token& stop) {
@@ -1872,6 +1872,7 @@ void PipelineCache::InitializeDriverCache() {
 			PostDueDriverCache();
 		}
 	});
+	return !initial_data.empty();
 }
 
 void PipelineCache::CheckpointDriverCache(bool slow_creation) {

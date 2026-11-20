@@ -168,7 +168,8 @@ struct PipelineCache::StoreRecord {
 	ShaderTessellationInputInfo        layout;
 };
 
-void PipelineCache::WarmUp(const std::filesystem::path& path) {
+void PipelineCache::WarmUp(const std::filesystem::path& path,
+                           [[maybe_unused]] bool driver_cache_restored) {
 	if (path.empty()) {
 		return;
 	}
@@ -222,6 +223,8 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 
 	const auto modules = MapModules();
 #if defined(ANYPS5_KYTY)
+	const bool shared = WarmUpSharedCache(m_graphics);
+	const bool lookup = driver_cache_restored && !shared && m_graphics.pipeline_cache_lookup_enabled;
 	std::vector<std::function<void(vk::PipelineCache)>> jobs;
 	jobs.reserve(m_graphics_pipelines.size() + modules.size());
 	for (auto& node: m_graphics_pipelines) {
@@ -240,14 +243,16 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 	for (const auto* module: modules | std::views::values) {
 		if (module != nullptr && module->info.stage == ShaderType::Compute) {
 			module->pipeline_requested = true;
-			jobs.emplace_back([this, module, &pipeline = m_compute_pipelines[module->id]](vk::PipelineCache cache) {
-				CreatePipelineInternal(m_graphics, pipeline, *module, cache);
-			});
+			auto& pipeline = m_compute_pipelines[module->id];
+			if (!lookup || !FindComputePipeline(m_graphics, pipeline, *module, m_driver_cache)) {
+				jobs.emplace_back([this, module, &pipeline](vk::PipelineCache cache) {
+					CreatePipelineInternal(m_graphics, pipeline, *module, cache);
+				});
+			}
 		}
 	}
 	const auto                     threads = WarmUpThreads(jobs.size());
 	std::vector<vk::PipelineCache> caches(threads);
-	const bool                     shared  = WarmUpSharedCache(m_graphics);
 	for (auto& cache: caches) {
 		const vk::PipelineCacheCreateInfo create {};
 		if (shared || m_graphics.device.createPipelineCache(&create, nullptr, &cache) != vk::Result::eSuccess) {

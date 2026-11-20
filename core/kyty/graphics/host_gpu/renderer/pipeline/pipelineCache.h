@@ -774,13 +774,13 @@ private:
 #endif
 	void ClaimPipeline(const GraphicsPipelineKey& key);
 	void ClaimComputePipeline(uint64_t module_id);
-	void InitializeDriverCache();
+	bool InitializeDriverCache();
 	void CheckpointDriverCache(bool slow_creation = false);
 	void NoteCreatedPipeline(std::chrono::steady_clock::time_point started);
 	void PostDueDriverCache();
 	void WriteDriverCache();
 
-	void WarmUp(const std::filesystem::path& path);
+	void WarmUp(const std::filesystem::path& path, bool driver_cache_restored);
 	struct StoreRecord;
 	bool ReadRecord(std::span<const uint8_t> frame, StoreRecord& record) const;
 	bool AddRecord(StoreRecord& record);
