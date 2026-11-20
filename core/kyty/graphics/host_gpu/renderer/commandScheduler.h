@@ -182,6 +182,7 @@ private:
 	std::atomic<bool>           m_flips_pending {false};
 	bool                        m_flip_running KYTY_GUARDED_BY(m_flip_mutex) = false;
 	uint64_t                    m_last_flip_tick = 0;
+	bool                        m_flips_in_place = false;
 	std::once_flag              m_flip_thread_once;
 	std::jthread                m_flip_thread;
 #endif

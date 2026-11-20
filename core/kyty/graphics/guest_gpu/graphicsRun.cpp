@@ -3011,8 +3011,9 @@ void CommandProcessor::ExecuteReleaseMem(uint32_t data_sel, bool interrupt, void
 #else
 	const auto labels_pending = [this] { return m_deferred_labels.load(std::memory_order_acquire); };
 #endif
+	const bool at_completion = InPlaceMemory::Live();
 	if (data_sel != 0 &&
-	    (m_renderer.GetOcclusionQueries().HasPendingDumps() || labels_pending() != 0)) {
+	    (at_completion || m_renderer.GetOcclusionQueries().HasPendingDumps() || labels_pending() != 0)) {
 		const auto     vaddr = reinterpret_cast<uint64_t>(address);
 		const uint64_t size  = data_sel == 1 ? sizeof(uint32_t) : sizeof(uint64_t);
 		auto&          buffers   = m_renderer.GetBufferCache();
@@ -3034,6 +3035,9 @@ void CommandProcessor::ExecuteReleaseMem(uint32_t data_sel, bool interrupt, void
 				g_label_stats.around.fetch_add(1, std::memory_order_relaxed);
 			}
 #endif
+			if (at_completion) {
+				InPlaceMemory::NoteLabelAtCompletion();
+			}
 			m_deferred_labels.fetch_add(1, std::memory_order_relaxed);
 #if defined(ANYPS5_KYTY)
 			s_deferred_labels.fetch_add(1, std::memory_order_relaxed);

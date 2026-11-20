@@ -41,6 +41,8 @@ class Buffer {
 public:
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
 	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size);
+	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address, uint64_t size,
+	       vk::Buffer imported, vk::DeviceAddress device_address);
 	~Buffer();
 	KYTY_CLASS_NO_COPY(Buffer);
 
@@ -52,6 +54,7 @@ public:
 	[[nodiscard]] bool               IsDeviceLocal() const noexcept { return m_device_local; }
 #endif
 	[[nodiscard]] MemoryUsage        Usage() const noexcept { return m_usage; }
+	[[nodiscard]] bool               InPlace() const noexcept { return m_in_place; }
 	[[nodiscard]] uint64_t           CpuAddress() const noexcept { return m_cpu_address; }
 	[[nodiscard]] vk::DeviceAddress  BufferDeviceAddress() const noexcept {
 		EXIT_IF(m_device_address == 0);
@@ -76,6 +79,7 @@ public:
 	int    stream_score = 0;
 	size_t lru_id       = 0;
 	bool device_address_pinned = false;
+	bool in_place_refused      = false;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }
@@ -95,6 +99,7 @@ private:
 	VmaAllocation                 m_allocation = nullptr;
 	uint64_t                      m_size;
 	bool                          m_coherent = false;
+	bool                          m_in_place = false;
 #if defined(ANYPS5_KYTY)
 	bool                          m_device_local = false;
 #endif

@@ -140,6 +140,36 @@ public:
 		       manager->WriteFaultFindsOpen(vaddr % TRACKER_REGION_SIZE, block_size, open_block, gpu);
 	}
 
+	uint64_t SetInPlace(uint64_t vaddr, uint64_t size) {
+		uint64_t pages = 0;
+		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			Common::ScopedLock lock(manager->lock);
+			pages += manager->SetInPlace(offset, bytes);
+		});
+		return pages;
+	}
+
+	uint64_t ClearInPlace(uint64_t vaddr, uint64_t size) {
+		uint64_t pages = 0;
+		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			Common::ScopedLock lock(manager->lock);
+			pages += manager->ClearInPlace(offset, bytes);
+		});
+		return pages;
+	}
+
+	[[nodiscard]] bool TouchesCommandMemory(uint64_t vaddr, uint64_t size) const noexcept {
+		if (size == 0) {
+			return false;
+		}
+		for (auto block = vaddr & ~(CommandBlocks::BlockSize - 1); block < vaddr + size; block += CommandBlocks::BlockSize) {
+			if (m_command_blocks.Contains(block) || m_segment_blocks.Contains(block)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	void MarkCommandBlocks(uint64_t vaddr, uint64_t size) { m_command_blocks.Mark(vaddr, size); }
 	void MarkSegmentBlocks(uint64_t vaddr, uint64_t size) { m_segment_blocks.Mark(vaddr, size); }
 	void ForgetCommandBlocks(uint64_t vaddr, uint64_t size) {

@@ -432,6 +432,16 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	       image_atomic_int64, conditional_rendering, barycentric, compute_derivatives,
 	       acceleration_structure, ray_query, cooperative_matrix, float8] = supported;
 	graphics.memory_budget_ext_enabled = add(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+	if (BufferCache::CommandMemoryInPlaceRequested()) {
+		graphics.host_import_enabled = add(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+		if (graphics.host_import_enabled) {
+			vk::PhysicalDeviceExternalMemoryHostPropertiesEXT host {};
+			vk::PhysicalDeviceProperties2                     host_properties {};
+			host_properties.pNext = &host;
+			physical_device.getProperties2(&host_properties);
+			graphics.host_import_alignment = host.minImportedHostPointerAlignment;
+		}
+	}
 	add(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
 	const bool extended_dynamic_state = add(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME);
 	if (!add(VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME)) {

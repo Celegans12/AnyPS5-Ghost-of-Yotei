@@ -5,11 +5,13 @@
 #include "common/emulatorConfig.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/inPlaceMemory.h"
 #if defined(ANYPS5_KYTY)
 #include "graphics/guest_gpu/graphicsRun.h"
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <limits>
 #include <optional>
 #include <tuple>
@@ -325,7 +327,19 @@ void CommandScheduler::DeferFlipCompletion(Common::UniqueFunction<void>&& comple
 	CheckActive();
 	EXIT_IF(!complete);
 	const uint64_t previous = std::exchange(m_last_flip_tick, CurrentTick());
-	if (!EarlyFlipEnabled()) {
+	if (!m_flips_in_place && InPlaceMemory::Live() && previous < CurrentTick()) {
+		if (EarlyFlipEnabled()) {
+			DrainFlipCompletions();
+		}
+		m_flips_in_place = true;
+	}
+	if (m_flips_in_place && previous != 0 && previous < CurrentTick()) {
+		const auto started = std::chrono::steady_clock::now();
+		m_master.Wait(previous);
+		InPlaceMemory::NoteBoundedFlip(static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()));
+	}
+	if (!EarlyFlipEnabled() || m_flips_in_place) {
 		QueuePriorityOperation(std::move(complete));
 		return;
 	}
@@ -579,6 +593,14 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(m_command.IsInvalid());
 	if (m_submit_hook != nullptr) {
 		m_submit_hook(m_submit_hook_data, m_command);
+	}
+	if (InPlaceMemory::Live()) {
+		m_command.EndRendering();
+		vk::MemoryBarrier host {};
+		host.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+		host.dstAccessMask = vk::AccessFlagBits::eHostRead | vk::AccessFlagBits::eHostWrite;
+		m_command.Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eHost, {},
+		                                   1, &host, 0, nullptr, 0, nullptr);
 	}
 
 	m_command.End();

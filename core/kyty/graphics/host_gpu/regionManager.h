@@ -291,7 +291,7 @@ public:
 		const auto page  = static_cast<size_t>(offset / TRACKER_PAGE_SIZE);
 		const auto first = static_cast<size_t>(offset / block_size * block_size / TRACKER_PAGE_SIZE);
 		const auto last  = first + static_cast<size_t>(block_size / TRACKER_PAGE_SIZE);
-		if (!m_cpu_dirty.Get(page) || m_gpu_dirty.Get(page)) {
+		if ((!m_cpu_dirty.Get(page) && !m_in_place.Get(page)) || m_gpu_dirty.Get(page)) {
 			return false;
 		}
 		*gpu = m_gpu_written.Any(first, last);
@@ -301,6 +301,7 @@ public:
 		RegionBits closed(~m_cpu_dirty, first, last);
 		closed &= RegionBits(~m_gpu_dirty, first, last);
 		closed &= RegionBits(~m_gpu_noted, first, last);
+		closed &= RegionBits(~m_in_place, first, last);
 		return closed.None();
 	}
 
@@ -311,6 +312,14 @@ public:
 	template <DirtySource source, bool enable>
 	void ChangeState(uint64_t offset, uint64_t size) KYTY_REQUIRES(lock) {
 		const auto [start, end] = GetPageRange(offset, size);
+		if constexpr (enable) {
+			if (m_any_in_place && m_in_place.Any(start, end)) {
+				for (const auto [first, last]: RegionBits(~m_in_place, start, end)) {
+					ChangeState<source, enable>(first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
+				}
+				return;
+			}
+		}
 		if constexpr (source == DirtySource::Cpu && enable) {
 			if (m_gpu_dirty.Any(start, end)) {
 				EXIT("CPU dirty state conflicts with GPU dirty state\n");
@@ -471,6 +480,9 @@ public:
 		auto&      written      = m_cpu_written[static_cast<size_t>(consumer)];
 		RegionBits mask(written, start, end);
 		mask |= RegionBits(m_cpu_dirty, start, end);
+		if (m_any_in_place) {
+			mask |= RegionBits(m_in_place, start, end);
+		}
 		written.UnsetRange(start, end);
 		for (const auto [first, last]: mask) {
 			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
@@ -480,14 +492,17 @@ public:
 	template <typename Func>
 	void MarkGpuDirtyUnlessCpuDirty(uint64_t offset, uint64_t size, Func&& func) KYTY_REQUIRES(lock) {
 		const auto [start, end] = GetPageRange(offset, size);
-		m_gpu_written.SetRange(start, end);
-		m_gpu_noted.SetRange(start, end);
+		RegionBits tracked(~m_in_place, start, end);
+		m_gpu_written |= tracked;
+		m_gpu_noted |= tracked;
 		RegionBits mask(~m_cpu_dirty, start, end);
+		mask &= tracked;
 		if (mask.None()) {
 			return;
 		}
 		auto either = m_cpu_dirty;
 		either |= m_gpu_dirty;
+		either |= m_in_place;
 		RegionBits changed(~either, start, end);
 		for (const auto [first, last]: mask) {
 			m_gpu_dirty.SetRange(first, last);
@@ -496,6 +511,50 @@ public:
 		for (const auto [first, last]: mask) {
 			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
 		}
+	}
+
+	uint64_t SetInPlace(uint64_t offset, uint64_t size) KYTY_REQUIRES(lock) {
+		const auto [start, end] = GetPageRange(offset, size);
+		RegionBits newly(~m_in_place, start, end);
+		if (newly.None()) {
+			return 0;
+		}
+		RegionBits clean(~m_cpu_dirty, start, end);
+		clean &= newly;
+		RegionBits gpu(m_gpu_dirty, start, end);
+		gpu &= newly;
+		RegionBits keep(~newly);
+		m_cpu_dirty &= keep;
+		m_gpu_dirty &= keep;
+		m_in_place |= newly;
+		m_any_in_place = true;
+		m_has_cpu_dirty.store(!m_cpu_dirty.None(), std::memory_order_release);
+		UpdateProtection<false, false>(clean);
+		UpdateProtection<false, true>(gpu);
+		m_has_gpu_dirty.store(!m_gpu_dirty.None(), std::memory_order_release);
+		return CountPages(newly);
+	}
+
+	uint64_t ClearInPlace(uint64_t offset, uint64_t size) KYTY_REQUIRES(lock) {
+		if (!m_any_in_place) {
+			return 0;
+		}
+		const auto [start, end] = GetPageRange(offset, size);
+		RegionBits leaving(m_in_place, start, end);
+		if (leaving.None()) {
+			return 0;
+		}
+		m_in_place &= RegionBits(~leaving);
+		m_any_in_place = !m_in_place.None();
+		m_cpu_dirty |= leaving;
+		for (auto& written: m_cpu_written) {
+			written |= leaving;
+		}
+		m_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
+		s_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
+		BdaDirtyRegions::Mark(m_cpu_addr / TRACKER_REGION_SIZE);
+		m_has_cpu_dirty.store(true, std::memory_order_release);
+		return CountPages(leaving);
 	}
 
 	bool CopyCpuDirty(RegionBits& pages) const KYTY_REQUIRES(lock) {
@@ -515,11 +574,22 @@ public:
 	TrackingSpinLock lock {SpinLockClass::Tracker};
 
 private:
+	static uint64_t CountPages(const RegionBits& pages) {
+		uint64_t count = 0;
+		for (const auto [first, last]: pages) {
+			count += last - first;
+		}
+		return count;
+	}
+
 	uint32_t OpenBlockPages(size_t page, size_t first, size_t last) KYTY_REQUIRES(lock) {
 		RegionBits open(~m_gpu_dirty, first, last);
 		RegionBits noted(m_gpu_noted, first, last);
 		noted.Unset(page);
 		open &= ~noted;
+		if (m_any_in_place) {
+			open &= RegionBits(~m_in_place, first, last);
+		}
 		RegionBits clean(~m_cpu_dirty, first, last);
 		clean &= open;
 		uint32_t opened = 0;
@@ -609,6 +679,8 @@ private:
 	RegionBits                 m_gpu_noted KYTY_GUARDED_BY(lock);
 	RegionBits                 m_block_opened KYTY_GUARDED_BY(lock);
 	bool                       m_any_block_opened KYTY_GUARDED_BY(lock) = false;
+	RegionBits                 m_in_place KYTY_GUARDED_BY(lock);
+	bool                       m_any_in_place KYTY_GUARDED_BY(lock) = false;
 	std::unique_ptr<BusyPages> m_busy KYTY_GUARDED_BY(lock);
 	std::atomic<uint32_t>      m_kept_sync {0};
 	std::atomic<uint64_t> m_host_write_epoch {0};

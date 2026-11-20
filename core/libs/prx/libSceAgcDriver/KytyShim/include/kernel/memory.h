@@ -137,6 +137,7 @@ bool TryWriteBackingQwords(uint64_t vaddr, const uint64_t* values, uint32_t coun
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] const void* FindBackingPointer(uint64_t vaddr, uint64_t size);
+[[nodiscard]] bool GuestViewRange(const uint8_t** base, uint64_t* guest_bytes, uint64_t* view_bytes);
 bool TryGetBackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces);
 bool TryGetSparseBackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces);
 bool DiscardBacking(uint64_t address, uint64_t size);

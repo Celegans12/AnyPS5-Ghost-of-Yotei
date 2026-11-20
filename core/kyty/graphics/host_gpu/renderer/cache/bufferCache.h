@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
+#include "graphics/host_gpu/renderer/cache/inPlaceMemory.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
@@ -104,6 +105,11 @@ public:
 	enum class WriteFaultOwner : uint8_t { CommandBuffer, CommandSegment, GpuNeighbor, Buffer, Other };
 	WriteFaultOwner        InvalidateFaultedPage(uint64_t vaddr);
 	static void            CountWriteFault(WriteFaultOwner owner, bool image);
+	[[nodiscard]] static bool CommandMemoryInPlaceRequested() noexcept { return InPlaceMemory::Requested(); }
+	[[nodiscard]] bool        ServesInPlace(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] uint64_t    InPlaceGpuWriteTick(uint64_t vaddr, uint64_t size) const;
+	void                      NoteInPlaceGpuWrite(uint64_t vaddr, uint64_t size);
+	void                      ServeInPlaceConversions();
 	void NoteCommandBuffer(uint64_t vaddr, uint64_t size) {
 		if (size != 0 && GuestRange {vaddr, size}.Valid()) {
 			m_memory_tracker.MarkCommandBlocks(vaddr, size);
@@ -181,7 +187,7 @@ public:
 	void        WaitReadbackRelease();
 	[[nodiscard]] bool WriteAroundGpuWrites(uint64_t vaddr, const void* data, uint64_t size);
 	[[nodiscard]] bool MayBeGpuModified(uint64_t vaddr, uint64_t size) const {
-		return m_memory_tracker.MayBeGpuModified(vaddr, size);
+		return m_memory_tracker.MayBeGpuModified(vaddr, size) || InPlaceGpuWriteTick(vaddr, size) != 0;
 	}
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
@@ -329,6 +335,7 @@ private:
 	[[nodiscard]] uint64_t InFlightReadbackTick(uint64_t begin, uint64_t end) const;
 	void ReleaseReadback(uint64_t vaddr, uint64_t size, uint64_t pages_begin, uint64_t pages_end,
 	                     uint64_t tick, bool is_write);
+	std::unique_ptr<InPlaceMemory> m_in_place;
 	struct CopyFeedback;
 	std::unique_ptr<CopyFeedback> m_copy_feedback;
 	size_t                        m_copy_feedback_entries = 0;

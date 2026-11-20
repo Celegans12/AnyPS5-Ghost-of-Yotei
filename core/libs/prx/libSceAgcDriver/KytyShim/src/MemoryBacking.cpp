@@ -865,6 +865,15 @@ const void* FindBackingPointer(uint64_t vaddr, uint64_t size) {
 	return split ? nullptr : result;
 }
 
+bool GuestViewRange(const uint8_t** base, uint64_t* guest_bytes, uint64_t* view_bytes) {
+	if (!Shim::ViewEnabled()) return false;
+	const auto& state = State();
+	*base = state.base;
+	*guest_bytes = state.guest_bytes;
+	*view_bytes = state.view_bytes;
+	return true;
+}
+
 bool TryGetBackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces) {
 	pieces.clear();
 	if (!ValidRange(vaddr, size) || !Shim::ViewEnabled()) return false;
