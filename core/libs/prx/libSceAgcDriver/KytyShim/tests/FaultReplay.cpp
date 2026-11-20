@@ -2,14 +2,16 @@
 
 #include <array>
 #include <atomic>
-#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
+#ifndef _WIN32
+#include <csignal>
 #include <sys/mman.h>
 #include <unistd.h>
+#endif
 
 namespace {
 
@@ -24,9 +26,12 @@ std::uint8_t*              g_backing = nullptr;
 std::atomic<int>           g_replays {0};
 std::atomic<int>           g_fallbacks {0};
 std::atomic<int>           g_traps {0};
+std::atomic<bool>          g_eligible {true};
+#ifndef _WIN32
 std::atomic<bool>          g_raise_on_replay {false};
 std::atomic<int>           g_user_traps {-1};
 std::atomic<std::uint64_t> g_user_value {0};
+#endif
 
 void Require(bool condition, const char* message) {
     if (condition) return;
@@ -47,16 +52,52 @@ const void* Backing(std::uint64_t ea, std::uint64_t size) {
     return g_backing + (ea - guest);
 }
 
+bool ProtectGuest(bool readable) {
+#ifdef _WIN32
+    DWORD previous;
+    return VirtualProtect(g_guest, PageSize, readable ? PAGE_READONLY : PAGE_NOACCESS, &previous) != 0;
+#else
+    return ::mprotect(g_guest, PageSize, readable ? PROT_READ : PROT_NONE) == 0;
+#endif
+}
+
+bool ReplayReadFault(Replay::Context& context, std::uint64_t address) {
+    const auto eligible = [](std::uint64_t, std::uint64_t) { return g_eligible.load(); };
+    if (!Replay::Start(context, address, eligible, Backing)) return false;
+    ++g_replays;
+    return true;
+}
+
+#ifdef _WIN32
+LONG CALLBACK OnVectoredException(EXCEPTION_POINTERS* exception) {
+    const auto& record = *exception->ExceptionRecord;
+    auto& context = *exception->ContextRecord;
+    if (record.ExceptionCode == EXCEPTION_SINGLE_STEP) {
+        if (!Replay::Finish(context)) return EXCEPTION_CONTINUE_SEARCH;
+        ++g_traps;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if (record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record.NumberParameters < 2 ||
+        record.ExceptionInformation[0] != 0) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    const auto address = record.ExceptionInformation[1];
+    const auto guest = reinterpret_cast<std::uint64_t>(g_guest);
+    if (address < guest || address - guest >= PageSize) return EXCEPTION_CONTINUE_SEARCH;
+    if (ReplayReadFault(context, address)) return EXCEPTION_CONTINUE_EXECUTION;
+    ++g_fallbacks;
+    return ProtectGuest(true) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+}
+#else
 void OnSegv(int, siginfo_t* info, void* native) {
     auto&      context = *static_cast<ucontext_t*>(native);
     const auto address = reinterpret_cast<std::uint64_t>(info->si_addr);
-    if (Replay::Start(context, address, [](std::uint64_t, std::uint64_t) { return true; }, Backing)) {
-        g_replays++;
+    if (ReplayReadFault(context, address)) {
         if (g_raise_on_replay.exchange(false)) ::raise(SIGUSR1);
         return;
     }
     g_fallbacks++;
-    ::mprotect(g_guest, PageSize, PROT_READ);
+    (void)ProtectGuest(true);
 }
 
 void OnTrap(int, siginfo_t*, void* native) {
@@ -81,6 +122,7 @@ void Install(int number, void (*handler)(int, siginfo_t*, void*), int blocked) {
     if (blocked != 0) sigaddset(&action.sa_mask, blocked);
     Require(::sigaction(number, &action, nullptr) == 0, "sigaction failed");
 }
+#endif
 
 struct Outcome {
     int replays;
@@ -88,12 +130,16 @@ struct Outcome {
 };
 
 template <typename Body>
-Outcome Run(Body&& body) {
-    Require(::mprotect(g_guest, PageSize, PROT_NONE) == 0, "mprotect failed");
+Outcome Run(Body&& body, bool eligible = true) {
+    g_eligible = eligible;
+    Require(ProtectGuest(false), "could not protect the guest view");
     const int replays   = g_replays;
     const int fallbacks = g_fallbacks;
+    const int traps     = g_traps;
     body();
-    return {g_replays - replays, g_fallbacks - fallbacks};
+    const Outcome outcome {g_replays - replays, g_fallbacks - fallbacks};
+    Require(g_traps - traps == outcome.replays, "a replay did not receive exactly one single-step event");
+    return outcome;
 }
 
 std::uint64_t Address(std::size_t offset) {
@@ -205,6 +251,10 @@ void Replaying() {
     Require(result.replays == 1 && result.fallbacks == 0, "mov r, [rdx] was not replayed");
     Require(value == Word && base == Address(64), "mov r, [rdx] read a wrong value or left rdx shifted");
 
+    result = Run([&] { value = LoadThrough(Address(64), base); }, false);
+    Require(result.replays == 0 && result.fallbacks == 1, "a read outside the eligible range was replayed");
+    Require(value == Word && base == Address(64), "an ineligible read fell back with the wrong state");
+
     result = Run([&] { value = LoadSelf(Address(64)); });
     Require(result.replays == 1 && result.fallbacks == 0, "mov rdx, [rdx] was not replayed");
     Require(value == Word, "mov rdx, [rdx] read a wrong value");
@@ -237,6 +287,7 @@ void Replaying() {
         Require(value == (Word & 0xFFFFu), "bzhi rax, [rcx], rdx read a wrong value");
     }
 
+#ifndef _WIN32
     const int traps   = g_traps;
     g_raise_on_replay = true;
     result            = Run([&] { value = LoadThrough(Address(64), base); });
@@ -244,27 +295,46 @@ void Replaying() {
     Require(value == Word && base == Address(64), "a signal pending during a replay broke the replayed read");
     Require(g_user_traps == traps + 1, "a signal pending during a replay ran before the replayed instruction");
     Require(g_user_value == Word, "a signal handler read a wrong value during a replay");
+#endif
 }
 
 }
 
 int main() {
     Decoding();
+#ifdef _WIN32
+    const HANDLE mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, PageSize, nullptr);
+    Require(mapping != nullptr, "could not create the page mapping");
+    g_guest   = static_cast<std::uint8_t*>(MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, PageSize));
+    g_backing = static_cast<std::uint8_t*>(MapViewOfFile(mapping, FILE_MAP_WRITE, 0, 0, PageSize));
+    CloseHandle(mapping);
+    Require(g_guest != nullptr && g_backing != nullptr, "could not map both views");
+#else
     const int file = ::memfd_create("kyty-fault-replay", 0);
     Require(file >= 0 && ::ftruncate(file, PageSize) == 0, "memfd failed");
     g_guest   = static_cast<std::uint8_t*>(::mmap(nullptr, PageSize, PROT_NONE, MAP_SHARED, file, 0));
     g_backing = static_cast<std::uint8_t*>(::mmap(nullptr, PageSize, PROT_READ | PROT_WRITE, MAP_SHARED, file, 0));
     Require(g_guest != MAP_FAILED && g_backing != MAP_FAILED, "mmap failed");
+#endif
     const auto guest = reinterpret_cast<std::uint64_t>(g_guest);
     std::memcpy(g_backing, &guest, sizeof(guest));
     const std::uint64_t one = 1;
     std::memcpy(g_backing + 8, &one, sizeof(one));
     g_backing[16] = Byte;
     std::memcpy(g_backing + 64, &Word, sizeof(Word));
+#ifdef _WIN32
+    void* handler = AddVectoredExceptionHandler(1, OnVectoredException);
+    Require(handler != nullptr, "could not install the vectored exception handler");
+#else
     Install(SIGSEGV, OnSegv, SIGUSR1);
     Install(SIGTRAP, OnTrap, 0);
     Require(std::signal(SIGUSR1, OnUser) != SIG_ERR, "signal failed");
+#endif
     Replaying();
+#ifdef _WIN32
+    Require(RemoveVectoredExceptionHandler(handler) != 0, "could not remove the vectored exception handler");
+    Require(UnmapViewOfFile(g_guest) != 0 && UnmapViewOfFile(g_backing) != 0, "could not unmap both views");
+#endif
     std::puts("kyty_shim_fault_replay: ok");
     return 0;
 }
