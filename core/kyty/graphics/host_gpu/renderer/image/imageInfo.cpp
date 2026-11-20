@@ -74,6 +74,16 @@ vk::Extent3D ImageInfo::MipExtent(uint32_t level) const {
 	        IsVolume() ? std::max(extent.depth >> level, 1u) : resources.layers};
 }
 
+bool ImageInfo::HasTiledLayout() const {
+	TileTextureElementLayout element {};
+	if (samples > 1 || !IsTiled() || (IsDepthPlane(*this) && resources.levels == 1) ||
+	    !TileGetTextureElementLayout(guest_format, element)) {
+		return true;
+	}
+	TileTextureBlockLayout layout {};
+	return TileGetTextureBlockLayout(guest_format, tile_mode, IsVolume(), layout);
+}
+
 void ImageInfo::UpdateSize() {
 	EXIT_IF(guest_format == Prospero::BufferFormat::kInvalid || extent.width == 0 ||
 	        extent.height == 0 || extent.depth == 0 || resources.levels == 0 ||

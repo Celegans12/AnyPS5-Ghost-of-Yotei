@@ -49,6 +49,7 @@ struct TextureDescDerivation {
 	vk::Format              view_format       = vk::Format::eUndefined;
 	uint64_t                size              = 0;
 	std::string unsupported;
+	bool        unknown_tiling = false;
 	struct Found {
 		ImageId                 id;
 		TextureCache::ImageDesc desc;
