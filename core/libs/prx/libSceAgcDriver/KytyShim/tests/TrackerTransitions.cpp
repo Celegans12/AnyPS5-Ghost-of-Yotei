@@ -1,4 +1,3 @@
-#include "common/runtimeSwitches.h"
 #include "graphics/host_gpu/bdaDirtyRegions.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/pageManager.h"
@@ -71,8 +70,7 @@ void operator delete[](void* memory, std::size_t, std::align_val_t) noexcept {
 
 namespace {
 
-namespace Bda      = Libs::Graphics::BdaDirtyRegions;
-namespace Switches = Common::RuntimeSwitches;
+namespace Bda = Libs::Graphics::BdaDirtyRegions;
 using Libs::Graphics::MemoryTracker;
 using Libs::Graphics::PageManager;
 using Libs::Graphics::RegionManager;
@@ -146,12 +144,6 @@ void QuestionsCreateNoRegion(PageManager& pages) {
 	Check(modified, "questions: a range that starts in a region never tracked is not written");
 	Check(tracker.RegionCpuDirtyEpoch(region) == 0, "questions: a question across two regions created the first");
 	Check(RegionManager::CpuDirtyEpoch() == global + 1, "questions: a question across two regions advanced the epoch");
-
-	Switches::Assign(Switches::Switch::TrackerLazyRegions, false);
-	Check(tracker.IsRegionCpuModified(next - TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE),
-	      "questions: the switch turned off does not answer as before");
-	Check(tracker.RegionCpuDirtyEpoch(region) != 0, "questions: the switch turned off does not create the region as before");
-	Switches::Assign(Switches::Switch::TrackerLazyRegions, true);
 	tracker.MarkRegionAsCpuModified(next, TRACKER_PAGE_SIZE);
 }
 
@@ -378,8 +370,6 @@ void FaultOnTheUploadingThread(PageManager& pages) {
 }
 
 int main() {
-	Check(Switches::On(Switches::Switch::TrackerLazyRegions), "KYTY_TRACKER_LAZY_REGIONS is on without the variable");
-	Check(Switches::On(Switches::Switch::WrittenUploadUnlocked), "KYTY_WRITTEN_UPLOAD_UNLOCKED is on without the variable");
 	PageManager pages;
 	QuestionsCreateNoRegion(pages);
 	CallbacksKeepTheirOwnProtections(pages);

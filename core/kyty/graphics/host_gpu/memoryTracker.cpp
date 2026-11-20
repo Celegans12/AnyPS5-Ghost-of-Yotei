@@ -2,7 +2,6 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
-#include "common/runtimeSwitches.h"
 
 namespace Libs::Graphics {
 
@@ -72,11 +71,6 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 }
 
 bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
-	if (!Common::RuntimeSwitches::On(Common::RuntimeSwitches::Switch::TrackerLazyRegions)) {
-		return Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-			return manager->IsModifiedUnlocked<DirtySource::Cpu>(offset, bytes);
-		});
-	}
 	ValidateRange(vaddr, size);
 	const auto last = (vaddr + size - 1) / TRACKER_REGION_SIZE;
 	for (auto index = vaddr / TRACKER_REGION_SIZE; index <= last; index++) {

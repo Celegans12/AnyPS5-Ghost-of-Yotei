@@ -2,7 +2,6 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_MEMORYTRACKER_H_
 
 #include "common/assert.h"
-#include "common/runtimeSwitches.h"
 #include "graphics/host_gpu/commandBlocks.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/rangeSet.h"
@@ -344,18 +343,15 @@ public:
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
 		if (is_written) {
 			s_written_uploads.fetch_add(1, std::memory_order_relaxed);
-			if (Common::RuntimeSwitches::On(Common::RuntimeSwitches::Switch::WrittenUploadUnlocked)) {
-				UploadWritten(vaddr, size, range_func, upload_func);
-				return;
-			}
-			s_written_locked.fetch_add(1, std::memory_order_relaxed);
+			UploadWritten(vaddr, size, range_func, upload_func);
+			return;
 		}
-		const bool defer = !is_written && DeferProtections();
-		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) KYTY_NO_THREAD_SAFETY_ANALYSIS {
-			if (!is_written && !manager->IsModifiedUnlocked<DirtySource::Cpu>(offset, bytes)) {
+		const bool defer = DeferProtections();
+		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			if (!manager->IsModifiedUnlocked<DirtySource::Cpu>(offset, bytes)) {
 				return;
 			}
-			if (!is_written && device_sync != 0) {
+			if (device_sync != 0) {
 				const std::pair<uint64_t, uint64_t> range {offset, bytes};
 				Common::ScopedLock                    lock(manager->lock);
 				DeferScope deferred(defer, manager);
@@ -367,24 +363,12 @@ public:
 				}
 				return;
 			}
-			manager->lock.lock();
-			{
-				DeferScope deferred(defer, manager);
-				manager->ForEachModifiedRange<DirtySource::Cpu, true>(offset, bytes, range_func, deferred.Sink());
-			}
-			if (!is_written) {
-				manager->lock.unlock();
-			}
+			Common::ScopedLock lock(manager->lock);
+			DeferScope         deferred(defer, manager);
+			manager->ForEachModifiedRange<DirtySource::Cpu, true>(offset, bytes, range_func, deferred.Sink());
 		});
 		upload_func();
 		ApplyDeferredProtections();
-		if (is_written) {
-			Iterate<false>(vaddr, size,
-			               [](RegionManager* manager, uint64_t offset, uint64_t bytes) KYTY_NO_THREAD_SAFETY_ANALYSIS {
-				               manager->ChangeState<DirtySource::Gpu, true>(offset, bytes);
-				               manager->lock.unlock();
-			               });
-		}
 	}
 
 	template <typename RangeFunc, typename UploadFunc>

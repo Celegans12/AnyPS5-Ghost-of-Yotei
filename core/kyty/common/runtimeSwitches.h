@@ -14,8 +14,6 @@ namespace Common::RuntimeSwitches {
 enum class Switch : uint32_t {
 	FlatDefer,
 	GenericComputeVariant,
-	TrackerLazyRegions,
-	WrittenUploadUnlocked,
 	Count
 };
 
