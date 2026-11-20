@@ -335,6 +335,42 @@ void Translator::V_LERP_U8(const Decoder::Instruction& inst) {
 	WriteOperand(DestinationOperand(inst), result);
 }
 
+void Translator::V_QSAD_U8(const Decoder::Instruction& inst, bool masked, bool wide) {
+	EXIT_IF(inst.dst.clamp);
+	const auto source      = ReadU32Pair(inst.src0);
+	const auto reference   = ReadU32(inst.src1);
+	const auto accumulator = ReadU32Pair(inst.src2);
+	const auto sad         = [&](uint32_t shift) {
+		auto window = source[0];
+		if (shift != 0u) {
+			window = ir.BitwiseOr(ir.ShiftRightLogical(source[0], IR::U32(IR::Value(shift))),
+			                      ir.ShiftLeftLogical(source[1], IR::U32(IR::Value(32u - shift))));
+		}
+		return PackedSad(window, reference, 8u, masked);
+	};
+	const auto destination = DestinationOperand(inst);
+	if (wide) {
+		EXIT_IF(inst.src2.kind != Decoder::OperandKind::Sgpr &&
+		        inst.src2.kind != Decoder::OperandKind::Vgpr);
+		const auto accumulator_high = ReadU32Pair(OffsetOperand(inst.src2, 2u));
+		WriteU32Pair(destination,
+		             {ir.IAdd(sad(0u), accumulator[0]), ir.IAdd(sad(8u), accumulator[1])});
+		WriteU32Pair(OffsetOperand(destination, 2u),
+		             {ir.IAdd(sad(16u), accumulator_high[0]),
+		              ir.IAdd(sad(24u), accumulator_high[1])});
+		return;
+	}
+	const auto packed = [&](IR::U32 addend, uint32_t shift) {
+		const auto low  = ir.BitwiseAnd(ir.IAdd(ir.BitwiseAnd(addend, IR::U32(IR::Value(0xffffu))),
+		                                        sad(shift)),
+		                                IR::U32(IR::Value(0xffffu)));
+		const auto high = ir.IAdd(ir.ShiftRightLogical(addend, IR::U32(IR::Value(16u))),
+		                          sad(shift + 8u));
+		return ir.BitwiseOr(low, ir.ShiftLeftLogical(high, IR::U32(IR::Value(16u))));
+	};
+	WriteU32Pair(destination, {packed(accumulator[0], 0u), packed(accumulator[1], 16u)});
+}
+
 void Translator::S_BITSET_B32(const Decoder::Instruction& inst, bool set) {
 	const auto offset = ir.BitwiseAnd(ReadU32(inst.src0), IR::U32(IR::Value(31u)));
 	const auto bit    = ir.ShiftLeftLogical(IR::U32(IR::Value(1u)), offset);

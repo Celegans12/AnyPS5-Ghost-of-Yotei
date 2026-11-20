@@ -598,6 +598,9 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_SAD_U32: return V_SAD_U32(inst);
 		case O::V_MSAD_U8: return V_MSAD_U8(inst);
 		case O::V_LERP_U8: return V_LERP_U8(inst);
+		case O::V_QSAD_PK_U16_U8: return V_QSAD_U8(inst, false, false);
+		case O::V_MQSAD_PK_U16_U8: return V_QSAD_U8(inst, true, false);
+		case O::V_MQSAD_U32_U8: return V_QSAD_U8(inst, true, true);
 		case O::V_ADD3_U32: return Integer3(inst, IR::ValueOpcode::IAdd32, IR::ValueOpcode::IAdd32);
 		case O::V_BCNT_U32_B32: return V_BCNT_U32_B32(inst);
 		case O::V_MBCNT_LO_U32_B32: return V_MBCNT_U32_B32(inst, true);

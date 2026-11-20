@@ -224,6 +224,7 @@ private:
 	void V_SAD_U32(const Decoder::Instruction& inst);
 	void V_MSAD_U8(const Decoder::Instruction& inst);
 	void V_LERP_U8(const Decoder::Instruction& inst);
+	void V_QSAD_U8(const Decoder::Instruction& inst, bool masked, bool wide);
 	void S_BITSET_B32(const Decoder::Instruction& inst, bool set);
 	void S_BITSET_B64(const Decoder::Instruction& inst, bool set);
 	void V_BCNT_U32_B32(const Decoder::Instruction& inst);

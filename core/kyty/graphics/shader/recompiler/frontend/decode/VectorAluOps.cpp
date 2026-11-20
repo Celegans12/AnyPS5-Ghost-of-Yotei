@@ -289,6 +289,9 @@ constexpr OpcodeMap VOP3_OPCODE_LIST[] = {
     {0x15cu, Opcode::V_SAD_U16},
     {0x15du, Opcode::V_SAD_U32},
     {0x171u, Opcode::V_MSAD_U8},
+    {0x172u, Opcode::V_QSAD_PK_U16_U8},
+    {0x173u, Opcode::V_MQSAD_PK_U16_U8},
+    {0x175u, Opcode::V_MQSAD_U32_U8},
     {0x15eu, Opcode::V_CVT_PK_U8_F32},
     {0x178u, Opcode::V_XOR3_B32},
     {0x12fu, Opcode::V_CVT_PKRTZ_F16_F32},
@@ -1672,6 +1675,15 @@ void DecodeVopc(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	ReadLiteralOperands(code, word_index, inst);
 }
 
+uint32_t Vop3DestinationDwords(Opcode opcode) {
+	switch (opcode) {
+		case Opcode::V_QSAD_PK_U16_U8:
+		case Opcode::V_MQSAD_PK_U16_U8: return 2;
+		case Opcode::V_MQSAD_U32_U8: return 4;
+		default: return 1;
+	}
+}
+
 void DecodeVop3(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                 Instruction& inst) {
 	const uint32_t word0  = code[word_index];
@@ -1750,6 +1762,7 @@ void DecodeVop3(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	} else {
 		DecodeVectorGpr(vdst, inst.dst);
 	}
+	inst.data_dwords = Vop3DestinationDwords(inst.opcode);
 	DecodeScalarSource(src0, pc, inst.src0);
 	inst.dst.clamp = native_clamp_modifier && clamp != 0u;
 	inst.dst.omod  = native_result_modifiers ? omod : 0u;

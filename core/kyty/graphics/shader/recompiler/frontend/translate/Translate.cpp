@@ -879,6 +879,13 @@ void IncludeInstructionVectorRegisters(const Decoder::Instruction& inst, uint32_
 		case Decoder::Opcode::V_CVT_F64_I32:
 		case Decoder::Opcode::V_CVT_F64_F32:
 		case Decoder::Opcode::V_CVT_F64_U32: include_vector(inst.dst, 2u); break;
+		case Decoder::Opcode::V_QSAD_PK_U16_U8:
+		case Decoder::Opcode::V_MQSAD_PK_U16_U8:
+		case Decoder::Opcode::V_MQSAD_U32_U8:
+			include_vector(inst.dst, inst.data_dwords);
+			include_vector(inst.src0, 2u);
+			include_vector(inst.src2, inst.data_dwords);
+			break;
 		case Decoder::Opcode::V_FMA_F64: include_vector(inst.src2, 2u); [[fallthrough]];
 		case Decoder::Opcode::V_ADD_F64:
 		case Decoder::Opcode::V_MIN_F64:
