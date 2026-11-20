@@ -163,8 +163,6 @@ AnyPS5 opens the window, so Kyty's window options do nothing; `ANYPS5_FULLSCREEN
 
 | Variable | Values | Default | Effect | Category | Platform | Origin |
 |---|---|---|---|---|---|---|
-| `KYTY_BORDERLESS` | any value | unset | Borderless window flag, set in `window.cpp`, which is not built | inert | — | KytyPS5 |
-| `KYTY_OPENXR` | `0` | unset | Skips OpenXR start-up; read in `openxrHeadset.cpp`, which is not built | inert | — | KytyPS5 |
 | `KYTY_HDR` | `0` or `1`, else stops | `0` | Asks for an HDR10 swapchain format; without one the log says `HDR10 surface unavailable; using SDR output` | option | all | Kyty option |
 | `KYTY_STRETCH` | `0` or `1`, else stops | `0` | Fills the whole window with the game's image instead of fitting its aspect ratio | option | all | Kyty option |
 | `KYTY_PRESENT_MODE` | `Fifo`, `Mailbox`, `Immediate`, any case, else stops | `Mailbox` | Vulkan present mode of the swapchain; `ANYPS5_PRESENT_MODE` is not read with this backend | option | all | Kyty option |
@@ -211,7 +209,6 @@ The table draws are GPU-driven draws of a shader pair's table programs; the nati
 | `KYTY_DRAW_BUFFERS` | `1`; other text is off | on (KytyPS5: off) | Copies the small read-only buffer ranges of a draw to the stream buffer together before its stages bind them | perf | all | Kyty import; on by default `50d7c13842` |
 | `KYTY_TABLE_XPR` | `0`, `1`, `2` (read in base 0) | `2` | Table draws: `0` off, `1` on, `2` also continues runs of clean draws, which the command processor's `DrawStateObserver` finds | perf | all | Kyty import |
 | `KYTY_TABLE_DISPATCH` | `0`, `1` | `0`; `1` for Demon's Souls (`PPSA01340` to `PPSA01342`) | Dispatches of a shader pair that learned its table program go through the table | perf | all | Kyty import |
-| `KYTY_TABLE_INDIRECT` | number | `1` | Read and never used: the indirect-table code is compiled out (`KYTY_CX_INDIRECT` is 0) | inert | — | Kyty import |
 | `KYTY_TABLE_STORE_BUDGET` | number; `0` no limit | `32` | Table stores a frame asks for; the others are deferred to the normal path | perf | all | Kyty import |
 | `KYTY_TABLE_SET_PROOFS` | `0`, `1`, `2` | `1` | Checks of a table's image sets: `0` checks every use in full, `1` skips a use whose proof still holds, `2` does and counts the uses a proof held for that did not pass | perf | all | Kyty import |
 | `KYTY_TABLE_MRU` | bit mask | `7` | Bit `1` a larger pair cache, `2` variant hints, `4` reuse of the previous draw's set when its words match | perf | all | Kyty import |
@@ -267,7 +264,6 @@ The table draws are GPU-driven draws of a shader pair's table programs; the nati
 | `KYTY_COPY_FEEDBACK` | `0` is off | on | After a small GPU copy into guest memory, snapshots the destination so that a later guest read is served from the snapshot instead of a readback | perf | all | Kyty import |
 | `KYTY_ASYNC_REPROTECT` | `0` is off | on | The write protection of the pages an upload marks clean is applied by the host copy thread, ahead of the copy | perf | all | Kyty import |
 | `KYTY_ASYNC_IMAGE_STAGING` | `0` or `1`; empty counts as unset | on for Demon's Souls, else off | The staging copies of image uploads run on the host copy thread | perf | all | Kyty import |
-| `KYTY_ENGINE_FREE_BUFFERS` | `0` off, `2` drops GPU-written bytes, else on | on | Buffers over a block the game freed and kept mapped go as for an unmap. Its only entry, `NoteGameFree`, has no caller in this build: it belongs to Demon's Souls' page-free hook, which is not imported | inert | — | Kyty import |
 | `KYTY_EARLY_FLIP` | `0` or `1`, empty counts as unset, else stops | on | Completes a guest flip once its command buffer is submitted, on a thread of its own; `0` is KytyPS5's behaviour. See [below](#details) | perf | all | `499dfc3f39` |
 | `KYTY_LABELS_AFTER_DUMPS` | `0` or `1`, empty counts as unset, else stops | on | A deferred `RELEASE_MEM` label waits for the newest pending occlusion dump instead of its own command buffer; `0` is KytyPS5's behaviour. See [below](#details) | perf | all | `ef88cc3285` |
 | `KYTY_LABELS_AROUND_GPU_WRITES` | `0` or `1`, empty counts as unset, else stops | on | A `RELEASE_MEM` label that arrives while other labels are deferred, on a page the GPU wrote elsewhere but none of whose own bytes it wrote, is deferred behind them instead of draining the GPU; `0` drains. See [below](#details) | perf | all | AnyKyty |
@@ -293,7 +289,6 @@ This build does not read KytyPS5's `KYTY_PIPELINE_PRECOMPILE`: stopping the game
 | `KYTY_PIPELINE_MANIFEST` | `0` or `1`, else stops | `1` | Warms the pipelines listed in the title's manifest (shipped with the assets, or recorded in an earlier session) at start | perf | all | Kyty option |
 | `KYTY_RECORD_PIPELINE_MANIFEST` | `0` or `1`, else stops | `0` | Records the pipelines of the session as a manifest even when the manifest is off; the shader store is not used while it records | debug | all | Kyty option |
 | `KYTY_STRICT_PIPELINE_MANIFEST` | `0` or `1`, else stops | `0` (the build's `KYTY_STRICT_PIPELINE_MANIFEST_DEFAULT`) | A pipeline of a shipped manifest that fails to build stops the emulator instead of being dropped | debug | all | Kyty option |
-| `KYTY_PIPELINE_HELPERS` | number | unset | Number of helper processes that compile pipelines. They are never started in this build: `PipelineHelperProcesses` returns 0 on Linux and when `ANYPS5_KYTY` is defined | inert | — | Kyty import |
 | `KYTY_SHADER_CACHE` | `0` or `1`, else stops | `1` (KytyPS5: `0`) | Keeps recompiled shaders in `_PipelineCache/<title id>.shaders` and warms them up at start; a Release build only, and not while `KYTY_GRAPHICS_DEBUG_DUMP` or the manifest recording is on. A second start loads them instead of translating the shaders again: on a 16-core Ryzen with an RTX 5080, one title loaded 900 modules and 314 pipelines in 534 ms where it had translated 610 modules in 2.4 to 3.0 s, with the same frame rate and the same images. The first start of a title gains nothing | perf | all | Kyty option; on by default in AnyKyty |
 | `KYTY_SHADER_CACHE_STAMP` | integer in base 0, else ignored | the stamp the build computes from the shader recompiler's sources | Replaces the stamp written in the shader store's header; `0` turns the store off | debug | all | `4749ffc567` |
 | `KYTY_SHADER_CACHE_THREADS` | whole number, `0` or text is ignored | `Common::ParallelThreads()`, at most the number of jobs | Threads that warm the shader store up | perf | all | `4749ffc567` |
@@ -321,7 +316,6 @@ This build does not read KytyPS5's `KYTY_PIPELINE_PRECOMPILE`: stopping the game
 | `KYTY_PRINTF_DIRECTION` | `Silent`, `Console`, `File`, any case, else stops | `Silent` | Where Kyty's log (`LOGF`) goes: nowhere, stderr beside AnyPS5's own lines, or `KYTY_PRINTF_OUTPUT_FILE` | debug | all | Kyty option |
 | `KYTY_PRINTF_OUTPUT_FILE` | path | `_kyty.txt` | File of the `File` direction | debug | all | Kyty option |
 | `KYTY_SESSION_LOG` | path | empty | Session log file, opened at start with a header | debug | all | Kyty option |
-| `KYTY_RELAUNCHED` | any value | unset | KytyPS5's launcher sets it when it starts the emulator again, and KytyPS5's `common/logging/log.cpp`, which is not built, then appends to the log files. The shim's log does not read it: its files are truncated at each start | inert | — | KytyPS5 |
 | `KYTY_SHADER_LOG_DIRECTION` | `Silent`, `Console`, `File`, any case, else stops | `Silent` | Anything but `Silent` makes the recompiler dump its IR; the shader dumps go under `KYTY_SHADER_LOG_FOLDER` | debug | all | Kyty option |
 | `KYTY_SHADER_LOG_FOLDER` | path | `_Shaders` | Folder of the shader dumps | debug | all | Kyty option |
 | `KYTY_COMMAND_BUFFER_DUMP` | `0` or `1`, else stops | `0` | Writes each command buffer the title submits to a file under `KYTY_COMMAND_BUFFER_DUMP_FOLDER`, named by frame and number | debug | all | Kyty option |

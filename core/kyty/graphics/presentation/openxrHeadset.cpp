@@ -16,7 +16,6 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
-#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <mutex>
@@ -536,10 +535,6 @@ void ThreadMain() {
 
 void OpenXrInit() {
 	if (!Config::VrEnabled()) {
-		return;
-	}
-	if (const char* env = std::getenv("KYTY_OPENXR");
-	    env != nullptr && std::strcmp(env, "0") == 0) {
 		return;
 	}
 	const char*          extensions[] = {XR_KHR_VULKAN_ENABLE_EXTENSION_NAME};

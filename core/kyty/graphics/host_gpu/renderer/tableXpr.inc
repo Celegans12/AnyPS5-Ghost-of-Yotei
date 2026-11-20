@@ -2624,7 +2624,6 @@ void TableLoadSwitches() {
 		load("KYTY_TABLE_XPR", kyty_local_table_xpr_mode);
 		if (::Loader::DemonsSoulsTitle::IsSupportedGame()) kyty_local_table_dispatch_mode.store(1, std::memory_order_relaxed);
 		load("KYTY_TABLE_DISPATCH", kyty_local_table_dispatch_mode);
-		load("KYTY_TABLE_INDIRECT", kyty_local_table_indirect_mode);
 		load("KYTY_TABLE_STORE_BUDGET", kyty_local_table_store_budget);
 		load("KYTY_TABLE_SET_PROOFS", kyty_local_table_set_proofs);
 		load("KYTY_TABLE_MRU", kyty_local_table_mru);

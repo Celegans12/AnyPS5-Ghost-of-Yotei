@@ -817,10 +817,6 @@ static void WindowCreate(WindowContext& context) {
 			}
 		}
 	}
-
-	if (std::getenv("KYTY_BORDERLESS") != nullptr) {
-		window_flags |= static_cast<uint32_t>(SDL_WINDOW_BORDERLESS);
-	}
 #endif
 	context.window = SDL_CreateWindow(KYTY_SDL_WINDOW_CAPTION, width, height, window_flags);
 

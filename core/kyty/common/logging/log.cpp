@@ -4,7 +4,6 @@
 #include "kytyGitVersion.h"
 
 #include <cstdio>
-#include <cstdlib>
 #include <ctime>
 #include <filesystem>
 #include <iterator>
@@ -42,11 +41,10 @@ static void OpenSessionLog(const std::filesystem::path& path) {
 	if (path.has_parent_path()) {
 		std::filesystem::create_directories(path.parent_path(), error);
 	}
-	const bool relaunched = std::getenv(RelaunchedVariable) != nullptr;
 #if defined(_WIN32)
-	std::FILE* file = _wfsopen(path.c_str(), relaunched ? L"ab" : L"wb", _SH_DENYNO);
+	std::FILE* file = _wfsopen(path.c_str(), L"wb", _SH_DENYNO);
 #else
-	std::FILE* file = std::fopen(path.c_str(), relaunched ? "ab" : "wb");
+	std::FILE* file = std::fopen(path.c_str(), "wb");
 #endif
 	if (file == nullptr) {
 		WriteStdout("Session log: cannot open the file\n", {});
@@ -64,8 +62,7 @@ static void OpenSessionLog(const std::filesystem::path& path) {
 #endif
 	char started[32] = "";
 	std::strftime(started, sizeof(started), "%Y-%m-%d %H:%M:%S", &local);
-	WriteToSessionLog(fmt::format("--- {} {} ---\n{}\n", relaunched ? "Relaunched" : "Session",
-	                              started, KYTY_BUILD_LABEL));
+	WriteToSessionLog(fmt::format("--- Session {} ---\n{}\n", started, KYTY_BUILD_LABEL));
 	std::fflush(g_session);
 }
 
@@ -84,8 +81,7 @@ void Initialize() {
 		if (path.has_parent_path()) {
 			std::filesystem::create_directories(path.parent_path());
 		}
-		const bool truncate = std::getenv(RelaunchedVariable) == nullptr;
-		sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(path.native(), truncate);
+		sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(path.native(), true);
 	}
 	if (sink != nullptr) {
 		sink->set_formatter(std::make_unique<spdlog::pattern_formatter>(

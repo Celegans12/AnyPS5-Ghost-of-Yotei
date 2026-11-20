@@ -3227,16 +3227,12 @@ uint64_t BufferCache::SplitUnmappedBuffers(uint64_t vaddr, uint64_t size, FreeBl
 	return cut;
 }
 
-uint64_t BufferCache::DropFreedRange(uint64_t vaddr, uint64_t size, bool read_back, FreeBlocksQuery free_blocks,
+uint64_t BufferCache::DropFreedRange(uint64_t vaddr, uint64_t size, FreeBlocksQuery free_blocks,
                                      FreeBlockSplits* splits) {
 	if (size == 0 || UINT64_MAX - vaddr < size) return 0;
 	ForgetCommandBuffers(vaddr, size);
 	if (!IsRegionRegistered(vaddr, size)) return 0;
-	if (read_back) {
-		InvalidateMemory(vaddr, size);
-	} else {
-		DiscardGpuWrites(vaddr, size);
-	}
+	InvalidateMemory(vaddr, size);
 	const auto deleted = DeleteUnmappedBuffers(vaddr, size);
 	return deleted + SplitUnmappedBuffers(vaddr, size, free_blocks, splits);
 }

@@ -132,7 +132,7 @@ public:
 	};
 	uint64_t               SplitUnmappedBuffers(uint64_t vaddr, uint64_t size, FreeBlocksQuery free_blocks = nullptr,
 	                                            FreeBlockSplits* splits = nullptr);
-	uint64_t               DropFreedRange(uint64_t vaddr, uint64_t size, bool read_back, FreeBlocksQuery free_blocks,
+	uint64_t               DropFreedRange(uint64_t vaddr, uint64_t size, FreeBlocksQuery free_blocks,
 	                                      FreeBlockSplits* splits);
 	void                   InvalidateUnlessGpuModified(uint64_t vaddr, uint64_t size) noexcept;
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false,

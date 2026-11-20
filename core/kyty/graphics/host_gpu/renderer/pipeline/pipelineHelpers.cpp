@@ -719,34 +719,11 @@ void PipelineHelpers::LogProgress() const {
 }
 
 uint32_t PipelineHelperProcesses(const GraphicContext& graphics) {
-#if defined(ANYPS5_KYTY)
 	static_cast<void>(graphics);
 	return 0;
-#else
-	if (const char* value = std::getenv("KYTY_PIPELINE_HELPERS"); value != nullptr) {
-		uint32_t   count  = 0;
-		const auto end    = value + std::strlen(value);
-		const auto parsed = std::from_chars(value, end, count);
-		return parsed.ec == std::errc {} && parsed.ptr == end ? count : 0u;
-	}
-	constexpr uint32_t NvidiaVendor = 0x10deu;
-	if (graphics.GetPhysicalDeviceProperties().vendorID != NvidiaVendor) {
-		return 0;
-	}
-	DWORD_PTR process_mask = 0;
-	DWORD_PTR system_mask  = 0;
-	if (!::GetProcessAffinityMask(::GetCurrentProcess(), &process_mask, &system_mask)) {
-		return 0;
-	}
-	const auto processors = static_cast<uint32_t>(std::popcount(process_mask));
-	return processors / 2u > 2u ? processors / 2u - 2u : 1u;
-#endif
 }
 
 uint32_t PipelineHelperProcessesAlone(uint32_t processes) {
-	if (std::getenv("KYTY_PIPELINE_HELPERS") != nullptr) {
-		return processes;
-	}
 	DWORD_PTR process_mask = 0;
 	DWORD_PTR system_mask  = 0;
 	if (!::GetProcessAffinityMask(::GetCurrentProcess(), &process_mask, &system_mask)) {

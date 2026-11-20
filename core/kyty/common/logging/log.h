@@ -19,8 +19,6 @@ struct Lifecycle {
 	static constexpr auto        emergency_shutdown = Log::Flush;
 };
 
-inline constexpr const char* RelaunchedVariable = "KYTY_RELAUNCHED";
-
 bool IsSilent();
 void Write(fmt::text_style style, std::string_view text);
 void WriteToConsoleAndLog(std::string_view text);
