@@ -2399,11 +2399,14 @@ bool RenderExecutor::TemplateCommitsSupported() {
 }
 
 void RenderExecutor::StoreTemplateCommit(DrawTemplate& stored, const PipelineCache::Pipeline& pipeline) {
-	std::vector<vk::DescriptorUpdateTemplateEntry> entries;
-	entries.reserve(m_descriptor_writes.size());
 	stored.commit_valid = false;
 	stored.commit_data.clear();
 	stored.commit_slots.clear();
+	if (m_descriptor_writes.empty()) {
+		return;
+	}
+	std::vector<vk::DescriptorUpdateTemplateEntry> entries;
+	entries.reserve(m_descriptor_writes.size());
 	for (size_t i = 0; i < m_descriptor_writes.size(); i++) {
 		const auto& write = m_descriptor_writes[i];
 		const auto  stage = m_commit_capture_kinds[i].first;
