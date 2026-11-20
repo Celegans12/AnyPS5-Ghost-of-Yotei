@@ -2258,7 +2258,10 @@ std::array<uint32_t, 3> EmitTriangleIndices(ValueEmitContext& ctx, const std::ar
 		EmitLabel(state, merge);
 		return gathered;
 	});
-	const auto selected = Select(state, vector, fast, fast_values, slow_values);
+	const auto fast_components = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeBoolVector(state, 3), fast_components,
+	                          fast, fast, fast);
+	const auto selected = Select(state, vector, fast_components, fast_values, slow_values);
 	std::array<uint32_t, 3> result {};
 	for (uint32_t k = 0; k < 3; k++) {
 		result[k] = state.builder.AllocateId();

@@ -1,3 +1,4 @@
+#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/ir/Block.h"
 #include "graphics/shader/recompiler/ir/RayQuery.h"
 #include "graphics/shader/recompiler/ir/passes/RayQueryOracle.h"
@@ -5,11 +6,13 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <spirv-tools/libspirv.hpp>
 #include <vector>
 
 namespace {
 
 namespace IR = Libs::Graphics::ShaderRecompiler::IR;
+namespace Spirv = Libs::Graphics::ShaderRecompiler::Spirv;
 
 int failures = 0;
 
@@ -145,6 +148,45 @@ void NodeCountFacts() {
            "the BLAS fact changes bit 31 only");
 }
 
+void TriangleIndexSpirv() {
+    namespace Emit = Spirv::Emitter;
+    const IR::Value unused(0u);
+    IR::Block alpha;
+    alpha.AppendNewInst(IR::ValueOpcode::RayQueryAlpha,
+                        {unused, unused, unused, unused, unused, unused, unused,
+                         unused, unused, unused, unused, unused, unused, unused});
+    IR::Program program;
+    program.blocks.push_back(&alpha);
+    program.stage = Libs::Graphics::ShaderType::Compute;
+    program.lane_local = true;
+    program.info.uses_dma = true;
+    program.info.ray_query = true;
+    const Libs::Graphics::ShaderComputeInputInfo compute {};
+    const Spirv::Profile profile {.ray_query = true};
+    Emit::EmitterState state(program, {.compute = &compute}, profile);
+    Emit::ValueEmitContext ctx(state);
+    Emit::DefineModule(state);
+    Emit::DefineGetBdaPointer(state);
+    Emit::DefineIndirectBufferLoads(ctx);
+    auto& builder = state.builder;
+    builder.AddFunction(spv::OpFunction, Emit::TypeVoid(state), state.main_func,
+                        spv::FunctionControlMaskNone, Emit::TypeFunction(state));
+    Emit::EmitLabel(state, state.entry_label);
+    const auto zero = Emit::ConstantU32(state, 0);
+    const auto indices = Emit::EmitTriangleIndices(ctx, {zero, zero, zero, zero}, zero);
+    Expect(indices[0] != 0 && indices[1] != 0 && indices[2] != 0, "the triangle load emits three indices");
+    builder.AddFunction(spv::OpReturn);
+    builder.AddFunction(spv::OpFunctionEnd);
+    Emit::DefineBdaLoads(state);
+    builder.AddEntryPoint(spv::ExecutionModelGLCompute, state.main_func, "main", state.interface_variables);
+
+    spvtools::SpirvTools validator(SPV_ENV_VULKAN_1_3);
+    validator.SetMessageConsumer([](spv_message_level_t, const char*, const spv_position_t&, const char* message) {
+        std::fprintf(stderr, "%s\n", message);
+    });
+    Expect(validator.Validate(builder.Build()), "the ray-query triangle index load emits valid SPIR-V");
+}
+
 }
 
 int main() {
@@ -152,6 +194,7 @@ int main() {
     EmptyWalks();
     Modes();
     NodeCountFacts();
+    TriangleIndexSpirv();
     if (failures != 0) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);
         return 1;
