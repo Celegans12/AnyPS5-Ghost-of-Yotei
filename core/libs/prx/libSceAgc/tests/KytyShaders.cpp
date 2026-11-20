@@ -213,7 +213,7 @@ ShaderSemantic semantic(std::uint32_t id, std::uint32_t mapping, bool flat) {
     return value;
 }
 
-void checkInterpolants(int (*create)(ShaderRegister*, const Shader*, const Shader*), const char* name) {
+void checkInterpolants(decltype(&sceAgcCreateInterpolantMapping_0100) create, const char* name) {
     std::array<ShaderSemantic, 3> inputs{semantic(5, 0, false), semantic(6, 0, true), semantic(9, 0, false)};
     std::array<ShaderSemantic, 2> outputs{semantic(5, 3, false), semantic(6, 4, false)};
     Shader ps{};
