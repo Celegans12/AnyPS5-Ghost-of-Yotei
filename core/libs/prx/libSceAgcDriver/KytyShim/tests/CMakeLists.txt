@@ -287,17 +287,22 @@ if(NOT WIN32)
     set_tests_properties(kyty_shim_rt_corpus PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
 endif()
 
-find_program(kytyThreadSafetyClang NAMES clang++)
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND kytyThreadSafetyClang)
-    set(kytyThreadSafetyCompile ${kytyThreadSafetyClang} -std=c++20 -fsyntax-only -Wthread-safety -Werror=thread-safety
+function(kyty_register_thread_safety_tests)
+    if(NOT ANYPS5_KYTY_CXX_COMPILER)
+        return()
+    endif()
+    get_property(directory GLOBAL PROPERTY KYTY_THREAD_SAFETY_TESTS_DIRECTORY)
+    set(compile ${ANYPS5_KYTY_CXX_COMPILER} -std=c++20 -fsyntax-only -Wthread-safety -Werror=thread-safety
             -I${CMAKE_SOURCE_DIR}/core/kyty)
-    add_test(NAME kyty_shim_thread_safety_accepts COMMAND ${kytyThreadSafetyCompile}
-            ${CMAKE_CURRENT_SOURCE_DIR}/ThreadSafetyGuarded.cpp)
+    add_test(NAME kyty_shim_thread_safety_accepts COMMAND ${compile} ${directory}/ThreadSafetyGuarded.cpp)
     set_tests_properties(kyty_shim_thread_safety_accepts PROPERTIES TIMEOUT 60)
-    add_test(NAME kyty_shim_thread_safety_rejects COMMAND ${kytyThreadSafetyCompile}
-            ${CMAKE_CURRENT_SOURCE_DIR}/ThreadSafetyViolation.cpp)
+    add_test(NAME kyty_shim_thread_safety_rejects COMMAND ${compile} ${directory}/ThreadSafetyViolation.cpp)
     set_tests_properties(kyty_shim_thread_safety_rejects PROPERTIES TIMEOUT 60
             PASS_REGULAR_EXPRESSION "reading variable 'm_value' requires holding mutex 'm_mutex'.*calling function 'BumpLocked' requires holding mutex 'm_mutex' exclusively")
+endfunction()
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set_property(GLOBAL PROPERTY KYTY_THREAD_SAFETY_TESTS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+    cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}" CALL kyty_register_thread_safety_tests)
 endif()
 
 if(NOT WIN32)
