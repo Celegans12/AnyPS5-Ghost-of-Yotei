@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/runtimeSwitches.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -3080,11 +3081,7 @@ bool LoadResourcePlan(std::span<const uint8_t> bytes, ResourcePlan& plan) {
 
 #if defined(ANYPS5_KYTY)
 bool GenericComputeVariants() {
-	static const bool on = [] {
-		const char* value = std::getenv("KYTY_GENERIC_COMPUTE_VARIANT");
-		return value == nullptr || std::string_view(value) != "0";
-	}();
-	return on;
+	return Common::RuntimeSwitches::On(Common::RuntimeSwitches::Switch::GenericComputeVariant);
 }
 
 namespace {

@@ -36,6 +36,21 @@ On by default unless the row says otherwise.
 | `KYTY_SHADER_CACHE` | `0`, `1` (default) | Keep recompiled shaders on disk and warm them up at the next start (Release builds). `0` translates them again at each start. A nonempty `ANYPS5_NO_SHADER_CACHE` value other than `0` forces the store off. |
 | `ANYPS5_KYTY_PRESTART` | `0`, `1` (default) | `0` starts the Kyty GPU after the window exists instead of during its creation |
 
+## Comparing two settings in one run
+
+`KYTY_AB` alternates two arms inside one session, so both play the same scene. Phase A keeps the listed settings as set,
+phase B turns them over, at a flip, between two submissions. Only `KYTY_FLAT_DEFER` and `KYTY_GENERIC_COMPUTE_VARIANT` can
+change while the title runs; any other name stops at start with the list ([why](THIRD_PARTY_KYTY.md#details)).
+
+| Variable | Values | Effect |
+|---|---|---|
+| `KYTY_AB` | `<seconds>:<setting>[+<setting>...]` | Phases of at least `<seconds>`; `[kyty-ab]` lines give each phase's presents and img/s |
+| `KYTY_AB_SETTLE` | seconds, `2` by default | Start of the counted part of each phase |
+| `KYTY_AB_START` | flip count, or `<n>s` | When the first phase begins |
+
+For example `KYTY_AB=40:KYTY_FLAT_DEFER KYTY_AB_SETTLE=8`, then `python3 tools/kyty_ab_report.py <session folder or log>`
+for each arm's img/s, draws per image and `[kyty-*]` counters.
+
 ## Ray tracing
 
 | Variable | Values | Effect |

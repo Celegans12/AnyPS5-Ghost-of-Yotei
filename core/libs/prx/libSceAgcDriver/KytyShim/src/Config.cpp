@@ -6,6 +6,7 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/runtimeSwitches.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
@@ -220,6 +221,7 @@ void StartRuntime() {
     std::call_once(started, [] {
         std::string applied;
         const auto options = OptionsFromEnvironment(applied);
+        Common::Ab::Start();
         Config::Initialize();
         Config::Load(options);
         Log::Initialize();

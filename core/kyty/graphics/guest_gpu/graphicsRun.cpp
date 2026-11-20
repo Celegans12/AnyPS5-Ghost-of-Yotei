@@ -4,6 +4,7 @@
 #include "common/debugCounters.h"
 #if defined(ANYPS5_KYTY)
 #include "common/fallback.h"
+#include "common/runtimeSwitches.h"
 #endif
 #include "common/hackNotice.h"
 #include "common/logging/log.h"
@@ -3056,6 +3057,13 @@ void CommandProcessor::WriteLodStats(void* dst, uint32_t size, uint32_t control)
 	});
 }
 
+#if defined(ANYPS5_KYTY)
+static void NoteAbFlip() {
+	if (!Common::Ab::Configured()) return;
+	for (const auto& line: Common::Ab::AtFlip()) ::Log::WriteToConsoleAndLog(line);
+}
+
+#endif
 void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_arg) {
 	if (graphics_debug_dump_enabled()) {
 		LOGF("CommandProcessor::Flip()\n");
@@ -3077,6 +3085,9 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 		    true);
 #endif
 		GetScheduler().Flush();
+#if defined(ANYPS5_KYTY)
+		NoteAbFlip();
+#endif
 	});
 }
 
@@ -3106,6 +3117,9 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 		    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); }, true);
 #endif
 		GetScheduler().Flush();
+#if defined(ANYPS5_KYTY)
+		NoteAbFlip();
+#endif
 	});
 }
 
