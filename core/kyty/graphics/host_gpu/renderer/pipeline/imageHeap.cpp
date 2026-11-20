@@ -24,6 +24,7 @@ namespace IR = ShaderRecompiler::IR;
 constexpr uint64_t MinTableBytes        = 64ull * 1024ull;
 constexpr uint32_t LargeTableIdleFrames = 32;
 constexpr uint32_t ElementMask          = (1u << IR::ImageHeapKindShift) - 1u;
+constexpr uint32_t SlotsKeptFromTables  = IR::ImageHeapCapacity / 8u;
 
 template <typename Pred, typename Fn>
 void ForEachRun(size_t begin, size_t end, Pred&& pred, Fn&& fn) {
@@ -529,6 +530,7 @@ uint32_t ImageHeap::Allocate(bool may_fail) {
 		m_free.push_back(m_retired.front().second);
 		m_retired.pop_front();
 	}
+	if (may_fail && IR::ImageHeapCapacity - m_elements.size() + m_free.size() <= SlotsKeptFromTables) return 0u;
 	if (m_free.empty()) {
 		if (m_elements.size() == IR::ImageHeapCapacity) {
 			if (may_fail) return 0u;
