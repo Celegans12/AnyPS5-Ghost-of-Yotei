@@ -445,13 +445,6 @@ public:
 		UploadScope& operator=(const UploadScope&) = delete;
 	};
 	[[nodiscard]] static std::vector<DeferredProtect>& DeferredProtects() noexcept { return s_deferred; }
-	[[nodiscard]] static bool AsyncReprotect() noexcept {
-		static const bool on = [] {
-			const char* value = std::getenv("KYTY_ASYNC_REPROTECT");
-			return value == nullptr || value[0] != '0';
-		}();
-		return on;
-	}
 
 private:
 	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
@@ -464,7 +457,7 @@ private:
 #else
 	inline static thread_local std::vector<DeferredProtect> s_deferred;
 #endif
-	[[nodiscard]] static bool DeferProtections() noexcept { return s_upload_takes_protections && AsyncReprotect(); }
+	[[nodiscard]] static bool DeferProtections() noexcept { return s_upload_takes_protections; }
 	struct DeferScope {
 		RegionManager*                          manager = nullptr;
 		std::vector<PageManager::DeferredRange> ranges;

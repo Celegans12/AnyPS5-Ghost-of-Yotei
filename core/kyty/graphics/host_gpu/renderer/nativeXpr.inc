@@ -1,15 +1,5 @@
 namespace {
 
-bool NativeXprSwitch(const char* name) {
-	const char* value = std::getenv(name);
-	return value == nullptr || value[0] != '0';
-}
-
-bool NativeXprAsyncPipelines() {
-	static const bool enabled = NativeXprSwitch("KYTY_ASYNC_XPR_PIPELINES");
-	return enabled;
-}
-
 struct NativeXprKeyHash {
 	[[nodiscard]] size_t operator()(uint64_t key) const noexcept { return static_cast<size_t>(key); }
 };
@@ -83,14 +73,6 @@ struct RenderExecutor::NativeXprCache {
 
 namespace {
 
-bool StateKeyCacheEnabled() {
-	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_STATE_KEY_CACHE");
-		return value == nullptr || value[0] != '0';
-	}();
-	return enabled;
-}
-
 uint64_t NativeXprStateKeyOf(const CommandBuffer& buffer, StateKeyCache* cache = nullptr,
                              uint64_t context_id = 0, uint64_t user_config_id = 0) {
 	const auto& ctx = buffer.GetRegisters();
@@ -98,7 +80,7 @@ uint64_t NativeXprStateKeyOf(const CommandBuffer& buffer, StateKeyCache* cache =
 	const auto& vs  = buffer.GetShaders().GetVs();
 	const auto& ps  = buffer.GetShaders().GetPs();
 	uint64_t    hash = 0;
-	if (cache != nullptr && context_id != 0 && user_config_id != 0 && StateKeyCacheEnabled() &&
+	if (cache != nullptr && context_id != 0 && user_config_id != 0 &&
 	    cache->context_id == context_id && cache->user_config_id == user_config_id) {
 		hash = cache->hash;
 	} else {

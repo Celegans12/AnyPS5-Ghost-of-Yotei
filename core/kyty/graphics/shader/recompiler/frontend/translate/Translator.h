@@ -29,7 +29,6 @@ inline Decoder::Operand ConditionOperand(Decoder::OperandKind kind) {
 using LaneSpills = std::array<std::pair<uint32_t, uint32_t>, IR::NumVectorRegs>;
 inline constexpr LaneSpills NoLaneSpills {};
 
-[[nodiscard]] bool NativeF16Enabled();
 
 class Translator {
 public:

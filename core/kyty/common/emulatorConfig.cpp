@@ -242,26 +242,6 @@ bool RenderDocEnabled() {
 	return g_config->renderdoc_enabled;
 }
 
-bool ReadbackLinearImagesEnabled() {
-	return g_config->readback_linear_images;
-}
-
-bool ReadbackTiledImagesEnabled() {
-	return g_config->readback_tiled_images;
-}
-
-bool ReadbackStorageImagesEnabled() {
-	return g_config->readback_storage_images;
-}
-
-bool SyncRawImageBuffersEnabled() {
-	return g_config->sync_raw_image_buffers;
-}
-
-uint32_t GetFlushDraws() {
-	return g_config->flush_draws;
-}
-
 bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
 }
@@ -343,23 +323,15 @@ uint32_t ParseGpuPipelineStages(const char* value) {
 	return parsed == 1 ? GPU_PIPELINE_ALL : static_cast<uint32_t>(parsed) & GPU_PIPELINE_ALL;
 }
 
-bool ResolveHelperEnabled() {
-	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_RESOLVE_HELPER");
-		return value != nullptr && std::string_view(value) == "1";
-	}();
-	return enabled;
-}
-
 void ConfigureGpuStageThread(GpuStageThread stage) {
-	static const std::array<int, 6> cpus = [] {
-		std::array<int, 6> result {4, 6, 8, 10, 2, 0};
+	static const std::array<int, 5> cpus = [] {
+		std::array<int, 5> result {4, 6, 8, 10, 2};
 		const char*        value = std::getenv("KYTY_GPU_THREAD_CPUS");
 		if (value == nullptr) {
 			return result;
 		}
 		if (std::string_view(value) == "off") {
-			return std::array<int, 6> {-1, -1, -1, -1, -1, -1};
+			return std::array<int, 5> {-1, -1, -1, -1, -1};
 		}
 		for (auto& cpu: result) {
 			if (*value == '\0') {
@@ -374,13 +346,7 @@ void ConfigureGpuStageThread(GpuStageThread stage) {
 		}
 		return result;
 	}();
-	static const bool high_priority = [] {
-		const char* value = std::getenv("KYTY_GPU_THREAD_PRIORITY");
-		return value == nullptr || std::string_view(value) != "0";
-	}();
-	if (high_priority) {
-		Common::Thread::RaiseCurrentPriority();
-	}
+	Common::Thread::RaiseCurrentPriority();
 #if defined(ANYPS5_KYTY) && KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 	static const bool listed = [] {
 		const char* value = std::getenv("KYTY_GPU_THREAD_CPUS");
@@ -393,7 +359,7 @@ void ConfigureGpuStageThread(GpuStageThread stage) {
 #endif
 	static std::once_flag reserved;
 	std::call_once(reserved, [] {
-		Common::Thread::ReserveCores(std::span {cpus}.first(ResolveHelperEnabled() ? 6 : 5));
+		Common::Thread::ReserveCores(std::span {cpus});
 	});
 	Common::Thread::PinCurrent(cpus[static_cast<uint32_t>(stage)]);
 }

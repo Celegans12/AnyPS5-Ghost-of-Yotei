@@ -10,10 +10,6 @@
 #include <span>
 #include <vector>
 
-extern "C" {
-extern volatile std::atomic_uint32_t kyty_local_scout_mode;
-}
-
 namespace Libs::Graphics {
 class RenderContext;
 using GpuResourceManager = RenderContext;
@@ -21,15 +17,10 @@ using GpuResourceManager = RenderContext;
 
 namespace Libs::Graphics::Scout {
 
-[[nodiscard]] inline uint32_t Mode() {
-	return kyty_local_scout_mode.load(std::memory_order_relaxed);
-}
 [[nodiscard]] bool Running() noexcept;
 
 void Start(RenderContext& resources);
 void Stop();
-
-void Feed(uint64_t sequence, std::span<const uint32_t> commands, bool constant, bool reset);
 
 [[nodiscard]] constexpr bool IsDraw(uint32_t opcode) {
 	return opcode == Pm4::IT_DRAW_INDEX_2 || opcode == Pm4::IT_DRAW_INDEX_OFFSET_2 || opcode == Pm4::IT_DRAW_INDEX_AUTO ||
@@ -41,11 +32,10 @@ void BeginSubmission(uint64_t sequence);
 void NoteDraw(const uint32_t* packet);
 void SkipDraws(uint32_t count);
 void NoteDrawAt(const uint32_t* packet, uint64_t sequence, uint32_t ordinal);
-void NoteWrite(const void* address, uint32_t size, const void* values = nullptr);
-void CheckWait(const void* address, uint32_t size);
+void NoteWrite(const void* address, uint32_t size);
 void NoteHostWrite(uint64_t address, uint64_t size, bool write_back = false);
 inline void NoteHostWriteIfOn(uint64_t address, uint64_t size, bool write_back = false) {
-	if (Mode() != 0) NoteHostWrite(address, size, write_back);
+	NoteHostWrite(address, size, write_back);
 }
 
 struct Run {
@@ -112,28 +102,8 @@ static_assert(sizeof(Ticket) <= 4096);
 }
 [[nodiscard]] bool WrittenSince(const Ticket& ticket, bool& write_back);
 
-[[nodiscard]] const Ticket* Current();
-[[nodiscard]] uint64_t      CurrentPacket();
 [[nodiscard]] bool EvaluateAhead(const std::array<uint64_t, 3>& key, uint64_t key_hash, std::span<const uint32_t> gs_user,
                                  std::span<const uint32_t> ps_user, Ticket& ticket);
-
-enum class Reason : uint8_t {
-	Unwalked,
-	Ticket,
-	NotNative,
-	Continuation,
-	NotTable,
-	Constant,
-	Behind,
-	NoViewEmpty,
-	NoViewOther,
-	Refused,
-	Short,
-	TooBig,
-	Fenced,
-	Count
-};
-[[nodiscard]] Reason CurrentReason();
 
 }
 

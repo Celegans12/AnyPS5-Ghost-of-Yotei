@@ -429,7 +429,6 @@ public:
 	static void NoteAheadGuestWrite(uint64_t sequence, uint64_t address,
 	                                std::span<const uint32_t> data, bool one_address);
 	static void RetireAheadGuestWrites(uint64_t executed);
-	[[nodiscard]] static bool AheadGuestWritesPending();
 	[[nodiscard]] static uint64_t AheadWritesSequence();
 	static void SyncAheadWrites(uint64_t sequence);
 	static void BeginAheadThread(uint32_t slot);

@@ -351,7 +351,7 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	const bool counters = queries.PrepareRead(address, size);
 	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(
 	    address, size, resource.written,
-	    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()), id);
+	    resource.formatted, id);
 	if (counters) {
 		queries.NoteReadTarget(address, size, *buffer, offset);
 	}
@@ -2810,7 +2810,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		uint32_t buffer_offset = 0;
 		const auto& source = prepared.buffer_sources[index];
 		const uint32_t flags = (resource.uniform_index != UINT32_MAX ? 1u : 0u) |
-		                       (resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()) ? 2u : 0u);
+		                       (resource.formatted ? 2u : 0u);
 		const bool     share = m_draw_buffer_views_on && !resource.written && source.address != 0 && source.size != 0;
 		const DrawStreamRead* streamed = nullptr;
 		if (m_draw_stream_read_count != 0 && !resource.written && (flags & 2u) == 0) {
@@ -3087,7 +3087,7 @@ void RenderExecutor::StreamDrawReads(std::span<PreparedBindings* const> stages) 
 				continue;
 			}
 			if (source.size > MaxRange || m_draw_stream_read_count == m_draw_stream_reads.size() ||
-			    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()) ||
+			    resource.formatted ||
 			    queries.MayPrepareRead(source.address, source.size) ||
 			    !cache.IsRegionCpuModified(source.address, source.size)) {
 				continue;

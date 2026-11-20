@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <bit>
-#include <cstdlib>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
@@ -196,14 +195,6 @@ uint32_t TypeU32ElementPointer(EmitterState& state, spv::StorageClass storage_cl
 
 namespace {
 
-bool UniformBuffersEnabled() {
-	static const bool enabled = [] {
-		const auto* value = std::getenv("KYTY_UNIFORM_BUFFERS");
-		return value == nullptr || value[0] != '0';
-	}();
-	return enabled;
-}
-
 uint32_t PushConstantArrayType(EmitterState& state) {
 	const auto count = ConstantU32(state, IR::PushData::DwordCount);
 	return state.builder.DecoratedType(
@@ -257,7 +248,7 @@ void DefineDescriptors(EmitterState& state) {
 	}
 	auto& uniform_count = counts[static_cast<size_t>(Kind::UniformBuffers)];
 	for (auto& buffer: info.buffers) {
-		buffer.uniform_index = UniformBuffersEnabled() && state.profile.robust_buffer_access &&
+		buffer.uniform_index = state.profile.robust_buffer_access &&
 		                               buffer.descriptor_index != UINT32_MAX && buffer.constant_only
 		                           ? uniform_count++ : UINT32_MAX;
 	}

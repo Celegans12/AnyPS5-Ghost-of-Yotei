@@ -48,7 +48,6 @@ namespace {
 constexpr uint64_t NumFramesBeforeRemoval = 16;
 constexpr size_t   MaxParkedImages  = 8;
 constexpr uint64_t ParkedImageTicks = 2048;
-constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
 constexpr uint64_t LazyReadbackBytes = 256 * 1024;
 constexpr uint64_t PartialDirtyMinSize = uint64_t {8} << 20;
 constexpr uint64_t PartialDirtyGranule = uint64_t {256} << 10;
@@ -139,17 +138,14 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
     : m_graphics(graphics), m_scheduler(scheduler), m_page_manager(page_manager),
       m_blit_helper(graphics, scheduler),
       m_tiler(graphics, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)),
-      m_buffer_cache(buffer_cache), m_readback_linear_images(Config::ReadbackLinearImagesEnabled()),
-      m_readback_tiled_images(Config::ReadbackTiledImagesEnabled()),
-      m_readback_storage_images(Config::ReadbackStorageImagesEnabled()) {
+      m_buffer_cache(buffer_cache) {
 #if defined(ANYPS5_KYTY)
 	const char*            write_back = std::getenv("KYTY_WRITE_BACK_IMAGES");
 	const std::string_view write_back_value {write_back == nullptr ? "" : write_back};
 	if (!write_back_value.empty() && write_back_value != "0" && write_back_value != "1") {
 		EXIT("invalid KYTY_WRITE_BACK_IMAGES: %s (0 or 1)\n", write_back);
 	}
-	m_readback_first_writes   = m_readback_storage_images;
-	m_readback_storage_images = m_readback_storage_images || write_back_value != "0";
+	m_readback_storage_images = write_back_value != "0";
 #endif
 	if (m_graphics.CanReportMemoryUsage()) {
 		constexpr int64_t GiB = 1024ll * 1024 * 1024;
@@ -927,11 +923,8 @@ void TextureCache::UntrackImageTail(ImageId id) {
 
 void TextureCache::TrackImageDownload(ImageId id, Image& image) {
 	const auto& info   = image.info;
-	const auto  texels = static_cast<uint64_t>(info.extent.width) * info.extent.height *
-	                     info.extent.depth * info.resources.layers;
-	if (info.IsTiled() ? m_readback_tiled_images && texels <= SmallTiledReadbackTexels
-	                   : m_readback_linear_images) {
-		if (!info.IsTiled() && info.data.size >= LazyReadbackBytes &&
+	if (!info.IsTiled()) {
+		if (info.data.size >= LazyReadbackBytes &&
 		    !m_readback_consumers.contains(ReadbackConsumerKey(info))) {
 			ArmLazyReadback(image);
 			return;
@@ -2652,13 +2645,6 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
 		EXIT("TextureCache: texture requires rediscovery before final acquisition\n");
 	}
-	const bool first_write =
-#if defined(ANYPS5_KYTY)
-	    m_readback_first_writes && (!image.IsGpuModified() || image.IsDefinitelyCpuDirty()) &&
-#else
-	    m_readback_storage_images && (!image.IsGpuModified() || image.IsDefinitelyCpuDirty()) &&
-#endif
-	    !m_buffer_cache.HasOnlyGpuDirtyBytes(image.info.data.address, image.info.data.size);
 	RefreshImage(id);
 	if (image.info.HasStencil() &&
 	    desc.info.data.address >= image.info.stencil.address &&
@@ -2672,9 +2658,6 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		case BindingType::Storage:
 			CommitGpuWrite(image);
 			TrackImageDownload(id, image);
-			if (first_write) {
-				m_download_images.insert(id);
-			}
 			break;
 		default: EXIT("TextureCache: invalid texture binding\n");
 	}
@@ -3665,9 +3648,6 @@ void TextureCache::RunGarbageCollector() {
 }
 
 void TextureCache::ProcessDownloadImages() {
-	if (!m_readback_linear_images && !m_readback_tiled_images) {
-		return;
-	}
 	(void)DownloadQueuedImages();
 }
 

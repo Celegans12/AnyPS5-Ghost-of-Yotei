@@ -175,7 +175,6 @@ public:
 private:
 	void ProcessPm4(Pm4Execution& execution);
 	void SuspendPm4();
-	void                CountDraw();
 	const void*         IndexAddress(uint32_t first_index) const;
 	static const void*  IndexAddress(uint64_t base, uint32_t type_and_size, uint32_t first_index);
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
@@ -314,9 +313,6 @@ private:
 	alignas(64) uint64_t m_synthetic_occlusion_counter = 0;
 	uint64_t m_batch_tick = 0;
 	uint32_t m_batch_work = 0;
-	const uint32_t m_flush_draws = Config::GetFlushDraws();
-	uint64_t       m_flush_tick  = 0;
-	uint32_t       m_draws       = 0;
 	uint32_t m_indirect_instances         = 0;
 	uint64_t m_indirect_instances_sequence = 0;
 	bool     m_has_indirect_instances      = false;

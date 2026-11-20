@@ -452,7 +452,7 @@ void Translator::Write16Bits(const Decoder::Operand& operand, IR::U32 value) {
 void Translator::WriteF16(const Decoder::Operand& operand, IR::F32 value) {
 	value           = ApplyF32ResultModifiers(operand, value);
 	const auto half = IR::F16(ir.Emit(IR::ValueOpcode::ConvertF16F32, {value}));
-	if (NativeF16Enabled() && WriteF16Lane(operand, half)) {
+	if (WriteF16Lane(operand, half)) {
 		return;
 	}
 	const auto bits = IR::U32(ir.Emit(IR::ValueOpcode::ConvertU32U16,

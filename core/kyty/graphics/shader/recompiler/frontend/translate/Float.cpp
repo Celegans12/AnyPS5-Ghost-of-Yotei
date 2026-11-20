@@ -2,18 +2,9 @@
 
 #include <array>
 #include <bit>
-#include <cstdlib>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
-
-bool NativeF16Enabled() {
-	static const bool enabled = [] {
-		const auto* value = std::getenv("KYTY_NATIVE_F16");
-		return value == nullptr || value[0] != '0';
-	}();
-	return enabled;
-}
 
 namespace {
 
@@ -75,7 +66,7 @@ IR::U32 Translator::ReadPackedF16(const Decoder::Operand& operand) {
 void Translator::PackedFloat16(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                                bool accumulator, bool quiet_snan) {
 	const auto native = NativePackedF16Opcode(opcode);
-	if (NativeF16Enabled() && native != IR::ValueOpcode::Identity && inst.dst.omod == 0u &&
+	if (native != IR::ValueOpcode::Identity && inst.dst.omod == 0u &&
 	    !inst.dst.clamp) {
 		const auto lhs = ReadPackedF16(inst.src0);
 		const auto rhs = ReadPackedF16(inst.src1);
@@ -239,7 +230,7 @@ void Translator::Float16Binary(const Decoder::Instruction& inst, IR::ValueOpcode
                                bool reverse) {
 	const auto native      = NativeScalarF16Opcode(opcode);
 	const auto destination = DestinationOperand(inst);
-	if (NativeF16Enabled() && native != IR::ValueOpcode::Identity && destination.omod == 0u &&
+	if (native != IR::ValueOpcode::Identity && destination.omod == 0u &&
 	    !destination.clamp) {
 		const auto lhs    = ReadF16Lane(reverse ? inst.src1 : inst.src0, false);
 		const auto rhs    = ReadF16Lane(reverse ? inst.src0 : inst.src1, false);
@@ -260,7 +251,7 @@ void Translator::Float16Ternary(const Decoder::Instruction& inst, IR::ValueOpcod
                                 bool accumulator, bool mix) {
 	const auto native      = NativeScalarF16Opcode(opcode);
 	const auto destination = DestinationOperand(inst);
-	if (NativeF16Enabled() && !mix && native == IR::ValueOpcode::FPFma16 &&
+	if (!mix && native == IR::ValueOpcode::FPFma16 &&
 	    destination.omod == 0u && !destination.clamp) {
 		std::array<IR::Value, 3> halves;
 		for (uint32_t index = 0; index < halves.size(); index++) {

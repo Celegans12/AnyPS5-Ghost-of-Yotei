@@ -1160,14 +1160,6 @@ uint64_t BufferCache::InFlightReadbackTick(uint64_t begin, uint64_t end) const {
 	return tick;
 }
 
-static bool CopyFeedbackOn() {
-	static const bool on = [] {
-		const char* value = std::getenv("KYTY_COPY_FEEDBACK");
-		return value == nullptr || value[0] != '0';
-	}();
-	return on;
-}
-
 struct BufferCache::CopyFeedback {
 	static constexpr uint64_t SlotSize  = 64 * 1024;
 	static constexpr size_t   SlotCount = 512;
@@ -1239,7 +1231,7 @@ void BufferCache::InvalidateCopyFeedback(uint64_t vaddr, uint64_t size) noexcept
 }
 
 void BufferCache::ScheduleCopyFeedback(uint64_t vaddr, uint64_t size) {
-	if (!CopyFeedbackOn() || m_resources == nullptr) return;
+	if (m_resources == nullptr) return;
 	const auto mapping_epoch = m_resources->MappingEpoch();
 	if (size == 0 || !GuestRange {vaddr, size}.Valid() || ((vaddr | size) & 3u) != 0 ||
 	    size > CopyFeedback::SlotSize || !m_gpu_modified_ranges.Contains(vaddr, size) ||
@@ -3020,10 +3012,6 @@ void BufferCache::NoteGpuModifiedChange(uint64_t vaddr, uint64_t size, bool dirt
 			apply(mask);
 		}
 	}
-}
-
-bool BufferCache::HasOnlyGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
-	return m_gpu_modified_ranges.Contains(vaddr, size);
 }
 
 bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {

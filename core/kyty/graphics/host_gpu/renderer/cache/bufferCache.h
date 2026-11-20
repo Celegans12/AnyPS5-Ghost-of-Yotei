@@ -168,7 +168,6 @@ public:
 	void ScheduleCopyFeedback(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] bool HasOnlyGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool NeverGpuWritten(uint64_t vaddr, uint64_t size) const noexcept;
 	[[nodiscard]] bool NoGpuBytesNow(uint64_t vaddr, uint64_t size) const noexcept;
 	[[nodiscard]] bool GpuLinesOverflowed() const noexcept { return m_gpu_line_overflow.load(std::memory_order_relaxed); }

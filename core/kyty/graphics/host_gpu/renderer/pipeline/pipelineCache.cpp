@@ -3765,10 +3765,6 @@ void PipelineCache::NoteAheadGuestWrite(uint64_t sequence, uint64_t address,
 	state.Count(write, 1);
 }
 
-bool PipelineCache::AheadGuestWritesPending() {
-	return !t_ahead_guest_writes.writes.empty();
-}
-
 void PipelineCache::BeginAheadThread(uint32_t slot) {
 	ShaderRecompiler::IR::UsePlanScratchSlot(slot);
 	t_ahead_unlocked = true;

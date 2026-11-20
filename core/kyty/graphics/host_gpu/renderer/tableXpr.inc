@@ -28,14 +28,6 @@ TableDrawExportMapping(const GraphicContext& graphics, const HW::Context& ctx, u
 	return mapping;
 }
 
-bool TableStridesEnabled() {
-	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_TABLE_STRIDES");
-		return value == nullptr || value[0] != '0';
-	}();
-	return enabled;
-}
-
 bool TableBufferSpecialized(const ShaderRecompiler::IR::BufferResource&                 resource,
                             const ShaderRecompiler::IR::ResourceSpecialization::Buffer& specialized,
                             const std::array<uint32_t, 4>& words4, bool runtime_format) {
@@ -51,7 +43,7 @@ bool TableBufferSpecialized(const ShaderRecompiler::IR::BufferResource&         
 	} else if (!swizzle) {
 		packed_stride &= ~(3u << 16u);
 	}
-	const bool any_stride = TableStridesEnabled() && !swizzle && (specialized.packed_stride & (1u << 14u)) == 0u &&
+	const bool any_stride = !swizzle && (specialized.packed_stride & (1u << 14u)) == 0u &&
 	                        resource.indirect_root == ShaderRecompiler::IR::BufferResource::NoIndirectBuffer &&
 	                        resource.indirect_resources.empty();
 	const auto stride_bits = any_stride ? ~0x3fffu : ~0u;
@@ -78,9 +70,6 @@ static bool TableReadRun(uint64_t address, uint32_t count, uint32_t* out) {
 static thread_local int32_t g_table_offsets_key = -1;
 static int32_t TableStartInstance(const HW::VertexShaderInfo&) {
 	return g_table_offsets_key;
-}
-static bool TableMemoOn() {
-	return kyty_local_table_memo.load(std::memory_order_relaxed) != 0;
 }
 static uint32_t TableMemoVerifyEvery() {
 	return kyty_local_table_memo_verify.load(std::memory_order_relaxed);
@@ -300,6 +289,7 @@ struct RenderExecutor::TableXpr {
 	using Pair    = TablePair;
 	using Variant = TableVariant;
 	std::unordered_map<uint64_t, Pair, HashedKey> pairs;
+	static constexpr uint32_t StoreBudget     = 32;
 	static constexpr uint64_t PairSweepFrames = 600, PairKeepFrames = 3600;
 	static constexpr size_t   PairsKept       = 2048;
 	uint64_t                  pairs_swept     = 0;
@@ -580,8 +570,7 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 		const auto pair_hash = XXH3_64bits(pair_key.data(), sizeof(pair_key));
 		const auto found = catalog == nullptr || Role() == 0 ? decltype(catalog->pairs.end()) {} : catalog->pairs.find(pair_hash);
 		if (Role() != 0 && (catalog == nullptr || found == catalog->pairs.end())) return Spec::Refuse("table store"), TableResult::Native;
-		const auto entries = (kyty_local_table_mru.load(std::memory_order_relaxed) & 1u) != 0 ? TableXpr::PairCacheEntries : 256;
-		auto&      cached  = table.pair_cache[pair_hash & (entries - 1)];
+		auto&      cached  = table.pair_cache[pair_hash & (TableXpr::PairCacheEntries - 1)];
 		known        = own != nullptr && cached.first == pair_hash ? cached.second : nullptr;
 		if (known == nullptr) {
 			auto it = own != nullptr ? own->find(pair_hash) : found;
@@ -645,8 +634,7 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 		}
 		if (pair.store_frame == frame && pair.store_state == cache.state_key)
 			return Spec::Refuse("deferred: stored this frame"), LiveCounters::Add(LiveCounters::TableStoreDeferred), TableResult::Deferred;
-		if (const auto budget = kyty_local_table_store_budget.load(std::memory_order_relaxed);
-		    budget != 0 && table.store_requests >= budget)
+		if (table.store_requests >= TableXpr::StoreBudget)
 			return Spec::Refuse("deferred: store budget"), LiveCounters::Add(LiveCounters::TableStoreDeferred), TableResult::Native;
 		++table.store_requests;
 		Spec::Refuse("store: requested");
@@ -656,7 +644,7 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 		table.store_state = cache.state_key;
 		return TableResult::Store;
 	};
-	const bool memo = Role() == 0 && TableMemoOn();
+	const bool memo = Role() == 0;
 	if (memo) {
 		auto& entry = table.MemoAt(&pair, cache.state_key);
 		if (entry.pair == &pair && entry.key == cache.state_key && entry.epoch == table.memo_epoch &&
@@ -667,8 +655,7 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 			    every > 0 && memo_variant.state == cache.state_key && memo_variant.pipeline != nullptr &&
 			    !memo_variant.refused && ++table.memo_verify_count % static_cast<uint64_t>(every) == 0) {
 				verify           = true;
-				const bool hinted = (kyty_local_table_mru.load(std::memory_order_relaxed) & 2u) != 0 &&
-				                    pair.variant_hint < pair.variants.size() &&
+				const bool hinted = pair.variant_hint < pair.variants.size() &&
 				                    pair.variants[pair.variant_hint].state == cache.state_key;
 				const auto full_variant =
 				    hinted ? pair.variant_hint
@@ -708,8 +695,7 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 			}
 		}
 	}
-	const bool hint    = (kyty_local_table_mru.load(std::memory_order_relaxed) & 2u) != 0 &&
-	                  pair.variant_hint < pair.variants.size() && pair.variants[pair.variant_hint].state == cache.state_key;
+	const bool hint    = pair.variant_hint < pair.variants.size() && pair.variants[pair.variant_hint].state == cache.state_key;
 	const auto variant = hint ? pair.variants.begin() + pair.variant_hint
 	                          : std::ranges::find(pair.variants, cache.state_key, &TableXpr::Variant::state);
 	if (variant != pair.variants.end()) pair.variant_hint = static_cast<uint32_t>(variant - pair.variants.begin());
@@ -991,8 +977,7 @@ bool RenderExecutor::TableValidateSet(TableImageSet& set) {
 	}
 	if (set.ValidatedFrame(Role()) == frame && set.ResolutionEpoch(Role()) == resolution) return true;
 	LiveCensus::Scope census(LiveCensus::DrawPhase, 0x7ab1e, 7);
-	const auto mode  = kyty_local_table_set_proofs.load(std::memory_order_relaxed);
-	const bool own   = Role() == 0 && Spec::Current() == nullptr && mode != 0;
+	const bool own   = Role() == 0 && Spec::Current() == nullptr;
 	const bool full  = !own || textures.GcTick() >= set.touched_tick + TableImageSet::TouchTicks ||
 	                  textures.CurrentFrame() >= set.touched_frame + TableImageSet::TouchTicks ||
 	                  m_context.GetCommandScheduler().Current().IsInvalid();
@@ -1018,21 +1003,8 @@ bool RenderExecutor::TableValidateSet(TableImageSet& set) {
 		const bool held = !full && dep.proven && TableValidity(*image) == dep.validity &&
 		                  (!moved || !textures.RegistrationsSince(dep.desc.info.data.address, dep.desc.info.data.size,
 		                                                          set.resolution_epoch));
-		if (held && mode != 2) continue;
-		const auto refuse = [&] {
-			if (held) {
-				LiveCounters::Add(LiveCounters::TableProofMismatches);
-				static std::atomic<uint32_t> reports {0};
-				if (reports.fetch_add(1, std::memory_order_relaxed) < 16)
-					std::printf("Table: proven image use failed: addr=0x%llx size=0x%llx serial=%llu validity=%llu\n",
-					            static_cast<unsigned long long>(dep.desc.info.data.address),
-					            static_cast<unsigned long long>(dep.desc.info.data.size),
-					            static_cast<unsigned long long>(dep.serial), static_cast<unsigned long long>(dep.validity));
-			}
-			return false;
-		};
+		if (held) continue;
 		if (TableRefreshPending(*image, dep.desc)) {
-			if (held) (void)refuse();
 			if (Spec::Current() != nullptr) return Spec::Refuse("texture upload"), false;
 			if (!image->registered || image->depth_id || image->binding.needs_rebind) return false;
 			(void)textures.FindTexture(dep.id, dep.desc);
@@ -1040,7 +1012,7 @@ bool RenderExecutor::TableValidateSet(TableImageSet& set) {
 			if (image == nullptr || image->serial != dep.serial || TableRefreshPending(*image, dep.desc)) return false;
 		}
 		if (dep.target) {
-			if (!image->registered || image->binding.needs_rebind) return refuse();
+			if (!image->registered || image->binding.needs_rebind) return false;
 			(void)textures.GetImage(dep.id);
 			if (own) {
 				dep.proven   = true;
@@ -1069,7 +1041,7 @@ bool RenderExecutor::TableValidateSet(TableImageSet& set) {
 			}
 		}
 		if (!current) {
-			return refuse();
+			return false;
 		}
 		if (own) {
 			dep.proven   = sampled && dep.desc.info.metadata.kind != ImageMetadataKind::Dcc;
@@ -1321,7 +1293,7 @@ RenderExecutor::TableImageSet* RenderExecutor::TableSet(CommandBuffer& buffer, T
 						set = TableResolveSet(buffer, pair, variant, draw_state, words);
 				}
 			}
-		} else if ((kyty_local_table_mru.load(std::memory_order_relaxed) & 4u) != 0 && previous != nullptr && previous != last &&
+		} else if (previous != nullptr && previous != last &&
 		    !previous->refused && previous->words == words) {
 			set = previous;
 		} else {
@@ -1385,7 +1357,6 @@ void RenderExecutor::TableGather(const TablePair& pair, std::array<std::span<con
 		const bool  flat = form.valid && form.buffer_words.size() == 4 * plan.buffers.size() &&
 		                  user_data[st].size() >= form.user_words && user_data[st].size() <= 64;
 		const std::array<const uint32_t*, 3> bases {user_data[st].data(), block.data(), form.constants.data()};
-		const bool memo = kyty_local_table_gather_memo.load(std::memory_order_relaxed) != 0;
 		uint32_t   memo_hits = 0;
 		for (size_t i = 0; i < plan.buffers.size(); ++i) {
 			auto& [words4, entry] = entries[i];
@@ -1406,7 +1377,7 @@ void RenderExecutor::TableGather(const TablePair& pair, std::array<std::span<con
 					               : 0;
 				}
 			}
-			if (memo && entry != nullptr && words4 == fresh) {
+			if (entry != nullptr && words4 == fresh) {
 				++memo_hits;
 			} else {
 				words4 = fresh;
@@ -1775,16 +1746,8 @@ static const Scout::Ticket* TableScoutTicket(const Pair& pair, std::array<std::s
                                              uint32_t stages, RenderContext& resources, const Scout::Ticket* ahead) {
 	LiveCounters::Add(LiveCounters::ScoutChecks);
 	if (pair.scout_version == 0) return LiveCounters::Add(LiveCounters::ScoutLostNoView), nullptr;
-	const bool  pipelined = Scout::Mode() == 3;
-	const auto* ticket    = pipelined ? ahead : Scout::Current();
-	if (ticket == nullptr) {
-		LiveCounters::Add(LiveCounters::ScoutLostMissing);
-		static_assert(LiveCounters::ScoutMissFenced - LiveCounters::ScoutMissUnwalked == static_cast<uint32_t>(Scout::Reason::Fenced));
-		if (!pipelined)
-			LiveCounters::Add(static_cast<LiveCounters::Id>(LiveCounters::ScoutMissUnwalked + static_cast<uint32_t>(Scout::CurrentReason())));
-		return nullptr;
-	}
-	if (!pipelined && ticket->packet != Scout::CurrentPacket()) return LiveCounters::Add(LiveCounters::ScoutLostIdentity), nullptr;
+	const auto* ticket    = ahead;
+	if (ticket == nullptr) return LiveCounters::Add(LiveCounters::ScoutLostMissing), nullptr;
 	if (ticket->version != pair.scout_version || ticket->stages != stages)
 		return LiveCounters::Add(LiveCounters::ScoutLostPair), nullptr;
 	for (uint32_t st = 0; st < stages; ++st)
@@ -1883,81 +1846,6 @@ static void TableScoutApply(Table& table, const Pair& pair, const Scout::Ticket&
 	table.gathered = &pair;
 }
 
-template <typename Table, typename Pair>
-static void TableScoutVerify(const Table& table, const Pair& pair, const Scout::Ticket& ticket, uint32_t stages,
-                             bool evaluated) {
-	std::array<bool, 5> differ {};
-	char                detail[160] = "";
-	if (evaluated) {
-		const uint32_t* in       = ticket.data;
-		const uint32_t* segments = ticket.data + ticket.slot_words[0] + ticket.slot_words[1];
-		thread_local std::vector<uint32_t> scratch;
-		for (uint32_t st = 0; st < stages; ++st) {
-			const auto& runs   = pair.packed[st].runs;
-			const bool  before = differ[0];
-			for (size_t r = 0; r < runs.size(); ++r) {
-				const auto& run  = runs[r];
-				const auto* mine = table.blocks[st].data() + run.first;
-				uint32_t at = 0;
-				for (uint32_t k = 0; k < ticket.segments[st]; ++k) {
-					const uint32_t first = segments[k] & 0xffffu, count = segments[k] >> 16u;
-					if (run.first >= first && run.first < first + count) {
-						at += run.first - first;
-						break;
-					}
-					at += count;
-				}
-				for (uint32_t w = 0; w < run.count && !differ[0]; ++w) {
-					if (mine[w] == in[at + w]) continue;
-					differ[0] = true;
-					std::snprintf(detail, sizeof(detail), " (stage %u run %zu/%zu slot %u: ticket 0x%08x, render 0x%08x)", st, r,
-					              runs.size(), run.first + w, in[at + w], mine[w]);
-				}
-			}
-			scratch.assign(table.blocks[st].begin(), table.blocks[st].end());
-			TableScoutSlots(scratch.data(), in, segments, ticket.segments[st]);
-			if (differ[0] == before && scratch != table.blocks[st]) {
-				differ[4] = true;
-				std::snprintf(detail, sizeof(detail), " (stage %u: the apply's block differs)", st);
-			}
-			LiveCounters::Add(LiveCounters::ScoutApplyRuns, runs.size());
-			LiveCounters::Add(LiveCounters::ScoutApplySegments, ticket.segments[st]);
-			segments += ticket.segments[st];
-			in += ticket.slot_words[st];
-		}
-		in = segments;
-		differ[1] = table.words.size() != ticket.image_words || !std::equal(table.words.begin(), table.words.end(), in);
-		in += ticket.image_words;
-		differ[2] = table.lod_stats.size() != ticket.lod_stats || !std::equal(table.lod_stats.begin(), table.lod_stats.end(), in);
-		in += ticket.lod_stats;
-		for (uint32_t st = 0; st < stages; ++st) {
-			if (table.entries[st].size() != ticket.buffers[st]) {
-				differ[3] = true;
-				break;
-			}
-			for (const auto& [words4, entry]: table.entries[st]) {
-				differ[3] = differ[3] || !std::equal(words4.begin(), words4.end(), in) || entry != &table.resolved[in[4]];
-				in += 5;
-			}
-		}
-		if (differ == std::array<bool, 5> {}) return;
-	}
-	LiveCounters::Add(LiveCounters::ScoutMismatches);
-	if (!evaluated) LiveCounters::Add(LiveCounters::ScoutMismatchRefused);
-	if (differ[0]) LiveCounters::Add(LiveCounters::ScoutMismatchSlots);
-	if (differ[1]) LiveCounters::Add(LiveCounters::ScoutMismatchWords);
-	if (differ[2]) LiveCounters::Add(LiveCounters::ScoutMismatchLod);
-	if (differ[3]) LiveCounters::Add(LiveCounters::ScoutMismatchEntries);
-	if (differ[4]) LiveCounters::Add(LiveCounters::ScoutMismatchApply);
-	static std::atomic<uint32_t> reports {0};
-	if (reports.fetch_add(1, std::memory_order_relaxed) < 64)
-		std::printf("Scout: mismatch VS 0x%llx PS 0x%llx submission %llu draw %u:%s%s%s%s%s%s%s\n",
-		            static_cast<unsigned long long>(pair.vs), static_cast<unsigned long long>(pair.ps),
-		            static_cast<unsigned long long>(ticket.sequence), ticket.ordinal, evaluated ? "" : " refused",
-		            differ[0] ? " slots" : "", differ[1] ? " words" : "", differ[2] ? " lod" : "", differ[3] ? " entries" : "",
-		            differ[4] ? " apply" : "", detail);
-}
-
 #endif
 
 RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, TablePair& pair, TableVariant& variant,
@@ -1987,12 +1875,11 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	const auto* scout = Scout::Running() && spec_state == nullptr
 	                        ? TableScoutTicket(pair, user_data, stages, m_context, static_cast<const Scout::Ticket*>(m_table_ticket))
 	                        : nullptr;
-	if (scout != nullptr && (Scout::Mode() == 1 || Scout::Mode() == 3)) {
+	if (scout != nullptr) {
 		TableScoutApply(table, pair, *scout, stages);
 	} else {
 		const bool evaluated = TableEvaluate(pair, user_data);
 		if (evaluated) TableGather(pair, user_data);
-		if (scout != nullptr) TableScoutVerify(table, pair, *scout, stages, evaluated);
 		if (!evaluated)
 			return LiveCounters::Add(LiveCounters::TableDrawNative), Spec::Refuse("table: evaluation"), TableResult::Native;
 	}
@@ -2107,8 +1994,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	auto&      texture_cache = m_context.GetTextureCache();
 	const auto images_epoch  = texture_cache.ImagesEpoch();
 	const bool own           = spec_state == nullptr;
-	const bool read_after_write =
-	    set->read_after_write && kyty_local_draw_read_after_write.load(std::memory_order_relaxed) != 0;
+	const bool read_after_write = set->read_after_write;
 	const bool in_place      = same_command && emit.state == &draw_state && table.last_set == set &&
 	                      table.images_epoch == images_epoch && own && !read_after_write;
 	if (!in_place) {
@@ -2478,7 +2364,7 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
 	DrawRenderState table_state = state;
 	table_state.vertex_info[0].stage = {.module = pair->tables[0], .resources = &g_table_no_resources};
 	if (state.ps_active) table_state.ps_input_info.stage = {.module = pair->tables[1], .resources = &g_table_no_resources};
-	const auto* pipeline = pipelines.GetGraphicsPipeline(buffer, table_state, *m_draw_targets, NativeXprAsyncPipelines(), true);
+	const auto* pipeline = pipelines.GetGraphicsPipeline(buffer, table_state, *m_draw_targets, true, true);
 	if (pipeline != nullptr && (!pipeline->native_bindings || pipeline->uses_push_descriptors)) {
 		variant->refused = true;
 		Spec::Refuse("store: variant refused (bindings)");
@@ -2502,13 +2388,7 @@ void TableLoadSwitches() {
 				value.store(static_cast<uint32_t>(std::strtoul(text, nullptr, 0)), std::memory_order_relaxed);
 		};
 		load("KYTY_TABLE_XPR", kyty_local_table_xpr_mode);
-		load("KYTY_TABLE_STORE_BUDGET", kyty_local_table_store_budget);
-		load("KYTY_TABLE_SET_PROOFS", kyty_local_table_set_proofs);
-		load("KYTY_TABLE_MRU", kyty_local_table_mru);
-		load("KYTY_TABLE_GATHER_MEMO", kyty_local_table_gather_memo);
-		load("KYTY_TABLE_MEMO", kyty_local_table_memo);
 		load("KYTY_TABLE_MEMO_VERIFY", kyty_local_table_memo_verify);
-		load("KYTY_DRAW_READ_AFTER_WRITE", kyty_local_draw_read_after_write);
 		return true;
 	}();
 	(void)loaded;

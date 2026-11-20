@@ -56,10 +56,6 @@ constexpr Flag Flags[] = {
     {"KYTY_GRAPHICS_DEBUG_DUMP", &Options::graphics_debug_dump_enabled},
     {"KYTY_PROFILE", &Options::profiler_enabled},
     {"KYTY_SPIRV_DEBUG_PRINTF", &Options::spirv_debug_printf_enabled},
-    {"KYTY_READBACK_LINEAR_IMAGES", &Options::readback_linear_images},
-    {"KYTY_READBACK_TILED_IMAGES", &Options::readback_tiled_images},
-    {"KYTY_READBACK_STORAGE_IMAGES", &Options::readback_storage_images},
-    {"KYTY_SYNC_RAW_IMAGE_BUFFERS", &Options::sync_raw_image_buffers},
     {"KYTY_PERF_OVERLAY", &Options::perf_overlay_enabled},
 };
 
@@ -72,7 +68,6 @@ struct Number {
 
 constexpr Number Numbers[] = {
     {"KYTY_VBLANK_FREQUENCY", &Options::vblank_frequency, 0, 0xffffffffu},
-    {"KYTY_FLUSH_DRAWS", &Options::flush_draws, 0, 0xffffffffu},
     {"KYTY_RT_CHECK", &Options::rt_check_period, 0, 0xffffffffu},
     {"KYTY_RT_CHECK_PPM", &Options::rt_check_ppm, 0, 1000000u},
     {"KYTY_RT_CHECK_STRIKES", &Options::rt_check_strikes, 1, 1000u},

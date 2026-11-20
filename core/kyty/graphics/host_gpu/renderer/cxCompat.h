@@ -7,19 +7,9 @@
 
 extern "C++" {
 inline volatile std::atomic_uint32_t kyty_local_table_xpr_mode {2};
-inline volatile std::atomic_uint32_t kyty_local_table_store_budget {32};
-inline volatile std::atomic_uint32_t kyty_local_table_set_proofs {1};
-inline volatile std::atomic_uint32_t kyty_local_table_mru {7};
-inline volatile std::atomic_uint32_t kyty_local_table_gather_memo {1};
-inline volatile std::atomic_uint32_t kyty_local_table_memo {1};
 inline volatile std::atomic_uint32_t kyty_local_table_memo_verify {0};
-inline volatile std::atomic_uint32_t kyty_local_draw_read_after_write {1};
 inline volatile std::atomic_uint32_t kyty_local_speculate_mode {0};
 inline volatile std::atomic_uint32_t kyty_local_speculations_live {0};
-}
-
-extern "C" {
-extern volatile std::atomic_uint32_t kyty_local_scout_mode;
 }
 
 namespace Libs::Graphics {
@@ -41,15 +31,11 @@ namespace LiveCounters {
 enum Id : uint32_t {
 	TableDrawNative, TableStoreDeferred, TableStoreTargets, TableRingSharedBytes, TableRingShared, TableRegistered,
 	TableStoreVariant, TableRingCopies, TableRingBytes, TableRefusedSets,
-	TableProofMismatches, TableNoSet, TableMemoVerified, TableMemoMismatch, TableMemoHits, TableGatherMemoHits,
+	TableNoSet, TableMemoVerified, TableMemoMismatch, TableMemoHits, TableGatherMemoHits,
 	TableEvaluations, TableDraws, TableContinued,
-	ScoutMissUnwalked, ScoutMissTicket, ScoutMissNotNative, ScoutMissContinuation, ScoutMissNotTable, ScoutMissConstant,
-	ScoutMissBehind, ScoutMissNoViewEmpty, ScoutMissNoViewOther, ScoutMissRefused, ScoutMissShort, ScoutMissTooBig,
-	ScoutMissFenced,
-	ScoutUsedBacking, ScoutUsed, ScoutMismatchWords, ScoutMismatchSlots, ScoutMismatchRefused, ScoutMismatchLod,
-	ScoutMismatches, ScoutMismatchEntries, ScoutMismatchApply, ScoutLostWritten, ScoutLostWriteBack, ScoutLostWatched,
-	ScoutLostRegisters, ScoutLostPair, ScoutLostNoView, ScoutLostMissing, ScoutLostIdentity, ScoutLostEpoch,
-	ScoutLostDirty, ScoutLostChanged, ScoutChecks, ScoutApplySegments, ScoutApplyRuns,
+	ScoutUsedBacking, ScoutUsed, ScoutLostWritten, ScoutLostWriteBack, ScoutLostWatched,
+	ScoutLostRegisters, ScoutLostPair, ScoutLostNoView, ScoutLostMissing, ScoutLostEpoch,
+	ScoutLostDirty, ScoutLostChanged, ScoutChecks,
 	Count
 };
 inline void Add(Id, uint64_t = 1) noexcept {}

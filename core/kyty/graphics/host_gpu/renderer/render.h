@@ -208,10 +208,6 @@ public:
 	                                             const ShaderIndirectOffsets& indirect_offsets = {},
 	                                             bool indirect_draw = false, uint64_t context_id = 0,
 	                                             uint64_t user_config_id = 0);
-	[[nodiscard]] ResolvedDraw* ReserveResolvedDraw(const HW::Shader& shaders);
-	void ResolveDrawInto(ResolvedDraw& draw, const HW::Context& context, const HW::UserConfig& user_config,
-	                     const HW::Shader& shaders, const ShaderIndirectOffsets& indirect_offsets,
-	                     bool indirect_draw, uint64_t context_id, uint64_t user_config_id);
 	[[nodiscard]] ResolvedDraw* ResolveDispatchAhead(const HW::Context& context,
 	                                                 const HW::Shader& shaders,
 	                                                 const uint32_t (&groups)[3], uint32_t mode,
@@ -230,7 +226,6 @@ public:
 		m_resolved_draw = resolved != nullptr ? WaitResolvedDraw(resolved) : nullptr;
 	}
 	static ResolvedDraw* WaitResolvedDraw(ResolvedDraw* resolved) noexcept;
-	[[nodiscard]] static bool ResolvedDrawWritesBuffers(const ResolvedDraw& resolved);
 	static void ReleaseResolvedDraw(ResolvedDraw* resolved) noexcept;
 	void UseContextId(uint64_t context_id, uint64_t user_config_id = 0) noexcept {
 		m_context_id     = context_id;

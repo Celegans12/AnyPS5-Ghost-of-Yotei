@@ -25,17 +25,6 @@
 #include <x86intrin.h>
 #include <xxhash.h>
 
-namespace {
-uint32_t ScoutModeFromEnvironment() {
-	const char* value = std::getenv("KYTY_SCOUT");
-	return value != nullptr && value[0] >= '0' && value[0] <= '3' && value[1] == '\0' ? static_cast<uint32_t>(value[0] - '0') : 3u;
-}
-}
-
-extern "C" {
-[[gnu::used]] volatile std::atomic_uint32_t kyty_local_scout_mode {ScoutModeFromEnvironment()};
-}
-
 namespace Libs::Graphics::Scout {
 
 namespace {
@@ -54,80 +43,37 @@ constexpr const char* Names[Count] = {
 	"backing ranges"};
 std::atomic<uint64_t> g_counts[Count];
 inline void           Add(Id id, uint64_t n = 1) noexcept { g_counts[id].fetch_add(n, std::memory_order_relaxed); }
-void Report() {
-	std::string line;
-	for (uint32_t i = 0; i < Count; ++i)
-		if (const auto n = g_counts[i].load(std::memory_order_relaxed); n != 0)
-			line += std::string(" ") + Names[i] + " " + std::to_string(n) + ";";
-	std::printf("Scout:%s\n", line.c_str());
-	std::fflush(stdout);
-}
-}
-
-namespace SpinGate {
-inline bool Open(bool) { return true; }
 }
 
 struct alignas(128) RenderPosition {
 	std::atomic<uint64_t> render {0};
-	std::atomic<uint64_t> ring_head {0};
-};
-struct alignas(128) RenderFeed {
-	std::atomic<uint64_t> feed_tail {0};
-	std::atomic<uint32_t> wake {0};
 };
 struct alignas(128) ScoutWritten {
-	std::atomic<uint64_t> ring_tail {0};
-	std::atomic<uint64_t> feed_head {0};
 	std::atomic<uint64_t> quiescent {0};
 };
 struct alignas(128) ReadMostly {
-	std::atomic<bool>     running {false}, stop {false};
+	std::atomic<bool>     running {false};
 	std::atomic<uint64_t> retire_clock {0};
 };
 struct alignas(128) RenderOwn {
 	uint64_t        render_sequence = 0;
 	uint32_t        render_count    = 0;
 	const uint32_t* render_packet   = nullptr;
-	uint64_t        known_tail      = 0;
 	uint64_t        version         = 0;
 };
 struct alignas(128) AnyWriter {
 	std::atomic<uint64_t> write_clock {0};
 };
 RenderPosition g_render_position;
-RenderFeed     g_render_feed;
 ScoutWritten   g_scout_written;
 ReadMostly     g_read_mostly;
 RenderOwn      g_render_own;
 AnyWriter      g_any_writer;
 
-struct FeedEntry {
-	uint64_t        sequence = 0;
-	const uint32_t* commands = nullptr;
-	uint32_t        size     = 0;
-	bool            constant = false, reset = false;
-};
-constexpr uint64_t                 FeedEntries = 1024;
-std::array<FeedEntry, FeedEntries> g_feed;
-constexpr auto&                    g_feed_tail = g_render_feed.feed_tail;
-constexpr auto&                    g_feed_head = g_scout_written.feed_head;
-constexpr auto&                    g_wake      = g_render_feed.wake;
-
-constexpr uint64_t                RingSlots = 128;
-constexpr int64_t                 Lead      = 64;
-std::array<Ticket, RingSlots>     g_ring;
-constexpr auto&                   g_ring_tail = g_scout_written.ring_tail;
-constexpr auto&                   g_ring_head = g_render_position.ring_head;
-
 constexpr auto& g_render          = g_render_position.render;
 constexpr auto& g_render_sequence = g_render_own.render_sequence;
 constexpr auto& g_render_count    = g_render_own.render_count;
 constexpr auto& g_render_packet   = g_render_own.render_packet;
-
-constexpr size_t                                LabelEntries = 16384;
-std::array<std::atomic<uint64_t>, LabelEntries> g_labels {};
-std::array<uint32_t, LabelEntries>              g_label_values {};
 
 struct HostWrite {
 	std::atomic<uint64_t>     clock {0};
@@ -137,10 +83,6 @@ struct HostWrite {
 constexpr uint64_t                  WriteEntries = 4096;
 std::array<HostWrite, WriteEntries> g_writes;
 constexpr auto&                     g_write_clock = g_any_writer.write_clock;
-constexpr auto&                     g_known_tail = g_render_own.known_tail;
-
-constexpr size_t                              ReasonEntries = 4096;
-std::array<std::atomic<uint64_t>, ReasonEntries> g_reasons {};
 
 constexpr size_t                                 DirectoryEntries = 65536;
 std::array<std::atomic<View*>, DirectoryEntries> g_directory {};
@@ -150,21 +92,9 @@ std::vector<View*>                               g_retired;
 constexpr auto&                                  g_version = g_render_own.version;
 
 constexpr auto&     g_running = g_read_mostly.running;
-constexpr auto&     g_stop    = g_read_mostly.stop;
-std::thread*        g_thread = nullptr;
 RenderContext* g_resources = nullptr;
 
 constexpr std::array<uint32_t, 8> LodStatsMask {0, 0, 0, 0, 0, (0xfffu << 8u) | (1u << 25u), 0xffu, 0};
-
-uint64_t LabelSlot(uint64_t address) {
-	return ((address >> 2u) * 0x9e3779b97f4a7c15ull) >> 50u;
-}
-
-void Note(uint64_t sequence, uint32_t ordinal, Reason reason) {
-	g_reasons[ordinal & (ReasonEntries - 1)].store((sequence & 0xffffffu) << 40u | uint64_t {ordinal} << 8u |
-	                                                   static_cast<uint8_t>(reason),
-	                                               std::memory_order_relaxed);
-}
 
 bool Read(void* out, uint64_t address, uint64_t bytes) {
 	if (address == 0) return false;
@@ -172,24 +102,6 @@ bool Read(void* out, uint64_t address, uint64_t bytes) {
 	if (Libs::LibKernel::Memory::TryReadBackingToHost(address, out, bytes)) return true;
 #endif
 	return Common::GuardedCopy(out, reinterpret_cast<const void*>(address), bytes) == 0;
-}
-
-int32_t GsUserSgprAt(uint32_t location) {
-	const auto id = location - Pm4::SPI_SHADER_USER_DATA_GS_0;
-	return id < 32u ? static_cast<int32_t>(id) : -1;
-}
-
-bool TestValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func) {
-	switch (func) {
-		case 0: return true;
-		case 1: return (value & mask) < ref;
-		case 2: return (value & mask) <= ref;
-		case 3: return (value & mask) == ref;
-		case 4: return (value & mask) != ref;
-		case 5: return (value & mask) >= ref;
-		case 6: return (value & mask) > ref;
-		default: return false;
-	}
 }
 
 void Quiesce() {
@@ -215,30 +127,6 @@ struct Registers {
 	uint64_t                 es = 0, ls = 0, hs = 0, ps = 0;
 	std::array<uint32_t, 32> gs_user {}, ps_user {};
 	int32_t                  start_instance = -1;
-
-	void Set(uint32_t offset, uint32_t value) {
-		const auto low  = [&](uint64_t& base) { base = (base & 0xFFFFFF00000000FFull) | uint64_t {value} << 8u; };
-		const auto high = [&](uint64_t& base) { base = (base & 0xFFFF00FFFFFFFFFFull) | (uint64_t {value} & 0xffu) << 40u; };
-		if (offset - Pm4::SPI_SHADER_USER_DATA_GS_0 < 32u) {
-			gs_user[offset - Pm4::SPI_SHADER_USER_DATA_GS_0] = value;
-			return;
-		}
-		if (offset - Pm4::SPI_SHADER_USER_DATA_PS_0 < 32u) {
-			ps_user[offset - Pm4::SPI_SHADER_USER_DATA_PS_0] = value;
-			return;
-		}
-		switch (offset) {
-			case Pm4::SPI_SHADER_PGM_LO_ES: low(es); break;
-			case Pm4::SPI_SHADER_PGM_HI_ES: high(es); break;
-			case Pm4::SPI_SHADER_PGM_LO_LS: low(ls); break;
-			case Pm4::SPI_SHADER_PGM_HI_LS: high(ls); break;
-			case Pm4::SPI_SHADER_PGM_LO_HS: low(hs); break;
-			case Pm4::SPI_SHADER_PGM_HI_HS: high(hs); break;
-			case Pm4::SPI_SHADER_PGM_LO_PS: low(ps); break;
-			case Pm4::SPI_SHADER_PGM_HI_PS: high(ps); break;
-			default: break;
-		}
-	}
 };
 
 struct State {
@@ -254,34 +142,6 @@ struct State {
 	std::vector<uint64_t>                          pages;
 	std::array<std::vector<std::pair<std::array<uint32_t, 4>, uint32_t>>, 2> entries;
 };
-
-int64_t LeadOf(const State& state, uint64_t sequence, uint32_t ordinal) {
-	const auto render = g_render.load(std::memory_order_acquire);
-	const auto at     = render >> 24u;
-	const auto count  = static_cast<uint32_t>(render & 0xffffffu);
-	if (at > sequence) return -1;
-	if (at == sequence) return int64_t {ordinal} - count;
-	if (sequence - at > 64) return Lead + 1;
-	int64_t lead = ordinal;
-	for (auto s = at; s < sequence; ++s) {
-		const auto& [walked, draws] = state.draws[s & 255u];
-		if (walked != s) continue;
-		lead += s == at ? int64_t {draws} - count : int64_t {draws};
-	}
-	return lead;
-}
-
-bool Passed(uint64_t sequence, uint32_t ordinal) {
-	const auto render = g_render.load(std::memory_order_acquire);
-	return (render >> 24u) > sequence || ((render >> 24u) == sequence && (render & 0xffffffu) > ordinal);
-}
-
-bool Pause(uint32_t& spin) {
-	if (!SpinGate::Open(false)) return false;
-	if (++spin < 64) _mm_pause();
-	else std::this_thread::yield();
-	return true;
-}
 
 enum class Loss { None, Refused, Short, TooBig };
 
@@ -461,263 +321,6 @@ Loss Evaluate(State& state, const View& view, Ticket& ticket) {
 	return Loss::None;
 }
 
-bool Walk(State& state, const FeedEntry& entry) {
-	const auto sequence = entry.sequence;
-	if (entry.reset) state.registers = {};
-	if (entry.constant) state.constant = sequence;
-	LiveCounters::Add(LiveCounters::ScoutSubmissions);
-	struct Level {
-		uint64_t base = 0;
-		uint32_t size = 0, offset = 0;
-	};
-	std::array<Level, 8> stack {};
-	uint32_t             depth = 0;
-	stack[depth++]             = {reinterpret_cast<uint64_t>(entry.commands), entry.size, 0};
-	uint32_t                draws = 0;
-	uint32_t                run = 0;
-	std::array<uint32_t, 3> run_words {};
-	uint64_t                run_next = 0;
-	const auto abandon = [&] {
-		LiveCounters::Add(LiveCounters::ScoutAbandoned);
-		state.fence = std::max(state.fence, sequence);
-		return true;
-	};
-	const auto render_past = [&] {
-		LiveCounters::Add(LiveCounters::ScoutAbandoned);
-		return true;
-	};
-	const auto leave = [&] {
-		if (g_stop.load(std::memory_order_relaxed)) return false;
-		LiveCounters::Add(LiveCounters::ScoutStoodDown);
-		state.fence = std::max(state.fence, sequence);
-		return true;
-	};
-	std::array<uint32_t, 64> packet {};
-	while (depth != 0) {
-		if (g_stop.load(std::memory_order_relaxed)) return false;
-		auto& level = stack[depth - 1];
-		if (level.offset >= level.size) {
-			--depth;
-			continue;
-		}
-		if ((g_render.load(std::memory_order_acquire) >> 24u) > sequence) return render_past();
-		const auto at = level.base + uint64_t {level.offset} * 4u;
-		if (!Read(packet.data(), at, 4)) return abandon();
-		const auto header = packet[0];
-		if (header == 0x80000000u) {
-			++level.offset;
-			continue;
-		}
-		if ((header >> 30u) != 3u) return abandon();
-		const auto length = KYTY_PM4_LEN(header);
-		if (length > level.size - level.offset) return abandon();
-		const auto opcode = (header >> 8u) & 0xffu;
-		level.offset += length;
-		const auto body = [&](uint32_t dwords) { return dwords <= packet.size() && dwords <= length && Read(packet.data(), at, dwords * 4ull); };
-		const auto stop_here = [&] {
-			LiveCounters::Add(LiveCounters::ScoutWaitsStopped);
-			for (uint32_t spin = 0; !Passed(sequence, draws);)
-				if (g_stop.load(std::memory_order_relaxed) || !Pause(spin)) return false;
-			return true;
-		};
-		if (opcode == Pm4::IT_SET_SH_REG) {
-			if (length < 3) continue;
-			uint32_t offset = 0;
-			if (!Read(&offset, at + 4, 4)) return abandon();
-			if (offset == Pm4::SH_NOP || offset >= Pm4::SH_NUM) continue;
-			auto count = length - 2;
-			if (offset - Pm4::SPI_SHADER_USER_DATA_GS_0 < 32u) count = std::min(count, 32u - (offset - Pm4::SPI_SHADER_USER_DATA_GS_0));
-			if (offset - Pm4::SPI_SHADER_USER_DATA_PS_0 < 32u) count = std::min(count, 32u - (offset - Pm4::SPI_SHADER_USER_DATA_PS_0));
-			for (uint32_t i = 0; i < count; i += packet.size()) {
-				const auto n = std::min<uint32_t>(packet.size(), count - i);
-				if (!Read(packet.data(), at + 8 + i * 4ull, n * 4ull)) return abandon();
-				for (uint32_t j = 0; j < n; ++j) state.registers.Set(offset + i + j, packet[j]);
-			}
-		} else if (opcode == Pm4::IT_SET_SH_REG_INDIRECT) {
-			if (length != 5 || !body(5)) return abandon();
-			const auto table = (uint64_t {packet[1]} & 0xfffffffcu) | uint64_t {packet[2]} << 32u;
-			const auto count = packet[4] & 0x3fffu;
-			for (uint32_t i = 0; i < count; i += 32) {
-				const auto n = std::min<uint32_t>(32, count - i);
-				if (!Read(packet.data(), table + i * 8ull, n * 8ull)) break;
-				for (uint32_t j = 0; j < n; ++j) {
-					const auto raw = packet[2 * j];
-					if (raw == 0xffffffffu) continue;
-					const auto offset = raw & ~0x70000000u;
-					if (offset != Pm4::SH_NOP && offset < Pm4::SH_NUM) state.registers.Set(offset, packet[2 * j + 1]);
-				}
-			}
-		} else if (opcode == Pm4::IT_INDIRECT_BUFFER) {
-			if (length == 4) {
-				if (!body(4)) return abandon();
-				const auto address = uint64_t {packet[1]} | uint64_t {packet[2]} << 32u;
-				const auto size    = packet[3] & 0xfffffu;
-				if (size == 0) continue;
-				if (address == 0 || depth == stack.size()) return abandon();
-				stack[depth++] = {address, size, 0};
-			} else if (length == 14) {
-				if (!body(14)) return abandon();
-				const auto compare = (uint64_t {packet[2]} & 0xfffffff8u) | uint64_t {packet[3]} << 32u;
-				uint64_t   value   = 0;
-				if (g_resources->HasReadWatchers(compare, 8) || !Read(&value, compare, 8)) return abandon();
-				const auto mask = packet[4] | uint64_t {packet[5]} << 32u, reference = packet[6] | uint64_t {packet[7]} << 32u;
-				const auto mode = packet[1] & 0x3u;
-				const auto then_address = (uint64_t {packet[8]} & 0xfffffffcu) | uint64_t {packet[9]} << 32u;
-				const auto else_address = (uint64_t {packet[11]} & 0xfffffffcu) | uint64_t {packet[12]} << 32u;
-				const auto then_size = packet[10] & 0xfffffu, else_size = packet[13] & 0xfffffu;
-				if (depth == stack.size()) return abandon();
-				if (TestValue(value, reference, mask, (packet[1] >> 8u) & 0x7u)) stack[depth++] = {then_address, then_size, 0};
-				else if (mode == 2 && else_size != 0) stack[depth++] = {else_address, else_size, 0};
-			} else {
-				return abandon();
-			}
-		} else if (opcode == Pm4::IT_COND_EXEC) {
-			if (!body(5)) return abandon();
-			const auto address = uint64_t {packet[2]} << 32u | (packet[1] & 0xfffffffcu);
-			uint32_t   value   = 0;
-			if (g_resources->HasReadWatchers(address, 4) || !Read(&value, address, 4)) return abandon();
-			if (value == 0) level.offset = std::min(level.size, level.offset + (packet[4] & 0x3fffu));
-		} else if (opcode == Pm4::IT_WAIT_REG_MEM || opcode == Pm4::IT_WAIT_REG_MEM_64) {
-			if (!body(4)) return abandon();
-			const bool wide    = opcode == Pm4::IT_WAIT_REG_MEM_64;
-			const auto address = (packet[2] & ~(wide ? 0x7u : 0x3u)) | (uint64_t {packet[3]} & 0x3ffffu) << 32u;
-			bool       written = g_labels[LabelSlot(address)].load(std::memory_order_relaxed) == address;
-			if (wide) written = written && g_labels[LabelSlot(address + 4)].load(std::memory_order_relaxed) == address + 4;
-			if (written) {
-				LiveCounters::Add(LiveCounters::ScoutWaitsPassed);
-			} else if (!stop_here()) {
-				return leave();
-			}
-		} else if (opcode == Pm4::IT_REWIND) {
-			LiveCounters::Add(LiveCounters::ScoutRewinds);
-			if (!stop_here()) return leave();
-		} else if (opcode == Pm4::IT_NOP && header == 0xC0001024u) {
-			state.registers = {};
-		} else if (IsDraw(opcode)) {
-			const auto ordinal = draws++;
-			LiveCounters::Add(LiveCounters::ScoutDrawPackets);
-			const bool indirect = opcode == Pm4::IT_DRAW_INDIRECT || opcode == Pm4::IT_DRAW_INDEX_INDIRECT ||
-			                      opcode == Pm4::IT_DRAW_INDIRECT_MULTI || opcode == Pm4::IT_DRAW_INDEX_INDIRECT_MULTI;
-			if (!body(std::min<uint32_t>(length, 10))) return abandon();
-			state.registers.start_instance = indirect && length >= 4 ? GsUserSgprAt(packet[3] & 0xffffu) : -1;
-			if (header == 0xc0032500u) {
-				const std::array<uint32_t, 3> words {packet[2], packet[3], packet[4]};
-				if (run != 0 && run < 64 && at == run_next && words == run_words) {
-					++run;
-					run_next = at + 20;
-					Note(sequence, ordinal, Reason::Continuation);
-					continue;
-				}
-				run       = 1;
-				run_words = words;
-				run_next  = at + 20;
-			} else {
-				run = 0;
-				if (header != 0xc0083800u && header != 0xc0042700u && header != 0xc0033500u && header != 0xc0012d00u) {
-					Note(sequence, ordinal, Reason::NotNative);
-					continue;
-				}
-			}
-			const auto& registers = state.registers;
-			if (registers.es == 0 || registers.ls != 0 || registers.hs != 0) {
-				LiveCounters::Add(LiveCounters::ScoutNotTable);
-				Note(sequence, ordinal, Reason::NotTable);
-				continue;
-			}
-			if (state.constant != 0 && !((g_render.load(std::memory_order_acquire) >> 24u) > state.constant)) {
-				LiveCounters::Add(LiveCounters::ScoutConstant);
-				Note(sequence, ordinal, Reason::Constant);
-				continue;
-			}
-			if (state.fence != 0 && state.fence < sequence && !((g_render.load(std::memory_order_acquire) >> 24u) > state.fence)) {
-				LiveCounters::Add(LiveCounters::ScoutFenced);
-				Note(sequence, ordinal, Reason::Fenced);
-				continue;
-			}
-			bool stalled = false;
-			for (uint32_t spin = 0;;) {
-				const auto lead = LeadOf(state, sequence, ordinal);
-				if (lead < 0) break;
-				if (lead <= Lead && g_ring_tail.load(std::memory_order_relaxed) - g_ring_head.load(std::memory_order_acquire) < RingSlots)
-					break;
-				stalled = true;
-				if (g_stop.load(std::memory_order_relaxed) || !Pause(spin)) return leave();
-			}
-			if (stalled) LiveCounters::Add(LiveCounters::ScoutLeadStalls);
-			if (LeadOf(state, sequence, ordinal) < 0) {
-				LiveCounters::Add(LiveCounters::ScoutBehind);
-				Note(sequence, ordinal, Reason::Behind);
-				continue;
-			}
-			const std::array<uint64_t, 3> key {registers.es, registers.ps, static_cast<uint32_t>(registers.start_instance)};
-			const auto* view = g_directory[XXH3_64bits(key.data(), sizeof(key)) & (DirectoryEntries - 1)].load(std::memory_order_acquire);
-			if (view == nullptr || view->key != key) {
-				LiveCounters::Add(view == nullptr ? LiveCounters::ScoutNoView : LiveCounters::ScoutNoViewOther);
-				Note(sequence, ordinal, view == nullptr ? Reason::NoViewEmpty : Reason::NoViewOther);
-				Quiesce();
-				continue;
-			}
-			const auto tail   = g_ring_tail.load(std::memory_order_relaxed);
-			auto&      ticket = g_ring[tail % RingSlots];
-			ticket.sequence   = sequence;
-			ticket.ordinal    = ordinal;
-			ticket.packet     = at;
-			const auto loss   = Evaluate(state, *view, ticket);
-			Quiesce();
-			switch (loss) {
-				case Loss::None:
-					g_ring_tail.store(tail + 1, std::memory_order_release);
-					LiveCounters::Add(LiveCounters::ScoutTickets);
-					LiveCounters::Add(LiveCounters::ScoutTicketWords, ticket.used);
-					Note(sequence, ordinal, Reason::Ticket);
-					break;
-				case Loss::Refused: LiveCounters::Add(LiveCounters::ScoutRefused), Note(sequence, ordinal, Reason::Refused); break;
-				case Loss::Short: LiveCounters::Add(LiveCounters::ScoutShort), Note(sequence, ordinal, Reason::Short); break;
-				case Loss::TooBig: LiveCounters::Add(LiveCounters::ScoutTooBig), Note(sequence, ordinal, Reason::TooBig); break;
-			}
-		}
-	}
-	state.draws[sequence & 255u] = {sequence, draws};
-	return true;
-}
-
-void Main() {
-	KYTY_PROFILER_THREAD("Thread_Scout");
-	auto     state = std::make_unique<State>();
-	uint64_t last  = 0;
-	auto     report = std::chrono::steady_clock::now();
-	for (uint32_t spin = 0;;) {
-		Quiesce();
-		if (spin == 0 && std::chrono::steady_clock::now() - report > std::chrono::seconds(10)) {
-			report = std::chrono::steady_clock::now();
-			LiveCounters::Report();
-		}
-		const auto wake = g_wake.load(std::memory_order_acquire);
-		if (g_stop.load(std::memory_order_acquire)) return;
-		const auto head = g_feed_head.load(std::memory_order_relaxed);
-		if (head == g_feed_tail.load(std::memory_order_acquire)) {
-			if (++spin < 2048 && Pause(spin)) continue;
-			g_wake.wait(wake, std::memory_order_acquire);
-			spin = 0;
-			continue;
-		}
-		spin             = 0;
-		const auto entry = g_feed[head % FeedEntries];
-		g_feed_head.store(head + 1, std::memory_order_release);
-		if (last != 0 && entry.sequence > last + 1) state->fence = std::max(state->fence, entry.sequence - 1);
-		last = entry.sequence;
-		const bool shut = !SpinGate::Open(false);
-		if (shut || (g_render.load(std::memory_order_acquire) >> 24u) > entry.sequence) {
-			if (!((g_render.load(std::memory_order_acquire) >> 24u) > entry.sequence)) state->fence = std::max(state->fence, entry.sequence);
-			if (entry.reset) state->registers = {};
-			if (entry.constant) state->constant = entry.sequence;
-			LiveCounters::Add(shut ? LiveCounters::ScoutStoodDown : LiveCounters::ScoutAbandoned);
-			continue;
-		}
-		if (!Walk(*state, entry)) return;
-	}
-}
-
 }
 
 bool Running() noexcept {
@@ -725,25 +328,13 @@ bool Running() noexcept {
 }
 
 void Start(RenderContext& resources) {
-	if (Mode() == 0 || Running()) return;
+	if (Running()) return;
 	g_resources = &resources;
-	g_stop.store(false);
 	g_running.store(true);
-	if (Mode() == 3) {
-		return;
-	}
-	g_thread = new std::thread(Main);
-	std::printf("Scout: on (KYTY_SCOUT=%u)\n", Mode());
 }
 
 void Stop() {
 	if (!Running()) return;
-	g_stop.store(true, std::memory_order_seq_cst);
-	g_wake.fetch_add(1, std::memory_order_seq_cst);
-	g_wake.notify_all();
-	if (g_thread != nullptr && g_thread->joinable()) g_thread->join();
-	delete g_thread;
-	g_thread = nullptr;
 	g_running.store(false);
 	for (uint32_t i = 0; i < LiveCounters::Count; ++i)
 		if (const auto n = LiveCounters::g_counts[i].load(std::memory_order_relaxed); n != 0)
@@ -771,19 +362,6 @@ bool EvaluateAhead(const std::array<uint64_t, 3>& key, uint64_t key_hash, std::s
 	}
 	Quiesce();
 	return made;
-}
-
-void Feed(uint64_t sequence, std::span<const uint32_t> commands, bool constant, bool reset) {
-	if (!Running() || Mode() == 3) return;
-	const auto tail = g_feed_tail.load(std::memory_order_relaxed);
-	if (tail - g_feed_head.load(std::memory_order_acquire) >= FeedEntries) {
-		LiveCounters::Add(LiveCounters::ScoutFeedFull);
-		return;
-	}
-	g_feed[tail % FeedEntries] = {sequence, commands.data(), static_cast<uint32_t>(commands.size()), constant, reset};
-	g_feed_tail.store(tail + 1, std::memory_order_release);
-	g_wake.fetch_add(1, std::memory_order_release);
-	g_wake.notify_one();
 }
 
 void BeginSubmission(uint64_t sequence) {
@@ -814,45 +392,8 @@ void SkipDraws(uint32_t count) {
 	g_render.store(g_render_sequence << 24u | g_render_count, std::memory_order_release);
 }
 
-void NoteWrite(const void* address, uint32_t size, const void* values) {
-	const uint64_t first = reinterpret_cast<uint64_t>(address) & ~uint64_t {3};
-	const auto     end   = std::min(reinterpret_cast<uint64_t>(address) + size, first + uint64_t {64 * 4});
-	const bool keep  = Mode() == 2;
-	for (auto word = first; word < end; word += 4) {
-		g_labels[LabelSlot(word)].store(word, std::memory_order_relaxed);
-		if (keep) {
-			uint32_t value = 0;
-			const auto  begin  = reinterpret_cast<uint64_t>(address);
-			const bool  inside = values != nullptr && word >= begin && word + 4 <= begin + size;
-			const auto* from   = inside ? static_cast<const uint8_t*>(values) + (word - begin)
-			                            : reinterpret_cast<const uint8_t*>(word);
-			std::memcpy(&value, from, sizeof(value));
-			g_label_values[LabelSlot(word)] = value;
-		}
-	}
+void NoteWrite(const void* address, uint32_t size) {
 	NoteHostWrite(reinterpret_cast<uint64_t>(address), size);
-}
-
-void CheckWait(const void* address, uint32_t size) {
-	const auto first = reinterpret_cast<uint64_t>(address);
-	for (auto word = first; word < first + size; word += 4)
-		if (g_labels[LabelSlot(word)].load(std::memory_order_relaxed) != word) {
-			LiveCounters::Add(LiveCounters::ScoutWaitOther);
-			return;
-		}
-	LiveCounters::Add(LiveCounters::ScoutWaitChecks);
-	for (auto word = first; word < first + size; word += 4) {
-		const auto held = *reinterpret_cast<const uint32_t*>(word), wrote = g_label_values[LabelSlot(word)];
-		if (held == wrote) continue;
-		LiveCounters::Add(LiveCounters::ScoutWaitChanged);
-		static uint32_t reports = 0;
-		if (reports++ < 64)
-			std::printf("Scout: wait 0x%llx (%u bytes): word 0x%llx holds 0x%08x, the command processor wrote 0x%08x; "
-			            "submission %llu draw %u\n",
-			            static_cast<unsigned long long>(first), size, static_cast<unsigned long long>(word), held, wrote,
-			            static_cast<unsigned long long>(g_render_sequence), g_render_count);
-		return;
-	}
 }
 
 void NoteHostWrite(uint64_t address, uint64_t size, bool write_back) {
@@ -898,14 +439,6 @@ bool WrittenSince(const Ticket& ticket, bool& write_back) {
 	return false;
 }
 
-Reason CurrentReason() {
-	const auto ordinal = g_render_count - 1;
-	const auto noted   = g_reasons[ordinal & (ReasonEntries - 1)].load(std::memory_order_relaxed);
-	if ((noted >> 40u) != (g_render_sequence & 0xffffffu) || ((noted >> 8u) & 0xffffffffu) != ordinal)
-		return Reason::Unwalked;
-	return static_cast<Reason>(noted & 0xffu);
-}
-
 uint64_t NextVersion() {
 	return ++g_version;
 }
@@ -919,33 +452,6 @@ void Retire(uint64_t key_hash, uint64_t version) {
 	auto& entry = g_directory[key_hash & (DirectoryEntries - 1)];
 	auto* view  = entry.load(std::memory_order_acquire);
 	if (view != nullptr && view->version == version && entry.compare_exchange_strong(view, nullptr)) RetireView(view);
-}
-
-const Ticket* Current() {
-	const auto    sequence = g_render_sequence;
-	const auto    ordinal  = g_render_count - 1;
-	auto          head     = g_ring_head.load(std::memory_order_relaxed);
-	const Ticket* found    = nullptr;
-	bool          later    = false;
-	for (uint32_t pass = 0; pass < 2 && !later; ++pass) {
-		if (pass == 1) g_known_tail = g_ring_tail.load(std::memory_order_acquire);
-		for (; head != g_known_tail; ++head) {
-			const auto& ticket = g_ring[head % RingSlots];
-			if (ticket.sequence > sequence || (ticket.sequence == sequence && ticket.ordinal >= ordinal)) {
-				if (ticket.sequence == sequence && ticket.ordinal == ordinal) found = &ticket;
-				later = true;
-				break;
-			}
-		}
-	}
-	g_ring_head.store(head, std::memory_order_release);
-	const auto* next = reinterpret_cast<const char*>(&g_ring[(head + 1) % RingSlots]);
-	for (uint32_t line = 0; line < 12; ++line) __builtin_prefetch(next + 64 * line);
-	return found;
-}
-
-uint64_t CurrentPacket() {
-	return reinterpret_cast<uint64_t>(g_render_packet);
 }
 
 }

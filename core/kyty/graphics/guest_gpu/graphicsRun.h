@@ -153,7 +153,6 @@ private:
 	uint64_t        m_submit_id = 0;
 	std::atomic_int m_done_num  = 0;
 	uint64_t        m_scout_sequence = 0;
-	bool            m_scout_reset    = false;
 
 	struct WaitRange {
 		uint64_t begin = 0;

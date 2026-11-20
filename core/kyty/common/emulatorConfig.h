@@ -107,11 +107,6 @@ struct ConfigOptions {
 	bool                   spirv_debug_printf_enabled  = false;
 	bool                   gpu_assisted_validation_enabled = false;
 	bool                   renderdoc_enabled           = false;
-	bool                   readback_linear_images      = true;
-	bool                   readback_tiled_images       = false;
-	bool                   readback_storage_images     = false;
-	bool                   sync_raw_image_buffers      = false;
-	uint32_t               flush_draws                 = 0;
 	bool                   tessellation_enabled        = true;
 	bool                   occlusion_queries_enabled   = true;
 	bool                   relaxed_shader_float        = false;
@@ -198,11 +193,6 @@ bool SpirvDebugPrintfEnabled();
 bool GpuAssistedValidationEnabled();
 
 bool RenderDocEnabled();
-bool ReadbackLinearImagesEnabled();
-bool ReadbackTiledImagesEnabled();
-bool ReadbackStorageImagesEnabled();
-bool SyncRawImageBuffersEnabled();
-uint32_t GetFlushDraws();
 bool TessellationEnabled();
 bool OcclusionQueriesEnabled();
 bool RelaxedShaderFloatEnabled();
@@ -229,10 +219,8 @@ enum class GpuStageThread : uint32_t {
 	Execution        = 1,
 	Recording        = 2,
 	Resolve          = 3,
-	HostCopy         = 4,
-	ResolveHelper    = 5
+	HostCopy         = 4
 };
-bool ResolveHelperEnabled();
 void ConfigureGpuStageThread(GpuStageThread stage);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();

@@ -481,12 +481,7 @@ private:
 	uint64_t         m_image_set_epoch        = 0;
 	static constexpr uint64_t ImageSetChangeHistory = 1024;
 	std::array<std::pair<uint64_t, uint64_t>, ImageSetChangeHistory> m_image_set_changes {};
-	bool             m_readback_linear_images = false;
-	bool             m_readback_tiled_images  = false;
 	bool             m_readback_storage_images = false;
-#if defined(ANYPS5_KYTY)
-	bool             m_readback_first_writes   = false;
-#endif
 	struct ExactLookup {
 		ImageInfo info;
 		ImageId   id;

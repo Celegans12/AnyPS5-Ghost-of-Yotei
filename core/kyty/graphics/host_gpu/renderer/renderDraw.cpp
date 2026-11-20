@@ -695,16 +695,6 @@ void RenderExecutor::ReleaseResolvedDraw(ResolvedDraw* resolved) noexcept {
 	resolved->busy.store(false, std::memory_order_release);
 }
 
-bool RenderExecutor::ResolvedDrawWritesBuffers(const ResolvedDraw& resolved) {
-	for (uint32_t i = 0; i < resolved.programs.stages; i++) {
-		const auto* plan = resolved.programs.plans[i];
-		if (plan == nullptr || std::ranges::any_of(plan->info.buffers, [](const auto& buffer) { return buffer.written; })) {
-			return true;
-		}
-	}
-	return false;
-}
-
 RenderExecutor::ResolvedDraw* RenderExecutor::WaitResolvedDraw(ResolvedDraw* resolved) noexcept {
 	auto state = resolved->state.load(std::memory_order_acquire);
 	for (Common::SpinWait wait; state == ResolvedDraw::Pending;
@@ -1578,25 +1568,6 @@ RenderExecutor::ResolvedDraw& RenderExecutor::NextResolvedDraw() {
 	}
 	ring.next = (ring.next + 1) % ResolvedDrawRing::Size;
 	return draw;
-}
-
-RenderExecutor::ResolvedDraw* RenderExecutor::ReserveResolvedDraw(const HW::Shader& shaders) {
-	if (!DrawHasValidVertexShader(shaders)) {
-		return nullptr;
-	}
-	auto& draw = NextResolvedDraw();
-	draw.state.store(ResolvedDraw::Pending, std::memory_order_relaxed);
-	draw.busy.store(true, std::memory_order_relaxed);
-	return &draw;
-}
-
-void RenderExecutor::ResolveDrawInto(ResolvedDraw& draw, const HW::Context& context,
-                                     const HW::UserConfig& user_config, const HW::Shader& shaders,
-                                     const ShaderIndirectOffsets& indirect_offsets, bool indirect_draw,
-                                     uint64_t context_id, uint64_t user_config_id) {
-	const bool resolved = ResolveDrawPrograms(draw, context, user_config, shaders, indirect_offsets, indirect_draw,
-	                                          context_id, user_config_id);
-	draw.state.store(resolved ? ResolvedDraw::Ready : ResolvedDraw::Failed, std::memory_order_release);
 }
 
 bool RenderExecutor::ResolveDrawPrograms(ResolvedDraw& draw, const HW::Context& context,

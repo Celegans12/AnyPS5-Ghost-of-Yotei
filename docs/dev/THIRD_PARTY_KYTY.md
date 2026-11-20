@@ -179,13 +179,9 @@ AnyPS5 opens the window, so Kyty's window options do nothing; `ANYPS5_FULLSCREEN
 | Variable | Values | Default | Effect | Category | Platform | Origin |
 |---|---|---|---|---|---|---|
 | `KYTY_GPU_PIPELINE` | a number (base 0), else stops: `0` runs the whole GPU inline on one thread, `1` means every stage, other values keep the bits `1` recording, `2` command processor, `4` resolve | every stage (`7`) | Which stages of the emulated GPU run on threads of their own | perf | all | Kyty import |
-| `KYTY_GPU_THREAD_CPUS` | unset, empty, `off`, or up to six logical CPUs separated by commas: command processor, execution, recording, resolve, host copy, resolve helper; else stops | unset | Unset or empty: on Linux each stage keeps to the CPUs of the largest last-level cache, on Windows KytyPS5's `{4, 6, 8, 10, 2, 0}`. `off`: no placement. A list pins the stages; stages past its end keep KytyPS5's value. See [below](#details) | perf | all | Kyty import; Linux default `c06a623c12` |
-| `KYTY_GPU_THREAD_PRIORITY` | `0` | unset | `0` keeps the stage threads at their normal priority; otherwise they are raised, which only happens on Windows (`RaiseCurrentPriority` does nothing on Linux) | perf | Windows | Kyty import |
+| `KYTY_GPU_THREAD_CPUS` | unset, empty, `off`, or up to five logical CPUs separated by commas: command processor, execution, recording, resolve, host copy; else stops | unset | Unset or empty: on Linux each stage keeps to the CPUs of the largest last-level cache, on Windows KytyPS5's `{4, 6, 8, 10, 2}`. `off`: no placement. A list pins the stages; stages past its end keep KytyPS5's value. See [below](#details) | perf | all | Kyty import; Linux default `c06a623c12` |
 | `KYTY_GPU_SPIN_US` | microseconds; text that is not a number reads as `0` | `2000` | How long a pipeline thread spins on an empty or full handoff before it waits in the kernel; `0` never spins | perf | all | Kyty import |
 | `KYTY_FAST_TLS` | `0` turns it off, any other value or unset leaves it on | on | Serves the emulated TLS of `libSceAgcDriver.prx`'s own `thread_local` variables from one native TLS slot instead of libgcc's `__emutls_get_address`, whose `pthread_getspecific` takes a spin lock on every access and whose storage a thread frees before its `thread_local` destructors run, which corrupts the heap when the thread exits (#116); a thread's slot storage is freed after those destructors; variables of other modules keep libgcc's | perf | Windows | AnyKyty |
-| `KYTY_RESOLVE_HELPER` | `1` | unset | A second thread resolves some draws ahead of their execution beside the resolve thread; it takes the sixth entry of `KYTY_GPU_THREAD_CPUS` | perf | all | Kyty import |
-| `KYTY_SCOUT` | `0` to `3`, any other text reads as `3` | `3` | Look-ahead on queue 0: `0` off, `1` uses the scout thread's tickets, `2` its verifier, `3` the resolve thread evaluates each draw's tables ahead | perf | all | Kyty import |
-| `KYTY_FLUSH_DRAWS` | whole number, else stops | `0` | Submits the open command buffer every this many draws; `0` never does it on a count | perf | all | Kyty option |
 | `KYTY_IDLE_SUBMIT` | `0` or `1`, empty counts as unset, else stops | on | After a draw or a dispatch, submits the open command buffer when every closed one has been submitted and the GPU has finished them; `0` keeps a command buffer open until the end of the guest submission. See [below](#details) | perf | all | `820414454e` |
 | `KYTY_CP_ORDERED_READBACK` | `0` turns it off, any other value or unset leaves it on | on | A command processor read that faults on a page the GPU may own waits only for the operations that read is ordered after, instead of the whole GPU queue, and indirect register tables whose bytes the GPU never wrote are read without a fault; `0` drains the queue as before | perf | all | AnyKyty |
 | `KYTY_REPLAY_GPU_PAGE_READS` | On Linux `0` turns it off and any other value or unset leaves it on; on Windows only `1` turns it on | on (Linux), off (Windows) | A guest read that faults on a GPU-owned page, on bytes no GPU write is near, is replayed on the backing view instead of waiting for a readback; instructions that write memory or read the shifted register are never replayed; `0` waits for the readback as before; on Windows the replay ends on the single step exception of the vectored handler, and stays off by default until it is measured there | perf | all | AnyKyty |
@@ -208,21 +204,10 @@ The table draws are GPU-driven draws of a shader pair's table programs.
 | `KYTY_DRAW_TEMPLATES` | `0`, `1`, `2`; other text reads as `1` | `2` (KytyPS5: off) | Draw templates: `1` turns them on, `2` also keys them by the draw's registers and takes the pipeline and render targets from them | perf | all | Kyty import; on by default `50d7c13842` |
 | `KYTY_DRAW_BUFFERS` | `1`; other text is off | on (KytyPS5: off) | Copies the small read-only buffer ranges of a draw to the stream buffer together before its stages bind them | perf | all | Kyty import; on by default `50d7c13842` |
 | `KYTY_TABLE_XPR` | `0`, `1`, `2` (read in base 0) | `2` | Table draws: `0` off, `1` on, `2` also continues runs of clean draws, which the command processor's `DrawStateObserver` finds | perf | all | Kyty import |
-| `KYTY_TABLE_STORE_BUDGET` | number; `0` no limit | `32` | Table stores a frame asks for; the others are deferred to the normal path | perf | all | Kyty import |
-| `KYTY_TABLE_SET_PROOFS` | `0`, `1`, `2` | `1` | Checks of a table's image sets: `0` checks every use in full, `1` skips a use whose proof still holds, `2` does and counts the uses a proof held for that did not pass | perf | all | Kyty import |
-| `KYTY_TABLE_MRU` | bit mask | `7` | Bit `1` a larger pair cache, `2` variant hints, `4` reuse of the previous draw's set when its words match | perf | all | Kyty import |
 | `KYTY_TABLE_DESCRIPTOR_WRITES` | `0` or `1`; empty counts as unset, else stops | `1` when the device's `VkPhysicalDeviceDriverProperties::driverID` is `VK_DRIVER_ID_MESA_RADV`, else `0` | A draw whose image tables are reused but whose ring set is not current fills each table with descriptor writes from the table's host copy; a slot whose image view is not proven alive is still copied. `0` copies each table's whole capacity from its persistent set; on RADV those copies took most of the execute thread's time in a CPU profile, on NVIDIA the writes were slower | perf | all | AnyKyty |
 | `KYTY_TABLE_RESOLUTIONS` | `1` to `4096`; empty counts as unset, else stops | `256` | Entries of the cache that resolves the image tables of the normal draw path, one per table key, least recently used evicted. Evicting or renewing an entry invalidates only the table states that use it (one generation per entry), and the elements of all entries are kept under the 8 × 65,536 of the old cache by clearing the least recently used entries. Ignored with `KYTY_TABLE_RESOLUTION_LEGACY=1` | perf | all | AnyKyty |
 | `KYTY_TABLE_RESOLUTION_LEGACY` | `0` or `1`; empty counts as unset, else stops | `0` | `1` restores Kyty's cache of table resolutions: 8 entries, and creating, evicting or clearing any entry invalidates every table state (one generation for all), which then resolves its tables again | perf | all | AnyKyty |
-| `KYTY_TABLE_GATHER_MEMO` | number | `1` | Memoises the buffer descriptors a table gathers | perf | all | Kyty import |
-| `KYTY_TABLE_MEMO` | number | `1` | Remembers by shader pair and state key what a table draw drew with last | perf | all | Kyty import |
 | `KYTY_TABLE_MEMO_VERIFY` | number | `0` | Every Nth memo hit is checked against the full path, and a difference is counted | debug | all | Kyty import |
-| `KYTY_TABLE_STRIDES` | first character `0` is off | on | Table programs read an unswizzled buffer of any stride from the block, where otherwise they specialise on the stride | perf | all | Kyty import |
-| `KYTY_DRAW_READ_AFTER_WRITE` | number | `1` | A draw whose image set binds one image as texture and as written storage transits it at every draw, after the last draw's write | compat | all | Kyty import |
-| `KYTY_STATE_KEY_CACHE` | first character `0` is off | on | Hashes the draw-state registers again only for another snapshot of them; also used by table draws | perf | all | Kyty import |
-| `KYTY_ASYNC_XPR_PIPELINES` | first character `0` is off | on | Creates the pipeline of a record or table variant on a background thread; `0` does it on the execution thread; also used by table draws | perf | all | Kyty import |
-| `KYTY_UNIFORM_BUFFERS` | first character `0` is off | on | Shaders read constants at small immediate offsets through uniform buffer views (needs `uniformBufferStandardLayout`); `0` reads them through the storage buffer | perf | all | Kyty import |
-| `KYTY_NATIVE_F16` | first character `0` is off | on | Shaders compute F16 natively (needs `shaderFloat16`); `0` does it per lane in F32 | perf | all | Kyty import |
 | `KYTY_TESSELLATION` | `0` or `1`, else stops | `1` | Draws patch primitives with tessellation; `0` drops them before their programs are looked up or prepared | option | all | Kyty option |
 | `KYTY_OCCLUSION_QUERIES` | `0` or `1`, else stops | `1` | Host occlusion queries, which need the device's `hostQueryReset`; `0` turns them off | option | all | Kyty option |
 | `KYTY_RELAXED_SHADER_FLOAT` | `0` or `1`, else stops | `0` | Relaxes the shader recompiler's float rules (min and max, trigonometric functions) for speed | experimental | all | Kyty option |
@@ -234,19 +219,13 @@ The table draws are GPU-driven draws of a shader pair's table programs.
 
 | Variable | Values | Default | Effect | Category | Platform | Origin |
 |---|---|---|---|---|---|---|
-| `KYTY_READBACK_LINEAR_IMAGES` | `0` or `1`, else stops | `1` | Copies a GPU-written linear image back to guest memory at the next suspend point | compat | all | Kyty option |
-| `KYTY_READBACK_TILED_IMAGES` | `0` or `1`, else stops | `0` | The same for tiled images, which is slow | compat | all | Kyty option |
-| `KYTY_READBACK_STORAGE_IMAGES` | `0` or `1`, else stops | `0` | Copies every storage image back on its first write; see `KYTY_WRITE_BACK_IMAGES` | compat | all | Kyty option |
 | `KYTY_WRITE_BACK_IMAGES` | `0` or `1`, empty counts as unset, else stops | on | Copies the queued readbacks back at each `ACQUIRE_MEM` or `RELEASE_MEM` with GL2 write-back and at each flip; `0` is KytyPS5's behaviour. See [below](#details) | compat | all | `9d957fd81e` |
 | `KYTY_FLAT_TABLE_SLOTS` | `0` turns it off, any other value or unset leaves it on | on | A new image descriptor table finds repeated 32-byte descriptors through a flat index the execution thread reuses, instead of one `unordered_map` node per distinct descriptor; the slots, the mapping and their order are the same; `0` uses the `unordered_map` | perf | all | AnyKyty |
 | `KYTY_URGENT_WRITEBACK_WAIT` | `0` turns it off, any other value or unset leaves it on | on | A guest thread that faults on a page whose texture write-back is still in the open command buffer sends the flush on the urgent queue and waits for that submission itself, instead of queueing the flush behind every operation the command processor has queued; `0` sends it through the ordinary command queue | perf | all | AnyKyty |
 | `KYTY_FIX_STENCIL_FILL_HELD_PLANE` | `0` turns it off, any other value or unset leaves it on | on | A buffer fill of a stencil plane becomes a clear of the depth image's stencil aspect only while that aspect holds the plane; a fill of another plane runs as the game's own fill, so it no longer wipes the plane the depth image holds; `0` clears the aspect for a fill of any registered plane | compat | all | AnyKyty |
 | `KYTY_TILE_VIA_VRAM` | `0` or `1`, empty counts as unset, else stops | on | Tiles a tiled image's readback in device-local memory, then copies it once to the host; `0` is KytyPS5's behaviour. See [below](#details) | perf | all | `08c666a175` |
 | `KYTY_COMPARE_WRITE_BACK` | `0` or `1`, empty counts as unset, else stops | on | An image readback writes guest memory only where the GPU result differs from the bytes read when the readback was recorded and the guest bytes still hold that read; `0` writes the image's whole footprint, KytyPS5's behaviour. See [below](#details) | compat | all | AnyKyty |
-| `KYTY_SYNC_RAW_IMAGE_BUFFERS` | `0` or `1`, else stops | `0` | Obtains a raw buffer that a shader reads the way a formatted (texel) buffer is obtained | compat | all | Kyty option |
 | `KYTY_SRT_WALKER_PROBE` | `0` or `1`, empty counts as unset, else stops | on | The shader resource table walk of the execution thread reads a page the GPU may own through the fault handler's around-GPU-writes read, without taking the fault; `0` takes the fault. See [below](#details) | perf | all | `8095894f76` |
-| `KYTY_COPY_FEEDBACK` | `0` is off | on | After a small GPU copy into guest memory, snapshots the destination so that a later guest read is served from the snapshot instead of a readback | perf | all | Kyty import |
-| `KYTY_ASYNC_REPROTECT` | `0` is off | on | The write protection of the pages an upload marks clean is applied by the host copy thread, ahead of the copy | perf | all | Kyty import |
 | `KYTY_EARLY_FLIP` | `0` or `1`, empty counts as unset, else stops | on | Completes a guest flip once its command buffer is submitted, on a thread of its own; `0` is KytyPS5's behaviour. See [below](#details) | perf | all | `499dfc3f39` |
 | `KYTY_LABELS_AFTER_DUMPS` | `0` or `1`, empty counts as unset, else stops | on | A deferred `RELEASE_MEM` label waits for the newest pending occlusion dump instead of its own command buffer; `0` is KytyPS5's behaviour. See [below](#details) | perf | all | `ef88cc3285` |
 | `KYTY_LABELS_AROUND_GPU_WRITES` | `0` or `1`, empty counts as unset, else stops | on | A `RELEASE_MEM` label that arrives while other labels are deferred, on a page the GPU wrote elsewhere but none of whose own bytes it wrote, is deferred behind them instead of draining the GPU; `0` drains. See [below](#details) | perf | all | AnyKyty |
@@ -331,7 +310,7 @@ The window, the flip and vblank pacing, the guest memory and the thread priority
 | `ANYPS5_UPSCALE` | `fsr`, `cmaa2`, `rcas`, unset or empty, else stops | unset | Scales the presentation with FSR 1 (EASU and RCAS) when the window is larger than the display buffer, applies Intel CMAA2 morphological anti-aliasing under `cmaa2` at 1:1, or 1:1 native RCAS under `rcas`; unset or empty keeps the bilinear blit | option | all | AnyPS5 |
 | `ANYPS5_FSR_SHARPNESS` | number, 0.0 to 2.0, else stops | `0.2` | RCAS sharpness in stops under `ANYPS5_UPSCALE=fsr` or `rcas`, from 0.0 (sharpest) to 2.0 (weakest) | option | all | AnyPS5 |
 | `APS5_SYNC_FLIP` | presence | unset | Debug aid: the flip worker waits until the presenter is done with each flip | debug | all | AnyPS5 |
-| `APS5_THREAD_PRIORITY` | `off`, `high`, `rt` | `off` | Raises the presenter thread above the title's threads; Kyty's own stage threads follow `KYTY_GPU_THREAD_PRIORITY` instead | perf | all | `a9c132a629` |
+| `APS5_THREAD_PRIORITY` | `off`, `high`, `rt` | `off` | Raises the presenter thread above the title's threads; Kyty's own stage threads are always raised, which only happens on Windows | perf | all | `a9c132a629` |
 | `APS5_THREAD_NICE`, `APS5_THREAD_RT`, `APS5_THREAD_RTTIME_US` | see [ENVIRONMENT](ENVIRONMENT.md) | see there | Tune that raised priority on Linux | perf | Linux | `a9c132a629` |
 
 ### Details
@@ -340,22 +319,22 @@ The settings below change how a part of the driver works, so each has its reason
 
 KytyPS5's log (`LOGF`) is silent by default; `KYTY_PRINTF_DIRECTION=Console` sends it to stderr, beside AnyPS5's own lines.
 
-GPU stage threads on Linux: KytyPS5 places them only on Windows (`{4, 6, 8, 10, 2, 0}` counts SMT siblings as adjacent
+GPU stage threads on Linux: KytyPS5 places them only on Windows (`{4, 6, 8, 10, 2}` counts SMT siblings as adjacent
 logical processors, and its core reservation uses Windows CPU sets). Under `ANYPS5_KYTY` on Linux, with
-`KYTY_GPU_THREAD_CPUS` unset or empty, each stage thread (command processor, execution, recording, resolve, host copy,
-resolve helper) keeps to the logical CPUs that share the largest last-level cache (`/sys/devices/system/cpu`: on a Ryzen
+`KYTY_GPU_THREAD_CPUS` unset or empty, each stage thread (command processor, execution, recording, resolve, host copy)
+keeps to the logical CPUs that share the largest last-level cache (`/sys/devices/system/cpu`: on a Ryzen
 9 7950X3D, CPUs 0-7 and 16-23, the 3D V-Cache CCD), intersected with its current affinity. No core is reserved, and the
 threads it creates afterwards inherit that set. Measured on Subnautica: +7 % to +22 % frames per second, 25-35 % less CPU
 time per draw on each stage (`notes/au-dela-p4-placement.md`). `KYTY_GPU_THREAD_CPUS=off` turns it off. An explicit list
 pins each stage to that Linux logical CPU, without core reservation; threads a stage creates afterwards inherit its CPU.
 
 Images the game reads after the GPU writes them: KytyPS5 copies a GPU-written linear image back to guest memory at the
-next suspend point, unless `KYTY_READBACK_STORAGE_IMAGES=1`. A game that waits for the label of a `RELEASE_MEM` with GL2
+next suspend point. A game that waits for the label of a `RELEASE_MEM` with GL2
 write-back and then reads the image reads stale memory: in TCG Card Shop Simulator (PPSA36301) a 64×64 RGBA32F image is
 read that way and the street stays almost black. Under `ANYPS5_KYTY`, the write-back half of that setting is on by
 default: at each `ACQUIRE_MEM` or `RELEASE_MEM` with GL2 write-back and at each flip, the images already queued for
 readback are copied back, and their pages stay read-protected until the copy lands. No other image is copied: the copy
-of every storage image on its first write still needs `KYTY_READBACK_STORAGE_IMAGES=1`. `KYTY_WRITE_BACK_IMAGES=0`
+of every storage image on its first write is not done. `KYTY_WRITE_BACK_IMAGES=0`
 restores KytyPS5's behaviour; any value other than empty, `0` or `1` stops the emulator with a message naming the
 variable.
 
@@ -472,7 +451,7 @@ labels of every queue makes the case more likely in titles without occlusion que
 
 `m_program_lock`, the spin lock of `graphics/host_gpu/renderer/pipeline/pipelineCache.cpp` that guards the program
 cache, has a narrower scope than upstream's in this build (`programLock.cpp`). The resolve thread always runs upstream's
-unlocked ahead mode, which upstream only uses with `KYTY_RESOLVE_HELPER=1`, and the execute thread releases the lock
+unlocked ahead mode, which upstream only uses with its resolve helper thread, and the execute thread releases the lock
 while it materializes the resources of a cached program, which can wait for the GPU when it reads GPU-written buffers.
 A waiter spins briefly, then yields. `KYTY_PROGRAM_LOCK`, `KYTY_LOCK_STATS` and `KYTY_LOCK_STATS_PERIOD` are read once.
 
