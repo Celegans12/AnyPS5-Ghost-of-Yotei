@@ -219,6 +219,11 @@ public:
 	                                                         uint32_t           mode, uint64_t args_addr,
 	                                                         bool               async_compute);
 	bool TakeResolvedDispatch(ShaderComputeInputInfo& input_info, const ShaderModule*& module);
+#if defined(ANYPS5_KYTY)
+	void CheckDeferredDraw(CommandBuffer& buffer, const DrawRenderState& state);
+	void CheckDeferredDispatch(const HW::ComputeShaderInfo& regs, const ShaderComputeInputInfo& pristine,
+	                           const ShaderComputeInputInfo& input_info, const ShaderModule* module);
+#endif
 	void UseResolvedDraw(ResolvedDraw* resolved) noexcept {
 		m_resolved_draw = resolved != nullptr ? WaitResolvedDraw(resolved) : nullptr;
 	}
@@ -650,6 +655,9 @@ private:
 	std::unique_ptr<ResolvedDrawRing, void (*)(ResolvedDrawRing*)> m_resolved_ring {nullptr,
 	                                                                                nullptr};
 	ResolvedDraw*                                                  m_resolved_draw = nullptr;
+#if defined(ANYPS5_KYTY)
+	ResolvedDraw* m_flat_defer_check = nullptr;
+#endif
 	uint64_t                                                       m_context_id    = 0;
 	uint64_t                                                       m_user_config_id = 0;
 	StateKeyCache                                                  m_state_key_cache;

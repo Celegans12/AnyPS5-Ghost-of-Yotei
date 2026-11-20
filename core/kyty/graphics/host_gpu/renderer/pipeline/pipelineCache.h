@@ -54,6 +54,10 @@ public:
 		m_plan        = nullptr;
 		m_failed      = false;
 		m_gpu_written = false;
+#if defined(ANYPS5_KYTY)
+		m_deferred_words     = 0;
+		m_deferred_gpu_words = 0;
+#endif
 	}
 	bool               Read(uint64_t address, void* data, uint64_t size, bool strict);
 	void               RecordLoad(uint64_t address, uint32_t value, uint32_t flat_slot);
@@ -69,8 +73,17 @@ public:
 	[[nodiscard]] bool HasDescriptorRefresh() const { return !m_refresh.empty(); }
 	void RefreshDescriptorWords(std::span<ShaderRecompiler::IR::ResourceSnapshot>          resources,
 	                            std::span<const ShaderRecompiler::IR::ResourcePlan* const> plans) const;
+#if defined(ANYPS5_KYTY)
+	void RefreshFlatLoads(std::span<ShaderRecompiler::IR::ResourceSnapshot> resources, bool gpu_copies = false,
+	                      const ShaderRecompiler::IR::CompiledShaderInfo* program = nullptr) const;
+	void                   NoteDeferredLoads(std::span<uint64_t> addresses);
+	[[nodiscard]] uint32_t DeferredWords() const { return m_deferred_words; }
+	[[nodiscard]] uint32_t DeferredGpuWords() const { return m_deferred_gpu_words; }
+	static void            ReadGuestNow(uint64_t address, void* bytes, uint32_t size);
+#else
 	void RefreshFlatLoads(std::span<ShaderRecompiler::IR::ResourceSnapshot> resources,
 	                      bool gpu_copies = false) const;
+#endif
 
 	[[nodiscard]] bool     DwordAligned() const;
 	[[nodiscard]] size_t   WordCount() const { return m_bytes.size() / 4u; }
@@ -113,6 +126,9 @@ private:
 		uint32_t stage   = 0;
 		uint32_t slot    = 0;
 		uint32_t count   = 1;
+#if defined(ANYPS5_KYTY)
+		bool deferred = false;
+#endif
 	};
 	void                  Append(uint64_t address, const void* data, uint32_t size, bool strict,
 	                             bool zero_test = false);
@@ -132,6 +148,10 @@ private:
 	const ShaderRecompiler::IR::ResourcePlan* m_plan = nullptr;
 	bool                  m_failed      = false;
 	bool                  m_gpu_written = false;
+#if defined(ANYPS5_KYTY)
+	uint32_t         m_deferred_words     = 0;
+	mutable uint32_t m_deferred_gpu_words = 0;
+#endif
 };
 
 struct ProgramResolution {
@@ -149,6 +169,18 @@ struct ProgramResolution {
 		stages          = 0;
 		refreshed_words = false;
 	}
+#if defined(ANYPS5_KYTY)
+	[[nodiscard]] bool Revalidate(bool gpu_flat_loads = false,
+	                              const ShaderRecompiler::IR::CompiledShaderInfo* program = nullptr) {
+		if (!reads.StillValid()) {
+			return false;
+		}
+		refreshed_words = reads.HasDescriptorRefresh();
+		reads.RefreshDescriptorWords(std::span(resources).first(stages), std::span(plans).first(stages));
+		reads.RefreshFlatLoads(std::span(resources).first(stages), gpu_flat_loads, program);
+		return true;
+	}
+#else
 	[[nodiscard]] bool Revalidate(bool gpu_flat_loads = false) {
 		if (!reads.StillValid()) {
 			return false;
@@ -158,6 +190,7 @@ struct ProgramResolution {
 		reads.RefreshFlatLoads(std::span(resources).first(stages), gpu_flat_loads);
 		return true;
 	}
+#endif
 };
 
 struct GraphicContext;

@@ -10,9 +10,11 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <map>
+#include <string_view>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -239,7 +241,39 @@ uint64_t KYTY_SYSV_ABI ProbeGuestLoad(uint64_t address, WalkerCachedPage* cache)
 #endif
 }
 
-void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address, uint32_t cache) {
+#if defined(ANYPS5_KYTY)
+thread_local bool                  t_walker_defer = false;
+thread_local std::vector<uint64_t> t_deferred_loads;
+
+SrtFlatDefer FlatDeferMode() {
+	static const SrtFlatDefer mode = [] {
+		const char*            value = std::getenv("KYTY_FLAT_DEFER");
+		const std::string_view text {value == nullptr ? "" : value};
+		return text == "1" ? SrtFlatDefer::On : text == "verify" ? SrtFlatDefer::Verify : SrtFlatDefer::Off;
+	}();
+	return mode;
+}
+
+bool DefersFlatLoad(uint32_t slot) {
+	return slot != NoFlatSlot && slot != ZeroTestSlot && !IsDescriptorSlot(slot) && FlatDeferMode() != SrtFlatDefer::Off;
+}
+
+uint64_t KYTY_SYSV_ABI ProbeFlatGuestLoad(uint64_t address, WalkerCachedPage* cache) {
+	const bool before = t_walker_faulted;
+	t_walker_faulted  = false;
+	const auto result = ProbeGuestLoad(address, cache);
+	if (t_walker_faulted && t_walker_defer) {
+		t_deferred_loads.push_back(address);
+		t_walker_faulted = before;
+		return result;
+	}
+	t_walker_faulted = t_walker_faulted || before;
+	return result;
+}
+#endif
+
+void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address, uint32_t cache,
+               [[maybe_unused]] uint32_t slot) {
 	Xbyak::Label direct, done, slow;
 	code.lea(code.r10, code.ptr[address]);
 	code.mov(code.rax, code.r10);
@@ -265,7 +299,11 @@ void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address, uint32_
 	code.and_(code.rsp, -16);
 	code.mov(code.rdi, code.r10);
 	code.lea(code.rsi, code.ptr[code.rdx + cache]);
+#if defined(ANYPS5_KYTY)
+	code.mov(code.rax, reinterpret_cast<uint64_t>(DefersFlatLoad(slot) ? &ProbeFlatGuestLoad : &ProbeGuestLoad));
+#else
 	code.mov(code.rax, reinterpret_cast<uint64_t>(&ProbeGuestLoad));
+#endif
 	code.call(code.rax);
 	code.mov(code.rsp, code.rbp);
 	for (const auto& reg: {code.rbp, code.r10, code.r8, code.rdx, code.rsi, code.rdi}) {
@@ -1145,6 +1183,7 @@ void WalkerCompiler::EmitRead(const Node& node, uint32_t index) {
 	const bool vector = op == ValueOpcode::LoadBufferU32;
 	auto args = std::span(node.args);
 	Xbyak::Label zero;
+	const auto   flat_slot = index < m_flat_slots.size() ? m_flat_slots[index] : NoFlatSlot;
 	if (vector) {
 		Fetch(args[0], m_ret);
 		c.test(c.rax, c.rax);
@@ -1171,7 +1210,7 @@ void WalkerCompiler::EmitRead(const Node& node, uint32_t index) {
 			c.shr(c.rcx, 48);
 			c.jnz(m_ret, Near);
 			if (index < m_zero_tested.size() && m_zero_tested[index]) SkipZeroTestedLoad(c, c.rax, m_ret);
-			LoadGuest(c, c.rax, m_page_cache);
+			LoadGuest(c, c.rax, m_page_cache, flat_slot);
 		} else {
 			Load(c.r11, args[1]);
 			c.shr(c.r11d, 16);
@@ -1203,12 +1242,12 @@ void WalkerCompiler::EmitRead(const Node& node, uint32_t index) {
 			if (index < m_zero_tested.size() && m_zero_tested[index]) {
 				SkipZeroTestedLoad(c, c.rax + c.r9 + static_cast<size_t>(immediate), m_ret);
 			}
-			LoadGuest(c, c.rax + c.r9 + static_cast<size_t>(immediate), m_page_cache);
+			LoadGuest(c, c.rax + c.r9 + static_cast<size_t>(immediate), m_page_cache, flat_slot);
 		}
 		++m_captures;
 		c.mov(c.qword[c.r8], c.r10);
 		c.mov(c.dword[c.r8 + 8], c.eax);
-		c.mov(c.dword[c.r8 + 12], index < m_flat_slots.size() ? m_flat_slots[index] : NoFlatSlot);
+		c.mov(c.dword[c.r8 + 12], flat_slot);
 		c.add(c.r8, 16);
 		Store(node);
 	}
@@ -1685,6 +1724,9 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	t_walker_faulted = false;
 	t_gpu_produced   = runtime.gpu_produced;
 	t_pending_write  = runtime.pending_write;
+#if defined(ANYPS5_KYTY)
+	t_walker_defer = t_walker_ahead && runtime.defer_flat_loads;
+#endif
 	++t_walk;
 	const auto* end = plan.srt_code->getCode<Walker>()(runtime.user_data.data(), flat.data(),
 	                                                     scratch.data(), runtime.shader_base);
@@ -1692,6 +1734,9 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	t_walker_ahead   = false;
 	t_gpu_produced   = nullptr;
 	t_pending_write  = nullptr;
+#if defined(ANYPS5_KYTY)
+	t_walker_defer = false;
+#endif
 	if (end == nullptr || t_walker_faulted) return false;
 	const auto* first = scratch.data() + plan.srt_captures / 8u;
 	if (reads != nullptr) {
@@ -1758,6 +1803,16 @@ uint32_t SrtWalkerAheadLoadLength(uint64_t rip, uint64_t address) {
 	if (length != 0) t_walker_faulted = true;
 	return length;
 }
+
+#if defined(ANYPS5_KYTY)
+SrtFlatDefer SrtFlatDeferMode() {
+	return FlatDeferMode();
+}
+
+std::vector<uint64_t>& SrtDeferredLoadsOfThread() {
+	return t_deferred_loads;
+}
+#endif
 
 void SetSrtWalkerGuestMemory(const SrtWalkerGuestMemory& memory) {
 	if (g_guest_memory_set.load(std::memory_order_acquire)) {

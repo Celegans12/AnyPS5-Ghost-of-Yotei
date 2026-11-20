@@ -1525,6 +1525,12 @@ RenderExecutor::NativeXprRecord* RenderExecutor::NativeXprRelocated(uint64_t fra
 	auto& cache = *m_native_xpr;
 	store       = false;
 	auto* resolved = m_resolved_draw;
+#if defined(ANYPS5_KYTY)
+	if (resolved != nullptr && resolved->programs.reads.DeferredWords() != 0) {
+		++cache.counters.relocated_unresolved;
+		return nullptr;
+	}
+#endif
 	if (resolved == nullptr || !resolved->programs.reads.StillValid()) {
 		++cache.counters.relocated_unresolved;
 		return nullptr;
