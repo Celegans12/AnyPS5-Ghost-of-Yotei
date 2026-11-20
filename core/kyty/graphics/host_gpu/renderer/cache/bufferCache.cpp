@@ -97,6 +97,8 @@ struct WriteBlockStats {
 	std::atomic<uint64_t> image {0};
 	std::atomic<uint64_t> buffer {0};
 	std::atomic<uint64_t> other {0};
+	std::atomic<uint64_t> already_open {0};
+	std::atomic<uint64_t> command_image {0};
 	std::atomic<int64_t>  last_line {0};
 };
 
@@ -491,6 +493,57 @@ static bool WriteFaultBlocks() {
 	return on;
 }
 
+static bool WriteFaultFastPath() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_WRITE_FAULT_FAST_PATH");
+		return value == nullptr || value[0] != '0';
+	}();
+	return on;
+}
+
+BufferCache::WriteFaultOwner BufferCache::InvalidateGuestWriteFault(uint64_t vaddr) {
+	static constexpr uint64_t FaultBlockSize = CommandBlocks::BlockSize;
+	const auto page       = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto block      = Common::AlignDown(page, FaultBlockSize);
+	const bool command    = m_memory_tracker.IsCommandBlock(page);
+	const bool segment    = !command && m_memory_tracker.IsSegmentBlock(page);
+	const bool open_block = (command || segment) && WriteFaultBlocks();
+	const auto owner_of   = [&](bool gpu, bool tracked) {
+		return command   ? WriteFaultOwner::CommandBuffer
+		       : segment ? WriteFaultOwner::CommandSegment
+		       : gpu     ? WriteFaultOwner::GpuNeighbor
+		       : tracked ? WriteFaultOwner::Buffer
+		                 : WriteFaultOwner::Other;
+	};
+	auto& stats   = g_write_block_stats;
+	bool  gpu_any = false;
+	if (m_memory_tracker.WriteFaultFindsOpen(page, FaultBlockSize, open_block, &gpu_any)) {
+		stats.already_open.fetch_add(1, std::memory_order_relaxed);
+		return owner_of(gpu_any, false);
+	}
+	const auto end  = block + FaultBlockSize;
+	uint64_t   mark = TRACKER_PAGE_SIZE;
+	if (!open_block && page >= TRACKER_PAGE_SIZE && GuestRange {page - TRACKER_PAGE_SIZE, end - page}.Valid() &&
+	    m_memory_tracker.IsRegionCpuModified(page - TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE) &&
+	    !m_memory_tracker.IsRegionGpuModified(page, end - page)) {
+		mark = end - page;
+	}
+	const auto probe = m_memory_tracker.FaultWrite(page, FaultBlockSize, open_block, mark);
+	const auto owner = owner_of(probe.gpu, probe.tracked);
+	if (probe.opened != 0) {
+		stats.blocks.fetch_add(1, std::memory_order_relaxed);
+		stats.pages.fetch_add(probe.opened, std::memory_order_relaxed);
+	}
+	if (!probe.done) {
+		if (mark == TRACKER_PAGE_SIZE) {
+			InvalidateMemory(vaddr, 1, true);
+		} else {
+			InvalidateMemory(page, mark, true);
+		}
+	}
+	return owner;
+}
+
 BufferCache::WriteFaultOwner BufferCache::InvalidateFaultedPage(uint64_t vaddr) {
 	static constexpr uint64_t FaultBlockSize = CommandBlocks::BlockSize;
 	static_assert(TRACKER_REGION_SIZE % FaultBlockSize == 0);
@@ -499,6 +552,8 @@ BufferCache::WriteFaultOwner BufferCache::InvalidateFaultedPage(uint64_t vaddr) 
 	if (GuestGpu::IsGpuThread() || GuestGpu::IsCommandProcessorThread() ||
 	    !GuestRange {Common::AlignDown(page, FaultBlockSize), FaultBlockSize}.Valid()) {
 		m_memory_tracker.NoteGuestWriteFault(page);
+	} else if (WriteFaultFastPath()) {
+		return InvalidateGuestWriteFault(vaddr);
 	} else {
 		const bool command = m_memory_tracker.IsCommandBlock(page);
 		const bool segment = !command && m_memory_tracker.IsSegmentBlock(page);
@@ -529,6 +584,9 @@ BufferCache::WriteFaultOwner BufferCache::InvalidateFaultedPage(uint64_t vaddr) 
 void BufferCache::CountWriteFault(WriteFaultOwner owner, bool image) {
 	auto& stats = g_write_block_stats;
 	stats.faults.fetch_add(1, std::memory_order_relaxed);
+	if (image && (owner == WriteFaultOwner::CommandBuffer || owner == WriteFaultOwner::CommandSegment)) {
+		stats.command_image.fetch_add(1, std::memory_order_relaxed);
+	}
 	auto& counter = owner == WriteFaultOwner::CommandBuffer    ? stats.command
 	                : owner == WriteFaultOwner::CommandSegment ? stats.segment
 	                : owner == WriteFaultOwner::GpuNeighbor    ? stats.gpu
@@ -636,7 +694,23 @@ void BufferCache::LogWriteBlockSummary() {
 	const auto image    = stats.image.exchange(0, std::memory_order_relaxed);
 	const auto buffer   = stats.buffer.exchange(0, std::memory_order_relaxed);
 	const auto other    = stats.other.exchange(0, std::memory_order_relaxed);
+	const auto open     = stats.already_open.exchange(0, std::memory_order_relaxed);
+	const auto cmd_img  = stats.command_image.exchange(0, std::memory_order_relaxed);
 	const auto opened   = RegionManager::TakeOpenedUploadBytes();
+	const auto tracker  = TrackingSpinLock::TakeContention(SpinLockClass::Tracker);
+	const auto pagelock = TrackingSpinLock::TakeContention(SpinLockClass::Pages);
+	const auto textures = TrackingSpinLock::TakeContention(SpinLockClass::Textures);
+	const auto others   = TrackingSpinLock::TakeContention(SpinLockClass::Other);
+	const auto seconds  = static_cast<double>(now - last) / 1e9;
+	if (tracker.waits + pagelock.waits + textures.waits + others.waits != 0) {
+		::Log::WriteToConsoleAndLog(fmt::format(
+		    "[kyty-locks] summary of the last {:.0f} s: contended acquisitions of a TrackingSpinLock and time spent waiting: "
+		    "{} on tracker regions ({:.1f} ms), {} on page manager regions ({:.1f} ms), {} on the texture cache ({:.1f} ms), {} "
+		    "on others ({:.1f} ms)\n",
+		    seconds, tracker.waits, static_cast<double>(tracker.ns) / 1e6, pagelock.waits,
+		    static_cast<double>(pagelock.ns) / 1e6, textures.waits, static_cast<double>(textures.ns) / 1e6, others.waits,
+		    static_cast<double>(others.ns) / 1e6));
+	}
 	if (faults == 0 && uploaded == 0) {
 		return;
 	}
@@ -645,10 +719,10 @@ void BufferCache::LogWriteBlockSummary() {
 	    "marked written with them), {} left to the page path; {:.1f} MiB of buffer uploads; faults by owner, first match: {} in "
 	    "a command buffer the CP read, {} elsewhere in a command buffer segment, {} in a block with a page the GPU wrote, {} "
 	    "watched by an image or texture, {} in a buffer of the cache, {} other; {:.1f} MiB of pages opened with a block handed "
-	    "to uploads\n",
-	    static_cast<double>(now - last) / 1e9, faults, blocks, pages, faults - std::min(faults, blocks),
+	    "to uploads; {} found their page already open, {} in command memory also watched by an image or table\n",
+	    seconds, faults, blocks, pages, faults - std::min(faults, blocks),
 	    static_cast<double>(uploaded) / (1024.0 * 1024.0), command, segment, gpu, image, buffer, other,
-	    static_cast<double>(opened) / (1024.0 * 1024.0)));
+	    static_cast<double>(opened) / (1024.0 * 1024.0), open, cmd_img));
 }
 
 void BufferCache::LogReadbackSummary() {

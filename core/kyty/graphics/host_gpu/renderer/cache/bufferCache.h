@@ -285,6 +285,7 @@ private:
 	friend struct BufferCacheTestAccess;
 
 	bool IsBufferInvalid(BufferId id) const { return !id || m_slot_buffers[id].is_deleted; }
+	WriteFaultOwner InvalidateGuestWriteFault(uint64_t vaddr);
 
 	using BufferMap = std::map<uint64_t, BufferId>;
 	struct OverlapResult {

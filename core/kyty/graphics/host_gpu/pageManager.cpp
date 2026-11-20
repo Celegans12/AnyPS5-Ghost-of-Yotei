@@ -140,7 +140,7 @@ struct PageManager::Impl {
 	static_assert(sizeof(PageState) == 5);
 
 	struct Region {
-		TrackingSpinLock                    lock;
+		TrackingSpinLock                    lock {SpinLockClass::Pages};
 		std::array<PageState, REGION_PAGES> pages KYTY_GUARDED_BY(lock);
 		std::array<std::atomic<uint8_t>, REGION_PAGES> read_hint {};
 	};

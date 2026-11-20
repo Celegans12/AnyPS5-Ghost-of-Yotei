@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -38,8 +39,33 @@
 
 namespace Libs::Graphics {
 
+enum class SpinLockClass : uint8_t { Other, Tracker, Pages, Textures };
+
+struct SpinLockCounters {
+	std::atomic<uint64_t> waits {0};
+	std::atomic<uint64_t> ns {0};
+};
+
 class KYTY_CAPABILITY("spin lock") TrackingSpinLock final {
 public:
+	static constexpr size_t CLASSES = 4;
+
+	struct Contention {
+		uint64_t waits = 0;
+		uint64_t ns    = 0;
+	};
+
+	TrackingSpinLock() noexcept = default;
+	explicit TrackingSpinLock(SpinLockClass kind) noexcept: m_class(kind) {}
+	TrackingSpinLock(const TrackingSpinLock&)            = delete;
+	TrackingSpinLock& operator=(const TrackingSpinLock&) = delete;
+
+	[[nodiscard]] static Contention TakeContention(SpinLockClass kind) noexcept {
+		auto& counters = s_contention[static_cast<size_t>(kind)];
+		return {.waits = counters.waits.exchange(0, std::memory_order_relaxed),
+		        .ns    = counters.ns.exchange(0, std::memory_order_relaxed)};
+	}
+
 	void lock() noexcept KYTY_ACQUIRE() KYTY_NO_THREAD_SAFETY_ANALYSIS {
 		const auto thread = CurrentThread();
 		if (m_state.exchange(1, std::memory_order_acquire) != 0) [[unlikely]] {
@@ -91,6 +117,7 @@ private:
 #endif
 	void LockSlow(uint32_t thread) noexcept {
 		const bool own_core = Common::Thread::HasReservedCore();
+		const auto started  = std::chrono::steady_clock::now();
 		for (uint32_t round = 0;; round++) {
 			EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) == thread);
 			if (round < SpinRounds || own_core) {
@@ -102,6 +129,12 @@ private:
 			}
 			if (m_state.load(std::memory_order_relaxed) == 0 &&
 			    m_state.exchange(1, std::memory_order_acquire) == 0) {
+				const auto waited = std::chrono::steady_clock::now() - started;
+				auto&      counters = s_contention[static_cast<size_t>(m_class)];
+				counters.waits.fetch_add(1, std::memory_order_relaxed);
+				counters.ns.fetch_add(
+				    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(waited).count()),
+				    std::memory_order_relaxed);
 				return;
 			}
 		}
@@ -138,9 +171,12 @@ private:
 #endif
 	}
 
+	inline static std::array<SpinLockCounters, CLASSES> s_contention {};
+
 	std::atomic_uint32_t m_state {0};
 	std::atomic_uint32_t m_owner {0};
 	std::atomic_uint32_t m_sleepers {0};
+	SpinLockClass        m_class = SpinLockClass::Other;
 };
 
 static_assert(std::atomic_uint32_t::is_always_lock_free);
@@ -217,24 +253,55 @@ public:
 		if (!open_block || m_gpu_dirty.Get(page)) {
 			return probe;
 		}
-		RegionBits open(~m_gpu_dirty, first, last);
-		RegionBits noted(m_gpu_noted, first, last);
-		noted.Unset(page);
-		open &= ~noted;
-		RegionBits clean(~m_cpu_dirty, first, last);
-		clean &= open;
-		for (const auto [begin, end]: clean) {
-			probe.opened += static_cast<uint32_t>(end - begin);
+		probe.opened = OpenBlockPages(page, first, last);
+		return probe;
+	}
+
+	struct WriteFaultProbe {
+		uint32_t opened  = 0;
+		bool     gpu     = false;
+		bool     tracked = false;
+		bool     done    = false;
+	};
+
+	[[nodiscard]] WriteFaultProbe FaultWrite(uint64_t offset, uint64_t block_size, bool open_block, uint64_t mark_size)
+	    KYTY_REQUIRES(lock) {
+		const auto page  = static_cast<size_t>(offset / TRACKER_PAGE_SIZE);
+		const auto first = static_cast<size_t>(offset / block_size * block_size / TRACKER_PAGE_SIZE);
+		const auto last  = first + static_cast<size_t>(block_size / TRACKER_PAGE_SIZE);
+		WriteFaultProbe probe {.gpu = m_gpu_written.Any(first, last), .tracked = !m_cpu_dirty.Get(page)};
+		NoteGuestWriteFault(offset);
+		if (open_block) {
+			if (!m_gpu_dirty.Get(page)) {
+				probe.opened = OpenBlockPages(page, first, last);
+				probe.done   = true;
+			}
+			return probe;
 		}
-		for (const auto [begin, end]: open) {
-			ChangeState<DirtySource::Cpu, true>(begin * TRACKER_PAGE_SIZE, (end - begin) * TRACKER_PAGE_SIZE);
-		}
-		clean.Unset(page);
-		if (!clean.None()) {
-			m_block_opened |= clean;
-			m_any_block_opened = true;
+		const auto [start, end] = GetPageRange(offset, mark_size);
+		if (!m_gpu_dirty.Any(start, end)) {
+			ChangeState<DirtySource::Cpu, true>(offset, mark_size);
+			probe.done = true;
 		}
 		return probe;
+	}
+
+	[[nodiscard]] bool WriteFaultFindsOpen(uint64_t offset, uint64_t block_size, bool open_block, bool* gpu) const
+	    KYTY_NO_THREAD_SAFETY_ANALYSIS {
+		const auto page  = static_cast<size_t>(offset / TRACKER_PAGE_SIZE);
+		const auto first = static_cast<size_t>(offset / block_size * block_size / TRACKER_PAGE_SIZE);
+		const auto last  = first + static_cast<size_t>(block_size / TRACKER_PAGE_SIZE);
+		if (!m_cpu_dirty.Get(page) || m_gpu_dirty.Get(page)) {
+			return false;
+		}
+		*gpu = m_gpu_written.Any(first, last);
+		if (!open_block) {
+			return true;
+		}
+		RegionBits closed(~m_cpu_dirty, first, last);
+		closed &= RegionBits(~m_gpu_dirty, first, last);
+		closed &= RegionBits(~m_gpu_noted, first, last);
+		return closed.None();
 	}
 
 	[[nodiscard]] static uint64_t TakeOpenedUploadBytes() noexcept {
@@ -445,9 +512,31 @@ public:
 		return m_has_gpu_dirty.load(std::memory_order_acquire);
 	}
 
-	TrackingSpinLock lock;
+	TrackingSpinLock lock {SpinLockClass::Tracker};
 
 private:
+	uint32_t OpenBlockPages(size_t page, size_t first, size_t last) KYTY_REQUIRES(lock) {
+		RegionBits open(~m_gpu_dirty, first, last);
+		RegionBits noted(m_gpu_noted, first, last);
+		noted.Unset(page);
+		open &= ~noted;
+		RegionBits clean(~m_cpu_dirty, first, last);
+		clean &= open;
+		uint32_t opened = 0;
+		for (const auto [begin, end]: clean) {
+			opened += static_cast<uint32_t>(end - begin);
+		}
+		for (const auto [begin, end]: open) {
+			ChangeState<DirtySource::Cpu, true>(begin * TRACKER_PAGE_SIZE, (end - begin) * TRACKER_PAGE_SIZE);
+		}
+		clean.Unset(page);
+		if (!clean.None()) {
+			m_block_opened |= clean;
+			m_any_block_opened = true;
+		}
+		return opened;
+	}
+
 	void NoteOpenedUpload(const RegionBits* uploaded, const RegionBits& cleaned) KYTY_REQUIRES(lock) {
 		if (!m_any_block_opened) {
 			return;
