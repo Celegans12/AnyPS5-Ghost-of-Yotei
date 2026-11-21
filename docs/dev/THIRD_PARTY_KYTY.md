@@ -70,6 +70,7 @@ be second declarations of AnyPS5 exports for `core/libs/tests/test_public_header
   | `046bf882` | — | `swapchain.cpp` only: a flip copies layer 0 of the cached image that holds the surface |
   | `fc705b4b` | — | `DMA_DATA` writes whose destination ends in `0x3022c` are no longer dropped |
   | `f130c02b` | — | `WRITE_DATA` to a GDS destination writes the GDS buffer at its 16-bit dword offset |
+  | `f216821b` | — | an indirect buffer is fetched at its target with the two low bits cleared |
 
   `Presenter::PrepareFrame` takes the VideoOut pixel format since `50c0c066`: the shim passes the display buffer's
   `pixelFormat`.
