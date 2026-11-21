@@ -75,6 +75,7 @@ be second declarations of AnyPS5 exports for `core/libs/tests/test_public_header
   | `46213dfd` | — | shorter compiled SRT walkers (biased scratch register, bases formed once per walk, folded constant offsets, inline tests of values already evaluated, plain marks of later blocks); ported by hand onto the walker's page cache, flat words and ahead loads, kept after an in-run A/B (+4.0 % on Ghost of Yotei) |
   | `f6e3373d` | #2407 | `AssociateStencil` tells the image heap before it rewrites an image as a stencil plane |
   | `c453fc68`, `073d6937` | #1622 | an f32 add or subtract of a `V_MUL_F32` product, directly, negated, or through a bitcast or the EXEC select of a VGPR write, is `NoContraction`; behind `KYTY_F32_PRODUCT_NO_CONTRACTION` until its cost is measured |
+  | `657a94e7` | — | `WalkSrt` appends the walker's captured reads to the caller's list in one pass; adapted to the 16-byte capture records of the imported revision |
 
   `Presenter::PrepareFrame` takes the VideoOut pixel format since `50c0c066`: the shim passes the display buffer's
   `pixelFormat`.
