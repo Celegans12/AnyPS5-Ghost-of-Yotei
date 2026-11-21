@@ -719,7 +719,7 @@ void ImageHeap::Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point,
 void ImageHeap::UnmapMemory(uint64_t address, uint64_t size) {
 	TakeChanges();
 	const auto other = [&](const Image::HeapChange& change) {
-		return !ImageRangeOverlaps(change.data, {address, size});
+		return change.data.Empty() || !ImageRangeOverlaps(change.data, {address, size});
 	};
 	{
 		std::scoped_lock lock {Image::heap_mutex};
