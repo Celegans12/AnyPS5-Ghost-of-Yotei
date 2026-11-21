@@ -139,6 +139,14 @@ if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
     set_tests_properties(kyty_shim_image_write_back_alias PROPERTIES TIMEOUT 25 SKIP_RETURN_CODE 77
             ENVIRONMENT "KYTY_GPU_PIPELINE=0;KYTY_WRITE_BACK_IMAGES=1;KYTY_COMPARE_WRITE_BACK=1"
             PASS_REGULAR_EXPRESSION "kyty_shim_image_write_back_alias: ok" FAIL_REGULAR_EXPRESSION "FAILED")
+    target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/BufferCachePages.cpp)
+    add_test_executable(kyty_shim_buffer_cache_pages_tests ${CMAKE_CURRENT_SOURCE_DIR}/BufferCachePagesMain.cpp)
+    configure_host_test_executable(kyty_shim_buffer_cache_pages_tests)
+    target_link_libraries(kyty_shim_buffer_cache_pages_tests PRIVATE libSceAgcDriver libkernel libc)
+    add_test(NAME kyty_shim_buffer_cache_pages COMMAND kyty_shim_buffer_cache_pages_tests)
+    set_tests_properties(kyty_shim_buffer_cache_pages PROPERTIES TIMEOUT 25 SKIP_RETURN_CODE 77
+            ENVIRONMENT "KYTY_GPU_PIPELINE=0"
+            PASS_REGULAR_EXPRESSION "kyty_shim_buffer_cache_pages: ok" FAIL_REGULAR_EXPRESSION "FAILED")
 endif()
 
 if(WIN32)
