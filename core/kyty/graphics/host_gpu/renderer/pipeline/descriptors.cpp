@@ -405,6 +405,45 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	return result;
 }
 
+struct MirrorView {
+	uint64_t address    = 0;
+	uint32_t range      = 0;
+	uint32_t adjustment = 0;
+};
+
+static MirrorView MirrorStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
+                                      const ShaderRecompiler::IR::BufferResource& resource) {
+	const auto& [address, size, id] = source;
+	if (address == 0 || size == 0) {
+		return {};
+	}
+	const auto& graphics = context.GetGraphics();
+	const auto& limits   = graphics.GetPhysicalDeviceProperties().limits;
+	const bool  uniform  = resource.constant_only && graphics.robust_buffer_access_enabled;
+	const auto  alignment =
+	    uniform ? std::max<vk::DeviceSize>(graphics.StorageMinAlignment(), limits.minUniformBufferOffsetAlignment)
+	            : graphics.StorageMinAlignment();
+	if (size > limits.maxStorageBufferRange) {
+		EXIT("storage buffer range is unsupported\n");
+	}
+	auto&      queries  = context.GetOcclusionQueries();
+	const bool counters = queries.PrepareRead(address, size);
+	auto [buffer, offset] = context.GetBufferCache().ObtainMirroredBuffer(address, size, id);
+	if (counters) {
+		queries.NoteReadTarget(address, size, *buffer, offset);
+	}
+	const auto adjustment = offset - Common::AlignDown(offset, alignment);
+	if (adjustment >= 256 || size > limits.maxStorageBufferRange - adjustment) {
+		EXIT("storage buffer offset adjustment is unsupported\n");
+	}
+	auto range = size + adjustment;
+	if (uniform) {
+		range = std::min(std::min<uint64_t>(range, ShaderRecompiler::IR::UniformBufferBytes),
+		                 uint64_t {limits.maxUniformBufferRange});
+	}
+	return {address - adjustment, static_cast<uint32_t>(range), static_cast<uint32_t>(adjustment)};
+}
+
 static vk::DescriptorBufferInfo StreamedStorageBuffer(RenderContext& context, uint64_t offset, uint64_t size,
                                                       const ShaderRecompiler::IR::BufferResource& resource,
                                                       uint32_t&                                   buffer_offset) {
@@ -2765,13 +2804,12 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages, bool
 		const auto& snapshot = *prepared.runtime->resources;
 		const auto& layout   = program.bindings;
 		prepared.buffer_sources.resize(layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
-		if (layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)] == 0) {
+		prepared.mirror_sources.resize(layout.mirror_count);
+		if (layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)] == 0 && layout.mirror_count == 0) {
 			continue;
 		}
-		for (uint32_t resource = 0; resource < program.info.buffers.size(); ++resource) {
+		const auto source_of = [&](uint32_t resource) -> PreparedBindings::BufferSource {
 			const auto& metadata = program.info.buffers[resource];
-			if (metadata.descriptor_index == UINT32_MAX) continue;
-			auto& source = prepared.buffer_sources[metadata.descriptor_index];
 			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]);
 			const auto address = descriptor.Base48();
 			auto size = descriptor.GetSize();
@@ -2780,8 +2818,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages, bool
 				size = std::max(size, uint64_t {metadata.max_byte_extent});
 			}
 			if (address == 0 || size == 0) {
-				source = {};
-				continue;
+				return {};
 			}
 			if (descriptor.NumRecords() == UINT32_MAX) {
 				if (program.info.buffers[resource].written) {
@@ -2815,13 +2852,20 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages, bool
 						    program.shader_hash, resource, address, size, descriptor.fields[0],
 						    descriptor.fields[1], descriptor.fields[2], descriptor.fields[3]));
 					}
-					source = {};
-					continue;
+					return {};
 				}
 #endif
 				size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
 			}
-			source = {address, size, find_buffers ? cache.FindBuffer(address, size) : NULL_BUFFER_ID};
+			return {address, size, find_buffers ? cache.FindBuffer(address, size) : NULL_BUFFER_ID};
+		};
+		for (uint32_t resource = 0; resource < program.info.buffers.size(); ++resource) {
+			const auto& metadata = program.info.buffers[resource];
+			if (metadata.descriptor_index != UINT32_MAX) {
+				prepared.buffer_sources[metadata.descriptor_index] = source_of(resource);
+			} else if (metadata.mirror_index != UINT32_MAX) {
+				prepared.mirror_sources[metadata.mirror_index] = source_of(resource);
+			}
 		}
 	}
 }
@@ -2894,6 +2938,21 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared, uint64_t invocati
 			}
 			prepared.uniform_buffers[resource.uniform_index] = view;
 		}
+	}
+	for (uint32_t i = 0; i < program.info.buffers.size() && i < snapshot.buffers.size(); i++) {
+		const auto& resource = program.info.buffers[i];
+		if (resource.mirror_index == UINT32_MAX || resource.mirror_index >= prepared.mirror_sources.size()) continue;
+		ShaderBufferResource descriptor;
+		std::copy_n(snapshot.buffers[i].dwords.begin(), std::size(descriptor.fields), descriptor.fields);
+		const auto view  = MirrorStorageBuffer(m_context, prepared.mirror_sources[resource.mirror_index], resource);
+		const auto dword = layout.MirrorDword() + ShaderRecompiler::IR::Bindings::MirrorDwords * resource.mirror_index;
+		prepared.shader_data[dword]      = static_cast<uint32_t>(view.address);
+		prepared.shader_data[dword + 1u] = static_cast<uint32_t>(view.address >> 32u);
+		prepared.shader_data[dword + 2u] = view.range;
+		const bool vector_reads_none = descriptor.OutOfBounds() == 0u && descriptor.Stride() == 0u;
+		prepared.shader_data[dword + 3u] = view.adjustment |
+		                                   ((descriptor.PackedStride() & ShaderRecompiler::IR::BufferStrideMask) << 8u) |
+		                                   (vector_reads_none ? 1u << 31u : 0u);
 	}
 	if (layout.stride_count != 0u) {
 		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {

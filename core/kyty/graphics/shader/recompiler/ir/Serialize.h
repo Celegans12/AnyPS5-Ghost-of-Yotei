@@ -170,7 +170,7 @@ template <class S, class T> void Io(S& io, T& value) {
 KYTY_IO_FIELDS(MemoryInfo, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x,
                y, z)
 KYTY_IO_FIELDS(BufferWriteSpan, a, b)
-KYTY_IO_FIELDS(BufferResource, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v)
+KYTY_IO_FIELDS(BufferResource, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w)
 KYTY_IO_FIELDS(ImageResource, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w,
                x, y, z, A, B, C, D, E)
 KYTY_IO_FIELDS(SamplerResource, a, b, c, d, e, f, g, h, i, j, k)
@@ -211,7 +211,7 @@ KYTY_IO_FIELDS(ResourceSpecialization::Buffer, a, b, c, d, e, f, g, h)
 KYTY_IO_FIELDS(ResourceSpecialization::Image, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q)
 KYTY_IO_FIELDS(ResourceSpecialization::Sampler, a, b, c)
 KYTY_IO_FIELDS(ResourceSpecialization, a, b, c)
-KYTY_IO_FIELDS(Bindings, a, b, c, d, e, f, g, h, i, j, k)
+KYTY_IO_FIELDS(Bindings, a, b, c, d, e, f, g, h, i, j, k, l)
 KYTY_IO_FIELDS(TablePlan::Operand, a, b)
 KYTY_IO_FIELDS(TablePlan::Slot, a, b, c, d, e, f)
 KYTY_IO_FIELDS(TablePlan::Descriptor, a, b)

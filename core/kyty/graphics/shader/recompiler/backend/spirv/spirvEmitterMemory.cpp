@@ -106,6 +106,8 @@ uint32_t BufferByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR
 	uint32_t stride_value = 0;
 	if (state.program.table_mode && !swizzle && mem.resource < state.table_strides.size()) {
 		stride_value = state.table_strides[mem.resource];
+	} else if (IR::HasRuntimeStride(packed) && MirroredBuffer(state, mem.resource)) {
+		stride_value = EmitMirrorStride(state, mem.resource);
 	} else if (IR::HasRuntimeStride(packed)) {
 		const auto binding = state.program.info.buffers[mem.resource].descriptor_index;
 		stride_value       = binding < state.memory_strides.size() ? state.memory_strides[binding] : 0u;
@@ -397,8 +399,9 @@ uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memo
 	if (mem.kind == IR::ResourceKind::Buffer) {
 		const auto resource = ctx.state.program.info.buffers.at(mem.resource).descriptor_index;
 		if (prefix == 0u) {
-			prefix = ctx.state.program.table_mode ? ConstantU32(ctx.state, 0)
-			                                      : ctx.state.memory_byte_offsets[resource];
+			prefix = ctx.state.program.table_mode            ? ConstantU32(ctx.state, 0)
+			         : MirroredBuffer(ctx.state, mem.resource) ? EmitMirrorByteOffset(ctx.state, mem.resource)
+			                                                   : ctx.state.memory_byte_offsets[resource];
 		}
 		const auto address = Binary(ctx.state, spv::OpIAdd, TypeU32(ctx.state),
 		                            BufferByteAddress(ctx, inst, mem), prefix);
@@ -564,8 +567,9 @@ uint32_t LoadSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const 
 
 uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
                           uint32_t index) {
-	return EmitAccessLoad(ctx.state, TypeU32(ctx.state), EmitMemoryElementPointer(ctx.state, resource, index),
-	                      resource);
+	return EmitMirrorPartialLoad(
+	    ctx.state, resource, index,
+	    EmitAccessLoad(ctx.state, TypeU32(ctx.state), EmitMemoryElementPointer(ctx.state, resource, index), resource));
 }
 
 uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
@@ -574,7 +578,8 @@ uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& 
 	if (resource.element_bits < 32u) {
 		const auto loaded = EmitAccessLoad(ctx.state, ctx.state.storage_buffers[bits == 8u ? 0 : 1].element_type,
 		                                   EmitMemoryElementPointer(ctx.state, resource, index), resource);
-		value = Unary(ctx.state, spv::OpUConvert, TypeU32(ctx.state), loaded);
+		value = EmitMirrorPartialLoad(ctx.state, resource, index,
+		                              Unary(ctx.state, spv::OpUConvert, TypeU32(ctx.state), loaded));
 	} else {
 		const auto word = LoadWordInBounds(ctx, resource, index);
 		const auto byte = Binary(ctx.state, spv::OpBitwiseAnd, TypeU32(ctx.state), address,
@@ -2516,7 +2521,9 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 		}
 		const auto condition = EmitStorageElementInBounds(state, access, element);
 		return EmitValueOrZeroIfCondition(state, condition, [&]() {
-			return EmitAccessLoad(state, TypeU32(state), EmitMemoryElementPointer(state, access, element), access);
+			return EmitMirrorPartialLoad(
+			    state, access, element,
+			    EmitAccessLoad(state, TypeU32(state), EmitMemoryElementPointer(state, access, element), access));
 		});
 	};
 	const auto& resource = state.program.info.buffers.at(mem.resource);
