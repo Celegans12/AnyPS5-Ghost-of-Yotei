@@ -893,6 +893,16 @@ constexpr uint32_t DescriptorRefreshMask(DescriptorRefresh kind, uint32_t word) 
 	}
 }
 
+struct SrtWalkerVariant {
+	std::unique_ptr<Xbyak::CodeGenerator> code;
+	uint32_t                              captures      = 0;
+	uint32_t                              scratch_words = 0;
+	uint32_t                              outputs       = 0;
+
+	SrtWalkerVariant();
+	~SrtWalkerVariant();
+};
+
 struct ResourcePlan {
 	struct SelectorKeys {
 		std::vector<uint32_t> values;
@@ -929,6 +939,7 @@ struct ResourcePlan {
 	std::vector<DescriptorRefresh>      descriptor_refresh;
 	std::vector<uint32_t>               descriptor_word_flat;
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;
+	std::unique_ptr<SrtWalkerVariant>     srt_long_walker;
 	uint32_t                              srt_user_data = 0;
 	uint32_t                              srt_captures  = 0;
 	mutable std::vector<uint64_t>           srt_scratch;
