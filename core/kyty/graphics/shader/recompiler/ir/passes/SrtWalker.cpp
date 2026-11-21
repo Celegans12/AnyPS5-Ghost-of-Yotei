@@ -1837,7 +1837,10 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	if (end == nullptr || t_walker_faulted) return false;
 	const auto* first = scratch.data() + plan.srt_captures / 8u;
 	if (reads != nullptr) {
-		for (auto* read = first; read != end; read += 2) reads->emplace_back(*read, sizeof(uint32_t));
+		const auto base = reads->size();
+		reads->resize(base + static_cast<size_t>(end - first) / 2u);
+		auto* out = reads->data() + base;
+		for (auto* read = first; read != end; read += 2) *out++ = std::pair<uint64_t, uint64_t> {*read, sizeof(uint32_t)};
 	}
 	if (runtime.record_loads != nullptr) {
 		runtime.record_loads(runtime.userdata, std::span<const uint64_t>(first, end));

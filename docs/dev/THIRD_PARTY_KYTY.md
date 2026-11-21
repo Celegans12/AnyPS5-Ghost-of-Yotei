@@ -72,6 +72,7 @@ be second declarations of AnyPS5 exports for `core/libs/tests/test_public_header
   | `f130c02b` | — | `WRITE_DATA` to a GDS destination writes the GDS buffer at its 16-bit dword offset |
   | `f216821b` | — | an indirect buffer is fetched at its target with the two low bits cleared |
   | `8d0ebb8f` | — | the SRT walker evaluates `SMin32` in runtime descriptor values |
+  | `657a94e7` | — | `WalkSrt` appends the walker's captured reads to the caller's list in one pass; adapted to the 16-byte capture records of the imported revision |
 
   `Presenter::PrepareFrame` takes the VideoOut pixel format since `50c0c066`: the shim passes the display buffer's
   `pixelFormat`.
