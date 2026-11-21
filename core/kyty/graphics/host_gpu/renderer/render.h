@@ -228,6 +228,7 @@ public:
 	static ResolvedDraw* WaitResolvedDraw(ResolvedDraw* resolved) noexcept;
 	static void ReleaseResolvedDraw(ResolvedDraw* resolved) noexcept;
 	enum class AheadNote : uint8_t { NotAttempted, Prepared, NotPrepared, TableSkip };
+	enum class ExecuteCause : uint8_t { TableSkip, Revalidation, NotPrepared, Again, Other, Count };
 	void BeginAheadOperation(ResolvedDraw* resolved, AheadNote note) noexcept;
 	void EndAheadOperation() noexcept;
 	void NoteTableServed() noexcept { m_ahead_table = true; }
@@ -655,7 +656,6 @@ private:
 	std::unique_ptr<ResolvedDrawRing, void (*)(ResolvedDrawRing*)> m_resolved_ring {nullptr,
 	                                                                                nullptr};
 	ResolvedDraw*                                                  m_resolved_draw = nullptr;
-	enum class ExecuteCause : uint8_t { TableSkip, Revalidation, NotPrepared, Again, Other, Count };
 	[[nodiscard]] ExecuteCause MissingAheadCause() const noexcept;
 	[[nodiscard]] bool         RevalidateAhead(ResolvedDraw& resolved, bool dispatch);
 	const ShaderModule* ResolveComputeHere(const HW::ComputeShaderInfo& regs, ShaderComputeInputInfo& input_info);

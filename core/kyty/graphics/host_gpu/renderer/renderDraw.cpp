@@ -709,7 +709,8 @@ RenderExecutor::ResolvedDraw* RenderExecutor::WaitResolvedDraw(ResolvedDraw* res
 
 namespace {
 constexpr size_t   RefusedCauses        = static_cast<size_t>(StaleRead::Count);
-constexpr size_t   ExecuteCauses        = 5;
+constexpr size_t   ExecuteCauses        = static_cast<size_t>(RenderExecutor::ExecuteCause::Count);
+constexpr size_t   ShapeRefusal         = static_cast<size_t>(StaleRead::None);
 constexpr size_t   AheadRefusals        = static_cast<size_t>(AheadRefusal::Count);
 constexpr uint32_t RevalidationSampling = 16;
 
@@ -782,6 +783,7 @@ void RenderExecutor::EndAheadOperation() noexcept {
 
 RenderExecutor::ExecuteCause RenderExecutor::MissingAheadCause() const noexcept {
 	if (m_ahead_taken) return ExecuteCause::Again;
+	if (m_ahead_present) return ExecuteCause::Revalidation;
 	switch (m_ahead_note) {
 		case AheadNote::TableSkip: return ExecuteCause::TableSkip;
 		case AheadNote::NotPrepared: return ExecuteCause::NotPrepared;
@@ -1095,17 +1097,18 @@ DrawRenderState& RenderExecutor::AcquireDrawRenderState(bool tessellation, bool&
 	shaders_resolved = false;
 	if (resolved == nullptr) {
 		m_execute_cause = MissingAheadCause();
+		if (m_execute_cause == ExecuteCause::Revalidation) Bump(g_execute_resolve.refused[0][ShapeRefusal]);
 	} else if (resolved->compute_module != nullptr ||
 	           !(resolved->storage.state.indirect_offsets == indirect_offsets) ||
 	           resolved->storage.state.indirect_draw != indirect_draw) {
-		g_execute_resolve.refused[0][0].fetch_add(1, std::memory_order_relaxed);
+		Bump(g_execute_resolve.refused[0][ShapeRefusal]);
 		m_execute_cause = ExecuteCause::Revalidation;
 	} else if (RevalidateAhead(*resolved, false)) {
 		shaders_resolved = true;
 	} else {
 		m_execute_cause = ExecuteCause::Revalidation;
 	}
-	m_ahead_taken = m_ahead_taken || resolved != nullptr;
+	m_ahead_taken = m_ahead_taken || m_ahead_present;
 #if defined(ANYPS5_KYTY)
 	m_flat_defer_check = nullptr;
 	if (shaders_resolved) {
@@ -1880,7 +1883,7 @@ bool RenderExecutor::TakeResolvedDispatch(ShaderComputeInputInfo& input_info,
 	}
 	m_ahead_taken = true;
 	if (resolved->compute_module == nullptr) {
-		g_execute_resolve.refused[1][0].fetch_add(1, std::memory_order_relaxed);
+		Bump(g_execute_resolve.refused[1][ShapeRefusal]);
 		m_execute_cause = ExecuteCause::Revalidation;
 		return false;
 	}
@@ -1911,8 +1914,8 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, bool shaders_
 		m_context.GetImageHeap().BeginDraw();
 		const auto begin = Common::SteadyNs();
 		m_context.GetPipelineCache().GetGraphicsPrograms(buffer, state);
-		g_execute_resolve.here_ns[0].fetch_add(Common::SteadyNs() - begin, std::memory_order_relaxed);
-		g_execute_resolve.here[0][static_cast<size_t>(m_execute_cause)].fetch_add(1, std::memory_order_relaxed);
+		Bump(g_execute_resolve.here_ns[0], Common::SteadyNs() - begin);
+		Bump(g_execute_resolve.here[0][static_cast<size_t>(m_execute_cause)]);
 	}
 	if (state.vertex_info[0].stage.module == nullptr) {
 		return false;
