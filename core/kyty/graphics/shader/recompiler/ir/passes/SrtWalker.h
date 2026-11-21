@@ -16,6 +16,7 @@ inline constexpr uint64_t SrtGuestMemoryStart = 0x40000;
 inline constexpr uint32_t NoFlatSlot = UINT32_MAX;
 inline constexpr uint32_t DescriptorSlotFlag = 0x80000000u;
 inline constexpr uint32_t ZeroTestSlot = UINT32_MAX - 1u;
+inline constexpr uint32_t UnreadFlatSlotFlag = 0x40000000u;
 constexpr uint32_t DescriptorSlot(uint32_t source, uint32_t word) {
 	return DescriptorSlotFlag | (source << 3u) | word;
 }

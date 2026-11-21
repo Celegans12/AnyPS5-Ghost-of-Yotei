@@ -175,9 +175,11 @@ void ControlAndData() {
 	Check(deferred->flat_slot != IR::NoFlatSlot && deferred->flat_slot != IR::ZeroTestSlot &&
 	          !IR::IsDescriptorSlot(deferred->flat_slot),
 	      "ahead, a count the GPU produces is a word of the shader data, not a value to check");
-	Check(deferred->flat_slot < produced.snapshot.flattened_srt.size() &&
-	          deferred->flat_slot < taken.snapshot.flattened_srt.size() &&
-	          taken.snapshot.flattened_srt[deferred->flat_slot] == 7u,
+	Check((deferred->flat_slot & IR::UnreadFlatSlotFlag) != 0,
+	      "ahead, a count the GPU produces is recorded as a word the walk left unread");
+	const auto flat_slot = deferred->flat_slot & ~IR::UnreadFlatSlotFlag;
+	Check(flat_slot < produced.snapshot.flattened_srt.size() && flat_slot < taken.snapshot.flattened_srt.size() &&
+	          taken.snapshot.flattened_srt[flat_slot] == 7u,
 	      "the recorded word is the slot of the count in the shader data");
 	Check(Holds(produced, slot, target), "ahead, a count the GPU produces binds the buffer of both branches");
 	Check(produced.specialization == taken.specialization,

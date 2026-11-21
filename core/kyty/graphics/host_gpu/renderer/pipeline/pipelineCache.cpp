@@ -748,19 +748,25 @@ void GuestReadLog::RecordLoad(uint64_t address, uint32_t value, uint32_t flat_sl
 		return;
 	}
 	if (flat_slot != ShaderRecompiler::IR::NoFlatSlot) {
-		if (!m_flat_loads.empty()) {
-			auto& last = m_flat_loads.back();
-			const auto next = last.address + uint64_t {last.count} * sizeof(uint32_t);
-			if (last.stage == m_stage && next == address && last.slot + last.count == flat_slot &&
-			    (address & 0xfffu) != 0) {
-				last.count++;
-				return;
-			}
-		}
-		m_flat_loads.push_back({address, m_stage, flat_slot, 1});
+		AddFlatLoad(address, flat_slot);
 		return;
 	}
 	Append(address, &value, sizeof(value), false);
+}
+
+void GuestReadLog::AddFlatLoad(uint64_t address, uint32_t flat_slot) {
+	const bool unread = (flat_slot & ShaderRecompiler::IR::UnreadFlatSlotFlag) != 0;
+	const auto slot   = flat_slot & ~ShaderRecompiler::IR::UnreadFlatSlotFlag;
+	if (!unread && !m_flat_loads.empty()) {
+		auto&      last = m_flat_loads.back();
+		const auto next = last.address + uint64_t {last.count} * sizeof(uint32_t);
+		if (!last.unread && last.stage == m_stage && next == address && last.slot + last.count == slot &&
+		    (address & 0xfffu) != 0) {
+			last.count++;
+			return;
+		}
+	}
+	m_flat_loads.push_back({.address = address, .stage = m_stage, .slot = slot, .count = 1, .unread = unread});
 }
 
 void GuestReadLog::RecordLoads(std::span<const uint64_t> loads) {
@@ -816,16 +822,7 @@ void GuestReadLog::RecordLoads(std::span<const uint64_t> loads) {
 			continue;
 		}
 		if (flat_slot != ShaderRecompiler::IR::NoFlatSlot) {
-			if (!m_flat_loads.empty()) {
-				auto&      last = m_flat_loads.back();
-				const auto next = last.address + uint64_t {last.count} * sizeof(uint32_t);
-				if (last.stage == m_stage && next == address && last.slot + last.count == flat_slot &&
-				    (address & 0xfffu) != 0) {
-					last.count++;
-					continue;
-				}
-			}
-			m_flat_loads.push_back({address, m_stage, flat_slot, 1});
+			AddFlatLoad(address, flat_slot);
 			continue;
 		}
 		append(address, value, false);
@@ -901,8 +898,9 @@ void GuestReadLog::RefreshFlatLoads(std::span<ShaderRecompiler::IR::ResourceSnap
 			continue;
 		}
 #if defined(ANYPS5_KYTY)
-		const bool gpu_copies = gpu_copies_allowed &&
-		                        (!load.deferred || (program != nullptr && !FlatWordsReadOnCpu(*program, load.slot, load.count)));
+		const bool gpu_copies =
+		    gpu_copies_allowed && ((!load.deferred && !load.unread) ||
+		                           (program != nullptr && !FlatWordsReadOnCpu(*program, load.slot, load.count)));
 #endif
 		const auto page_index = load.address >> 12u;
 		auto&      page       = checked[page_index % checked.size()];

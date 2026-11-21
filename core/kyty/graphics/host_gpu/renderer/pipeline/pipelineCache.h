@@ -170,12 +170,14 @@ private:
 		uint32_t stage   = 0;
 		uint32_t slot    = 0;
 		uint32_t count   = 1;
+		bool     unread  = false;
 #if defined(ANYPS5_KYTY)
 		bool deferred = false;
 #endif
 	};
 	void                  Append(uint64_t address, const void* data, uint32_t size, bool strict,
 	                             bool zero_test = false);
+	void                  AddFlatLoad(uint64_t address, uint32_t flat_slot);
 	[[nodiscard]] bool ZeroTestHolds(const Entry& entry) const;
 	std::vector<Entry>    m_entries;
 	std::vector<uint8_t>  m_bytes;

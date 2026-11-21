@@ -1250,7 +1250,7 @@ void WalkerCompiler::SkipGpuControlLoad(const Xbyak::RegExp& address, uint32_t f
 		++m_captures;
 		c.mov(c.qword[c.r8], c.r10);
 		c.mov(c.dword[c.r8 + 8], 0);
-		c.mov(c.dword[c.r8 + 12], flat_slot);
+		c.mov(c.dword[c.r8 + 12], flat_slot | UnreadFlatSlotFlag);
 		c.add(c.r8, 16);
 	}
 	c.mov(c.byte[c.rdx + state], 3);
