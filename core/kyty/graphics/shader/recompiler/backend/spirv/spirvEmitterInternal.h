@@ -23,6 +23,7 @@
 #include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -154,6 +155,7 @@ struct EmitterState {
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
 	bool                                             converged_calls         = false;
+	std::unordered_set<const IR::Inst*>             pair_shared;
 	uint32_t                                         bda_masked_function     = 0;
 	std::map<std::array<uint32_t, 2>, uint32_t>      bda_load_functions;
 	uint32_t                                         indirect_format_function = 0;
