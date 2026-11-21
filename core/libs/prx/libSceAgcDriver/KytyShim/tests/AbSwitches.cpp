@@ -93,9 +93,9 @@ void Refusals() {
 }
 
 void Defaults() {
-	Check(!Switches::On(Switch::FlatDefer), "KYTY_FLAT_DEFER is off without the variable");
+	Check(Switches::On(Switch::FlatDefer), "KYTY_FLAT_DEFER is on without the variable");
 	Check(Switches::On(Switch::GenericComputeVariant), "KYTY_GENERIC_COMPUTE_VARIANT is on without the variable");
-	Check(IR::SrtFlatDeferMode() == IR::SrtFlatDefer::Off, "the walker sees KYTY_FLAT_DEFER off");
+	Check(IR::SrtFlatDeferMode() == IR::SrtFlatDefer::On, "the walker sees KYTY_FLAT_DEFER on");
 	Check(IR::GenericComputeVariants(), "the compute variants see KYTY_GENERIC_COMPUTE_VARIANT on");
 	Check(Switches::Find("KYTY_FLAT_DEFER") == Switch::FlatDefer, "KYTY_FLAT_DEFER is a runtime switch");
 	Check(!Switches::Find("KYTY_WAVE_SPLIT").has_value(), "KYTY_WAVE_SPLIT is not a runtime switch");
@@ -131,10 +131,10 @@ void Phases() {
 		return;
 	}
 	Check(printed[0] ==
-	          "[kyty-ab] in-run A/B: phases of 2.0 s from present 3, settle 0.5 s; A: KYTY_FLAT_DEFER=0, "
-	          "KYTY_GENERIC_COMPUTE_VARIANT=1; B: KYTY_FLAT_DEFER=1, KYTY_GENERIC_COMPUTE_VARIANT=0\n",
+	          "[kyty-ab] in-run A/B: phases of 2.0 s from present 3, settle 0.5 s; A: KYTY_FLAT_DEFER=1, "
+	          "KYTY_GENERIC_COMPUTE_VARIANT=1; B: KYTY_FLAT_DEFER=0, KYTY_GENERIC_COMPUTE_VARIANT=0\n",
 	      "the first line states both arms");
-	Check(printed[1] == "[kyty-ab] phase A 0 begins at present 3 (t 0.250 s, wall 1000.250): KYTY_FLAT_DEFER=0, "
+	Check(printed[1] == "[kyty-ab] phase A 0 begins at present 3 (t 0.250 s, wall 1000.250): KYTY_FLAT_DEFER=1, "
 	                    "KYTY_GENERIC_COMPUTE_VARIANT=1\n",
 	      "phase A begins at the start present");
 	Check(printed[2] == "[kyty-ab] phase A 0 settled at present 7 (t 0.750 s, wall 1000.750)\n",
@@ -142,7 +142,7 @@ void Phases() {
 	Check(printed[3] == "[kyty-ab] phase A 0 settled for 1.500 s: 12 presents, 8.00 img/s, longest frame 125.0 ms, 12 "
 	                    "frames of 50 ms or more; presents 7 to 19, wall 1000.750 to 1002.250\n",
 	      "the end of phase A gives its presents and rate");
-	Check(printed[4] == "[kyty-ab] phase B 1 begins at present 19 (t 2.250 s, wall 1002.250): KYTY_FLAT_DEFER=1, "
+	Check(printed[4] == "[kyty-ab] phase B 1 begins at present 19 (t 2.250 s, wall 1002.250): KYTY_FLAT_DEFER=0, "
 	                    "KYTY_GENERIC_COMPUTE_VARIANT=0\n",
 	      "phase B begins with both settings turned over");
 	Check(printed[5] == "[kyty-ab] phase B 1 settled at present 23 (t 2.750 s, wall 1002.750)\n", "phase B settles");
@@ -152,14 +152,14 @@ void Phases() {
 	Check(Contains(printed[7], "[kyty-ab] phase A 2 begins at present 32 "), "phase A comes back");
 	Check(Contains(printed[9], "[kyty-ab] phase A 2 settled for 1.500 s: 12 presents, 8.00 img/s"), "phase A 2 ends");
 	Check(Contains(printed[10], "[kyty-ab] phase B 3 begins at present 48 ") &&
-	          Contains(printed[10], "KYTY_FLAT_DEFER=1, KYTY_GENERIC_COMPUTE_VARIANT=0"),
+	          Contains(printed[10], "KYTY_FLAT_DEFER=0, KYTY_GENERIC_COMPUTE_VARIANT=0"),
 	      "phase B comes back");
 	bool before = true, a0 = true, b1 = true, a2 = true, b3 = true;
 	for (size_t index = 0; index < arms.size(); ++index) {
 		const auto present = index + 1;
 		const auto seen    = arms[index];
-		const bool a       = !seen.flat_defer && seen.generic;
-		const bool b       = seen.flat_defer && !seen.generic;
+		const bool a       = seen.flat_defer && seen.generic;
+		const bool b       = !seen.flat_defer && !seen.generic;
 		if (present < 3) before = before && a;
 		else if (present < 19) a0 = a0 && a;
 		else if (present < 32) b1 = b1 && b;
@@ -169,7 +169,7 @@ void Phases() {
 	Check(before, "the settings keep the environment's values before the start");
 	Check(a0 && a2, "the points of use see the environment's values in phase A");
 	Check(b1 && b3, "the points of use see the other values in phase B, from the flip that begins it");
-	Switches::Assign(Switch::FlatDefer, false);
+	Switches::Assign(Switch::FlatDefer, true);
 	Switches::Assign(Switch::GenericComputeVariant, true);
 }
 
@@ -200,15 +200,15 @@ int Flips() {
 	Check(Ab::Configured() && Ab::Listed(Switch::FlatDefer) && !Ab::Listed(Switch::GenericComputeVariant),
 	      "KYTY_AB lists KYTY_FLAT_DEFER only");
 	const auto first = Ab::AtFlip();
-	Check(AnyContains(first, "[kyty-ab] in-run A/B: phases of 1.0 s from present 0, settle 0.5 s; A: KYTY_FLAT_DEFER=0; "
-	                         "B: KYTY_FLAT_DEFER=1"),
+	Check(AnyContains(first, "[kyty-ab] in-run A/B: phases of 1.0 s from present 0, settle 0.5 s; A: KYTY_FLAT_DEFER=1; "
+	                         "B: KYTY_FLAT_DEFER=0"),
 	      "the first flip states both arms");
 	Check(AnyContains(first, "[kyty-ab] phase A 0 begins at present 1 (t 0.000 s, wall "), "the first flip begins phase A");
-	Check(IR::SrtFlatDeferMode() == IR::SrtFlatDefer::Off, "phase A keeps KYTY_FLAT_DEFER off");
+	Check(IR::SrtFlatDeferMode() == IR::SrtFlatDefer::On, "phase A keeps KYTY_FLAT_DEFER on");
 	std::this_thread::sleep_for(std::chrono::milliseconds(1100));
 	const auto second = Ab::AtFlip();
 	Check(AnyContains(second, "[kyty-ab] phase B 1 begins at present 2 "), "a flip after the phase length begins phase B");
-	Check(IR::SrtFlatDeferMode() == IR::SrtFlatDefer::On, "phase B turns KYTY_FLAT_DEFER on");
+	Check(IR::SrtFlatDeferMode() == IR::SrtFlatDefer::Off, "phase B turns KYTY_FLAT_DEFER off");
 	Check(IR::GenericComputeVariants(), "a setting KYTY_AB does not list keeps its value");
 	if (g_failures != 0) {
 		for (const auto& line: first) std::fprintf(stderr, "%s", line.c_str());
