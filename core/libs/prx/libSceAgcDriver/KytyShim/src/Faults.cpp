@@ -72,11 +72,7 @@ bool             g_trap_installed = false;
 
 bool SwitchOn(const char* name) {
     const char* value = std::getenv(name);
-#ifdef _WIN32
-    return value != nullptr && value[0] == '1';
-#else
     return value == nullptr || value[0] != '0';
-#endif
 }
 
 bool ReplayReady() {
