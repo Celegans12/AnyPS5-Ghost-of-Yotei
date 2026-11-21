@@ -25,7 +25,7 @@ using namespace Libs::Graphics;
 namespace Libs::Graphics {
 
 struct BufferCacheTestAccess {
-	static void DiscardWrites(BufferCache& cache, uint64_t address, uint64_t size) {
+	static void DiscardGpuWrites(BufferCache& cache, uint64_t address, uint64_t size) {
 		cache.DiscardGpuWrites(address, size);
 	}
 };
@@ -213,7 +213,7 @@ const char* ProbeBufferWriteCoverage(GraphicContext& graphics) {
 		Require(producer.Process(dispatch, commands) == Pm4ProcessResult::Complete,
 		        "the storage-buffer dispatch did not finish recording");
 		Libs::LibKernel::Memory::WriteBacking(output + 8, &GuestWrite, sizeof(GuestWrite));
-		BufferCacheTestAccess::DiscardWrites(renderer.GetBufferCache(), output + 24, Page - 24);
+		BufferCacheTestAccess::DiscardGpuWrites(renderer.GetBufferCache(), output + 24, Page - 24);
 		std::array<uint32_t, 6> backing {};
 		if (!Libs::LibKernel::Memory::TryReadBacking(output, backing.data(), sizeof(backing))) {
 			failure = "could not read the guest backing";
