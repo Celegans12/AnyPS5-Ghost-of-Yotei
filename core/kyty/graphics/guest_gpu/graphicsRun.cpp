@@ -561,7 +561,7 @@ void GuestGpu::ResolveThread() {
 		const auto resolve_begin    = operation->kind != GpuOperationKind::Callback ? Common::SteadyNs() : 0;
 		if ((operation->kind == GpuOperationKind::DrawIndex ||
 		     operation->kind == GpuOperationKind::DrawIndirect) &&
-		    table_hint == 1u && !Common::RuntimeSwitches::On(Common::RuntimeSwitches::Switch::ResolveAheadAll)) {
+		    table_hint == 1u) {
 			operation->ahead_note = RenderExecutor::AheadNote::TableSkip;
 		} else if (operation->kind == GpuOperationKind::DrawIndex ||
 		           operation->kind == GpuOperationKind::DrawAuto) {
