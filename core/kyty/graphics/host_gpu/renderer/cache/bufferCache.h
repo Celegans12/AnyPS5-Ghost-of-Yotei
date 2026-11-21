@@ -429,6 +429,7 @@ private:
 	void NoteGpuLines(uint64_t vaddr, uint64_t size) noexcept;
 	void ForgetCurrentGpuLines(uint64_t vaddr, uint64_t size) noexcept;
 	void UnmarkGpuModified(uint64_t vaddr, uint64_t size);
+	void UnmarkPagesWithoutGpuBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool GpuLinesClean(uint64_t vaddr, uint64_t size, bool ever) const noexcept;
 	std::array<RangeSet, 16>                          m_checked_color_metadata;
 	RangeSet                                          m_released_ranges;

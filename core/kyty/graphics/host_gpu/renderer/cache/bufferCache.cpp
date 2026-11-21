@@ -2389,8 +2389,20 @@ bool BufferCache::TryReadMirroredGpuWrites(uint64_t vaddr, void* data, uint64_t 
 	});
 	if (m_gpu_modified_ranges.Subtract(vaddr, size)) {
 		NoteGpuModifiedChange(vaddr, size, false);
+		UnmarkPagesWithoutGpuBytes(vaddr, size);
 	}
 	return true;
+}
+
+void BufferCache::UnmarkPagesWithoutGpuBytes(uint64_t vaddr, uint64_t size) {
+	const auto end = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	for (auto page = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE); page < end; page += TRACKER_PAGE_SIZE) {
+		if (m_memory_tracker.IsRegionGpuModified(page, TRACKER_PAGE_SIZE) &&
+		    !m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE) &&
+		    InFlightReadbackTick(page, page + TRACKER_PAGE_SIZE) == 0) {
+			UnmarkGpuModified(page, TRACKER_PAGE_SIZE);
+		}
+	}
 }
 
 void BufferCache::RecordMirrorCopies(CommandBuffer& command) {
@@ -2729,6 +2741,7 @@ bool BufferCache::WriteAroundGpuWrites(uint64_t vaddr, const void* data, uint64_
 	if (m_inflight_readbacks.empty() || InFlightReadbackTick(vaddr, vaddr + size) == 0) {
 		if (m_gpu_modified_ranges.Subtract(vaddr, size)) {
 			NoteGpuModifiedChange(vaddr, size, false);
+			UnmarkPagesWithoutGpuBytes(vaddr, size);
 		}
 	}
 	return true;
@@ -3218,9 +3231,7 @@ void BufferCache::RunGarbageCollector() {
 			return false;
 		}
 		if (dirty) {
-			EXIT_NOT_IMPLEMENTED(
-			    !DownloadBufferMemory<true>(buffer, buffer.CpuAddress(), buffer.Size()) &&
-			    InFlightReadbackTick(buffer.CpuAddress(), buffer.CpuAddress() + buffer.Size()) == 0);
+			(void)DownloadBufferMemory<true>(buffer, buffer.CpuAddress(), buffer.Size());
 			dirty_buffers.push_back(id);
 		} else {
 			m_memory_tracker.MarkRegionAsCpuModified(buffer.CpuAddress(), buffer.Size());
