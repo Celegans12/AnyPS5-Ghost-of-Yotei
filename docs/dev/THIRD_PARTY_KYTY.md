@@ -66,6 +66,7 @@ be second declarations of AnyPS5 exports for `core/libs/tests/test_public_header
   | `7ee598b4`, `f26b1d7e` | #1403 | a compute dispatch's scalar reads may overlap the start of its own sentinel write range (`FindBuffers`); `a9d34f70`'s `CommitBindings` check is not in the imported revision |
   | `d6ad3c2b` | #1802 | a buffer allocation refused by VMA's budget is retried once without the budget limit |
   | `8d0ebb8f` | — | the SRT walker evaluates `SMin32` in runtime descriptor values |
+  | `657a94e7` | — | `WalkSrt` appends the walker's captured reads to the caller's list in one pass; adapted to the 16-byte capture records of the imported revision |
 
   `Presenter::PrepareFrame` takes the VideoOut pixel format since `50c0c066`: the shim passes the display buffer's
   `pixelFormat`.
