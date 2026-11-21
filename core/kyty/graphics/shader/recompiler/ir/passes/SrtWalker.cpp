@@ -183,6 +183,11 @@ struct WalkerPageAnswer {
 	uint64_t       page    = ~uint64_t {0};
 	SrtWalkerPage  kind    = SrtWalkerPage::Direct;
 	const uint8_t* backing = nullptr;
+#if defined(ANYPS5_KYTY)
+	const uint8_t* around       = nullptr;
+	bool           around_known = false;
+	bool           around_clean = false;
+#endif
 };
 thread_local std::array<WalkerPageAnswer, 4> t_page_answers;
 #if defined(ANYPS5_KYTY)
@@ -231,6 +236,25 @@ uint64_t KYTY_SYSV_ABI ProbeGuestLoad(uint64_t address, WalkerCachedPage* cache)
 		case SrtWalkerPage::PerLoad: break;
 	}
 #if defined(ANYPS5_KYTY)
+	if (!t_walker_ahead && g_guest_memory.around_page != nullptr &&
+	    address - page <= PageSize - sizeof(value)) {
+		if (!answer.around_known) {
+			answer.around_known = true;
+			answer.around       = g_guest_memory.around_page(address, answer.around_clean);
+		}
+		if (answer.around != nullptr && answer.around_clean) {
+			if (cache != nullptr) {
+				auto& slot   = cache[(page / PageSize) % WalkerPageCacheSlots];
+				slot.page    = page / PageSize;
+				slot.backing = answer.around;
+			}
+			std::memcpy(&value, answer.around + (address - page), sizeof(value));
+			return uint64_t {1} << 32u | value;
+		}
+		if (answer.around != nullptr) {
+			return g_guest_memory.read_on_page(address, value, answer.around) ? uint64_t {1} << 32u | value : 0;
+		}
+	}
 	if (g_guest_memory.read(address, value, t_walker_ahead, answer.backing)) {
 		if (t_walker_around) t_around_loads.push_back(address);
 		return uint64_t {1} << 32u | value;
