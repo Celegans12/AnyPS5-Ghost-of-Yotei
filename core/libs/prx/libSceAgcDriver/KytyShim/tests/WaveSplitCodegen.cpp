@@ -1,5 +1,6 @@
 #include "Wave64Programs.hpp"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvWaveSplit.h"
 
 #include <spirv-tools/libspirv.hpp>
 #include <spirv/unified1/spirv.hpp>
@@ -8,6 +9,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <initializer_list>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -50,6 +53,17 @@ void Check(bool value, const std::string& what) {
 	if (value) return;
 	++g_failures;
 	std::fprintf(stderr, "%s: FAILED: %s\n", Name, what.c_str());
+}
+
+bool Valid(const std::vector<uint32_t>& words, std::string& messages) {
+	spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
+	tools.SetMessageConsumer([&messages](spv_message_level_t, const char*, const spv_position_t&, const char* message) {
+		messages += message;
+		messages += '\n';
+	});
+	spvtools::ValidatorOptions validator;
+	validator.SetUniformBufferStandardLayout(true);
+	return tools.Validate(words.data(), words.size(), validator);
 }
 
 struct Module {
@@ -152,18 +166,61 @@ std::vector<uint32_t> Compile(const Program& program, uint64_t hash) {
 		Check(false, std::string(program.name) + ": the program's resources were not materialized");
 		return {};
 	}
-	auto compiled = Recompiler::CompileProgram(std::move(translated), options, specialization, 0u);
-	spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
-	std::string          messages;
-	tools.SetMessageConsumer([&messages](spv_message_level_t, const char*, const spv_position_t&, const char* message) {
-		messages += message;
-		messages += '\n';
-	});
-	spvtools::ValidatorOptions validator;
-	validator.SetUniformBufferStandardLayout(true);
-	Check(tools.Validate(compiled.spirv.data(), compiled.spirv.size(), validator),
-	      std::string(program.name) + ": invalid SPIR-V: " + messages);
+	auto        compiled = Recompiler::CompileProgram(std::move(translated), options, specialization, 0u);
+	std::string messages;
+	Check(Valid(compiled.spirv, messages), std::string(program.name) + ": invalid SPIR-V: " + messages);
 	return std::move(compiled.spirv);
+}
+
+std::vector<uint32_t> ComputeModule(bool derivatives) {
+	std::vector<uint32_t> words {spv::MagicNumber, 0x00010600u, 0u, 7u, 0u};
+	const auto put = [&](spv::Op op, std::initializer_list<uint32_t> operands, const char* text = nullptr) {
+		std::vector<uint32_t> packed;
+		if (text != nullptr) {
+			packed.assign(std::strlen(text) / 4u + 1u, 0u);
+			std::memcpy(packed.data(), text, std::strlen(text));
+		}
+		words.push_back(static_cast<uint32_t>((operands.size() + packed.size() + 1u) << spv::WordCountShift) | op);
+		words.insert(words.end(), operands);
+		words.insert(words.end(), packed.begin(), packed.end());
+	};
+	put(spv::OpCapability, {spv::CapabilityShader});
+	if (derivatives) {
+		put(spv::OpCapability, {spv::CapabilityComputeDerivativeGroupQuadsKHR});
+		put(spv::OpExtension, {}, "SPV_KHR_compute_shader_derivatives");
+	}
+	put(spv::OpMemoryModel, {spv::AddressingModelLogical, spv::MemoryModelGLSL450});
+	put(spv::OpEntryPoint, {spv::ExecutionModelGLCompute, 5u}, "main");
+	put(spv::OpExecutionMode, {5u, spv::ExecutionModeLocalSize, 8u, 8u, 1u});
+	if (derivatives) put(spv::OpExecutionMode, {5u, spv::ExecutionModeDerivativeGroupQuadsKHR});
+	put(spv::OpTypeVoid, {1u});
+	put(spv::OpTypeBool, {2u});
+	put(spv::OpTypeInt, {3u, 32u, 0u});
+	put(spv::OpTypeFunction, {4u, 1u});
+	put(spv::OpFunction, {1u, 5u, spv::FunctionControlMaskNone, 4u});
+	put(spv::OpLabel, {6u});
+	put(spv::OpReturn, {});
+	put(spv::OpFunctionEnd, {});
+	return words;
+}
+
+void ComputeDerivatives() {
+	for (const bool derivatives: {false, true}) {
+		auto        module = ComputeModule(derivatives);
+		const auto  label  = std::string(derivatives ? "8x8 with compute derivatives" : "8x8 without compute derivatives");
+		std::string messages;
+		Check(Valid(module, messages), label + ": invalid input module: " + messages);
+		std::string refusal;
+		const bool  split = Recompiler::Spirv::SplitWaveAcrossSubgroups(module, refusal);
+		std::printf("%s: %s: %s\n", Name, label.c_str(), split ? "split" : ("kept in lane pairs: " + refusal).c_str());
+		if (derivatives) {
+			Check(!split, label + ": derivative quads follow the 2D workgroup layout, which the split flattens");
+			continue;
+		}
+		messages.clear();
+		Check(split && Inspect(module).local_size == std::array<uint32_t, 3> {64u, 1u, 1u} && Valid(module, messages),
+		      label + ": the split runs the group flat on 32-wide subgroups: " + refusal + messages);
+	}
 }
 
 }
@@ -188,6 +245,7 @@ int main() {
 			      std::string(program.name) + ": the wave's store to one LDS word goes through the exchange first");
 		}
 	}
+	ComputeDerivatives();
 	if (g_failures != 0) return 1;
 	std::printf("%s: ok\n", Name);
 	return 0;
