@@ -2782,7 +2782,7 @@ int64_t LabelClockNs() {
 	           std::chrono::steady_clock::now().time_since_epoch())
 	    .count();
 }
-} // namespace
+}
 
 void CommandProcessor::LogLabelSummary() {
 	auto&      stats = g_label_stats;
