@@ -25,6 +25,10 @@ const std::vector<Case> Cases = {
     {"branch-target-outside-the-program", 0x00, 0x00, {0xbf827fffu, 0xbf810000u}},
     {"stale-lane-spill-after-read-lane-elimination", 0x32, 0x00, {0xd7610014u, 0x0201e205u, 0xbf810000u}, true},
     {"literal-constant-without-its-word", 0x00, 0x00, {0x7e0002ffu}},
+    {"vop1-dpp-without-its-modifier-word", 0x00, 0x00, {0x7e0002fau}},
+    {"smem-without-its-second-word", 0x00, 0x00, {0xf4000000u}},
+    {"mimg-nsa-without-its-address-words", 0x00, 0x00, {0xf0000002u, 0x00000000u}},
+    {"backward-branch-before-the-program", 0x00, 0x00, {0xbf828000u, 0xbf810000u}},
     {"empty-program-end", 0x00, 0x00, {0xbf810000u}},
 };
 

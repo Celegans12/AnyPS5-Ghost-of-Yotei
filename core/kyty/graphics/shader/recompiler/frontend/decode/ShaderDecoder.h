@@ -950,6 +950,7 @@ bool IsDsWriteOpcode(Opcode opcode);
 void DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand);
 void DecodeScalarDestination(uint32_t code, uint32_t pc, Operand& operand);
 void DecodeVectorGpr(uint32_t reg, Operand& operand);
+void RequireWords(std::span<const uint32_t> code, uint32_t word_index, uint32_t word_count);
 void ReadLiteralOperands(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst);
 void SetRawWords(Instruction& inst, std::span<const uint32_t> code, uint32_t word_index,
                  uint32_t word_count);

@@ -696,6 +696,7 @@ void DecodeSdwaSource(uint32_t code, uint32_t fields, uint32_t pc, Operand& oper
 
 void DecodeVop1Sdwa(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                     uint32_t opcode, uint32_t vdst, Instruction& inst) {
+	RequireWords(code, word_index, 2u);
 	const auto modifier = code[word_index + 1u];
 	const auto dst_sel  = (modifier >> 8u) & 0x7u;
 	const auto dst_u    = (modifier >> 11u) & 0x3u;
@@ -746,6 +747,7 @@ void DecodeVop1Dpp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_in
 		SetUnsupported(inst, Family::VOP1, opcode, "FP64 instructions do not support DPP");
 		return;
 	}
+	RequireWords(code, word_index, 2u);
 	const auto modifier = code[word_index + 1u];
 	const auto src0     = modifier & 0xffu;
 	SetRawWords(inst, code, word_index, 2);
@@ -1092,6 +1094,7 @@ void FinalizeVop2Instruction(std::span<const uint32_t> code, uint32_t word_index
 
 void DecodeVop2Sdwa(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                     uint32_t opcode, uint32_t vdst, uint32_t vsrc1, Instruction& inst) {
+	RequireWords(code, word_index, 2u);
 	const auto modifier = code[word_index + 1u];
 	const auto fields   = DecodeVop2SdwaFields(modifier);
 	SetRawWords(inst, code, word_index, 2);
@@ -1112,6 +1115,7 @@ void DecodeVop2Sdwa(uint32_t pc, std::span<const uint32_t> code, uint32_t word_i
 
 void DecodeVop2Dpp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                    uint32_t opcode, uint32_t vdst, uint32_t vsrc1, Instruction& inst) {
+	RequireWords(code, word_index, 2u);
 	const auto modifier = code[word_index + 1u];
 	const auto src0     = modifier & 0xffu;
 	SetRawWords(inst, code, word_index, 2);
@@ -1147,6 +1151,7 @@ bool SupportsVopcSdwa(Opcode opcode) {
 
 void DecodeVopcSdwa(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                     uint32_t opcode, uint32_t vsrc1, Instruction& inst) {
+	RequireWords(code, word_index, 2u);
 	const auto modifier = code[word_index + 1u];
 	SetRawWords(inst, code, word_index, 2);
 	if (((modifier >> 16u) & 0x7u) > 6u || ((modifier >> 24u) & 0x7u) > 6u) {
@@ -1174,6 +1179,7 @@ void DecodeVopcSdwa(uint32_t pc, std::span<const uint32_t> code, uint32_t word_i
 
 void DecodeVopcDpp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                    uint32_t opcode, uint32_t vsrc1, Instruction& inst) {
+	RequireWords(code, word_index, 2u);
 	const auto modifier = code[word_index + 1u];
 	const auto src0     = modifier & 0xffu;
 	SetRawWords(inst, code, word_index, 2);

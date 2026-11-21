@@ -277,11 +277,19 @@ void DecodeVectorGpr(uint32_t reg, Operand& operand) {
 	operand.reg  = reg;
 }
 
+void RequireWords(std::span<const uint32_t> code, uint32_t word_index, uint32_t word_count) {
+	if (word_index >= code.size() || code.size() - word_index < word_count) {
+		EXIT("shader instruction at pc 0x%08x needs %u words, the code ends after %u words", word_index * 4u,
+		     word_count, static_cast<uint32_t>(code.size()));
+	}
+}
+
 void ReadLiteralOperands(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst) {
 	if (!HasLiteral(inst)) {
 		return;
 	}
 
+	RequireWords(code, word_index, inst.word_count + 1u);
 	const auto literal = code[word_index + inst.word_count];
 	ApplyLiteral(inst.src0, literal);
 	ApplyLiteral(inst.src1, literal);
@@ -293,6 +301,7 @@ void ReadLiteralOperands(std::span<const uint32_t> code, uint32_t word_index, In
 
 void SetRawWords(Instruction& inst, std::span<const uint32_t> code, uint32_t word_index,
                  uint32_t word_count) {
+	RequireWords(code, word_index, word_count);
 	inst.word_count = word_count;
 	for (uint32_t i = 0; i < inst.word_count; i++) {
 		inst.raw[i] = code[word_index + i];
@@ -339,9 +348,27 @@ Family GetInstructionFamily(uint32_t word) {
 	}
 }
 
+static uint32_t BaseWordCount(Family family) {
+	switch (family) {
+		case Family::VOP3:
+		case Family::VOP3P:
+		case Family::SMEM:
+		case Family::MUBUF:
+		case Family::MTBUF:
+		case Family::FLAT:
+		case Family::DS:
+		case Family::MIMG:
+		case Family::EXP: return 2u;
+		default: return 1u;
+	}
+}
+
 void DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst) {
 	const uint32_t pc = word_index * sizeof(uint32_t);
-	switch (GetInstructionFamily(code[word_index])) {
+	RequireWords(code, word_index, 1u);
+	const Family family = GetInstructionFamily(code[word_index]);
+	RequireWords(code, word_index, BaseWordCount(family));
+	switch (family) {
 		case Family::SOP1: DecodeSop1(pc, code, word_index, inst); return;
 		case Family::SOP2: DecodeSop2(pc, code, word_index, inst); return;
 		case Family::SOPK: DecodeSopk(pc, code, word_index, inst); return;
@@ -415,8 +442,10 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program,
 			if (branch_targets.empty()) {
 				branch_targets.resize(code.size());
 			}
-			branch_targets[target_index] = true;
-			last_target                  = std::max<size_t>(last_target, target_index);
+			if (target_index < code.size()) {
+				branch_targets[target_index] = true;
+			}
+			last_target = std::max<size_t>(last_target, target_index);
 		}
 		const bool ends_path = inst.opcode == Opcode::S_ENDPGM || (tail && inst.opcode == Opcode::S_BRANCH);
 		if (ends_path &&
