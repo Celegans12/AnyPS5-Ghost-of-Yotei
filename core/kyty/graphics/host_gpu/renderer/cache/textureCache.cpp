@@ -2504,8 +2504,6 @@ ImageId TextureCache::FindImageImpl(ImageDesc& desc, bool exact_format, bool spe
 		int32_t view_layer = -1;
 		if (!result) {
 			for (const auto candidate: candidates) {
-				view_mip                = -1;
-				view_layer              = -1;
 				const auto& merged_info = result ? m_slot_images[result].info : desc.info;
 				const auto  overlap =
 				    ResolveOverlap(merged_info, desc.type, candidate, result, speculative,
@@ -2520,7 +2518,9 @@ ImageId TextureCache::FindImageImpl(ImageDesc& desc, bool exact_format, bool spe
 					return {};
 				}
 				if (overlap.image) {
-					result     = overlap.image;
+					result = overlap.image;
+				}
+				if (overlap.mip >= 0) {
 					view_mip   = overlap.mip;
 					view_layer = overlap.layer;
 				}
