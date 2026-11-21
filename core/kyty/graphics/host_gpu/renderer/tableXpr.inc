@@ -2351,7 +2351,7 @@ void TableReportIfDue(uint64_t frame, uint64_t now) {
 	    at("xpr: draw runs tried"), at("xpr: clean draws"), at("xpr: drawn by continue") + at("xpr: drawn by try"),
 	    at("xpr: drawn by continue"), at("xpr: drawn by try"), at("xpr: draws served"), at("xpr: sent to learn"),
 	    at("xpr: deferred"), at("xpr: refused by the table"), at("xpr: off or invalid"),
-	    at("xpr: stages (no ES program)") + at("xpr: stages (tessellation)"),
+	    at("xpr: stages (no ES program)") + at("xpr: stages (tessellation)") + at("xpr: stages (LS or HS registers left set)"),
 	    at("xpr: refused pair") + at("table: pair refused"),
 	    at("xpr: direct shape (indirect address)") + at("xpr: direct shape (offset source)") +
 	        at("xpr: direct shape (no indices)") + at("xpr: direct shape (empty)") +
@@ -2443,7 +2443,11 @@ bool RenderExecutor::TableXprTry(CommandBuffer& buffer, uint64_t args_addr, uint
 	if (mode == 0 || buffer.IsInvalid()) return Spec::Refuse("xpr: off or invalid"), false;
 	const auto& try_vs = buffer.GetShaders().GetVs();
 	if (try_vs.es_regs.data_addr == 0 || try_vs.ls_regs.data_addr != 0 || try_vs.hs_regs.data_addr != 0)
-		return Spec::Refuse(try_vs.es_regs.data_addr == 0 ? "xpr: stages (no ES program)" : "xpr: stages (tessellation)"), false;
+		return Spec::Refuse(try_vs.es_regs.data_addr == 0 ? "xpr: stages (no ES program)"
+		                    : buffer.GetUserConfig().GetPrimType() == Prospero::PrimitiveType::kPatch
+		                        ? "xpr: stages (tessellation)"
+		                        : "xpr: stages (LS or HS registers left set)"),
+		       false;
 	const auto refused_tag =
 	    (likely_tag ^ (uint64_t {static_cast<uint32_t>(g_table_offsets_key)} * 0xff51afd7ed558ccdull)) | 1ull;
 	const auto refused_slot       = (refused_tag >> 40u) & (m_table_refused.size() - 1);
