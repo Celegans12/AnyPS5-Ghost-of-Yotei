@@ -9,7 +9,6 @@
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
-#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -228,18 +227,6 @@ void InvalidateMemory(uint64_t vaddr, uint64_t size) {
 #if defined(ANYPS5_KYTY)
 namespace {
 
-bool WalkerProbeEnabled() {
-	static const bool enabled = [] {
-		const char*            value = std::getenv("KYTY_SRT_WALKER_PROBE");
-		const std::string_view text {value == nullptr ? "" : value};
-		if (!text.empty() && text != "0" && text != "1") {
-			Shim::Fail("invalid KYTY_SRT_WALKER_PROBE: %s (0 or 1)\n", value);
-		}
-		return text != "0";
-	}();
-	return enabled;
-}
-
 Graphics::ShaderRecompiler::IR::SrtWalkerPage WalkerGuestPage(uint64_t address, bool ahead, const uint8_t*& backing) {
 	constexpr uint64_t PageSize = 4096;
 	backing = nullptr;
@@ -265,7 +252,7 @@ void InstallGpuResources(Graphics::RenderContext* resources) noexcept {
 	g_gpu_resources = resources;
 	if (resources != nullptr) Shim::SetGpuRangeHooks(&MapGpuRange, &UnmapGpuRange);
 #if defined(ANYPS5_KYTY)
-	if (resources != nullptr && WalkerProbeEnabled()) {
+	if (resources != nullptr) {
 		Graphics::ShaderRecompiler::IR::SetSrtWalkerGuestMemory({&WalkerGuestPage, &WalkerGuestRead});
 	}
 #endif

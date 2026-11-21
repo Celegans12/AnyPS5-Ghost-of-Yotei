@@ -225,7 +225,6 @@ The table draws are GPU-driven draws of a shader pair's table programs.
 | `KYTY_FIX_STENCIL_FILL_HELD_PLANE` | `0` turns it off, any other value or unset leaves it on | on | A buffer fill of a stencil plane becomes a clear of the depth image's stencil aspect only while that aspect holds the plane; a fill of another plane runs as the game's own fill, so it no longer wipes the plane the depth image holds; `0` clears the aspect for a fill of any registered plane | compat | all | AnyKyty |
 | `KYTY_TILE_VIA_VRAM` | `0` or `1`, empty counts as unset, else stops | on | Tiles a tiled image's readback in device-local memory, then copies it once to the host; `0` is KytyPS5's behaviour. See [below](#details) | perf | all | `08c666a175` |
 | `KYTY_COMPARE_WRITE_BACK` | `0` or `1`, empty counts as unset, else stops | on | An image readback writes guest memory only where the GPU result differs from the bytes read when the readback was recorded and the guest bytes still hold that read; `0` writes the image's whole footprint, KytyPS5's behaviour. See [below](#details) | compat | all | AnyKyty |
-| `KYTY_SRT_WALKER_PROBE` | `0` or `1`, empty counts as unset, else stops | on | The shader resource table walk of the execution thread reads a page the GPU may own through the fault handler's around-GPU-writes read, without taking the fault; `0` takes the fault. See [below](#details) | perf | all | `8095894f76` |
 | `KYTY_EARLY_FLIP` | `0` or `1`, empty counts as unset, else stops | on | Completes a guest flip once its command buffer is submitted, on a thread of its own; `0` is KytyPS5's behaviour. See [below](#details) | perf | all | `499dfc3f39` |
 | `KYTY_LABELS_AFTER_DUMPS` | `0` or `1`, empty counts as unset, else stops | on | A deferred `RELEASE_MEM` label waits for the newest pending occlusion dump instead of its own command buffer; `0` is KytyPS5's behaviour. See [below](#details) | perf | all | `ef88cc3285` |
 | `KYTY_LABELS_AROUND_GPU_WRITES` | `0` or `1`, empty counts as unset, else stops | on | A `RELEASE_MEM` label that arrives while other labels are deferred, on a page the GPU wrote elsewhere but none of whose own bytes it wrote, is deferred behind them instead of draining the GPU; `0` drains. See [below](#details) | perf | all | AnyKyty |
@@ -386,7 +385,7 @@ that share a 16 KiB page with data shaders write through device addresses, the w
 load faulted, and the fault handler copied the page back after the GPU finished everything. A probe that compared the bytes
 before and after each such copy found them unchanged in every read in game; reading around page marks without the copy
 removed those waits, but left the pages protected, so every later load of the walk and of the resolve thread faulted, and
-the frame rate dropped by 5 %: that path was not kept. Two smaller changes were. `KYTY_SRT_WALKER_PROBE` installs the walk's
+the frame rate dropped by 5 %: that path was not kept. Two smaller changes were. The shim installs the walk's
 guest-memory provider (`SetSrtWalkerGuestMemory`), which the import carried but nothing installed: on the execution thread a
 load from a page that may fault goes through the same around-GPU-writes read as the fault handler, without the signal, and a
 load it cannot serve still faults. `KYTY_IDLE_SUBMIT` submits the open command buffer after a draw or a dispatch when the GPU
@@ -395,8 +394,8 @@ reads the semaphore value the scheduler already knows and asks the driver at mos
 setting switched every 10 s inside one session (14 periods in game, neighbouring periods compared), on the open-world title:
 +1.6 % frames per second for the walk's provider, +4.1 % for the idle submit (from 47 to 60 submissions a frame); on Stray,
 whose execution thread is the wall, both within ±1 % (the idle submit takes it from 114 to 181 submissions a frame). Same
-images. Either variable at `0` restores the previous behaviour; another value stops the emulator with a message naming the
-variable.
+images. The provider has no switch since this measurement; `KYTY_IDLE_SUBMIT` at `0` restores the previous behaviour, another
+value stops the emulator with a message naming the variable.
 
 Suspend points: KytyPS5 makes `sceAgcSuspendPoint` (`GuestGpu::SuspendPoint`) acquire a binary semaphore that its
 priority thread releases once the GPU has finished the work queued before the previous suspend point, so a title can
