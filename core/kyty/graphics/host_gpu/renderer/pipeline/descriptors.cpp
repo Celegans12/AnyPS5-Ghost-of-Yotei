@@ -1066,20 +1066,18 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	auto       cached = m_texture_descs.find(key);
 	if (cached == m_texture_descs.end()) {
 		auto& origin = CurrentImageLayoutOrigin();
-		if (ImageLayoutDiagEnabled()) {
-			origin.path = table_candidate ? "table candidate"
-			              : resource.heap ? "image heap"
-			              : resource.indirect_root !=
-			                        ShaderRecompiler::IR::ImageResource::NoIndirectImage
-			                    ? "indirect image"
-			                    : "direct";
-			origin.shader           = Common::HackNotice::CurrentShaderSlot();
-			origin.source           = resource.source;
-			origin.descriptor_index = resource.descriptor_index;
-			origin.first_use_pc     = resource.first_use_pc;
-			origin.indirect_root    = resource.indirect_root;
-			origin.words            = value.dwords;
-		}
+		origin.path  = table_candidate ? "table candidate"
+		               : resource.heap ? "image heap"
+		               : resource.indirect_root !=
+		                         ShaderRecompiler::IR::ImageResource::NoIndirectImage
+		                     ? "indirect image"
+		                     : "direct";
+		origin.shader           = Common::HackNotice::CurrentShaderSlot();
+		origin.source           = resource.source;
+		origin.descriptor_index = resource.descriptor_index;
+		origin.first_use_pc     = resource.first_use_pc;
+		origin.indirect_root    = resource.indirect_root;
+		origin.words            = value.dwords;
 		auto derived = DeriveTextureDesc(resource, descriptor);
 		if (derived.unknown_tiling) {
 			ReportDeclinedTiling(resource, value, table_candidate, derived.desc.info);
