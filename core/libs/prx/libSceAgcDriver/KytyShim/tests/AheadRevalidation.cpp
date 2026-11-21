@@ -36,7 +36,8 @@ void UnbackedRead() {
 	Check(!log.StillValid() && log.Stale() == StaleRead::Failed, "revalidation refuses a failed resolution as failed");
 	log.Clear();
 	Check(!log.Failed() && log.Refusal() == AheadRefusal::None, "clearing forgets the refusal");
-	Check(log.StillValid() && log.Stale() == StaleRead::None, "clearing forgets the stale read");
+	Check(log.Stale() == StaleRead::None, "clearing forgets the stale read");
+	Check(log.StillValid() && log.Stale() == StaleRead::None, "a cleared log is valid again");
 }
 
 void EmptyRead() {

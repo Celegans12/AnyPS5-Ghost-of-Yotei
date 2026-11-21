@@ -84,6 +84,7 @@ public:
 		m_plan        = nullptr;
 		m_failed      = false;
 		m_refusal     = AheadRefusal::None;
+		m_stale       = StaleRead::None;
 		m_gpu_written = false;
 #if defined(ANYPS5_KYTY)
 		m_deferred_words     = 0;
