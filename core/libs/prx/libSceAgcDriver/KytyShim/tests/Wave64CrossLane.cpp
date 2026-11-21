@@ -273,6 +273,17 @@ void printTail(const std::string& log) {
     std::cerr << (log.size() > TailBytes ? log.substr(log.size() - TailBytes) : log) << '\n';
 }
 
+std::string path(const std::string& log) {
+    const auto kept = log.find("wave64 kept in lane pairs");
+    if (kept != std::string::npos) {
+        const auto reason = log.find("reason=", kept);
+        const auto end = reason == std::string::npos ? std::string::npos : log.find('\n', reason);
+        return "lane pairs" + (reason == std::string::npos ? std::string() : ", " + log.substr(reason + 7, end - reason - 7));
+    }
+    if (log.find("wave64 split across subgroups") != std::string::npos) return "split";
+    return "not split";
+}
+
 std::uint32_t laneValue(std::uint32_t lane) {
     return (lane * 0x9e3779b1u) ^ 0x5a5a1234u;
 }
@@ -504,6 +515,11 @@ int main(int argc, char** argv) {
                           ("kyty-wave64-cross-lane-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
         std::filesystem::create_directories(root);
         const bool vulkanRequired = std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr;
+#if defined(_WIN32)
+        _putenv_s("KYTY_PRINTF_DIRECTION", "Console");
+#else
+        setenv("KYTY_PRINTF_DIRECTION", "Console", 1);
+#endif
         int failures = 0;
         bool first = true;
         for (const auto& test : Cases) {
@@ -523,11 +539,11 @@ int main(int argc, char** argv) {
             first = false;
             const auto failure = test.check(result.output);
             if (failure.empty()) {
-                std::cout << test.name << ": ok\n";
+                std::cout << test.name << ": ok (" << path(result.log) << ")\n";
                 continue;
             }
             ++failures;
-            std::cerr << test.name << ": " << failure << '\n';
+            std::cerr << test.name << " (" << path(result.log) << "): " << failure << '\n';
         }
         if (failures != 0) return 1;
         std::filesystem::remove_all(root);
