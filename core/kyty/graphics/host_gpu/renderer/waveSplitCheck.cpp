@@ -68,10 +68,10 @@ WaveSplitCheck::~WaveSplitCheck() {
 }
 
 bool WaveSplitCheck::Candidate(const ShaderComputeInputInfo& input_info) {
-	return input_info.wave_size == 64u && input_info.host_subgroup_size == 32u &&
-	       uint64_t {std::max(input_info.threads_num[0], 1u)} * std::max(input_info.threads_num[1], 1u) *
-	               std::max(input_info.threads_num[2], 1u) ==
-	           64u;
+	const auto threads = uint64_t {std::max(input_info.threads_num[0], 1u)} * std::max(input_info.threads_num[1], 1u) *
+	                     std::max(input_info.threads_num[2], 1u);
+	return input_info.wave_size == 64u && input_info.host_subgroup_size == 32u && threads % 64u == 0 &&
+	       threads <= 1024u;
 }
 
 bool WaveSplitCheck::Prepare() {
@@ -107,7 +107,9 @@ bool WaveSplitCheck::Prepare() {
 	SetVulkanObjectNameF(graphics.device, m_pipeline, "Wave Split Check Compare");
 	m_ready = true;
 	Note(fmt::format("[kyty-split-check] on: one dispatch in {} of every split wave64 compute program (one in {} once "
-	                 "verified) also runs in lane pairs on the same inputs, and the outputs of both are compared",
+	                 "verified) also runs in lane pairs on the same inputs, and the outputs of both are compared; every "
+	                 "other check runs the lane pair module twice instead, as a witness of what the program does not fix "
+	                 "by itself",
 	                 Config::WaveSplitCheckPeriod(), uint64_t {Config::WaveSplitCheckPeriod()} * SlowerAfter));
 	return true;
 }
@@ -209,7 +211,8 @@ bool WaveSplitCheck::Begin(const ShaderModule& split, const ShaderModule& pairs)
 		program.waiting = true;
 		return false;
 	}
-	m_pending[slot] = {.busy = true, .hash = hash, .dwords = 0, .index = program.dispatches - 1};
+	m_witness       = program.started++ % 2u == 1u;
+	m_pending[slot] = {.busy = true, .hash = hash, .dwords = 0, .index = program.dispatches - 1, .witness = m_witness};
 	m_slot          = slot;
 	m_hash          = hash;
 	m_active        = true;
@@ -436,13 +439,22 @@ void WaveSplitCheck::Finish(uint32_t slot) {
 	auto pending         = std::move(m_pending[slot]);
 	m_pending[slot]      = {};
 	auto& program        = m_programs[pending.hash];
-	program.checks++;
-	m_checks++;
-	if (differ == 0) {
-		program.clean++;
+	if (pending.witness) {
+		program.witnessed++;
+		m_witnesses++;
+		if (differ != 0) {
+			program.unsteady++;
+			m_unsteady++;
+		}
 	} else {
-		program.differing++;
-		m_differ++;
+		program.checks++;
+		m_checks++;
+		if (differ == 0) {
+			program.clean++;
+		} else {
+			program.differing++;
+			m_differ++;
+		}
 	}
 	std::string where;
 	if (differ != 0) {
@@ -455,7 +467,15 @@ void WaveSplitCheck::Finish(uint32_t slot) {
 			}
 		}
 	}
-	if (differ != 0 || program.checks == 1) {
+	if (pending.witness && (differ != 0 || program.witnessed == 1)) {
+		Note(fmt::format("[kyty-split-check] {}: witness dispatch {}: {} of {} output dwords differ between two lane pair "
+		                 "runs, {} output(s){}; {} witnesses with a difference in {} so far",
+		                 Hash(pending.hash), pending.index, differ, pending.dwords, pending.outputs.size(),
+		                 differ == 0 ? std::string()
+		                             : fmt::format("; first at dword {}{}: 0x{:08x} first run, 0x{:08x} second run",
+		                                           first, where, split, pairs),
+		                 m_unsteady, m_witnesses));
+	} else if (!pending.witness && (differ != 0 || program.checks == 1)) {
 		Note(fmt::format("[kyty-split-check] {}: dispatch {}: {} of {} output dwords differ, {} output(s){}; {} checks "
 		                 "with a difference in {} so far",
 		                 Hash(pending.hash), pending.index, differ, pending.dwords, pending.outputs.size(),

@@ -726,7 +726,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		if (pairs_module == nullptr || m_context.GetPipelineCache().TryGetComputePipeline(pairs) == nullptr) {
 			SplitCheck().Defer(compute_module->info.shader_hash, queued);
 		} else if (SplitCheck().Begin(*compute_module, *pairs_module)) {
-			record(input_info, 3);
+			record(SplitCheck().Witness() ? pairs : input_info, 3);
 			if (SplitCheck().Active()) {
 				record(pairs, 4);
 			}

@@ -34,6 +34,7 @@ public:
 	void                      Defer(uint64_t shader_hash, bool queued);
 	[[nodiscard]] bool        Begin(const ShaderModule& split, const ShaderModule& pairs);
 	[[nodiscard]] bool        Active() const noexcept { return m_active; }
+	[[nodiscard]] bool        Witness() const noexcept { return m_witness; }
 	void                      Before(const PreparedBindings& bindings);
 	void                      AfterSplit(const PreparedBindings& bindings);
 	void                      AfterPairs(const PreparedBindings& bindings);
@@ -55,6 +56,9 @@ private:
 		uint32_t    differing  = 0;
 		uint32_t    deferred   = 0;
 		uint32_t    queued     = 0;
+		uint32_t    started    = 0;
+		uint32_t    witnessed  = 0;
+		uint32_t    unsteady   = 0;
 		bool        verified   = false;
 		bool        waiting    = false;
 		std::string refused;
@@ -64,6 +68,7 @@ private:
 		uint64_t            hash   = 0;
 		uint64_t            dwords = 0;
 		uint64_t            index  = 0;
+		bool                witness = false;
 		std::vector<Output> outputs;
 	};
 
@@ -89,9 +94,12 @@ private:
 	uint64_t                              m_hash     = 0;
 	uint32_t                              m_slot     = UINT32_MAX;
 	bool                                  m_active   = false;
+	bool                                  m_witness  = false;
 	bool                                  m_ready    = false;
 	uint64_t                              m_checks   = 0;
 	uint64_t                              m_differ   = 0;
+	uint64_t                              m_witnesses = 0;
+	uint64_t                              m_unsteady  = 0;
 	vk::DescriptorSetLayout               m_descriptor_layout = nullptr;
 	vk::PipelineLayout                    m_pipeline_layout   = nullptr;
 	vk::Pipeline                          m_pipeline          = nullptr;
