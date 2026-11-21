@@ -1024,7 +1024,7 @@ void CommandProcessor::MemSemaphore(uint64_t* counter, bool signal, bool write) 
 	}
 }
 
-void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num,
+void CommandProcessor::WriteData(uint64_t destination, const uint32_t* src, uint32_t dw_num,
                                  uint32_t write_control) {
 	const uint32_t dst_sel = ((write_control >> 30u) & 0x1u) | ((write_control >> 7u) & 0x1eu);
 	const bool     write_one_address = ((write_control >> 16u) & 0x1u) != 0;
@@ -1041,6 +1041,17 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		return;
 	}
 
+	if (dst_sel == 6) {
+		EmitCallback([this, destination, src, dw_num, write_one_address] {
+			auto offset = destination;
+			for (uint32_t i = 0; i < dw_num; i++, offset += !write_one_address) {
+				m_renderer.GetBufferCache().FillBuffer((offset & 0xffffu) * 4u, 4u, src[i], true);
+			}
+		});
+		return;
+	}
+
+	auto* dst = reinterpret_cast<uint32_t*>(destination);
 	const auto sequence = EmitCallback([this, dst, src, dw_num, write_one_address] {
 		const auto* data  = write_one_address ? src + dw_num - 1 : src;
 		const auto  bytes = uint64_t {write_one_address ? 1u : dw_num} * sizeof(uint32_t);
