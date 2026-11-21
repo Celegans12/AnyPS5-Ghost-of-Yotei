@@ -101,6 +101,7 @@ public:
 	[[nodiscard]] bool        ServesInPlace(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] uint64_t    InPlaceGpuWriteTick(uint64_t vaddr, uint64_t size) const;
 	[[nodiscard]] uint64_t    InPlaceGpuWriteBytesTick(uint64_t vaddr, uint64_t size) const;
+	[[nodiscard]] bool        DeferredLabelPending(uint64_t vaddr, uint64_t size) const;
 	void                      NoteInPlaceGpuWrite(uint64_t vaddr, uint64_t size);
 	void                      ServeInPlaceConversions();
 	void NoteCommandBuffer(uint64_t vaddr, uint64_t size) {

@@ -63,6 +63,56 @@ void EveryDrainHasAReason() {
 	      "GPU-written bytes of the cache do not come before the block of an in-place write");
 }
 
+void OnlyTwoReasonsAreDeferred() {
+	for (unsigned bits = 0; bits < 256; bits++) {
+		const auto facts = FromBits(bits);
+		if (facts.in_place_bytes && !facts.in_place_block) {
+			continue;
+		}
+		const auto current = LabelOrder::Current(facts);
+		const auto route   = LabelOrder::AtCompletion(facts);
+		const auto reason  = LabelOrder::DrainReason(facts);
+		if (current != Route::Drain) {
+			Check(route == current, "own tick: a label deferred today takes another route");
+			continue;
+		}
+		const bool lifted = reason == Reason::InPlaceBlock || reason == Reason::NoLabelPending;
+		Check((route != Route::Drain) == lifted, "own tick: a drain is lifted for another reason than the two named");
+		if (route == Route::Defer) {
+			Check(!facts.tracked_page && !facts.in_place_bytes, "own tick: a plain deferral on a GPU-written page or under a write");
+		}
+		if (route == Route::DeferAround) {
+			Check(facts.tracked_page && !facts.tracked_bytes && !facts.in_place_bytes && facts.backing && facts.around_enabled,
+			      "own tick: a deferral around GPU writes without its conditions");
+		}
+	}
+}
+
+void DeferredLabelsAreMet() {
+	using Meet = InPlaceMemory::LabelMeet;
+	constexpr uint64_t Label = 0x20000040;
+	Check(InPlaceMemory::MeetsDeferredLabel(Label, 8, 10) == Meet::None, "a label is met before any was deferred");
+	const auto first = InPlaceMemory::NoteDeferredLabel(Label, 8);
+	Check(InPlaceMemory::MeetsDeferredLabel(Label + 7, 4, 10) == Meet::Pending, "a write across the end of a pending label is not met");
+	Check(InPlaceMemory::MeetsDeferredLabel(Label - 4, 4, 10) == Meet::None, "a write before a pending label is met");
+	Check(InPlaceMemory::MeetsDeferredLabel(Label + 8, 4, 10) == Meet::None, "a write after a pending label is met");
+	Check(InPlaceMemory::MeetsDeferredLabel(Label, 8, 1000, true) == Meet::Pending, "a pending label expired or was settled by a query");
+	const auto second = InPlaceMemory::NoteDeferredLabel(Label, 4);
+	InPlaceMemory::ForgetDeferredLabel(first);
+	Check(InPlaceMemory::MeetsDeferredLabel(Label + 4, 4, 10) == Meet::None, "a written label is still pending");
+	Check(InPlaceMemory::MeetsDeferredLabel(Label, 4, 10) == Meet::Pending, "a second label to the same address was dropped with the first");
+	InPlaceMemory::ForgetDeferredLabel(second);
+	Check(InPlaceMemory::MeetsDeferredLabel(Label, 8, 10) == Meet::None, "a label is pending after both were written");
+
+	(void)InPlaceMemory::NoteDeferredLabel(Label, 8, 11);
+	Check(InPlaceMemory::MeetsDeferredLabel(Label, 8, 10) == Meet::WouldBePending, "verify: a label is not held for its tick");
+	Check(InPlaceMemory::MeetsDeferredLabel(Label, 8, 11) == Meet::WouldBePending, "verify: a label is not held for the next tick");
+	Check(InPlaceMemory::MeetsDeferredLabel(Label, 8, 12) == Meet::None, "verify: a label is held for more than two ticks");
+	(void)InPlaceMemory::NoteDeferredLabel(Label, 8, 11);
+	Check(InPlaceMemory::MeetsDeferredLabel(Label, 8, 10, true) == Meet::WouldBePending, "verify: a settling write does not meet the label");
+	Check(InPlaceMemory::MeetsDeferredLabel(Label, 8, 10) == Meet::None, "verify: a settled label is met again");
+}
+
 void WrittenBytesAreExact() {
 	constexpr uint64_t Base = 0x10000100;
 	InPlaceMemory      memory;
@@ -94,6 +144,8 @@ void WrittenBytesAreExact() {
 int main() {
 	EveryDrainHasAReason();
 	WrittenBytesAreExact();
+	OnlyTwoReasonsAreDeferred();
+	DeferredLabelsAreMet();
 	if (g_failures != 0) {
 		return 1;
 	}

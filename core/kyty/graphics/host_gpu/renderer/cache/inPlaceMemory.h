@@ -52,6 +52,19 @@ public:
 	}
 	static void            NoteReadWait() noexcept { s_read_waits.fetch_add(1, std::memory_order_relaxed); }
 
+	enum class LabelMeet : uint8_t { None, Pending, WouldBePending };
+
+	[[nodiscard]] static uint64_t  NoteDeferredLabel(uint64_t vaddr, uint64_t size, uint64_t expires = 0);
+	static void                    ForgetDeferredLabel(uint64_t id);
+	[[nodiscard]] static LabelMeet MeetsDeferredLabel(uint64_t vaddr, uint64_t size, uint64_t natural_tick,
+	                                                  bool settle = false);
+	static void                    NoteLabelVerifyDrain() noexcept { s_label_verify_drains.fetch_add(1, std::memory_order_relaxed); }
+	[[nodiscard]] static uint64_t  LabelVerifyDrains() noexcept { return s_label_verify_drains.load(std::memory_order_relaxed); }
+	static void                    NoteGpuWriteOverLabel(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] static uint64_t  TakeGpuWritesOverLabels() noexcept {
+		return s_writes_over_labels.exchange(0, std::memory_order_relaxed);
+	}
+
 	void                   RequestConversion(uint64_t page) noexcept;
 	template <typename Func>
 	void TakeConversions(Func&& func) {
@@ -73,6 +86,13 @@ private:
 	};
 
 	enum class Refusal : uint8_t { None, Unbacked, GuestFile, Straddle, Chunk };
+
+	struct DeferredLabel {
+		uint64_t id      = 0;
+		uint64_t begin   = 0;
+		uint64_t end     = 0;
+		uint64_t expires = 0;
+	};
 
 	struct WrittenRange {
 		uint64_t begin = 0;
@@ -124,6 +144,12 @@ private:
 	inline static std::atomic<uint64_t> s_gpu_writes {0};
 	inline static std::atomic<uint64_t> s_read_waits {0};
 	inline static std::atomic<uint64_t> s_writes_over_pending {0};
+	inline static std::atomic<uint64_t> s_writes_over_labels {0};
+	inline static std::atomic<uint64_t> s_label_verify_drains {0};
+	inline static std::atomic<uint64_t> s_deferred_label_count {0};
+	inline static std::mutex            s_deferred_labels_mutex;
+	inline static std::vector<DeferredLabel> s_deferred_labels;
+	inline static uint64_t              s_next_deferred_label = 0;
 	inline static std::atomic<uint64_t> s_labels {0};
 	inline static std::atomic<uint64_t> s_bounded_flips {0};
 	inline static std::atomic<uint64_t> s_bounded_ns {0};

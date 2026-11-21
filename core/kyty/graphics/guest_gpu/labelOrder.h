@@ -45,6 +45,16 @@ inline constexpr size_t ReasonCount = static_cast<size_t>(Reason::Count);
 	return around ? Route::DeferAround : Route::Drain;
 }
 
+[[nodiscard]] constexpr Route AtCompletion(const Facts& facts) noexcept {
+	if (!facts.deferable || facts.in_place_bytes) {
+		return Route::Drain;
+	}
+	if (!facts.tracked_page) {
+		return Route::Defer;
+	}
+	return facts.around_enabled && !facts.tracked_bytes && facts.backing ? Route::DeferAround : Route::Drain;
+}
+
 [[nodiscard]] constexpr Reason DrainReason(const Facts& facts) noexcept {
 	if (!facts.deferable) {
 		return Reason::NotDeferable;

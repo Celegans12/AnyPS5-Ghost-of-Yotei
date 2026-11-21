@@ -300,6 +300,56 @@ uint64_t InPlaceMemory::PendingGpuWriteBytes(uint64_t vaddr, uint64_t size, uint
 	return latest;
 }
 
+uint64_t InPlaceMemory::NoteDeferredLabel(uint64_t vaddr, uint64_t size, uint64_t expires) {
+	std::lock_guard lock(s_deferred_labels_mutex);
+	const auto      id = ++s_next_deferred_label;
+	s_deferred_labels.push_back({id, vaddr, size > UINT64_MAX - vaddr ? UINT64_MAX : vaddr + size, expires});
+	s_deferred_label_count.store(s_deferred_labels.size(), std::memory_order_release);
+	return id;
+}
+
+void InPlaceMemory::ForgetDeferredLabel(uint64_t id) {
+	std::lock_guard lock(s_deferred_labels_mutex);
+	std::erase_if(s_deferred_labels, [id](const DeferredLabel& label) { return label.id == id; });
+	s_deferred_label_count.store(s_deferred_labels.size(), std::memory_order_release);
+}
+
+InPlaceMemory::LabelMeet InPlaceMemory::MeetsDeferredLabel(uint64_t vaddr, uint64_t size, uint64_t natural_tick,
+                                                           bool settle) {
+	if (size == 0 || s_deferred_label_count.load(std::memory_order_acquire) == 0) {
+		return LabelMeet::None;
+	}
+	const auto      end = size > UINT64_MAX - vaddr ? UINT64_MAX : vaddr + size;
+	std::lock_guard lock(s_deferred_labels_mutex);
+	std::erase_if(s_deferred_labels,
+	              [natural_tick](const DeferredLabel& label) { return label.expires != 0 && label.expires < natural_tick; });
+	auto met = LabelMeet::None;
+	for (const auto& label: s_deferred_labels) {
+		if (label.begin < end && vaddr < label.end) {
+			if (label.expires == 0) {
+				met = LabelMeet::Pending;
+				break;
+			}
+			met = LabelMeet::WouldBePending;
+		}
+	}
+	if (settle && met == LabelMeet::WouldBePending) {
+		std::erase_if(s_deferred_labels,
+		              [vaddr, end](const DeferredLabel& label) { return label.begin < end && vaddr < label.end; });
+	}
+	s_deferred_label_count.store(s_deferred_labels.size(), std::memory_order_release);
+	return met;
+}
+
+void InPlaceMemory::NoteGpuWriteOverLabel(uint64_t vaddr, uint64_t size) {
+	if (s_writes_over_labels.fetch_add(1, std::memory_order_relaxed) < 16) {
+		::Log::WriteToConsoleAndLog(fmt::format(
+		    "[kyty-label-drains] verify: the GPU writes 0x{:x}+0x{:x} in place over a label that "
+		    "KYTY_IN_PLACE_LABEL_DEFER=1 would still hold back: with the switch on the emulator stops here\n",
+		    vaddr, size));
+	}
+}
+
 void InPlaceMemory::RequestConversion(uint64_t page) noexcept {
 	const auto slot = m_request_head.fetch_add(1, std::memory_order_relaxed) % Requests;
 	m_requests[slot].store(page, std::memory_order_relaxed);
