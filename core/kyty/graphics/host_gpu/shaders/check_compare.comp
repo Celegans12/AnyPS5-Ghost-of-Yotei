@@ -3,11 +3,11 @@
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(std430, binding = 0) readonly buffer first_buf {
-    uint first[];
+    uint first_words[];
 };
 
 layout(std430, binding = 1) readonly buffer second_buf {
-    uint second[];
+    uint second_words[];
 };
 
 layout(std430, binding = 2) buffer result_buf {
@@ -17,12 +17,23 @@ layout(std430, binding = 2) buffer result_buf {
 layout(push_constant) uniform push_data {
     uint count;
     uint slot;
+    uint fetch;
 };
 
 shared uint group_differ;
 shared uint group_first;
 
 void main() {
+    if (fetch != 0u) {
+        if (gl_GlobalInvocationID.x == 0u) {
+            const uint first = result[slot * 8u + 1u];
+            if (first < count) {
+                result[slot * 8u + 2u] = first_words[first];
+                result[slot * 8u + 3u] = second_words[first];
+            }
+        }
+        return;
+    }
     if (gl_LocalInvocationIndex == 0u) {
         group_differ = 0u;
         group_first  = 0xffffffffu;
@@ -32,7 +43,7 @@ void main() {
     uint       found  = 0xffffffffu;
     const uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
     for (uint i = gl_GlobalInvocationID.x; i < count; i += stride) {
-        if (first[i] != second[i]) {
+        if (first_words[i] != second_words[i]) {
             differ++;
             found = min(found, i);
         }

@@ -2,7 +2,6 @@
 
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
-#include "gpu_tiler_shaders/rt_check_compare_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
@@ -29,11 +28,9 @@ namespace Libs::Graphics {
 
 namespace {
 
-constexpr uint64_t RegionBytes   = uint64_t {128} << 20u;
 constexpr uint64_t MinRegion     = uint64_t {4} << 20u;
 constexpr uint32_t QueuedAtMost  = 4;
 constexpr uint32_t DeferredAtMost = 4096;
-constexpr uint64_t OutputAlign   = 256;
 constexpr uint32_t ResultBytes   = 32;
 constexpr uint32_t VerifiedAfter = 4;
 constexpr uint32_t HostFullAfter = 8;
@@ -42,11 +39,6 @@ constexpr uint32_t CompareGroups = 1024;
 constexpr size_t   KeptFractions = 4096;
 constexpr uint64_t ContextServed = 52;
 constexpr uint64_t ContextCounts = 24;
-
-struct ComparePush {
-	uint32_t count = 0;
-	uint32_t slot  = 0;
-};
 
 std::string Hash(uint64_t hash) {
 	return fmt::format("0x{:016x}", hash);
@@ -66,14 +58,6 @@ std::string Compact(std::vector<double> values) {
 	return fmt::format("{:.3g}/{:.3g}/{:.3g}", values.front(), values[values.size() / 2], values.back());
 }
 
-auto OutputOrder(const auto& output) {
-	return std::tuple {output.key, output.kind, output.size};
-}
-
-auto OutputPlace(const auto& output) {
-	return std::tuple {output.key, output.kind};
-}
-
 std::string VersionLine() {
 	return RayTracingCheckVersionLine(KYTY_SHADER_STORE_STAMP, KYTY_HOST_GPU_STAMP,
 	                                  Config::RayTracingOracle(), Config::RayTracingCheckPpm());
@@ -84,16 +68,7 @@ std::string VersionLine() {
 RayTracingCheck::RayTracingCheck(RenderContext& context): m_context(context) {}
 
 RayTracingCheck::~RayTracingCheck() {
-	const auto device = m_context.GetGraphics().device;
-	if (m_pipeline) {
-		device.destroyPipeline(m_pipeline, nullptr);
-	}
-	if (m_pipeline_layout) {
-		device.destroyPipelineLayout(m_pipeline_layout, nullptr);
-	}
-	if (m_descriptor_layout) {
-		device.destroyDescriptorSetLayout(m_descriptor_layout, nullptr);
-	}
+	DestroyCheckComparePipeline(m_context.GetGraphics().device, m_compare);
 }
 
 bool RayTracingCheck::Served(const ShaderModule& module) {
@@ -259,28 +234,7 @@ bool RayTracingCheck::Prepare() {
 	m_results = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::Download, 0, AllFlags,
 	                                     uint64_t {ResultBytes} * m_pending.size());
 
-	const vk::DescriptorSetLayoutBinding bindings[] {
-	    {0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
-	    {1, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
-	    {2, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
-	};
-	vk::DescriptorSetLayoutCreateInfo layout_info {};
-	layout_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
-	layout_info.bindingCount = static_cast<uint32_t>(std::size(bindings));
-	layout_info.pBindings    = bindings;
-	RequireVulkanSuccess(graphics.device.createDescriptorSetLayout(&layout_info, nullptr, &m_descriptor_layout),
-	                     "create RT check descriptor layout");
-	const vk::PushConstantRange push {vk::ShaderStageFlagBits::eCompute, 0, sizeof(ComparePush)};
-	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
-	pipeline_layout_info.setLayoutCount         = 1;
-	pipeline_layout_info.pSetLayouts            = &m_descriptor_layout;
-	pipeline_layout_info.pushConstantRangeCount = 1;
-	pipeline_layout_info.pPushConstantRanges    = &push;
-	RequireVulkanSuccess(graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr, &m_pipeline_layout),
-	                     "create RT check pipeline layout");
-	m_pipeline = CreateComputePipeline(graphics.device, RT_CHECK_COMPARE_SPV, m_pipeline_layout,
-	                                   "create RT check pipeline");
-	SetVulkanObjectNameF(graphics.device, m_pipeline, "RT Check Compare");
+	CreateCheckComparePipeline(graphics.device, "RT check", "RT Check Compare", m_compare);
 	m_ready = true;
 	Note(fmt::format("[RT] check: differential check on, one dispatch in {} per program served natively (one in {} once "
 	                "verified), threshold {:.3g} of the output dwords, fallback after {} checked dispatches in a row "
@@ -408,128 +362,28 @@ bool RayTracingCheck::Begin(uint64_t shader_hash) {
 	return true;
 }
 
-bool RayTracingCheck::Collect(const PreparedBindings& bindings, std::vector<Output>& outputs,
-                              std::string& reason) const {
-	const auto& program  = bindings.runtime->module->info;
-	auto&       textures = m_context.GetTextureCache();
-	outputs.clear();
-	for (const auto& resource: program.info.buffers) {
-		if (!resource.written) {
-			continue;
-		}
-		const auto index = resource.descriptor_index;
-		if (index >= bindings.buffers.size() || index >= bindings.buffer_sources.size()) {
-			reason = "writes a buffer without a binding";
-			return false;
-		}
-		const auto& source = bindings.buffer_sources[index];
-		const auto& view   = bindings.buffers[index];
-		if (source.address == 0 || view.buffer == nullptr || view.range == 0) {
-			continue;
-		}
-		if (view.range == VK_WHOLE_SIZE || view.range < source.size) {
-			reason = "writes a buffer without a bounded view";
-			return false;
-		}
-		outputs.push_back({.key = source.address, .size = source.size, .kind = 0, .buffer = view.buffer,
-		                   .offset = view.offset + (view.range - source.size)});
-	}
-	for (uint32_t i = 0; i < program.info.images.size() && i < bindings.images.size(); i++) {
-		const auto& binding = bindings.images[i];
-		if (!program.info.images[i].written || !binding.image_id) {
-			continue;
-		}
-		auto& image = textures.GetImage(binding.image_id);
-		if (image.info.IsDepth() || image.info.samples != 1) {
-			reason = "writes a depth or multisampled image";
-			return false;
-		}
-		outputs.push_back({.key = image.info.data.address, .size = image.info.LinearSize(), .kind = 1,
-		                   .image = binding.image_id.index});
-	}
-	std::sort(outputs.begin(), outputs.end(),
-	          [](const Output& a, const Output& b) { return OutputOrder(a) < OutputOrder(b); });
-	outputs.erase(std::unique(outputs.begin(), outputs.end(),
-	                          [](const Output& a, const Output& b) { return OutputOrder(a) == OutputOrder(b); }),
-	              outputs.end());
-	uint64_t at = 0;
-	for (auto& output: outputs) {
-		output.at = at;
-		at += (output.size + OutputAlign - 1) / OutputAlign * OutputAlign;
-	}
-	if (at == 0) {
-		reason = "writes no output";
-		return false;
-	}
-	if (at > RegionBytes) {
-		reason = fmt::format("writes {} MiB, more than the {} MiB the check keeps", (at + (1u << 20u) - 1) >> 20u,
-		                     RegionBytes >> 20u);
-		return false;
-	}
-	return true;
-}
-
-void RayTracingCheck::Barrier(const CommandRecorder& command) const {
-	vk::MemoryBarrier2 barrier {};
-	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
-	barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
-	barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands | vk::PipelineStageFlagBits2::eHost;
-	barrier.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite |
-	                        vk::AccessFlagBits2::eHostRead;
-	vk::DependencyInfo dependency {};
-	dependency.memoryBarrierCount = 1;
-	dependency.pMemoryBarriers    = &barrier;
-	command.pipelineBarrier2(dependency);
-}
-
-void RayTracingCheck::Copy(const CommandRecorder& command, const std::vector<Output>& outputs, uint64_t region,
-                           bool restore) {
-	auto&      textures = m_context.GetTextureCache();
-	const auto scratch  = m_scratch->Handle();
-	for (const auto& output: outputs) {
-		const auto at = region + output.at;
-		if (output.kind == 0) {
-			if (restore) {
-				const vk::BufferCopy copy {at, output.offset, output.size};
-				command.copyBuffer(scratch, output.buffer, 1, &copy);
-			} else {
-				const vk::BufferCopy copy {output.offset, at, output.size};
-				command.copyBuffer(output.buffer, scratch, 1, &copy);
-			}
-			continue;
-		}
-		auto&      image  = textures.GetImage(ImageId {output.image});
-		const auto copies = image.info.BufferCopies(at);
-		if (restore) {
-			image.Upload(copies, scratch, at, output.size);
-		} else {
-			image.Download(copies, scratch, at, output.size);
-		}
-	}
-}
-
 void RayTracingCheck::Before(const PreparedBindings& bindings) {
 	if (!m_active) {
 		return;
 	}
 	std::string reason;
-	if (!Collect(bindings, m_outputs, reason)) {
+	if (!CollectCheckOutputs(m_context, bindings, m_outputs, reason)) {
 		std::lock_guard lock(m_mutex);
 		Refuse(m_hash, reason);
 		m_pending[m_slot].busy = false;
 		m_active               = false;
 		return;
 	}
-	m_region = m_outputs.back().at + (m_outputs.back().size + OutputAlign - 1) / OutputAlign * OutputAlign;
+	m_region = CheckOutputsBytes(m_outputs);
 	Reserve(m_region);
 	auto& scheduler = m_context.GetCommandScheduler();
 	scheduler.EndRendering();
 	const auto command = scheduler.Current().Handle();
-	Barrier(command);
+	CheckBarrier(command);
 	command.fillBuffer(m_scratch->Handle(), m_capacity, m_region, 0);
 	command.fillBuffer(m_scratch->Handle(), 2 * m_capacity, m_region, 0);
-	Copy(command, m_outputs, 0, false);
-	Barrier(scheduler.Current().Handle());
+	CopyCheckOutputs(m_context, command, m_scratch->Handle(), m_outputs, 0, false);
+	CheckBarrier(scheduler.Current().Handle());
 }
 
 void RayTracingCheck::AfterOracle(const PreparedBindings&, bool counted) {
@@ -538,7 +392,7 @@ void RayTracingCheck::AfterOracle(const PreparedBindings&, bool counted) {
 	}
 	auto& scheduler = m_context.GetCommandScheduler();
 	scheduler.EndRendering();
-	Barrier(scheduler.Current().Handle());
+	CheckBarrier(scheduler.Current().Handle());
 	const auto context = m_context.GetRayTracing()->ContextBuffer();
 	counted            = counted && context;
 	if (counted) {
@@ -551,10 +405,10 @@ void RayTracingCheck::AfterOracle(const PreparedBindings&, bool counted) {
 		m_pending[m_slot].counted     = counted;
 		m_pending[m_slot].preparation = counted && preparation != m_prepared ? preparation : 0;
 	}
-	Copy(scheduler.Current().Handle(), m_outputs, m_capacity, false);
-	Barrier(scheduler.Current().Handle());
-	Copy(scheduler.Current().Handle(), m_outputs, 0, true);
-	Barrier(scheduler.Current().Handle());
+	CopyCheckOutputs(m_context, scheduler.Current().Handle(), m_scratch->Handle(), m_outputs, m_capacity, false);
+	CheckBarrier(scheduler.Current().Handle());
+	CopyCheckOutputs(m_context, scheduler.Current().Handle(), m_scratch->Handle(), m_outputs, 0, true);
+	CheckBarrier(scheduler.Current().Handle());
 }
 
 void RayTracingCheck::AfterGuest(const PreparedBindings& bindings) {
@@ -562,13 +416,13 @@ void RayTracingCheck::AfterGuest(const PreparedBindings& bindings) {
 		return;
 	}
 	m_active = false;
-	std::vector<Output> guest;
-	std::string         reason;
-	bool                same = Collect(bindings, guest, reason);
-	std::vector<Output> matched;
+	std::vector<CheckOutput> guest;
+	std::string              reason;
+	bool                     same = CollectCheckOutputs(m_context, bindings, guest, reason);
+	std::vector<CheckOutput> matched;
 	for (const auto& output: m_outputs) {
-		const auto found = std::find_if(guest.begin(), guest.end(), [&](const Output& candidate) {
-			return OutputPlace(candidate) == OutputPlace(output) && candidate.size >= output.size;
+		const auto found = std::find_if(guest.begin(), guest.end(), [&](const CheckOutput& candidate) {
+			return CheckOutputPlace(candidate) == CheckOutputPlace(output) && candidate.size >= output.size;
 		});
 		if (!same || found == guest.end()) {
 			same = false;
@@ -586,13 +440,13 @@ void RayTracingCheck::AfterGuest(const PreparedBindings& bindings) {
 	}
 	auto& scheduler = m_context.GetCommandScheduler();
 	scheduler.EndRendering();
-	Barrier(scheduler.Current().Handle());
-	Copy(scheduler.Current().Handle(), matched, 2 * m_capacity, false);
+	CheckBarrier(scheduler.Current().Handle());
+	CopyCheckOutputs(m_context, scheduler.Current().Handle(), m_scratch->Handle(), matched, 2 * m_capacity, false);
 	const auto command = scheduler.Current().Handle();
 	const auto offset  = uint64_t {m_slot} * ResultBytes;
 	command.fillBuffer(m_results->Handle(), offset, 4, 0);
 	command.fillBuffer(m_results->Handle(), offset + 4, 4, 0xffffffffu);
-	Barrier(command);
+	CheckBarrier(command);
 	const std::array<vk::DescriptorBufferInfo, 3> infos {
 	    vk::DescriptorBufferInfo {m_scratch->Handle(), m_capacity, m_region},
 	    vk::DescriptorBufferInfo {m_scratch->Handle(), 2 * m_capacity, m_region},
@@ -605,12 +459,12 @@ void RayTracingCheck::AfterGuest(const PreparedBindings& bindings) {
 		writes[index].descriptorType  = vk::DescriptorType::eStorageBuffer;
 		writes[index].pBufferInfo     = &infos[index];
 	}
-	const ComparePush push {.count = static_cast<uint32_t>(m_region / 4), .slot = m_slot};
-	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_pipeline);
-	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0, writes);
-	command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+	const CheckComparePush push {.count = static_cast<uint32_t>(m_region / 4), .slot = m_slot};
+	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_compare.pipeline);
+	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_compare.pipeline_layout, 0, writes);
+	command.pushConstants(m_compare.pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
 	command.dispatch(std::min<uint32_t>(CompareGroups, (push.count + 255u) / 256u), 1, 1);
-	Barrier(command);
+	CheckBarrier(command);
 	{
 		std::lock_guard lock(m_mutex);
 		m_pending[m_slot].dwords  = push.count;

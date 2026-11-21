@@ -1,6 +1,7 @@
 #ifndef KYTY_GRAPHICS_HOST_GPU_RENDERER_RAY_TRACING_CHECK_H_
 #define KYTY_GRAPHICS_HOST_GPU_RENDERER_RAY_TRACING_CHECK_H_
 
+#include "graphics/host_gpu/renderer/checkOutputs.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/host_gpu/renderer/rayTracingReplay.h"
@@ -42,15 +43,6 @@ public:
 	void                      AfterGuest(const PreparedBindings& bindings);
 
 private:
-	struct Output {
-		uint64_t   key    = 0;
-		uint64_t   size   = 0;
-		uint32_t   kind   = 0;
-		vk::Buffer buffer = nullptr;
-		uint64_t   offset = 0;
-		uint32_t   image  = 0;
-		uint64_t   at     = 0;
-	};
 	struct Program {
 		uint64_t            dispatches = 0;
 		uint32_t            checks     = 0;
@@ -85,9 +77,6 @@ private:
 	bool     Prepare();
 	void     NoteEmpty(uint64_t hash);
 	void     Reserve(uint64_t region);
-	bool     Collect(const PreparedBindings& bindings, std::vector<Output>& outputs, std::string& reason) const;
-	void     Copy(const CommandRecorder& command, const std::vector<Output>& outputs, uint64_t region, bool restore);
-	void     Barrier(const CommandRecorder& command) const;
 	void     Finish(uint32_t slot);
 	void     Refuse(uint64_t hash, const std::string& reason);
 	void     Load();
@@ -102,7 +91,7 @@ private:
 	uint64_t                               m_capacity = 0;
 	std::unique_ptr<Buffer>                m_results;
 	std::array<Pending, 64>                m_pending {};
-	std::vector<Output>                    m_outputs;
+	std::vector<CheckOutput>               m_outputs;
 	uint64_t                               m_region   = 0;
 	uint64_t                               m_hash     = 0;
 	uint32_t                               m_slot     = UINT32_MAX;
@@ -112,9 +101,7 @@ private:
 	bool                                   m_loaded   = false;
 	std::atomic<bool>                      m_any_fallback {false};
 	std::filesystem::path                  m_path;
-	vk::DescriptorSetLayout                m_descriptor_layout = nullptr;
-	vk::PipelineLayout                     m_pipeline_layout   = nullptr;
-	vk::Pipeline                           m_pipeline          = nullptr;
+	CheckComparePipeline                  m_compare;
 };
 
 }
