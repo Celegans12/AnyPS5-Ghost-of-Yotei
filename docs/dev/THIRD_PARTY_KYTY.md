@@ -224,6 +224,7 @@ The table draws are GPU-driven draws of a shader pair's table programs.
 | `KYTY_COMPARE_WRITE_BACK` | `0` or `1`, empty counts as unset, else stops | on | An image readback writes guest memory only where the GPU result differs from the bytes read when the readback was recorded and the guest bytes still hold that read; `0` writes the image's whole footprint, KytyPS5's behaviour. See [below](#details) | compat | all | AnyKyty |
 | `KYTY_EARLY_FLIP` | `0` or `1`, empty counts as unset, else stops | on | Completes a guest flip once its command buffer is submitted, on a thread of its own; `0` is KytyPS5's behaviour. See [below](#details) | perf | all | `499dfc3f39` |
 | `KYTY_LABELS_AFTER_DUMPS` | `0` or `1`, empty counts as unset, else stops | on | A deferred `RELEASE_MEM` label waits for the newest pending occlusion dump instead of its own command buffer; `0` is KytyPS5's behaviour. See [below](#details) | perf | all | `ef88cc3285` |
+| `KYTY_IN_PLACE_LABEL_DEFER` | `0`, `1` or `verify`, empty counts as unset, else stops | off | Experimental, only while memory is served in place (`KYTY_COMMAND_MEMORY_IN_PLACE=1`): a `RELEASE_MEM` label that drains the GPU only because its 64 KiB block is under an in-place GPU write in flight, because its own bytes lie only under in-place `WRITE_DATA` or `DMA_DATA` copies, or because its page is GPU-written in the cache while no label is pending, is deferred to the end of its own tick instead; `verify` keeps the drains and checks each such label. See [below](#details) | perf | all | AnyKyty |
 | `KYTY_LABELS_AROUND_GPU_WRITES` | `0` or `1`, empty counts as unset, else stops | on | A `RELEASE_MEM` label that arrives while other labels are deferred, on a page the GPU wrote elsewhere but none of whose own bytes it wrote, is deferred behind them instead of draining the GPU; `0` drains. See [below](#details) | perf | all | AnyKyty |
 
 ### Pipelines and shader store
@@ -464,6 +465,41 @@ keeps occlusion queries or labels pending and places a label next to a GPU-writt
 drained the GPU about once a frame, 5.7 ms each, 2.78 s every 10 s on a heavy city scene; the line `[kyty-labels]`, every
 10 s on stderr, counts the labels deferred this way and the drains that remain. `KYTY_LABELS_AROUND_GPU_WRITES=0` restores
 KytyPS5's behaviour; another value stops the emulator with a message naming the variable.
+
+Why a label drains: when `[kyty-labels]` is printed, the line `[kyty-label-drains]` follows it with the labels of the
+period and their distinct addresses, how many were deferred to the end of a tick, written at once and written after a
+drain, and the first reason, in this order, that kept each drained label from being deferred: not a deferable kind (the
+GDS read, an invalid range); its own bytes lie under a GPU write to memory served in place that the GPU has not finished
+(the written ranges are kept byte for byte next to the 64 KiB blocks); its own bytes hold data the GPU wrote in the
+cache; `KYTY_LABELS_AROUND_GPU_WRITES=0`; the backing view does not hold it; only its 64 KiB block is under an in-place
+GPU write in flight; its page is GPU-written in the cache and no label is pending. Then: how many drained labels lie
+under an in-place write in flight and how many only share its block, the drain waits in eight classes of duration (count
+and milliseconds), and the GPU writes to memory served in place that were noted over a completion write still pending.
+The line `[kyty-label-covers]` then splits the drained labels that lie under an in-place GPU write in flight by what
+noted that write: a `WRITE_DATA` done as a GPU copy, a `DMA_DATA` fill or copy, a buffer bound for writing (its whole
+bound range), a texel buffer filled from an image; and says whether the newest such write was noted in the label's own
+tick and whether one covers exactly the label's bytes.
+
+Labels deferred to their own tick in place: with `KYTY_IN_PLACE_LABEL_DEFER=1`, two of these reasons no longer drain while
+memory is served in place. A label whose bytes no in-place GPU write in flight covers, on a page the cache does not hold
+as GPU-written, is deferred like any label on a clean page; one on a GPU-written page of the cache whose own bytes are
+clean and that the backing view holds is deferred around the GPU writes as with `KYTY_LABELS_AROUND_GPU_WRITES`, also when
+no label is pending. Both go on the first-in first-out priority queue at their own tick, so they are written after the GPU
+finished everything recorded before them, after every older label, and before a later label that drains. A label whose
+own bytes are under in-place writes in flight is deferred the same way when all of them are `WRITE_DATA` copies or
+`DMA_DATA` fills and copies: those were recorded before the label, so the GPU has done them when the label's tick ends,
+and a later one to the same bytes drains first as below. A label under a buffer bound for writing or a texel buffer
+filled from an image, or whose bytes the cache holds as GPU-written, still drains. Until such a label is
+written, a `WRITE_DATA`, a reference clock copy or a `DMA_DATA` to its bytes, and a read of them the command processor
+decides on (`WAIT_REG_MEM`, predication, a conditional execution), first drains the GPU as the label did before;
+a fill or copy the renderer would do on the CPU goes to the GPU; and a GPU write to memory served in place noted over its
+bytes stops the emulator with a message, because the label would land after a write that comes later in the stream.
+`verify` changes nothing: for each drained label the rule would defer it reads the label's bytes through the backing
+view before and after the drain (a change means a GPU write in flight reached them; not compared when an older write to
+the same bytes is still pending or the label lies under a copy, which changes them by design) and after the write (the value must be there), then treats the label as held back for
+two more submissions of the title and counts the later writes and decision reads that would drain first and the later
+in-place GPU writes that would stop the emulator. `[kyty-label-drains]` reports all of it and
+the first 16 findings of each kind are logged. Another value stops the emulator with a message naming the variable.
 
 Blocked waits on deferred writes: KytyPS5's command processor submits the open command buffer after a pass over a
 submission that made progress, but not after one that yields to another queue, nor when a queue resumes straight into a

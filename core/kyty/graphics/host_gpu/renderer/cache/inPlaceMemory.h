@@ -10,6 +10,7 @@
 #include <mutex>
 #include <optional>
 #include <unordered_map>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -42,9 +43,37 @@ public:
 	void                                  Register(uint64_t bytes, uint64_t pages) noexcept;
 	void                                  Unregister(uint64_t bytes, uint64_t pages) noexcept;
 
-	void                   NoteGpuWrite(uint64_t vaddr, uint64_t size, uint64_t tick);
+	enum class WriteKind : uint8_t { Binding, WriteData, DmaData, TexelBuffer, Count };
+
+	struct WriteCover {
+		uint64_t tick  = 0;
+		uint32_t kinds = 0;
+		bool     exact = false;
+	};
+
+	void                   NoteGpuWrite(uint64_t vaddr, uint64_t size, uint64_t tick, uint64_t known = 0,
+	                                    WriteKind kind = WriteKind::Binding);
+	[[nodiscard]] WriteCover PendingGpuWriteCover(uint64_t vaddr, uint64_t size, uint64_t known) const;
 	[[nodiscard]] uint64_t PendingGpuWrite(uint64_t vaddr, uint64_t size, uint64_t known) const;
+	[[nodiscard]] uint64_t PendingGpuWriteBytes(uint64_t vaddr, uint64_t size, uint64_t known) const;
+	static void            NoteGpuWriteOverPending() noexcept { s_writes_over_pending.fetch_add(1, std::memory_order_relaxed); }
+	[[nodiscard]] static uint64_t TakeGpuWritesOverPending() noexcept {
+		return s_writes_over_pending.exchange(0, std::memory_order_relaxed);
+	}
 	static void            NoteReadWait() noexcept { s_read_waits.fetch_add(1, std::memory_order_relaxed); }
+
+	enum class LabelMeet : uint8_t { None, Pending, WouldBePending };
+
+	[[nodiscard]] static uint64_t  NoteDeferredLabel(uint64_t vaddr, uint64_t size, uint64_t expires = 0);
+	static void                    ForgetDeferredLabel(uint64_t id);
+	[[nodiscard]] static LabelMeet MeetsDeferredLabel(uint64_t vaddr, uint64_t size, uint64_t natural_tick,
+	                                                  bool settle = false);
+	static void                    NoteLabelVerifyDrain() noexcept { s_label_verify_drains.fetch_add(1, std::memory_order_relaxed); }
+	[[nodiscard]] static uint64_t  LabelVerifyDrains() noexcept { return s_label_verify_drains.load(std::memory_order_relaxed); }
+	static void                    NoteGpuWriteOverLabel(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] static uint64_t  TakeGpuWritesOverLabels() noexcept {
+		return s_writes_over_labels.exchange(0, std::memory_order_relaxed);
+	}
 
 	void                   RequestConversion(uint64_t page) noexcept;
 	template <typename Func>
@@ -68,6 +97,20 @@ private:
 
 	enum class Refusal : uint8_t { None, Unbacked, GuestFile, Straddle, Chunk };
 
+	struct DeferredLabel {
+		uint64_t id      = 0;
+		uint64_t begin   = 0;
+		uint64_t end     = 0;
+		uint64_t expires = 0;
+	};
+
+	struct WrittenRange {
+		uint64_t begin = 0;
+		uint64_t end   = 0;
+		uint64_t tick  = 0;
+		WriteKind kind = WriteKind::Binding;
+	};
+
 	bool    Initialize(GraphicContext& graphics);
 	Refusal Locate(GraphicContext& graphics, uint64_t vaddr, uint64_t size, uint64_t* offset, Chunk** chunk,
 	               uint64_t* chunk_begin, uint64_t* chunk_end);
@@ -89,6 +132,7 @@ private:
 	mutable std::mutex                       m_writes_mutex;
 	std::atomic<uint64_t>                    m_writes_max {0};
 	mutable std::unordered_map<uint64_t, uint64_t> m_writes;
+	mutable std::vector<WrittenRange>              m_written_ranges;
 
 	std::array<std::atomic<uint64_t>, Requests> m_requests {};
 	std::atomic<uint32_t>                       m_request_head {0};
@@ -110,6 +154,13 @@ private:
 	inline static std::atomic<uint64_t> s_pages_out {0};
 	inline static std::atomic<uint64_t> s_gpu_writes {0};
 	inline static std::atomic<uint64_t> s_read_waits {0};
+	inline static std::atomic<uint64_t> s_writes_over_pending {0};
+	inline static std::atomic<uint64_t> s_writes_over_labels {0};
+	inline static std::atomic<uint64_t> s_label_verify_drains {0};
+	inline static std::atomic<uint64_t> s_deferred_label_count {0};
+	inline static std::mutex            s_deferred_labels_mutex;
+	inline static std::vector<DeferredLabel> s_deferred_labels;
+	inline static uint64_t              s_next_deferred_label = 0;
 	inline static std::atomic<uint64_t> s_labels {0};
 	inline static std::atomic<uint64_t> s_bounded_flips {0};
 	inline static std::atomic<uint64_t> s_bounded_ns {0};

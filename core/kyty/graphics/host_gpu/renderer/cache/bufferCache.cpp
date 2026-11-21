@@ -1557,7 +1557,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
                                     bool is_texel_buffer) {
 	if (buffer.InPlace()) {
 		if (is_texel_buffer && !is_written && !NoImageStartsAt(vaddr)) {
-			NoteInPlaceGpuWrite(vaddr, size);
+			NoteInPlaceGpuWrite(vaddr, size, InPlaceMemory::WriteKind::TexelBuffer);
 			return SynchronizeBufferFromImage(buffer, vaddr, size);
 		}
 		return false;
@@ -2037,7 +2037,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 		EXIT("BufferCache: invalid fill memory address\n");
 	}
 	(void)m_texture_cache.ClearMeta(vaddr);
-	if (!IsRegionGpuModified(vaddr, size) && !ServesInPlace(vaddr, size)) {
+	if (!IsRegionGpuModified(vaddr, size) && !ServesInPlace(vaddr, size) && !DeferredLabelPending(vaddr, size)) {
 		InvalidateMemory(vaddr, size);
 		m_texture_cache.InvalidateMemory(vaddr, size);
 		DrainHostCopies();
@@ -2048,7 +2048,9 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	}
 
 	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
+	m_in_place_write       = InPlaceMemory::WriteKind::DmaData;
 	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
+	m_in_place_write       = InPlaceMemory::WriteKind::Binding;
 	m_texture_cache.ProtectPendingImageWriteBacks(vaddr, size);
 	dst->Fill(dst_offset, size, value);
 }
@@ -2060,7 +2062,8 @@ bool BufferCache::ReplicateBuffer(uint64_t destination, uint64_t count, uint64_t
 	if (destination == 0 || source == 0 || ((destination | source) & 3u) != 0 || count == 0 ||
 	    pattern == 0 || (destination < source + from && source < destination + size) ||
 	    IsRegionGpuModified(destination, size) || IsRegionGpuModified(source, from) ||
-	    m_texture_cache.FindImageFromRange(source, from) || ServesInPlace(destination, size)) {
+	    m_texture_cache.FindImageFromRange(source, from) || ServesInPlace(destination, size) ||
+	    DeferredLabelPending(destination, size)) {
 		return false;
 	}
 	m_gpu_write_generation++;
@@ -2100,7 +2103,7 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	}
 	if (src_memory && dst_memory && !IsRegionGpuModified(dst_vaddr, size) &&
 	    !IsRegionGpuModified(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size) &&
-	    !ServesInPlace(dst_vaddr, size)) {
+	    !ServesInPlace(dst_vaddr, size) && !DeferredLabelPending(dst_vaddr, size)) {
 		DrainHostCopies();
 		std::memcpy(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr),
 		            size);
@@ -2116,8 +2119,10 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	const auto dst_id      = dst_memory ? FindBuffer(dst_vaddr, size) : BufferId {};
 	auto [src, src_offset] = src_memory ? ObtainBuffer(src_vaddr, size, false, true, src_id)
 	                                    : std::pair {&m_gds_buffer, src_vaddr};
+	m_in_place_write       = InPlaceMemory::WriteKind::DmaData;
 	auto [dst, dst_offset] = dst_memory ? ObtainBuffer(dst_vaddr, size, true, true, dst_id)
 	                                    : std::pair {&m_gds_buffer, dst_vaddr};
+	m_in_place_write       = InPlaceMemory::WriteKind::Binding;
 	if (dst_memory) {
 		m_texture_cache.ProtectPendingImageWriteBacks(dst_vaddr, size);
 	}
@@ -2602,8 +2607,48 @@ uint64_t BufferCache::InPlaceGpuWriteTick(uint64_t vaddr, uint64_t size) const {
 	return m_in_place->PendingGpuWrite(vaddr, size, m_scheduler.GetMasterSemaphore().KnownGpuTick());
 }
 
+uint64_t BufferCache::InPlaceGpuWriteBytesTick(uint64_t vaddr, uint64_t size) const {
+	if (!m_in_place) {
+		return 0;
+	}
+	return m_in_place->PendingGpuWriteBytes(vaddr, size, m_scheduler.GetMasterSemaphore().KnownGpuTick());
+}
+
+bool BufferCache::DeferredLabelPending(uint64_t vaddr, uint64_t size) const {
+	return InPlaceMemory::MeetsDeferredLabel(vaddr, size, m_scheduler.CurrentTick() - InPlaceMemory::LabelVerifyDrains()) ==
+	       InPlaceMemory::LabelMeet::Pending;
+}
+
+bool BufferCache::IsRegionTrackedGpuModified(uint64_t vaddr, uint64_t size) {
+	return m_memory_tracker.IsRegionGpuModified(vaddr, size);
+}
+
+InPlaceMemory::WriteCover BufferCache::InPlaceGpuWriteCover(uint64_t vaddr, uint64_t size) const {
+	if (!m_in_place) {
+		return {};
+	}
+	return m_in_place->PendingGpuWriteCover(vaddr, size, m_scheduler.GetMasterSemaphore().KnownGpuTick());
+}
+
 void BufferCache::NoteInPlaceGpuWrite(uint64_t vaddr, uint64_t size) {
-	m_in_place->NoteGpuWrite(vaddr, size, m_scheduler.CurrentTick());
+	NoteInPlaceGpuWrite(vaddr, size, m_in_place_write);
+}
+
+void BufferCache::NoteInPlaceGpuWrite(uint64_t vaddr, uint64_t size, InPlaceMemory::WriteKind kind) {
+	if (m_scheduler.HasPendingGuestOperations(vaddr, size)) {
+		InPlaceMemory::NoteGpuWriteOverPending();
+	}
+	switch (InPlaceMemory::MeetsDeferredLabel(vaddr, size, m_scheduler.CurrentTick() - InPlaceMemory::LabelVerifyDrains())) {
+		case InPlaceMemory::LabelMeet::Pending:
+			EXIT("KYTY_IN_PLACE_LABEL_DEFER=1: the GPU writes 0x%016" PRIx64 "+0x%" PRIx64
+			     " in place while a label deferred to the end of its tick is pending on these bytes; the order of the "
+			     "two writes cannot be kept, run with KYTY_IN_PLACE_LABEL_DEFER=0\n",
+			     vaddr, size);
+			break;
+		case InPlaceMemory::LabelMeet::WouldBePending: InPlaceMemory::NoteGpuWriteOverLabel(vaddr, size); break;
+		case InPlaceMemory::LabelMeet::None: break;
+	}
+	m_in_place->NoteGpuWrite(vaddr, size, m_scheduler.CurrentTick(), m_scheduler.GetMasterSemaphore().KnownGpuTick(), kind);
 }
 
 void BufferCache::ServeInPlaceConversions() {
@@ -2663,7 +2708,7 @@ bool BufferCache::WriteAroundGpuWrites(uint64_t vaddr, const void* data, uint64_
 		after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
 		native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eAllCommands, {}, 1,
 		                       &after, 0, nullptr, 0, nullptr);
-		NoteInPlaceGpuWrite(vaddr, size);
+		NoteInPlaceGpuWrite(vaddr, size, InPlaceMemory::WriteKind::WriteData);
 		m_gpu_write_generation++;
 		return true;
 	}
@@ -2723,9 +2768,10 @@ bool BufferCache::WriteAroundGpuWrites(uint64_t vaddr, const void* data, uint64_
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
-	if (InPlaceGpuWriteTick(vaddr, size) != 0) {
-		return true;
-	}
+	return InPlaceGpuWriteTick(vaddr, size) != 0 || HasTrackedGpuDirtyBytes(vaddr, size);
+}
+
+bool BufferCache::HasTrackedGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 	constexpr uint64_t PageSize = 4096;
 	const auto         page     = vaddr / PageSize;
 	if (!m_inflight_readbacks.empty() && size != 0 &&
