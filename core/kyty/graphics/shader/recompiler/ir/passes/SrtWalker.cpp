@@ -303,17 +303,23 @@ uint64_t KYTY_SYSV_ABI ProbeFlatGuestLoad(uint64_t address, WalkerCachedPage* ca
 }
 #endif
 
-void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& cache, [[maybe_unused]] uint32_t slot) {
+void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& cache, [[maybe_unused]] uint32_t slot, bool short_form) {
 	Xbyak::Label direct, done, slow;
 	code.mov(code.rax, code.r10);
 	code.shr(code.rax, 12);
 	code.mov(code.r11d, code.eax);
 	code.and_(code.r11d, WalkerPageCacheSlots - 1u);
 	code.shl(code.r11d, 4);
-	code.add(code.r11, code.rdx);
-	code.cmp(code.rax, code.qword[code.r11 + cache.getDisp()]);
-	code.jne(slow, Xbyak::CodeGenerator::T_NEAR);
-	code.mov(code.rcx, code.qword[code.r11 + (cache.getDisp() + 8u)]);
+	if (short_form) {
+		code.cmp(code.rax, code.qword[cache + code.r11]);
+		code.jne(slow, Xbyak::CodeGenerator::T_NEAR);
+		code.mov(code.rcx, code.qword[cache + code.r11 + 8u]);
+	} else {
+		code.add(code.r11, code.rdx);
+		code.cmp(code.rax, code.qword[code.r11 + cache.getDisp()]);
+		code.jne(slow, Xbyak::CodeGenerator::T_NEAR);
+		code.mov(code.rcx, code.qword[code.r11 + (cache.getDisp() + 8u)]);
+	}
 	code.test(code.rcx, code.rcx);
 	code.jz(direct, Xbyak::CodeGenerator::T_NEAR);
 	code.mov(code.r9d, code.r10d);
@@ -660,7 +666,7 @@ private:
 	Xbyak::Label                                      m_ret;
 	uint32_t m_shader_base = 0, m_page_cache = 0, m_reach = 0, m_states = 0, m_states_end = 0, m_bias = 0;
 	uint32_t m_user_data = 0, m_captures = 0, m_captures_offset = 0;
-	bool     m_short = false, m_body = true;
+	bool     m_short = false, m_body = true, m_loads = false;
 	std::vector<uint32_t> m_flat_slots;
 	std::vector<bool>     m_zero_tested;
 	std::vector<uint32_t> m_gpu_control;
@@ -1089,6 +1095,7 @@ void WalkerCompiler::Layout() {
 		const size_t skip = op == ValueOpcode::LoadBufferU32 ? 1u : 0u;
 		const bool   read = op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer ||
 		                    op == ValueOpcode::LoadBufferU32;
+		m_loads |= read;
 		if (read && node.result == Operand {Kind::Node, index} && node.args.size() > skip + 2u &&
 		    node.args[skip].kind == Kind::UserData && node.args[skip + 1].kind == Kind::UserData) {
 			m_bases.try_emplace({node.args[skip].value, node.args[skip + 1].value}, 0u);
@@ -1417,7 +1424,7 @@ void WalkerCompiler::EmitRead(const Node& node, uint32_t index) {
 		if (index < m_gpu_control.size() && m_gpu_control[index] != NoFlatSlot) {
 			SkipGpuControlLoad(c.r10, m_gpu_control[index], node.state);
 		}
-		LoadGuest(c, At(m_page_cache), flat_slot);
+		LoadGuest(c, At(m_page_cache), flat_slot, m_short);
 		++m_captures;
 		c.mov(c.qword[c.r8], c.r10);
 		c.mov(c.dword[c.r8 + 8], c.eax);
@@ -1675,7 +1682,9 @@ WalkerCompiler::Result WalkerCompiler::Compile(std::span<const Value> values) {
 	if (m_short) c.add(c.rdx, m_bias);
 	c.mov(c.qword[At(m_shader_base)], c.rcx);
 	for (uint32_t slot = 0; slot < WalkerPageCacheSlots; ++slot) {
+		if (m_short && !m_loads) break;
 		c.mov(c.qword[At(m_page_cache + slot * static_cast<uint32_t>(sizeof(WalkerCachedPage)))], -1);
+		if (m_short) continue;
 		c.mov(c.qword[At(m_page_cache + slot * static_cast<uint32_t>(sizeof(WalkerCachedPage)) + 8u)], 0);
 	}
 	for (const auto& [pair, slot]: m_bases) {
