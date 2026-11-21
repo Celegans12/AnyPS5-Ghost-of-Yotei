@@ -289,6 +289,17 @@ bool WalkerGuestRead(uint64_t address, uint32_t& value, bool ahead, const uint8_
 	return MayFaultOnGpuRead(address, sizeof(value)) && TryReadAroundGpuWrites(address, &value, sizeof(value));
 }
 
+const uint8_t* WalkerAroundPage(uint64_t address, bool& clean) {
+	constexpr uint64_t PageSize = 4096;
+	const auto*        backing  = FindAroundBackingPage(address);
+	clean = backing != nullptr && !GetGpuResources().GetBufferCache().HasGpuDirtyBytes(address & ~(PageSize - 1), PageSize);
+	return backing;
+}
+
+bool WalkerReadOnPage(uint64_t address, uint32_t& value, const uint8_t* backing) {
+	return TryReadAroundGpuWritesOnPage(address, &value, sizeof(value), backing);
+}
+
 }
 #endif
 
@@ -299,7 +310,8 @@ void InstallGpuResources(Graphics::RenderContext* resources) noexcept {
 	if (resources != nullptr) Shim::SetGpuRangeHooks(&MapGpuRange, &UnmapGpuRange);
 #if defined(ANYPS5_KYTY)
 	if (resources != nullptr) {
-		Graphics::ShaderRecompiler::IR::SetSrtWalkerGuestMemory({&WalkerGuestPage, &WalkerGuestRead});
+		Graphics::ShaderRecompiler::IR::SetSrtWalkerGuestMemory(
+		    {&WalkerGuestPage, &WalkerGuestRead, &WalkerAroundPage, &WalkerReadOnPage});
 	}
 #endif
 }
