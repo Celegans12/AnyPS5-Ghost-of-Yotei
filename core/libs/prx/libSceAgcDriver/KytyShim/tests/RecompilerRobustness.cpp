@@ -43,9 +43,11 @@ const std::vector<Refusal> Refusals = {
     {"position-export-from-a-compute-shader", 0x00, 0x00, {0xf80008cfu, 0x03020100u, 0xbf810000u},
      "position export outside a vertex processing stage"},
     {"depth-compare-sample-on-a-3d-image", 0x04, 0x00, {0xf0a00110u, 0x00400400u, 0xf8000801u, 0x00000004u, 0xbf810000u},
-     "depth comparison with a 3D or multisampled image"},
+     "depth comparison with a 3D image"},
     {"depth-compare-sample-on-a-multisampled-image", 0x04, 0x00, {0xf0a00130u, 0x00400400u, 0xf8000801u, 0x00000004u, 0xbf810000u},
-     "depth comparison with a 3D or multisampled image"},
+     "samples a multisampled image"},
+    {"sample-on-a-multisampled-image", 0x04, 0x00, {0xf0800130u, 0x00400400u, 0xf8000801u, 0x00000004u, 0xbf810000u},
+     "samples a multisampled image"},
 };
 
 struct ModeWrite {

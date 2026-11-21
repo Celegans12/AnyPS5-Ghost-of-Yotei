@@ -1124,14 +1124,20 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			ctx.Fail(inst, "uses depth comparison with a converted image");
 			return;
 		}
-		const auto refuses_dref = [&state](uint32_t resource) {
+		const auto multisampled = [&state](uint32_t resource) {
 			const auto dimension = state.program.info.images[resource].dimension;
-			return dimension == ImageDimension::Dim3D || dimension == ImageDimension::Dim2DMsaa ||
-			       dimension == ImageDimension::Dim2DMsaaArray;
+			return dimension == ImageDimension::Dim2DMsaa || dimension == ImageDimension::Dim2DMsaaArray;
 		};
-		if (dref && (refuses_dref(mem.resource) ||
-		             std::ranges::any_of(state.program.info.images[mem.resource].indirect_resources, refuses_dref))) {
-			ctx.Fail(inst, "uses depth comparison with a 3D or multisampled image");
+		const auto volume = [&state](uint32_t resource) {
+			return state.program.info.images[resource].dimension == ImageDimension::Dim3D;
+		};
+		const auto& indirect_images = state.program.info.images[mem.resource].indirect_resources;
+		if (multisampled(mem.resource) || std::ranges::any_of(indirect_images, multisampled)) {
+			ctx.Fail(inst, "samples a multisampled image");
+			return;
+		}
+		if (dref && (volume(mem.resource) || std::ranges::any_of(indirect_images, volume))) {
+			ctx.Fail(inst, "uses depth comparison with a 3D image");
 			return;
 		}
 		if (op == IR::ValueOpcode::ImageGatherRaw) {
