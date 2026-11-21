@@ -100,6 +100,9 @@ bool EquivalentValue(const ResourcePlan& program, Value left, Value right,
 
 }
 
+SrtWalkerVariant::SrtWalkerVariant()  = default;
+SrtWalkerVariant::~SrtWalkerVariant() = default;
+
 ResourcePlan::ResourcePlan() = default;
 ResourcePlan::ResourcePlan(ResourcePlan&&) noexcept = default;
 

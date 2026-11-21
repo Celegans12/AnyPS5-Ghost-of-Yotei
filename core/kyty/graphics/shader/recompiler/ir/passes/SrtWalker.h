@@ -132,6 +132,14 @@ void SetSrtWalkerGuestMemory(const SrtWalkerGuestMemory& memory);
 #if defined(ANYPS5_KYTY)
 [[nodiscard]] std::vector<uint64_t>& SrtDeferredLoadsOfThread();
 [[nodiscard]] std::vector<uint64_t>& SrtAroundLoadsOfThread();
+enum class SrtShortWalkers : uint8_t { Off, On, Verify };
+struct SrtWalkerChecks {
+	uint64_t walks      = 0;
+	uint64_t unstable   = 0;
+	uint64_t mismatches = 0;
+};
+[[nodiscard]] SrtShortWalkers SrtShortWalkersMode();
+[[nodiscard]] SrtWalkerChecks SrtWalkerChecksSoFar();
 #endif
 uint32_t SrtWalkerLoadLength(uint64_t rip);
 uint32_t SrtWalkerAheadLoadLength(uint64_t rip, uint64_t address);
