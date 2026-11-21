@@ -54,7 +54,7 @@ std::string Refused(const char* ab, const char* start = "", const char* settle =
 }
 
 void Refusals() {
-	const std::string listed = "settings KYTY_AB can change: KYTY_GENERIC_COMPUTE_VARIANT";
+	const std::string listed = "settings KYTY_AB can change: KYTY_GENERIC_COMPUTE_VARIANT, KYTY_UNIFORM_SCALAR_LOADS";
 	Check(Contains(Refused("KYTY_GENERIC_COMPUTE_VARIANT"), "expected <seconds>:<setting>"),
 	      "a value without a phase length is refused");
 	Check(Contains(Refused("0.5:KYTY_GENERIC_COMPUTE_VARIANT"), "at least 1 s"), "a phase under 1 s is refused");
