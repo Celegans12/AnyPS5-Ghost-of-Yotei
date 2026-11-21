@@ -3884,14 +3884,15 @@ const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo
 	return module;
 }
 
-const ShaderModule* PipelineCache::GetGuestComputeProgramQueued(const HW::ComputeShaderInfo& regs,
-                                                                ShaderComputeInputInfo& input_info, bool& queued) {
+const ShaderModule* PipelineCache::GetComputeProgramQueued(const HW::ComputeShaderInfo& regs,
+                                                           ShaderComputeInputInfo& input_info, bool& queued,
+                                                           const char* source, bool guest_traversal,
+                                                           bool lane_pairs) {
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 #if defined(ANYPS5_KYTY)
 	ShaderParams params;
-	if (!Common::Fallback::Run("draw or dispatch skipped: its shader stage could not be prepared",
-	                           "PipelineCache::GetGuestComputeProgramQueued", 0, regs.cs_regs.data_addr,
-	                           [&] { params = PrepareProgram(regs, input_info); })) {
+	if (!Common::Fallback::Run("draw or dispatch skipped: its shader stage could not be prepared", source, 0,
+	                           regs.cs_regs.data_addr, [&] { params = PrepareProgram(regs, input_info); })) {
 		return nullptr;
 	}
 #else
@@ -3902,42 +3903,28 @@ const ShaderModule* PipelineCache::GetGuestComputeProgramQueued(const HW::Comput
 	uint32_t push_data_cursor =
 	    input_info.dispatch_indirect_threads ? ShaderRecompiler::IR::PushData::NoStart : 0u;
 	const ProgramLockGuard lock(m_program_lock);
-	m_guest_traversal  = true;
+	m_guest_traversal  = guest_traversal;
+	m_lane_pairs       = lane_pairs;
 	m_queue_only       = true;
 	m_queued           = false;
 	const auto* module = GetProgram(params, input_info, push_data_cursor);
 	m_guest_traversal  = false;
+	m_lane_pairs       = false;
 	m_queue_only       = false;
 	queued             = m_queued;
 	return module;
 }
 
+const ShaderModule* PipelineCache::GetGuestComputeProgramQueued(const HW::ComputeShaderInfo& regs,
+                                                                ShaderComputeInputInfo& input_info, bool& queued) {
+	return GetComputeProgramQueued(regs, input_info, queued, "PipelineCache::GetGuestComputeProgramQueued", true,
+	                               false);
+}
+
 const ShaderModule* PipelineCache::GetLanePairsComputeProgramQueued(const HW::ComputeShaderInfo& regs,
                                                                     ShaderComputeInputInfo& input_info, bool& queued) {
-	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
-#if defined(ANYPS5_KYTY)
-	ShaderParams params;
-	if (!Common::Fallback::Run("draw or dispatch skipped: its shader stage could not be prepared",
-	                           "PipelineCache::GetLanePairsComputeProgramQueued", 0, regs.cs_regs.data_addr,
-	                           [&] { params = PrepareProgram(regs, input_info); })) {
-		return nullptr;
-	}
-#else
-	const auto params = PrepareProgram(regs, input_info);
-#endif
-	input_info.lds_storage = input_info.lds_size_dwords * 4u >
-	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
-	uint32_t push_data_cursor =
-	    input_info.dispatch_indirect_threads ? ShaderRecompiler::IR::PushData::NoStart : 0u;
-	const ProgramLockGuard lock(m_program_lock);
-	m_lane_pairs       = true;
-	m_queue_only       = true;
-	m_queued           = false;
-	const auto* module = GetProgram(params, input_info, push_data_cursor);
-	m_lane_pairs       = false;
-	m_queue_only       = false;
-	queued             = m_queued;
-	return module;
+	return GetComputeProgramQueued(regs, input_info, queued, "PipelineCache::GetLanePairsComputeProgramQueued",
+	                               false, true);
 }
 
 void PipelineCache::NoteAheadGuestWrite(uint64_t sequence, uint64_t address,

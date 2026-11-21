@@ -690,6 +690,9 @@ private:
 #endif
 	void UnlockPrograms() KYTY_RELEASE(m_program_lock);
 	void AssumeProgramsConfined() noexcept KYTY_ASSERT_CAPABILITY(m_program_lock) {}
+	const ShaderModule* GetComputeProgramQueued(const HW::ComputeShaderInfo& regs, ShaderComputeInputInfo& input_info,
+	                                            bool& queued, const char* source, bool guest_traversal,
+	                                            bool lane_pairs);
 	template <typename InputInfo>
 	void QueueCompile(const ProgramKey& key, const ShaderParams& params, const InputInfo& input_info,
 	                  uint32_t                                            push_data_cursor,
