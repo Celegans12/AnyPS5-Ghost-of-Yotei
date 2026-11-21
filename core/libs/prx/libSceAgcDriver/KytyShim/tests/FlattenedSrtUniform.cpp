@@ -37,6 +37,13 @@ constexpr std::array<uint32_t, 31> TableLoopWords {
     0x3a14050au, 0x3a16070bu, 0x80038103u, 0xbf82fff1u, 0xe0781000u, 0x80010806u, 0xbf810000u,
 };
 
+constexpr std::array<uint32_t, 31> SamplerLoopWords {
+    0xf40c0200u, 0xfa000000u, 0x7e080d00u, 0x060808f0u, 0x100808ffu, 0x3c800000u, 0x7e0a02f0u, 0x340c0084u,
+    0x7e100280u, 0x7e120280u, 0x7e140280u, 0x7e160280u, 0xbe830380u, 0xbf0a0203u, 0xbf84000du, 0x8f248403u,
+    0xf4080600u, 0x48000100u, 0xbf8cc07fu, 0xf09c0f08u, 0x00c20004u, 0xbf8c3f70u, 0x3a100108u, 0x3a120309u,
+    0x3a14050au, 0x3a16070bu, 0x80038103u, 0xbf82fff1u, 0xe0781000u, 0x80010806u, 0xbf810000u,
+};
+
 constexpr uint64_t GuestRegion   = 0x200900000ull;
 constexpr size_t   GuestBytes    = 0x40000u;
 constexpr uint64_t SrtAddress    = 0x200910000ull;
@@ -95,7 +102,8 @@ Texture MakeTexture(uint64_t address, uint32_t format) {
 }
 
 struct Compiled {
-	bool                  ok = false;
+	bool                  ok               = false;
+	bool                  indirect_sampler = false;
 	IR::Bindings          bindings;
 	std::vector<uint32_t> spirv;
 };
@@ -127,6 +135,9 @@ Compiled Compile(const std::vector<uint32_t>& code, const std::array<uint32_t, 1
 	auto compiled   = Recompiler::CompileProgram(std::move(translated), options, specialization, 0);
 	result.ok       = !compiled.spirv.empty();
 	result.bindings = compiled.program.bindings;
+	result.indirect_sampler =
+	    std::any_of(compiled.program.info.samplers.begin(), compiled.program.info.samplers.end(),
+	                [](const IR::SamplerResource& sampler) { return sampler.indirect_root != IR::SamplerResource::NoIndirectSampler; });
 	result.spirv    = std::move(compiled.spirv);
 	return result;
 }
@@ -211,6 +222,35 @@ void TableRead() {
 	      "table read: the SPIR-V declares the flattened SRT in the StorageBuffer storage class");
 }
 
+void SamplerTableRead() {
+	std::fill_n(g_guest, GuestBytes / 4u, 0u);
+	const auto texture = MakeTexture(TextureA, Format8888);
+	for (uint32_t word = 0; word < 8u; ++word) Poke(SrtAddress + word * 4u, texture[word]);
+	const std::array<std::array<uint32_t, 4>, 2> samplers {{{0x12u, 0u, 0u, 0u}, {0x0u, 0u, 0u, 0u}}};
+	for (uint32_t entry = 0; entry < samplers.size(); ++entry) {
+		for (uint32_t word = 0; word < 4u; ++word) Poke(SrtAddress + 0x100u + entry * 16u + word * 4u, samplers[entry][word]);
+	}
+	std::array<uint32_t, 16> user_data {};
+	user_data[0] = static_cast<uint32_t>(SrtAddress);
+	user_data[1] = static_cast<uint32_t>(SrtAddress >> 32u);
+	user_data[2] = static_cast<uint32_t>(samplers.size());
+	user_data[4] = static_cast<uint32_t>(OutputAddress);
+	user_data[5] = static_cast<uint32_t>(OutputAddress >> 32u);
+	user_data[6] = 64u * 16u;
+	user_data[7] = 0xfacu | (Format32UInt << 12u) | (1u << 24u) | (3u << 28u);
+	const std::vector<uint32_t> code(SamplerLoopWords.begin(), SamplerLoopWords.end());
+	const auto                  compiled = Compile(code, user_data);
+	Check(compiled.ok, "sampler table read: the shader compiles");
+	if (!compiled.ok) return;
+	Check(compiled.indirect_sampler, "sampler table read: the sampler is searched in a table at run time");
+	Check(compiled.bindings.descriptor_counts[static_cast<size_t>(IR::DescriptorBindingKind::FlattenedSrt)] == 1u,
+	      "sampler table read: the searched sampler table lives in the flattened SRT");
+	Check(!compiled.bindings.flattened_srt_uniform,
+	      "sampler table read: an SRT with a searched sampler table stays a storage buffer");
+	Check(StorageClassOfBinding(compiled.spirv, SrtBinding) == SpirvStorageStorageBuffer,
+	      "sampler table read: the SPIR-V declares the flattened SRT in the StorageBuffer storage class");
+}
+
 }
 
 int main() {
@@ -222,6 +262,7 @@ int main() {
 	}
 	ConstantRead();
 	TableRead();
+	SamplerTableRead();
 	if (g_failures != 0) {
 		std::fprintf(stderr, "%d failure(s)\n", g_failures);
 		return 1;
