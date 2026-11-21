@@ -70,7 +70,6 @@ enum class StaleRead : uint8_t {
 	GpuWrite,
 	Strict,
 	AroundGpuWrite,
-	ImageHeap,
 	Count
 };
 
@@ -108,7 +107,6 @@ public:
 	[[nodiscard]] bool         Failed() const { return m_failed; }
 	[[nodiscard]] AheadRefusal Refusal() const { return m_refusal; }
 	[[nodiscard]] StaleRead    Stale() const { return m_stale; }
-	void                       MarkStale(StaleRead why) const { m_stale = why; }
 	[[nodiscard]] bool MayHaveReadGpuWrites() const { return m_gpu_written; }
 	[[nodiscard]] bool ReadAroundGpuWrites() const { return m_around; }
 	void               NoteAroundLoads(std::span<uint64_t> addresses);
@@ -197,16 +195,6 @@ private:
 #endif
 };
 
-struct AheadHeapAcquisition {
-	bool                                              list = false;
-	ShaderRecompiler::IR::ImageHeapRequest            request;
-	ShaderRecompiler::IR::ImageResource               root;
-	const void*                                       owner    = nullptr;
-	uint32_t                                          resource = 0;
-	std::vector<ShaderRecompiler::IR::DescriptorValue> values;
-	ShaderRecompiler::IR::ImageHeapPrediction         predicted;
-};
-
 struct ProgramResolution {
 	static constexpr uint32_t MaxStages = 4;
 
@@ -214,13 +202,11 @@ struct ProgramResolution {
 	std::array<ShaderRecompiler::IR::ResourceSpecialization, MaxStages> specializations;
 	std::array<const ShaderRecompiler::IR::ResourcePlan*, MaxStages>    plans {};
 	GuestReadLog                                                        reads;
-	std::vector<AheadHeapAcquisition>                                   heap;
 	uint32_t                                                            stages = 0;
 	bool                                                                refreshed_words = false;
 
 	void Reset() {
 		reads.Clear();
-		heap.clear();
 		stages          = 0;
 		refreshed_words = false;
 	}

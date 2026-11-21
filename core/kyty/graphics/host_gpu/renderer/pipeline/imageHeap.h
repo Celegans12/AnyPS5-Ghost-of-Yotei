@@ -3,7 +3,6 @@
 
 #include "common/common.h"
 #include "graphics/host_gpu/renderer/image/image.h"
-#include "graphics/host_gpu/renderer/pipeline/imageHeapPredictions.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <deque>
@@ -35,10 +34,6 @@ public:
 	             ShaderRecompiler::IR::ImageHeapView&          result) override;
 	bool AcquireList(const ShaderRecompiler::IR::ImageHeapList& list,
 	                 ShaderRecompiler::IR::ImageHeapView&       result) override;
-	bool Predict(const ShaderRecompiler::IR::ImageHeapRequest& request,
-	             ShaderRecompiler::IR::ImageHeapPrediction&    prediction) override;
-	bool PredictList(const ShaderRecompiler::IR::ImageHeapList& list,
-	                 ShaderRecompiler::IR::ImageHeapPrediction& prediction) override;
 	void Rebind(RenderExecutor& executor);
 	void Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point, vk::PipelineLayout layout);
 	bool InvalidateMemory(uint64_t address, uint64_t size);
@@ -69,11 +64,6 @@ private:
 			return std::hash<const void*> {}(key.owner) ^ (size_t {key.resource} * 0x9e3779b97f4a7c15ull);
 		}
 	};
-
-	bool AcquireNow(const ShaderRecompiler::IR::ImageHeapRequest& request,
-	                ShaderRecompiler::IR::ImageHeapView&          result);
-	bool AcquireListNow(const ShaderRecompiler::IR::ImageHeapList& list,
-	                    ShaderRecompiler::IR::ImageHeapView&       result);
 
 	enum class State : uint8_t { Live, Stale, Buried };
 
@@ -155,7 +145,6 @@ private:
 	RenderContext&                       m_context;
 	PageManager&                         m_page_manager;
 	std::mutex                           m_mutex;
-	ImageHeapPredictions                 m_predictions;
 	std::vector<std::unique_ptr<Memory>> m_memories;
 	std::vector<std::unique_ptr<Memory>>           m_list_memories;
 	std::unordered_map<ListKey, List, ListKeyHash> m_lists;

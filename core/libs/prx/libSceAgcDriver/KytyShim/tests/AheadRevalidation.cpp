@@ -128,15 +128,6 @@ void AroundAddressOutsideReads() {
 	Check(!log.ReadAroundGpuWrites(), "no address read around marks nothing");
 }
 
-void HeapRefusal() {
-	GuestReadLog log;
-	log.Clear();
-	log.MarkStale(StaleRead::ImageHeap);
-	Check(log.Stale() == StaleRead::ImageHeap, "a heap taken at execution that differs names the image heap");
-	log.Clear();
-	Check(log.Stale() == StaleRead::None, "clearing forgets the image heap refusal");
-}
-
 }
 
 extern "C" int RunKytyAheadRevalidationTest() {
@@ -147,7 +138,6 @@ extern "C" int RunKytyAheadRevalidationTest() {
 	AroundReadThenGpuWrite();
 	OtherWordWrite();
 	AroundAddressOutsideReads();
-	HeapRefusal();
 	if (g_failures != 0) {
 		std::fprintf(stderr, "kyty_shim_ahead_revalidation: %d failures\n", g_failures);
 		return 1;
