@@ -12,6 +12,7 @@ struct Facts {
 	bool tracked_bytes  = false;
 	bool in_place_block = false;
 	bool in_place_bytes = false;
+	bool in_place_ordered = false;
 	bool around_enabled = false;
 	bool backing        = false;
 	bool label_pending  = false;
@@ -46,7 +47,7 @@ inline constexpr size_t ReasonCount = static_cast<size_t>(Reason::Count);
 }
 
 [[nodiscard]] constexpr Route AtCompletion(const Facts& facts) noexcept {
-	if (!facts.deferable || facts.in_place_bytes) {
+	if (!facts.deferable || (facts.in_place_bytes && !facts.in_place_ordered)) {
 		return Route::Drain;
 	}
 	if (!facts.tracked_page) {

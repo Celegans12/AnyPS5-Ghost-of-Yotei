@@ -31,6 +31,10 @@ Facts FromBits(unsigned bits) {
 	        .label_pending  = (bits & 128u) != 0};
 }
 
+bool Possible(const Facts& facts) {
+	return (!facts.in_place_bytes || facts.in_place_block) && (!facts.in_place_ordered || facts.in_place_bytes);
+}
+
 bool Reference(const Facts& facts, bool* around) {
 	const bool gpu_page = facts.deferable && (facts.tracked_page || facts.in_place_block);
 	*around = gpu_page && facts.around_enabled && facts.label_pending && !(facts.in_place_block || facts.tracked_bytes) &&
@@ -41,7 +45,7 @@ bool Reference(const Facts& facts, bool* around) {
 void EveryDrainHasAReason() {
 	for (unsigned bits = 0; bits < 256; bits++) {
 		const auto facts = FromBits(bits);
-		if (facts.in_place_bytes && !facts.in_place_block) {
+		if (!Possible(facts)) {
 			continue;
 		}
 		bool       around   = false;
@@ -63,10 +67,11 @@ void EveryDrainHasAReason() {
 	      "GPU-written bytes of the cache do not come before the block of an in-place write");
 }
 
-void OnlyTwoReasonsAreDeferred() {
-	for (unsigned bits = 0; bits < 256; bits++) {
-		const auto facts = FromBits(bits);
-		if (facts.in_place_bytes && !facts.in_place_block) {
+void OnlyNamedReasonsAreDeferred() {
+	for (unsigned bits = 0; bits < 512; bits++) {
+		auto facts             = FromBits(bits & 255u);
+		facts.in_place_ordered = (bits & 256u) != 0;
+		if (!Possible(facts)) {
 			continue;
 		}
 		const auto current = LabelOrder::Current(facts);
@@ -76,8 +81,16 @@ void OnlyTwoReasonsAreDeferred() {
 			Check(route == current, "own tick: a label deferred today takes another route");
 			continue;
 		}
+		if (facts.in_place_ordered) {
+			auto beside             = facts;
+			beside.in_place_bytes   = false;
+			beside.in_place_ordered = false;
+			Check(reason == Reason::InPlaceBytes || reason == Reason::NotDeferable, "own tick: a label under a copy has another reason");
+			Check(route == LabelOrder::AtCompletion(beside), "own tick: a label under ordered copies only is not treated as one beside them");
+			continue;
+		}
 		const bool lifted = reason == Reason::InPlaceBlock || reason == Reason::NoLabelPending;
-		Check((route != Route::Drain) == lifted, "own tick: a drain is lifted for another reason than the two named");
+		Check((route != Route::Drain) == lifted, "own tick: a drain is lifted for another reason than the ones named");
 		if (route == Route::Defer) {
 			Check(!facts.tracked_page && !facts.in_place_bytes, "own tick: a plain deferral on a GPU-written page or under a write");
 		}
@@ -137,6 +150,22 @@ void WrittenBytesAreExact() {
 	}
 	Check(memory.PendingGpuWriteBytes(Base + 999 * 0x100, 4, 1000) == 1007, "the newest of many writes is missed");
 	Check(memory.PendingGpuWriteBytes(Base + 998 * 0x100, 4, 1006) == 0, "an older finished write of many still counts");
+
+	constexpr uint64_t Label = 0x30000020;
+	InPlaceMemory      kinds;
+	kinds.NoteGpuWrite(Label, 8, 3, 0, InPlaceMemory::WriteKind::WriteData);
+	auto cover = kinds.PendingGpuWriteCover(Label, 8, 0);
+	Check(cover.tick == 3 && cover.exact && cover.kinds == 1u << static_cast<uint32_t>(InPlaceMemory::WriteKind::WriteData),
+	      "a WRITE_DATA copy over a label is not reported as such");
+	kinds.NoteGpuWrite(Label - 0x20, 0x1000, 4, 0);
+	cover = kinds.PendingGpuWriteCover(Label, 8, 0);
+	Check(cover.tick == 4 && cover.exact &&
+	          cover.kinds == (1u << static_cast<uint32_t>(InPlaceMemory::WriteKind::WriteData) |
+	                          1u << static_cast<uint32_t>(InPlaceMemory::WriteKind::Binding)),
+	      "a bound buffer over a label is not added to its cover");
+	cover = kinds.PendingGpuWriteCover(Label, 8, 3);
+	Check(cover.tick == 4 && !cover.exact && cover.kinds == 1u << static_cast<uint32_t>(InPlaceMemory::WriteKind::Binding),
+	      "a finished copy stays in the cover");
 }
 
 }
@@ -144,7 +173,7 @@ void WrittenBytesAreExact() {
 int main() {
 	EveryDrainHasAReason();
 	WrittenBytesAreExact();
-	OnlyTwoReasonsAreDeferred();
+	OnlyNamedReasonsAreDeferred();
 	DeferredLabelsAreMet();
 	if (g_failures != 0) {
 		return 1;

@@ -497,14 +497,17 @@ as GPU-written, is deferred like any label on a clean page; one on a GPU-written
 clean and that the backing view holds is deferred around the GPU writes as with `KYTY_LABELS_AROUND_GPU_WRITES`, also when
 no label is pending. Both go on the first-in first-out priority queue at their own tick, so they are written after the GPU
 finished everything recorded before them, after every older label, and before a later label that drains. A label whose
-own bytes an in-place write in flight covers, or the cache holds as GPU-written, still drains. Until such a label is
+own bytes are under in-place writes in flight is deferred the same way when all of them are `WRITE_DATA` copies or
+`DMA_DATA` fills and copies: those were recorded before the label, so the GPU has done them when the label's tick ends,
+and a later one to the same bytes drains first as below. A label under a buffer bound for writing or a texel buffer
+filled from an image, or whose bytes the cache holds as GPU-written, still drains. Until such a label is
 written, a `WRITE_DATA`, a reference clock copy or a `DMA_DATA` to its bytes, and a read of them the command processor
 decides on (`WAIT_REG_MEM`, predication, a conditional execution), first drains the GPU as the label did before;
 a fill or copy the renderer would do on the CPU goes to the GPU; and a GPU write to memory served in place noted over its
 bytes stops the emulator with a message, because the label would land after a write that comes later in the stream.
 `verify` changes nothing: for each drained label the rule would defer it reads the label's bytes through the backing
 view before and after the drain (a change means a GPU write in flight reached them; not compared when an older write to
-the same bytes is still pending) and after the write (the value must be there), then treats the label as held back for
+the same bytes is still pending or the label lies under a copy, which changes them by design) and after the write (the value must be there), then treats the label as held back for
 two more submissions of the title and counts the later writes and decision reads that would drain first and the later
 in-place GPU writes that would stop the emulator. `[kyty-label-drains]` reports all of it and
 the first 16 findings of each kind are logged. Another value stops the emulator with a message naming the variable.
