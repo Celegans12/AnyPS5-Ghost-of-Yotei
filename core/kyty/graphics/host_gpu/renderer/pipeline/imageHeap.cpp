@@ -137,26 +137,6 @@ ImageHeap::~ImageHeap() {
 }
 
 bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& result) {
-	const bool acquired = AcquireNow(request, result);
-	m_predictions.PublishTable(request, acquired, result);
-	return acquired;
-}
-
-bool ImageHeap::AcquireList(const IR::ImageHeapList& list, IR::ImageHeapView& result) {
-	const bool acquired = AcquireListNow(list, result);
-	m_predictions.PublishList(list, acquired, result);
-	return acquired;
-}
-
-bool ImageHeap::Predict(const IR::ImageHeapRequest& request, IR::ImageHeapPrediction& prediction) {
-	return m_predictions.PredictTable(request, prediction);
-}
-
-bool ImageHeap::PredictList(const IR::ImageHeapList& list, IR::ImageHeapPrediction& prediction) {
-	return m_predictions.PredictList(list, prediction);
-}
-
-bool ImageHeap::AcquireNow(const IR::ImageHeapRequest& request, IR::ImageHeapView& result) {
 	KYTY_PROFILER_FUNCTION();
 	const auto size = request.size & ~uint64_t {3};
 	if (request.count == 0u || request.step == 0u ||
@@ -237,7 +217,7 @@ uint32_t ImageHeap::Profile(const IR::ImageResource& root, bool table) {
 	return static_cast<uint32_t>(m_profiles.size() - 1u);
 }
 
-bool ImageHeap::AcquireListNow(const IR::ImageHeapList& list, IR::ImageHeapView& result) {
+bool ImageHeap::AcquireList(const IR::ImageHeapList& list, IR::ImageHeapView& result) {
 	KYTY_PROFILER_FUNCTION();
 	if (list.root == nullptr) {
 		return false;

@@ -519,17 +519,6 @@ add_test(NAME kyty_shim_ahead_revalidation COMMAND kyty_shim_ahead_revalidation_
 set_tests_properties(kyty_shim_ahead_revalidation PROPERTIES TIMEOUT 20
         PASS_REGULAR_EXPRESSION "kyty_shim_ahead_revalidation: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
 
-add_test_executable(kyty_shim_image_heap_predictions_tests ${CMAKE_CURRENT_SOURCE_DIR}/ImageHeapPredictions.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
-target_include_directories(kyty_shim_image_heap_predictions_tests PRIVATE ${LIBS_INCLUDE_DIR})
-configure_host_test_executable(kyty_shim_image_heap_predictions_tests)
-if(MINGW)
-    target_link_libraries(kyty_shim_image_heap_predictions_tests PRIVATE stdc++ gcc_eh)
-endif()
-target_link_libraries(kyty_shim_image_heap_predictions_tests PRIVATE Kyty::gpu libkernel libc)
-add_test(NAME kyty_shim_image_heap_predictions COMMAND kyty_shim_image_heap_predictions_tests)
-set_tests_properties(kyty_shim_image_heap_predictions PROPERTIES TIMEOUT 60
-        PASS_REGULAR_EXPRESSION "kyty_shim_image_heap_predictions: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED|ThreadSanitizer")
-
 add_test_executable(kyty_shim_generic_compute_replay_tests ${CMAKE_CURRENT_SOURCE_DIR}/GenericComputeReplay.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../../Execution/src/FrameCapture.cpp)
 target_include_directories(kyty_shim_generic_compute_replay_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/3rdparty/zstd/lib)

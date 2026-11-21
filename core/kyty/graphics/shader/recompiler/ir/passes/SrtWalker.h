@@ -53,23 +53,10 @@ struct ImageHeapList {
 	std::span<const DescriptorValue> values;
 };
 
-struct ImageHeapPrediction {
-	bool                         acquired   = false;
-	uint64_t                     slots      = 0;
-	uint32_t                     slot_count = 0;
-	std::vector<DescriptorValue> kinds;
-};
-
 class ImageHeapSource {
 public:
 	virtual bool Acquire(const ImageHeapRequest& request, ImageHeapView& view) = 0;
 	virtual bool AcquireList(const ImageHeapList& , ImageHeapView& ) {
-		return false;
-	}
-	virtual bool Predict(const ImageHeapRequest& , ImageHeapPrediction& ) {
-		return false;
-	}
-	virtual bool PredictList(const ImageHeapList& , ImageHeapPrediction& ) {
 		return false;
 	}
 

@@ -380,46 +380,6 @@ void RecordAheadLoads(void* userdata, std::span<const uint64_t> loads) {
 	static_cast<GuestReadLog*>(userdata)->RecordLoads(loads);
 }
 
-class AheadImageHeap final: public ShaderRecompiler::IR::ImageHeapSource {
-public:
-	AheadImageHeap(ShaderRecompiler::IR::ImageHeapSource& heap, std::vector<AheadHeapAcquisition>& acquisitions)
-	    : m_heap(heap), m_acquisitions(acquisitions) {}
-
-	bool Acquire(const ShaderRecompiler::IR::ImageHeapRequest& request, ShaderRecompiler::IR::ImageHeapView& view) override {
-		auto& acquisition   = m_acquisitions.emplace_back();
-		acquisition.request = request;
-		if (request.root != nullptr) acquisition.root = *request.root;
-		acquisition.request.root = nullptr;
-		return Predicted(request.root != nullptr && m_heap.Predict(request, acquisition.predicted), acquisition, view);
-	}
-
-	bool AcquireList(const ShaderRecompiler::IR::ImageHeapList& list, ShaderRecompiler::IR::ImageHeapView& view) override {
-		auto& acquisition    = m_acquisitions.emplace_back();
-		acquisition.list     = true;
-		acquisition.owner    = list.owner;
-		acquisition.resource = list.resource;
-		if (list.root != nullptr) acquisition.root = *list.root;
-		acquisition.values.assign(list.values.begin(), list.values.end());
-		return Predicted(list.root != nullptr && m_heap.PredictList(list, acquisition.predicted), acquisition, view);
-	}
-
-	[[nodiscard]] bool Unpredicted() const { return m_unpredicted; }
-
-private:
-	bool Predicted(bool known, const AheadHeapAcquisition& acquisition, ShaderRecompiler::IR::ImageHeapView& view) {
-		m_unpredicted = m_unpredicted || !known;
-		if (!known || !acquisition.predicted.acquired) return false;
-		view = {.slots      = acquisition.predicted.slots,
-		        .slot_count = acquisition.predicted.slot_count,
-		        .kinds      = acquisition.predicted.kinds};
-		return true;
-	}
-
-	ShaderRecompiler::IR::ImageHeapSource& m_heap;
-	std::vector<AheadHeapAcquisition>&     m_acquisitions;
-	bool                                   m_unpredicted = false;
-};
-
 class ProgramLockMaybe {
 public:
 #if defined(ANYPS5_KYTY)
@@ -2832,9 +2792,8 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 	key.user_data_count = params.user_data_count;
 	BuildStageStaticKey(input_info, key.static_state);
 	AppendNativeRayTracingKey(key.stage, key.static_state);
-	const bool unlocked  = t_ahead_unlocked;
-	Program*   program   = nullptr;
-	bool       heap_used = false;
+	const bool unlocked = t_ahead_unlocked;
+	Program*   program  = nullptr;
 	{
 		const ProgramLockMaybe lock(m_program_lock, unlocked);
 		const auto             entry = m_program_cache.find(key);
@@ -2850,15 +2809,14 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 			QueueCompile(key, params, input_info, push_data_cursor, nullptr);
 #endif
 		}
-		heap_used = entry != m_program_cache.end() &&
-		            std::ranges::any_of(entry->second.modules,
-		                                [](const ShaderModule& module) { return module.info.info.uses_image_heap; });
 		const auto refusal =
 		    entry == m_program_cache.end()                ? AheadRefusal::Compiling
 		    : ahead.stages == ProgramResolution::MaxStages || entry->second.skip_dispatch ? AheadRefusal::Shape
 		    : entry->second.call_source                   ? AheadRefusal::Calls
-		    : heap_used && m_image_heap == nullptr        ? AheadRefusal::ImageHeap
-		                                                  : AheadRefusal::None;
+		    : std::ranges::any_of(entry->second.modules,
+		                          [](const ShaderModule& module) { return module.info.info.uses_image_heap; })
+		        ? AheadRefusal::ImageHeap
+		        : AheadRefusal::None;
 		if (refusal != AheadRefusal::None) {
 			ahead.reads.Fail(refusal);
 			return nullptr;
@@ -2896,18 +2854,8 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 	ShaderRecompiler::IR::SrtDeferredLoadsOfThread().clear();
 	ShaderRecompiler::IR::SrtAroundLoadsOfThread().clear();
 #endif
-	std::optional<AheadImageHeap> heap;
-	if (m_image_heap != nullptr && heap_used) {
-		heap.emplace(*m_image_heap, ahead.heap);
-		runtime.image_heap = &*heap;
-	}
-	const bool materialized =
-	    ShaderRecompiler::IR::MaterializeResources(program->resource_plan, runtime, resources, specialization);
-	if (heap && heap->Unpredicted()) {
-		ahead.reads.Fail(AheadRefusal::ImageHeap);
-		return nullptr;
-	}
-	if (!materialized) {
+	if (!ShaderRecompiler::IR::MaterializeResources(program->resource_plan, runtime, resources,
+	                                                specialization)) {
 		ahead.reads.Fail(AheadRefusal::Materialize);
 		return nullptr;
 	}
@@ -2935,7 +2883,7 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 	if (module == modules.end() && program->ShareModule(specialization, resources, push_data_cursor, false)) {
 		module = modules.end() - 1;
 	}
-	if (module != modules.end() && module->info.info.uses_image_heap && !heap) {
+	if (module != modules.end() && module->info.info.uses_image_heap) {
 		ahead.reads.Fail(AheadRefusal::ImageHeap);
 		return nullptr;
 	}
