@@ -857,11 +857,14 @@ static TextureDescDerivation DeriveTextureDesc(const ShaderRecompiler::IR::Image
 	if (meta_compress && tile != Prospero::TileMode::kDepth) {
 		desc.info.metadata.kind = ImageMetadataKind::Dcc;
 	}
-	if (!desc.info.HasTiledLayout()) {
+	const bool element_layout = desc.info.HasElementLayout();
+	if (!element_layout || !desc.info.HasTiledLayout()) {
 		auto derived = unsupported(fmt::format(
-		    "unsupported tiled texture layout: format={} tile={} type={} extent={}x{}x{} "
+		    "{}: format={} tile={} type={} extent={}x{}x{} "
 		    "levels={} layers={} addr={:#018x} "
 		    "dwords={:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x}",
+		    element_layout ? "unsupported tiled texture layout"
+		                   : "unsupported texture element format",
 		    static_cast<uint32_t>(format), static_cast<uint32_t>(tile),
 		    static_cast<uint32_t>(descriptor.Type()), width, height, depth, levels, image_layers,
 		    address, descriptor.fields[0], descriptor.fields[1], descriptor.fields[2],
