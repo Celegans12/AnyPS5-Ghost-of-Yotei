@@ -326,18 +326,13 @@ void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address, uint32_
 	code.L(done);
 }
 
-uint64_t KYTY_SYSV_ABI ProbeZeroTestedLoad(uint64_t address) {
+uint64_t KYTY_SYSV_ABI ProbeGpuProducedLoad(uint64_t address) {
 	return t_walker_ahead && t_gpu_produced != nullptr && address >= GuestMemoryStart && t_gpu_produced(address)
 	           ? 1u
 	           : 0u;
 }
 
-uint64_t KYTY_SYSV_ABI ProbeGpuControlLoad(uint64_t address) {
-	return t_walker_ahead && t_gpu_produced != nullptr && address >= GuestMemoryStart && t_gpu_produced(address) ? 1u
-	                                                                                                             : 0u;
-}
-
-void SkipZeroTestedLoad(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address, const Xbyak::Label& skip) {
+void TestGpuProducedLoad(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address) {
 	code.lea(code.r10, code.ptr[address]);
 	for (const auto& reg: {code.rax, code.rcx, code.rdx, code.rsi, code.rdi, code.r8, code.r9, code.r10,
 	                       code.r11, code.rbp}) {
@@ -346,7 +341,7 @@ void SkipZeroTestedLoad(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address
 	code.mov(code.rbp, code.rsp);
 	code.and_(code.rsp, -16);
 	code.mov(code.rdi, code.r10);
-	code.mov(code.rax, reinterpret_cast<uint64_t>(&ProbeZeroTestedLoad));
+	code.mov(code.rax, reinterpret_cast<uint64_t>(&ProbeGpuProducedLoad));
 	code.call(code.rax);
 	code.mov(code.rsp, code.rbp);
 	code.test(code.rax, code.rax);
@@ -354,6 +349,10 @@ void SkipZeroTestedLoad(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address
 	                       code.rcx, code.rax}) {
 		code.pop(reg);
 	}
+}
+
+void SkipZeroTestedLoad(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address, const Xbyak::Label& skip) {
+	TestGpuProducedLoad(code, address);
 	code.jnz(skip, Xbyak::CodeGenerator::T_NEAR);
 }
 
@@ -1245,20 +1244,7 @@ void WalkerCompiler::EmitNode(uint32_t index) {
 void WalkerCompiler::SkipGpuControlLoad(const Xbyak::RegExp& address, uint32_t flat_slot, uint32_t state) {
 	auto&        c = m_code;
 	Xbyak::Label load;
-	c.lea(c.r10, c.ptr[address]);
-	for (const auto& reg: {c.rax, c.rcx, c.rdx, c.rsi, c.rdi, c.r8, c.r9, c.r10, c.r11, c.rbp}) {
-		c.push(reg);
-	}
-	c.mov(c.rbp, c.rsp);
-	c.and_(c.rsp, -16);
-	c.mov(c.rdi, c.r10);
-	c.mov(c.rax, reinterpret_cast<uint64_t>(&ProbeGpuControlLoad));
-	c.call(c.rax);
-	c.mov(c.rsp, c.rbp);
-	c.test(c.rax, c.rax);
-	for (const auto& reg: {c.rbp, c.r11, c.r10, c.r9, c.r8, c.rdi, c.rsi, c.rdx, c.rcx, c.rax}) {
-		c.pop(reg);
-	}
+	TestGpuProducedLoad(c, address);
 	c.jz(load, Near);
 	if (flat_slot != ControlOnlySlot) {
 		++m_captures;
