@@ -63,6 +63,7 @@ constexpr uint64_t PartialDirtyMinSize = uint64_t {8} << 20;
 constexpr uint64_t PartialDirtyGranule = uint64_t {256} << 10;
 constexpr uint64_t PartialUploadMaxShare = 2;
 constexpr uint64_t PartialUploadChunk = uint64_t {64} << 20;
+constexpr uint64_t GcDownloadAge = 80;
 
 void AddWrittenPages(RangeSet& written, uint64_t address, uint64_t size) {
 	const auto first = Common::AlignDown(address, TRACKER_PAGE_SIZE);
@@ -3716,7 +3717,7 @@ void TextureCache::RunGarbageCollector() {
 			age       = 160;
 			deletions = 40;
 		} else if (pressured) {
-			age       = 80;
+			age       = GcDownloadAge;
 			deletions = 20;
 		}
 		age = std::min(age, tick);
@@ -3739,7 +3740,8 @@ void TextureCache::RunGarbageCollector() {
 				continue;
 			}
 			if (owner->SafeToDownload() &&
-			    (!pressured || owner->info.HasStencil() || !DownloadImageMemory(id))) {
+			    ((!pressured && owner->lru_tick + GcDownloadAge > tick) || owner->info.HasStencil() ||
+			     !DownloadImageMemory(id))) {
 				continue;
 			}
 			--deletions;
