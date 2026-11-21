@@ -264,6 +264,11 @@ private:
 					m_entry       = m_in[inst.offset + 2];
 					break;
 				case spv::OpExecutionMode:
+					if (m_in[inst.offset + 2] == spv::ExecutionModeDerivativeGroupQuadsKHR ||
+					    m_in[inst.offset + 2] == spv::ExecutionModeDerivativeGroupLinearKHR) {
+						refusal = "compute derivatives group invocations by the workgroup layout";
+						return false;
+					}
 					if (m_in[inst.offset + 2] == spv::ExecutionModeLocalSize) {
 						const uint64_t threads =
 						    uint64_t {m_in[inst.offset + 3]} * m_in[inst.offset + 4] * m_in[inst.offset + 5];
