@@ -15,3 +15,4 @@ kyty_shim_cross_queue_graphics_waits_compute_clock	same device requirement as ky
 kyty_shim_cross_queue_recycled_label	same device requirement as kyty_shim_depth_target_alias
 kyty_shim_cross_queue_early_label	same device requirement as kyty_shim_depth_target_alias
 kyty_shim_cross_queue_recycled_label_own_tick	same device requirement as kyty_shim_depth_target_alias
+kyty_shim_wave_split_written_reads	same device requirement as kyty_shim_depth_target_alias, and the wave64 split it checks needs subgroups of 32
