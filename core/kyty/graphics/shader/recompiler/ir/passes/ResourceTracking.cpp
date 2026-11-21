@@ -770,7 +770,6 @@ private:
 		    fmt::format("shader resource tracking: hash=0x{:016x} stage={} pc=0x{:08x} {}",
 		                m_program.shader_hash, StageName(m_program.stage), pc, reason);
 		EXIT("%s", message.c_str());
-		std::abort();
 	}
 
 	Value NativeDescriptorSource(Value value, uint32_t reg, uint32_t use_pc,

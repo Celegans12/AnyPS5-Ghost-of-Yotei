@@ -17,7 +17,6 @@ namespace {
 
 [[noreturn]] void Fail(std::string_view message) {
 	EXIT("shader IR validation failed: %s", std::string(message).c_str());
-	std::abort();
 }
 
 bool IsRegisterStatePseudo(ValueOpcode opcode) {

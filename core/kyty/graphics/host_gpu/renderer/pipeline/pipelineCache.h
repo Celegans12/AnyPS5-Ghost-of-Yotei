@@ -136,12 +136,6 @@ public:
 	[[nodiscard]] bool     CollectChanges(std::vector<std::pair<uint32_t, uint32_t>>& changed) const;
 	[[nodiscard]] bool     FirstMismatch(uint32_t& index, uint64_t& address, uint32_t& size, uint32_t& old_value,
 	                                     uint32_t& new_value) const;
-	template <typename Function>
-	void ForEachRead(Function&& function) const {
-		for (const auto& entry: m_entries) {
-			function(entry.address, uint64_t {entry.size});
-		}
-	}
 
 private:
 	static constexpr uint64_t StrictCheckBytes = 64;

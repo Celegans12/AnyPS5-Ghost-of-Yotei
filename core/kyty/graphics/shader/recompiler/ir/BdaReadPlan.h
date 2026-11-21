@@ -8,7 +8,6 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 struct Program;
-struct ResourceSnapshot;
 
 struct BdaReadWord {
 	enum class Kind : uint8_t { Immediate, UserData, Flat };
@@ -30,6 +29,4 @@ struct BdaReadPlan {
 };
 
 [[nodiscard]] BdaReadPlan BuildBdaReadPlan(const Program& program);
-[[nodiscard]] bool EvaluateBdaReadPlan(const BdaReadPlan& plan, const ResourceSnapshot& snapshot,
-                                       std::vector<GuestRange>& output);
 }

@@ -1520,14 +1520,12 @@ const IR::ExportInfo& ValueEmitContext::Export(const IR::Inst& inst) const {
 [[noreturn]] void ValueEmitContext::Fail(const char* reason) const {
 	EXIT("SPIR-V emission failed: hash=0x%016" PRIx64 " stage=%u reason=%s\n",
 	     state.program.shader_hash, static_cast<unsigned>(state.program.stage), reason);
-	std::abort();
 }
 
 [[noreturn]] void ValueEmitContext::Fail(const IR::Inst& inst, const char* reason) const {
 	EXIT("SPIR-V emission failed: hash=0x%016" PRIx64 " stage=%u opcode=%s reason=%s\n",
 	     state.program.shader_hash, static_cast<unsigned>(state.program.stage),
 	     IR::ValueOpcodeName(inst.GetOpcode()), reason);
-	std::abort();
 }
 
 #if defined(ANYPS5_KYTY)

@@ -170,7 +170,6 @@ public:
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool NeverGpuWritten(uint64_t vaddr, uint64_t size) const noexcept;
 	[[nodiscard]] bool NoGpuBytesNow(uint64_t vaddr, uint64_t size) const noexcept;
-	[[nodiscard]] bool GpuLinesOverflowed() const noexcept { return m_gpu_line_overflow.load(std::memory_order_relaxed); }
 	static void NoteReplayedRead();
 	static void AllowReplayAfterReadback() noexcept;
 	static bool TakeReplayAfterReadback(uint64_t* begin, uint64_t* end) noexcept;
@@ -189,7 +188,6 @@ public:
 	}
 	[[nodiscard]] bool TouchLiveBuffer(BufferId id, vk::Buffer handle, uint64_t vaddr, uint64_t size);
 	void EnsureBufferContents(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] uint64_t BufferSetEpoch() const noexcept { return m_buffer_set_epoch; }
 	[[nodiscard]] static uint64_t BdaTableGeneration() noexcept { return 0; }
 	[[nodiscard]] StreamBuffer& GetTableUploadBuffer();
 	void               PrepareFaultBuffer() { m_fault_manager.PrepareFaultBuffer(); }

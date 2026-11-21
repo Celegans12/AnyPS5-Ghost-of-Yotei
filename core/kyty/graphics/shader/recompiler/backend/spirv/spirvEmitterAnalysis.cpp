@@ -65,7 +65,6 @@ uint32_t          ConstantU32(EmitterState& state, uint32_t value);
 	     " stage=%u resource=%" PRIu32 " binding_kind=%u reason=%s\n",
 	     state.program.shader_hash, static_cast<unsigned>(state.program.stage), resource,
 	     static_cast<unsigned>(kind), reason);
-	std::abort();
 }
 
 static uint32_t DescriptorElementPointer(EmitterState& state, uint32_t result_ptr_type,
@@ -88,7 +87,6 @@ const ImageDimensionInfo& ImageDimensionInfoFor(ImageDimension dimension) {
 		}
 	}
 	EXIT("SPIR-V image dimension %u is invalid\n", static_cast<uint32_t>(dimension));
-	std::abort();
 }
 
 uint32_t ImageScalarType(EmitterState& state, Prospero::TextureNumericClass numeric_class) {

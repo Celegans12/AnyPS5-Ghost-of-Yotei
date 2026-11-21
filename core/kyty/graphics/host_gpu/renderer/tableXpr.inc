@@ -465,7 +465,6 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
                                                      uint64_t index_base, uint64_t index_bytes,
                                                      vk::IndexType index_type, const NativeXprDirectDraw* direct) {
 	auto& table = OwnTable();
-	DropStaleCatalog();
 	TableSweepPairs();
 	LiveCensus::Scope census(LiveCensus::DrawPhase, 0x7ab1e, 0);
 	auto*       catalog = CatalogTable();

@@ -227,12 +227,10 @@ public:
 	}
 
 	[[nodiscard]] Taint TaintOf(Value value) const { return ArgTaint(value); }
-	[[nodiscard]] Taint RawTaint(const Inst* inst) const { return m_taint[m_slot.at(inst)]; }
 	[[nodiscard]] Taint DecisionTaint(const Inst* inst) const { return m_decision[m_slot.at(inst)]; }
 
 	void Activate(std::vector<uint8_t> active) { m_active = std::move(active); }
 	[[nodiscard]] uint64_t Work() const { return m_work; }
-	[[nodiscard]] const std::vector<uint8_t>& Active() const { return m_active; }
 
 	void Reset(uint64_t seed) {
 		m_seed = seed;
@@ -270,10 +268,6 @@ public:
 	void Force(const std::unordered_map<const Block*, const Block*>* forced) { m_forced = forced; }
 
 	[[nodiscard]] const std::unordered_set<uint64_t>& PreReads() const { return m_reads; }
-	[[nodiscard]] uint32_t LiveId(uint32_t slot) const {
-		const auto at = m_live_ids.find(slot);
-		return at == m_live_ids.end() ? NoSlot : at->second;
-	}
 	[[nodiscard]] const std::unordered_map<uint32_t, uint32_t>& LiveIds() const { return m_live_ids; }
 
 	const char* RunPrologue(const Block*& from) {
@@ -1262,7 +1256,6 @@ public:
 	explicit Random(uint64_t seed): m_state(seed) {}
 	uint64_t Next() { return Mix(m_state++); }
 	uint32_t Below(uint32_t bound) { return bound == 0 ? 0u : static_cast<uint32_t>(Next() % bound); }
-	float Unit() { return static_cast<float>(Below(1u << 20u)) / static_cast<float>(1u << 20u); }
 
 private:
 	uint64_t m_state;
@@ -1287,7 +1280,6 @@ public:
 	void        Emit(uint32_t site);
 
 	uint32_t detail = 0;
-	[[nodiscard]] uint64_t Work() const { return m_machine.Work(); }
 
 private:
 	void        Begin(uint64_t seed);

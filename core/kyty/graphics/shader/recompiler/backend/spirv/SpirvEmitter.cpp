@@ -15,7 +15,6 @@ namespace {
 [[noreturn]] void Fail(const IR::Program& program, const char* reason) {
 	EXIT("SPIR-V validation failed: hash=0x%016" PRIx64 " stage=%u reason=%s\n",
 	     program.shader_hash, static_cast<unsigned>(program.stage), reason);
-	std::abort();
 }
 
 }

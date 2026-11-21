@@ -149,8 +149,7 @@ private:
 	std::unique_ptr<CommandProcessor>                                m_gfx_cp;
 	std::array<std::unique_ptr<CommandProcessor>, ComputeQueueCount> m_compute_cp;
 
-	uint64_t        m_submit_id = 0;
-	std::atomic_int m_done_num  = 0;
+	std::atomic_int m_done_num = 0;
 	uint64_t        m_scout_sequence = 0;
 
 	struct WaitRange {

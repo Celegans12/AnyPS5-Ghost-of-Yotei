@@ -255,7 +255,6 @@ public:
 	void NativeXprEndDraw() noexcept {
 		m_table_store = false;
 	}
-	[[nodiscard]] bool TableStoreRequested() const noexcept { return m_table_store; }
 	void TableNoteNormalDraw(const DrawIndirectArgs& indirect, bool indexed, uint64_t started) noexcept;
 	[[nodiscard]] bool TableLikely(const HW::Shader& shaders) const noexcept;
 	[[nodiscard]] uint32_t TableHint(const HW::Shader& shaders) const noexcept;
@@ -707,8 +706,6 @@ private:
 	[[nodiscard]] static CatalogLock CatalogWrite() noexcept { return {}; }
 	[[nodiscard]] static CatalogLock CatalogRead() noexcept { return {}; }
 	void TableMemoRetired();
-	void DropStaleCatalog() {}
-	void ForgetStaleCatalog() {}
 	void TableForgetStates();
 	void TableSweepPairs();
 public:

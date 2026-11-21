@@ -15,7 +15,6 @@ constexpr uint32_t UnsetRayQuerySlot = 0xfffffffeu;
 
 [[noreturn]] void Fail(std::string_view message) {
 	EXIT("shader info collection failed: %s", std::string(message).c_str());
-	std::abort();
 }
 
 void AddInput(ShaderInfo& info, StageInputKind kind, uint32_t location, uint32_t components,
@@ -167,6 +166,9 @@ void AddBuiltinInput(ShaderInfo& info, StageInputKind kind) {
 			break;
 		case StageInputKind::WorkgroupId:
 			AddInput(info, kind, 0, 3, "gl_WorkGroupID");
+			break;
+		case StageInputKind::NumWorkgroups:
+			AddInput(info, kind, 0, 3, "gl_NumWorkGroups");
 			break;
 		case StageInputKind::LocalInvocationId:
 			AddInput(info, kind, 0, 3, "gl_LocalInvocationID");

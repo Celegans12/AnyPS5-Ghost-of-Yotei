@@ -170,7 +170,6 @@ public:
 	const uint32_t* StageIndirectRegisters(uint32_t opcode, const uint32_t* packet, uint32_t packet_dw);
 
 	[[nodiscard]] bool IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
-	void ScoutSkipDraws(uint32_t count) noexcept { m_scout_skipped += count; }
 
 private:
 	void ProcessPm4(Pm4Execution& execution);
@@ -252,7 +251,6 @@ private:
 	const uint32_t* m_scout_packet   = nullptr;
 	uint64_t        m_scout_sequence = 0;
 	uint32_t        m_scout_ordinal  = 0;
-	uint32_t        m_scout_skipped  = 0;
 	bool     m_predicate_skip = false;
 	std::unique_ptr<DrawStateObserver> m_draw_observer;
 	bool     m_occlusion_wait_requested = false;

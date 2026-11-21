@@ -1207,7 +1207,6 @@ void GuestGpu::ThreadRun(void* data) {
 	for (;;) {
 		Submission                   submission;
 		Common::UniqueFunction<void> command;
-		bool                         has_submission = false;
 		bool                         should_stop    = false;
 		if (spin_blocked) {
 			spin_blocked      = false;
@@ -1716,14 +1715,13 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			m_scout_packet   = packet;
 			m_scout_sequence = execution.m_scout_sequence;
 			m_scout_ordinal  = execution.m_scout_ordinal;
-			m_scout_skipped  = 0;
 		}
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, view + 1, remaining_dw, total_dw) + 1;
 		EXIT_IF(packet_dw > remaining_dw);
 		if (scout_draw) {
 			m_scout_packet = nullptr;
-			if (!execution.m_suspended) execution.m_scout_ordinal += 1 + std::exchange(m_scout_skipped, 0u);
+			if (!execution.m_suspended) ++execution.m_scout_ordinal;
 		}
 		if (execution.m_suspended) {
 			return;

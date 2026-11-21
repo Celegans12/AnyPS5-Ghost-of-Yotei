@@ -41,7 +41,6 @@ void SetFailure(Graph& graph, FailureKind kind, uint32_t block_id, const std::st
                                    const std::string& message) {
 	SetFailure(graph, kind, block_id, message);
 	EXIT("shader CFG build failed: %s", message.c_str());
-	std::abort();
 }
 
 uint32_t InstructionEndPc(const Instruction& inst) {
