@@ -85,7 +85,7 @@ void* Allocate(const EmutlsObject* object) {
     return value;
 }
 
-__attribute__((noinline)) void* Slow(EmutlsObject* object) {
+[[gnu::noinline]] void* Slow(EmutlsObject* object) {
     const DWORD error = GetLastError();
     if (!ready.load(std::memory_order_acquire)) Prepare();
     const auto address = reinterpret_cast<std::uintptr_t>(object);
