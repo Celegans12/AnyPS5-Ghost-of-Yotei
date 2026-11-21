@@ -214,7 +214,7 @@ None is needed: a game converted with the relinker starts and runs on the defaul
 | `ANYPS5_FULLSCREEN` | `0`, `1`, `windowed`, `borderless` | Opens the window fullscreen |
 | `ANYPS5_DISPLAY_INDEX` | index of a connected display, `0` by default | Display the window opens on |
 | `APS5_OUTPUT_RESOLUTION` | `<width>x<height>` | Output resolution reported to the game; unset, it follows the display. A size below 3840x2160 reports a sub-4K display, and a game that adapts to the display then renders fewer pixels. On a weaker GPU with a 4K display, `2560x1440` is worth a try |
-| `KYTY_GPU` | GPU index, `-1` for AnyKyty's choice (default) | Picks the Vulkan device |
+| `ANYPS5_GPU` | part of a GPU name, any case; unset for AnyKyty's choice (default) | Runs on the first Vulkan device whose name contains it, as in AnyPS5's own driver: `ANYPS5_GPU=radeon` or `ANYPS5_GPU=geforce`. The GPU the game runs on is in the host report that prints at start. A text that matches no device stops the game with a message that lists the devices. `KYTY_GPU`, the index that Kyty used, is not read |
 | `KYTY_HDR` | `0`, `1` | Asks for an HDR10 output when the display offers it |
 | `KYTY_STRETCH` | `0`, `1` | Fills the window instead of keeping the game's aspect ratio |
 | `ANYPS5_UPSCALE` | `fsr`, `cmaa2`, `rcas`, unset | Scales the picture with FSR 1 when the window is larger than the game's image, applies CMAA2 anti-aliasing, or only sharpens. `ANYPS5_FSR_SHARPNESS` sets the sharpness |

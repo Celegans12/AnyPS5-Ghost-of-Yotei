@@ -22,7 +22,7 @@ ARMS = ("baseline", "candidate")
 FORCED = {"ANYPS5_REQUIRE_VULKAN": "1", "ANYPS5_HOST_REPORT": "1"}
 STRICT_REPLAY_ENVIRONMENT = {"KYTY_ASYNC_PIPELINES": "0"}
 KYTY_SETTINGS = {
-    "KYTY_GPU", "KYTY_GPU_PIPELINE", "KYTY_GPU_SPIN_US", "KYTY_NATIVE_RT",
+    "KYTY_GPU_PIPELINE", "KYTY_GPU_SPIN_US", "KYTY_NATIVE_RT",
     "KYTY_PIPELINE_MANIFEST", "KYTY_PRINTF_DIRECTION", "KYTY_RT_CHECK", "KYTY_RT_CHECK_PPM",
     "KYTY_RT_CHECK_STRIKES", "KYTY_RT_ORACLE", "KYTY_RT_STATS", "KYTY76_LDS_SYNC",
 }
@@ -66,7 +66,7 @@ def _environment(value, shared=False):
             raise ValueError(f"unsupported environment key: {key!r}")
         if not isinstance(text, str) or len(text) > 4096 or "\0" in text:
             raise ValueError(f"invalid environment value: {key}")
-        if not shared and (key.startswith("VK_") or key in ("ANYPS5_GPU", "KYTY_GPU")):
+        if not shared and (key.startswith("VK_") or key == "ANYPS5_GPU"):
             raise ValueError(f"device selection must be shared by both arms: {key}")
     return value
 

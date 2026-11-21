@@ -253,7 +253,7 @@ Real compile errors still fail. Syntax checks do not replace a full build and te
 
 Use each runtime's full compiled AGC commit, not the current source checkout's commit. On Linux omit `.exe`. Shared `environment` records GPU/driver selection, Vulkan layers and other declared `APS5_*`, `ANYPS5_*` or `VK_*` settings. Per-arm environments record experimental differences; GPU selection belongs in the shared environment. The runner clears inherited settings in those namespaces and loader overrides, stages the runtime files, sets its library paths, and forces `ANYPS5_REQUIRE_VULKAN=1`, `ANYPS5_HOST_REPORT=1` and its private `ANYPS5_SHADER_CACHE_DIR`. It does not change existing validation gates or infer a source build's cleanliness from a binary hash.
 
-For Kyty, set `KYTY_GPU` in the shared environment. The shared or per-arm environment also accepts
+For Kyty, set `ANYPS5_GPU` in the shared environment too. The shared or per-arm environment also accepts
 `KYTY_GPU_PIPELINE`, `KYTY_GPU_SPIN_US`, `KYTY_NATIVE_RT`, `KYTY_PIPELINE_MANIFEST`, `KYTY_PRINTF_DIRECTION`,
 `KYTY_RT_CHECK`, `KYTY_RT_CHECK_PPM`, `KYTY_RT_CHECK_STRIKES`, `KYTY_RT_ORACLE`, `KYTY_RT_STATS` and
 `KYTY76_LDS_SYNC`. Move these controls from shell exports into the recipe. The runner clears inherited `KYTY_*`

@@ -98,8 +98,8 @@ PresentMode GetPresentMode() {
 	return g_config->present_mode;
 }
 
-int32_t GetGpuIndex() {
-	return g_config->gpu_index;
+const std::string& GetGpuName() {
+	return g_config->gpu_name;
 }
 
 bool FullscreenEnabled() {

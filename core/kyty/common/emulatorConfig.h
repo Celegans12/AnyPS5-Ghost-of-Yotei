@@ -70,7 +70,7 @@ struct ConfigOptions {
 	uint32_t               keyboard_player                = 0;
 	bool                   pad_haptic_rumble           = false;
 	PresentMode            present_mode                = PresentMode::Mailbox;
-	int32_t                gpu_index                   = -1;
+	std::string            gpu_name;
 	bool                   fullscreen_enabled          = false;
 	bool                   hdr_enabled                 = false;
 	bool                   hide_cursor_enabled         = false;
@@ -149,7 +149,7 @@ int      GetPlayerFromUserId(int32_t user_id);
 bool     IsGuestUserId(int32_t user_id);
 bool     PadHapticRumbleEnabled();
 PresentMode GetPresentMode();
-int32_t GetGpuIndex();
+const std::string& GetGpuName();
 bool     FullscreenEnabled();
 bool     HdrEnabled();
 bool     HideCursorEnabled();

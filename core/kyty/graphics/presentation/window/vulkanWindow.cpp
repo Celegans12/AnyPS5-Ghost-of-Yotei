@@ -172,13 +172,25 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 	    });
 	EXIT_NOT_IMPLEMENTED(devices.empty());
 
-	if (Config::GetGpuIndex() >= 0) {
-		if (static_cast<size_t>(Config::GetGpuIndex()) < devices.size()) {
-			devices = {devices[Config::GetGpuIndex()]};
-		} else {
-			LOGF("Vulkan GPU index %d is unavailable; selecting automatically\n",
-			     Config::GetGpuIndex());
+	const std::string requested = Common::ToLower(Config::GetGpuName());
+	if (!requested.empty()) {
+		std::string                     names;
+		std::vector<vk::PhysicalDevice> matching;
+		for (const auto& device: devices) {
+			vk::PhysicalDeviceProperties device_properties {};
+			device.getProperties(&device_properties);
+			names += names.empty() ? "" : ", ";
+			names += device_properties.deviceName.data();
+			if (Common::ToLower(device_properties.deviceName.data()).find(requested) !=
+			    std::string::npos) {
+				matching.push_back(device);
+			}
 		}
+		if (matching.empty()) {
+			EXIT("ANYPS5_GPU=\"%s\" matches the name of no Vulkan device; devices: %s\n",
+			     Config::GetGpuName().c_str(), names.c_str());
+		}
+		devices = std::move(matching);
 	} else if (vk::PhysicalDevice headset; Vr::OpenXrPhysicalDevice(instance, headset)) {
 		devices = {headset};
 	}
@@ -382,12 +394,18 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		}
 
 		if (best_device == nullptr ||
-		    device_properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu) {
+		    (requested.empty() &&
+		     device_properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu)) {
 			best_device       = device;
 			best_queue_family = queue_family;
 		}
 	}
 
+	if (best_device == nullptr && !requested.empty()) {
+		out_rejections.insert(0, fmt::format(" only among the devices whose name contains "
+		                                     "ANYPS5_GPU=\"{}\";",
+		                                     Config::GetGpuName()));
+	}
 	out_device       = best_device;
 	out_queue_family = best_queue_family;
 }

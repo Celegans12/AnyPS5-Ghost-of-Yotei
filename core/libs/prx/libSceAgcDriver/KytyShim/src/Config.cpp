@@ -169,7 +169,7 @@ Options OptionsFromEnvironment(std::string& applied) {
     for (const auto& path : Paths) {
         if (const char* value = Read(path.variable, applied)) options.*path.field = std::filesystem::path(value);
     }
-    if (const char* value = Read("KYTY_GPU", applied); value != nullptr && !ParseInteger(value, options.gpu_index)) EXIT("KytyShim: KYTY_GPU=%s is not a GPU index\n", value);
+    if (const char* value = Read("ANYPS5_GPU", applied)) options.gpu_name = value;
     if (const char* value = Read("KYTY_DLSS_PRESET", applied); value != nullptr) {
         const std::string_view text(value);
         if (text.size() != 1 || text[0] < 'A' || text[0] > 'O') EXIT("KytyShim: KYTY_DLSS_PRESET=%s is not a letter from A to O\n", value);

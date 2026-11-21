@@ -149,7 +149,7 @@ class RecipeTests(ReplayFixture):
                 self.validate(recipe)
 
     def test_device_selection_is_shared_and_inherited_instrumentation_is_removed(self):
-        for key in ("ANYPS5_GPU", "KYTY_GPU", "VK_ICD_FILENAMES"):
+        for key in ("ANYPS5_GPU", "VK_ICD_FILENAMES"):
             recipe = copy.deepcopy(self.recipe)
             recipe["arms"]["baseline"]["environment"] = {key: "selection"}
             with self.subTest(key=key), self.assertRaises(ValueError):
@@ -337,7 +337,7 @@ class RunnerTests(ReplayFixture):
 
     def test_kyty_recipe_settings_reach_inspectors_and_strict_replays(self):
         self.recipe.update(warmups=1, trials=1)
-        shared = {"KYTY_GPU": "0", "KYTY_RT_CHECK": "256", "KYTY_GPU_SPIN_US": "0"}
+        shared = {"KYTY_RT_CHECK": "256", "KYTY_GPU_SPIN_US": "0"}
         candidate = {"KYTY_RT_ORACLE": "1", "KYTY_NATIVE_RT": "1", "KYTY76_LDS_SYNC": "0",
                      "KYTY_GPU_SPIN_US": "2000"}
         self.recipe["environment"] = shared
