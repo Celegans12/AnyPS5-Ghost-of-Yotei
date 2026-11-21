@@ -450,6 +450,10 @@ if(BUILD_TESTING)
         add_test(NAME progress_history_output COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_progress_history.py HistoryReportOutputTests)
         set_tests_properties(progress_history_output PROPERTIES TIMEOUT 20)
+        add_test(NAME progress_history_helpers COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_progress_history.py
+            LocationAndSeriesTests UtcDayTests SpreadTests LabelledTests ShaderCountsTests)
+        set_tests_properties(progress_history_helpers PROPERTIES TIMEOUT 20)
         add_test(NAME progress_report COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_progress.py)
         add_test(NAME progress_open_pr_page COMMAND ${Python3_EXECUTABLE}
@@ -734,6 +738,8 @@ if(BUILD_TESTING)
         set_tests_properties(configure_seed_parsing PROPERTIES TIMEOUT 20)
         add_test(NAME vulkan_validation_gate_reports COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_vulkan_validation_gate.py ReportTests)
+        add_test(NAME vulkan_validation_gate_encoding COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_vulkan_validation_gate.py EncodingTests)
         add_test(NAME vulkan_validation_gate_integration COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_vulkan_validation_gate.py IntegrationTests)
         add_test(NAME vulkan_validation_gate_timeouts COMMAND ${Python3_EXECUTABLE}
