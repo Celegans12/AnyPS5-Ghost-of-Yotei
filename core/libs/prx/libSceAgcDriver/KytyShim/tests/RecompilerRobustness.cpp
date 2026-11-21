@@ -17,13 +17,8 @@ struct Case {
 };
 
 const std::vector<Case> Cases = {
-    {"vop3p-without-its-second-word", 0x3b, 0x07, {0x520a0001u, 0xce600001u}},
     {"branch-target-outside-the-program", 0x00, 0x00, {0xbf827fffu, 0xbf810000u}},
     {"stale-lane-spill-after-read-lane-elimination", 0x32, 0x00, {0xd7610014u, 0x0201e205u, 0xbf810000u}},
-    {"literal-constant-without-its-word", 0x00, 0x00, {0x7e0002ffu}},
-    {"vop1-dpp-without-its-modifier-word", 0x00, 0x00, {0x7e0002fau}},
-    {"smem-without-its-second-word", 0x00, 0x00, {0xf4000000u}},
-    {"mimg-nsa-without-its-address-words", 0x00, 0x00, {0xf0000002u, 0x00000000u}},
     {"backward-branch-before-the-program", 0x00, 0x00, {0xbf828000u, 0xbf810000u}},
     {"setreg-float-mode-denorm", 0x00, 0x00, {0xb9801901u, 0xbf810000u}},
     {"empty-program-end", 0x00, 0x00, {0xbf810000u}},
@@ -38,6 +33,11 @@ struct Refusal {
 };
 
 const std::vector<Refusal> Refusals = {
+    {"vop3p-without-its-second-word", 0x3b, 0x07, {0x520a0001u, 0xce600001u}, "the code ends after"},
+    {"literal-constant-without-its-word", 0x00, 0x00, {0x7e0002ffu}, "the code ends after"},
+    {"vop1-dpp-without-its-modifier-word", 0x00, 0x00, {0x7e0002fau}, "the code ends after"},
+    {"smem-without-its-second-word", 0x00, 0x00, {0xf4000000u}, "the code ends after"},
+    {"mimg-nsa-without-its-address-words", 0x00, 0x00, {0xf0000002u, 0x00000000u}, "the code ends after"},
     {"position-export-from-a-pixel-shader", 0x04, 0x00, {0xf80008cfu, 0x03020100u, 0xbf810000u},
      "position export outside a vertex processing stage"},
     {"position-export-from-a-compute-shader", 0x00, 0x00, {0xf80008cfu, 0x03020100u, 0xbf810000u},
