@@ -219,10 +219,8 @@ void VectorReadBuffer(bool robust) {
 	Check(compiled.ok, name + "the shader compiles");
 	if (!compiled.ok) return;
 	Check(compiled.valid, name + "invalid SPIR-V: " + compiled.messages);
-	Check(compiled.uniform_reads.size() == 1u,
-	      name + "the scalar loads of a buffer that vector loads also read go through a uniform view");
-	Check(StorageClassOfBinding(compiled.spirv, UniformBinding) == SpirvStorageUniform,
-	      name + "the uniform view is declared in the Uniform storage class");
+	Check(compiled.uniform_reads.empty() && UniformCount(compiled) == 0u,
+	      name + "a buffer that vector loads also read keeps its storage binding for its scalar loads");
 }
 
 void TableRead(bool robust) {

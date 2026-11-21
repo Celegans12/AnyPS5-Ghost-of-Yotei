@@ -278,21 +278,25 @@ void DefineImageArray(EmitterState& state, ImageDefinition& definition, const IR
 	return words <= IR::FlattenedSrtUniformWords;
 }
 
-[[nodiscard]] std::vector<bool> BuffersReadByScalarLoads(const IR::Program& program) {
-	std::vector<bool> read(program.info.buffers.size());
+[[nodiscard]] std::vector<bool> BuffersReadOnlyByScalarLoads(const IR::Program& program) {
+	std::vector<bool> scalar(program.info.buffers.size()), vector(program.info.buffers.size());
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
-			if (inst.GetOpcode() != IR::ValueOpcode::ReadConstBuffer) continue;
+			const auto opcode = inst.GetOpcode();
+			if (IR::BufferAccessOf(opcode) == IR::BufferAccess::None) continue;
 			const auto index = inst.Flags<IR::MemoryFlags>().index;
 			if (index >= program.memory_info.size()) continue;
 			const auto& memory = program.memory_info[index];
-			if (memory.kind == IR::ResourceKind::ScalarBuffer && !memory.planning_only &&
-			    memory.resource < read.size()) {
-				read[memory.resource] = true;
+			if (memory.planning_only || memory.resource >= scalar.size()) continue;
+			if (opcode == IR::ValueOpcode::ReadConstBuffer && memory.kind == IR::ResourceKind::ScalarBuffer) {
+				scalar[memory.resource] = true;
+			} else {
+				vector[memory.resource] = true;
 			}
 		}
 	}
-	return read;
+	for (size_t index = 0; index < scalar.size(); ++index) scalar[index] = scalar[index] && !vector[index];
+	return scalar;
 }
 
 [[nodiscard]] bool ReadOnlyScalarBuffer(const IR::BufferResource& buffer) {
@@ -328,7 +332,7 @@ void DefineDescriptors(EmitterState& state) {
 		buffer.descriptor_index = buffer.live && !table ? buffer_count++ : UINT32_MAX;
 	}
 	auto& uniform_count = counts[static_cast<size_t>(Kind::UniformBuffers)];
-	const auto scalar_reads = state.profile.uniform_scalar_loads ? BuffersReadByScalarLoads(state.program)
+	const auto scalar_reads = state.profile.uniform_scalar_loads ? BuffersReadOnlyByScalarLoads(state.program)
 	                                                             : std::vector<bool>(info.buffers.size());
 	for (size_t index = 0; index < info.buffers.size(); ++index) {
 		auto&      buffer   = info.buffers[index];
