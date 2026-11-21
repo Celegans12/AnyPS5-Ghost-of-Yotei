@@ -153,6 +153,7 @@ Window FindWindow(const Program& program) {
 }
 
 uint32_t LowerRelativeVgprs(Program& program) {
+	if (program.stage == ShaderType::Pixel) return 0;
 	const auto window = FindWindow(program);
 	if (window.end == 0) return 0;
 	const auto spare = window.end;
