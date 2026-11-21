@@ -25,7 +25,7 @@ verbatim at their top:
 | `core/kyty/common/` | `src/common/` | every file except `CMakeLists.txt` |
 | `core/kyty/cmake/` | `src/` | `embed_spirv.cmake`, `cmake_config.h.in`, `kytyGitVersion.h.in` |
 | `core/libs/prx/libSceAgcDriver/KytyShim/include/kernel/` | `src/kernel/` | `eventQueue.h`, `fileSystem.h`, `guestPause.h`, `memory.h`, `pthread.h` |
-| `core/libs/prx/libSceAgcDriver/KytyShim/include/libs/` | `src/libs/` | `agc.h`, `controller.h`, `errno.h`, `hmd2.h`, `ime.h`, `imeCommon.h`, `imeDialog.h`, `libs.h` |
+| `core/libs/prx/libSceAgcDriver/KytyShim/include/libs/` | `src/libs/` | `agc.h`, `controller.h`, `errno.h`, `hmd2.h`, `libs.h` |
 | `core/libs/prx/libSceAgcDriver/KytyShim/include/loader/` | `src/loader/` | `demonsSoulsPageFree.h`, `demonsSoulsTitle.h`, `guestOodle.h`, `systemContent.h`, `timer.h` |
 
 Outside those folders, code adapted from the Kyty core is built only with `-DANYPS5_GPU_BACKEND=kyty`:
