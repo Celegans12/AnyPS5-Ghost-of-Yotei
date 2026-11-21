@@ -331,6 +331,11 @@ uint64_t KYTY_SYSV_ABI ProbeZeroTestedLoad(uint64_t address) {
 	           : 0u;
 }
 
+uint64_t KYTY_SYSV_ABI ProbeGpuControlLoad(uint64_t address) {
+	return t_walker_ahead && t_gpu_produced != nullptr && address >= GuestMemoryStart && t_gpu_produced(address) ? 1u
+	                                                                                                             : 0u;
+}
+
 void SkipZeroTestedLoad(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address, const Xbyak::Label& skip) {
 	code.lea(code.r10, code.ptr[address]);
 	for (const auto& reg: {code.rax, code.rcx, code.rdx, code.rsi, code.rdi, code.r8, code.r9, code.r10,
@@ -603,6 +608,7 @@ private:
 	void Store(const Node& node);
 	void EmitNode(uint32_t index);
 	void EmitRead(const Node& node, uint32_t index);
+	void SkipGpuControlLoad(const Xbyak::RegExp& address, uint32_t flat_slot, uint32_t state);
 	void EmitStrict(const Node& node);
 
 	ResourcePlan&                                     m_plan;
@@ -617,6 +623,7 @@ private:
 	uint32_t m_user_data = 0, m_captures = 0;
 	std::vector<uint32_t> m_flat_slots;
 	std::vector<bool>     m_zero_tested;
+	std::vector<uint32_t> m_gpu_control;
 };
 
 void WalkerCompiler::AddOutput(Value value, uint32_t gate) {
@@ -802,6 +809,36 @@ void WalkerCompiler::FindFlatOnlyNodes(std::span<const Operand> conditions,
 				                  DescriptorSlotWord(word_slot[index]);
 				m_plan.descriptor_word_flat[word] = flat_of[index];
 			}
+		}
+	}
+	std::vector<bool> exact(m_nodes.size(), false);
+	const auto        need_exact = [&](const Operand& operand) {
+		if (operand.kind == Kind::Node && operand.value < exact.size()) exact[operand.value] = true;
+	};
+	for (const auto& words: descriptors) {
+		for (const auto& operand: words) need_exact(operand);
+	}
+	for (const auto& operand: outputs) need_exact(operand);
+	for (size_t index = 0; index < m_nodes.size(); ++index) {
+		const auto& node = m_nodes[index];
+		if (node.result != Operand {Kind::Node, index} || control[index]) continue;
+		const auto op        = node.inst->GetOpcode();
+		const bool zero_test = (op == ValueOpcode::ULessThan32 || op == ValueOpcode::ULessThanEqual32) &&
+		                       node.args.size() == 2 && node.args[1].kind == Kind::Unknown;
+		for (size_t k = 0; k < node.args.size(); ++k) {
+			if (!(zero_test && k == 0)) need_exact(node.args[k]);
+		}
+	}
+	m_gpu_control.assign(m_nodes.size(), NoFlatSlot);
+	for (size_t index = 0; index < m_nodes.size(); ++index) {
+		const auto& node = m_nodes[index];
+		const auto  op   = node.inst->GetOpcode();
+		const bool  load = !node.referenced && !masks.contains(node.inst) &&
+		                  (op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer ||
+		                   op == ValueOpcode::LoadBufferU32);
+		if (load && node.result == Operand {Kind::Node, index} && !exact[index] && !m_zero_tested[index] &&
+		    flat_reads[index] == 1 && uses[index] > 1 && flat_of[index] != NoFlatSlot) {
+			m_gpu_control[index] = flat_of[index];
 		}
 	}
 }
@@ -1183,6 +1220,34 @@ void WalkerCompiler::EmitNode(uint32_t index) {
 	}
 }
 
+void WalkerCompiler::SkipGpuControlLoad(const Xbyak::RegExp& address, uint32_t flat_slot, uint32_t state) {
+	auto&        c = m_code;
+	Xbyak::Label load;
+	c.lea(c.r10, c.ptr[address]);
+	for (const auto& reg: {c.rax, c.rcx, c.rdx, c.rsi, c.rdi, c.r8, c.r9, c.r10, c.r11, c.rbp}) {
+		c.push(reg);
+	}
+	c.mov(c.rbp, c.rsp);
+	c.and_(c.rsp, -16);
+	c.mov(c.rdi, c.r10);
+	c.mov(c.rax, reinterpret_cast<uint64_t>(&ProbeGpuControlLoad));
+	c.call(c.rax);
+	c.mov(c.rsp, c.rbp);
+	c.test(c.rax, c.rax);
+	for (const auto& reg: {c.rbp, c.r11, c.r10, c.r9, c.r8, c.rdi, c.rsi, c.rdx, c.rcx, c.rax}) {
+		c.pop(reg);
+	}
+	c.jz(load, Near);
+	++m_captures;
+	c.mov(c.qword[c.r8], c.r10);
+	c.mov(c.dword[c.r8 + 8], 0);
+	c.mov(c.dword[c.r8 + 12], flat_slot);
+	c.add(c.r8, 16);
+	c.mov(c.byte[c.rdx + state], 3);
+	c.jmp(m_ret, Near);
+	c.L(load);
+}
+
 void WalkerCompiler::EmitRead(const Node& node, uint32_t index) {
 	auto&      c    = m_code;
 	const auto& inst = *node.inst;
@@ -1217,6 +1282,9 @@ void WalkerCompiler::EmitRead(const Node& node, uint32_t index) {
 			c.shr(c.rcx, 48);
 			c.jnz(m_ret, Near);
 			if (index < m_zero_tested.size() && m_zero_tested[index]) SkipZeroTestedLoad(c, c.rax, m_ret);
+			if (index < m_gpu_control.size() && m_gpu_control[index] != NoFlatSlot) {
+				SkipGpuControlLoad(c.rax, m_gpu_control[index], node.state);
+			}
 			LoadGuest(c, c.rax, m_page_cache, flat_slot);
 		} else {
 			Load(c.r11, args[1]);
@@ -1248,6 +1316,9 @@ void WalkerCompiler::EmitRead(const Node& node, uint32_t index) {
 			c.ja(zero, Near);
 			if (index < m_zero_tested.size() && m_zero_tested[index]) {
 				SkipZeroTestedLoad(c, c.rax + c.r9 + static_cast<size_t>(immediate), m_ret);
+			}
+			if (index < m_gpu_control.size() && m_gpu_control[index] != NoFlatSlot) {
+				SkipGpuControlLoad(c.rax + c.r9 + static_cast<size_t>(immediate), m_gpu_control[index], node.state);
 			}
 			LoadGuest(c, c.rax + c.r9 + static_cast<size_t>(immediate), m_page_cache, flat_slot);
 		}
@@ -1562,6 +1633,20 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 			const auto offset = slot < reads.size() ? m_plan.srt_reads[slot].flat_offset : UINT32_MAX;
 			if (offset >= reads.size()) {
 				c.jmp(fail, Near);
+				return;
+			}
+			const auto& read = reads[slot];
+			if (read.kind == Kind::Node && read.value < m_gpu_control.size() &&
+			    m_gpu_control[read.value] != NoFlatSlot) {
+				Xbyak::Label deferred, done;
+				Fetch(read, deferred);
+				c.mov(c.dword[c.rsi + offset * sizeof(uint32_t)], c.eax);
+				c.jmp(done, Near);
+				c.L(deferred);
+				c.cmp(c.byte[c.rdx + m_nodes[read.value].state], 3);
+				c.jne(fail, Near);
+				c.mov(c.dword[c.rsi + offset * sizeof(uint32_t)], 0);
+				c.L(done);
 				return;
 			}
 			Fetch(reads[slot], fail);

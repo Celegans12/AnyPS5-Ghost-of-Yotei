@@ -1208,6 +1208,13 @@ bool GuestReadLog::StillValid() const {
 			if (around) {
 				continue;
 			}
+			if (gpu_owned) {
+				for (uint32_t done = 0; done + sizeof(uint32_t) <= entry.size; done += sizeof(uint32_t)) {
+					if (Libs::LibKernel::Memory::HasGpuWrittenBytes(entry.address + done, sizeof(uint32_t))) {
+						LearnGpuProducedBound(entry.address + done);
+					}
+				}
+			}
 			if (!SameGuestBytes(reinterpret_cast<const void*>(entry.address), recorded,
 			                    entry.size) &&
 			    !refreshable(entry)) {
