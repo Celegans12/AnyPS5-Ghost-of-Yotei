@@ -1731,7 +1731,6 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDrawAhead(
 	if (!ResolveDrawPrograms(draw, context, user_config, shaders, indirect_offsets, indirect_draw, context_id,
 	                         user_config_id)) {
 		NoteAheadRefusal(false, draw.programs.reads.Refusal());
-		m_ahead_refused = true;
 		return nullptr;
 	}
 	draw.busy.store(true, std::memory_order_relaxed);
@@ -1833,7 +1832,6 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDispatchAhead(const HW::Con
 	if (slot.programs.reads.Failed() || slot.compute_module == nullptr) {
 		slot.compute_module = nullptr;
 		NoteAheadRefusal(true, slot.programs.reads.Refusal());
-		m_ahead_refused = true;
 		return nullptr;
 	}
 	slot.busy.store(true, std::memory_order_relaxed);
@@ -1864,7 +1862,6 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveIndirectDispatchAhead(
 	if (slot.programs.reads.Failed() || slot.compute_module == nullptr) {
 		slot.compute_module = nullptr;
 		NoteAheadRefusal(true, slot.programs.reads.Refusal());
-		m_ahead_refused = true;
 		return nullptr;
 	}
 	slot.busy.store(true, std::memory_order_relaxed);

@@ -231,7 +231,6 @@ public:
 	void BeginAheadOperation(ResolvedDraw* resolved, AheadNote note) noexcept;
 	void EndAheadOperation() noexcept;
 	void NoteTableServed() noexcept { m_ahead_table = true; }
-	[[nodiscard]] bool TakeAheadRefused() noexcept { return std::exchange(m_ahead_refused, false); }
 	static void NoteAhead(bool dispatch, AheadNote note, uint64_t ns) noexcept;
 	void LogResolveSummary();
 	void UseContextId(uint64_t context_id, uint64_t user_config_id = 0) noexcept {
@@ -666,7 +665,6 @@ private:
 	bool         m_ahead_dispatch = false;
 	bool         m_ahead_taken    = false;
 	bool         m_ahead_table    = false;
-	bool         m_ahead_refused  = false;
 	uint32_t     m_revalidations  = 0;
 	uint64_t     m_resolve_frames = 0;
 #if defined(ANYPS5_KYTY)

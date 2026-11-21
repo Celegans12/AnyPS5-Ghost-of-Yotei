@@ -565,6 +565,7 @@ void GuestGpu::ResolveThread() {
 			operation->ahead_note = RenderExecutor::AheadNote::TableSkip;
 		} else if (operation->kind == GpuOperationKind::DrawIndex ||
 		           operation->kind == GpuOperationKind::DrawAuto) {
+			operation->ahead_note = RenderExecutor::AheadNote::NotPrepared;
 			operation->resolved =
 			    executor.ResolveDrawAhead(*operation->state.context, *operation->state.user_config,
 			                              *operation->state.shaders, {}, false, operation->state.context_id,
@@ -572,6 +573,7 @@ void GuestGpu::ResolveThread() {
 		} else if (operation->kind == GpuOperationKind::DrawIndirect) {
 			ShaderIndirectOffsets offsets;
 			if (IndirectDrawOffsets(operation->draw_indirect.registers, offsets)) {
+				operation->ahead_note = RenderExecutor::AheadNote::NotPrepared;
 				operation->resolved = executor.ResolveDrawAhead(
 				    *operation->state.context, *operation->state.user_config,
 				    *operation->state.shaders, offsets, true, operation->state.context_id,
@@ -579,6 +581,7 @@ void GuestGpu::ResolveThread() {
 			}
 		} else if (operation->kind == GpuOperationKind::DispatchDirect ||
 		           operation->kind == GpuOperationKind::DispatchIndirect) {
+			operation->ahead_note = RenderExecutor::AheadNote::NotPrepared;
 			if (operation->kind == GpuOperationKind::DispatchDirect) {
 				const uint32_t groups[] = {operation->dispatch.thread_group_x,
 				                           operation->dispatch.thread_group_y,
@@ -596,9 +599,6 @@ void GuestGpu::ResolveThread() {
 		if (operation->kind != GpuOperationKind::Callback) {
 			if (operation->resolved != nullptr) {
 				operation->ahead_note = RenderExecutor::AheadNote::Prepared;
-			} else if (executor.TakeAheadRefused() &&
-			           operation->ahead_note == RenderExecutor::AheadNote::NotAttempted) {
-				operation->ahead_note = RenderExecutor::AheadNote::NotPrepared;
 			}
 			RenderExecutor::NoteAhead(resolve_dispatch, operation->ahead_note, Common::SteadyNs() - resolve_begin);
 			const auto* next = m_operations.TryPeek();
