@@ -426,6 +426,8 @@ private:
 	[[nodiscard]] bool DownloadImageMemory(ImageId id);
 	[[nodiscard]] bool DownloadQueuedImages();
 	void               ProtectPendingImageWriteBacks(uint64_t address, uint64_t size);
+	void               ApplyPartialBufferCopy(uint64_t address, uint64_t size, const Buffer& buffer,
+	                                          uint64_t buffer_offset);
 	void               ArmLazyReadback(Image& image);
 	void               DisarmLazyReadback(Image& image);
 	void               FlushLazyImages(std::span<const std::pair<ImageId, uint64_t>> images);

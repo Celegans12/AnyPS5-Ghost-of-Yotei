@@ -2159,6 +2159,9 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 		m_texture_cache.ProtectPendingImageWriteBacks(dst_vaddr, size);
 	}
 	dst->CopyFrom(command, *src, src_offset, dst_offset, size);
+	if (dst_memory) {
+		m_texture_cache.ApplyPartialBufferCopy(dst_vaddr, size, *dst, dst_offset);
+	}
 }
 
 void BufferCache::WriteTicks::Assign(uint64_t begin, uint64_t end, uint64_t tick) {
