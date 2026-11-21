@@ -23,6 +23,7 @@ public:
 	~LodStatsCounter();
 	KYTY_CLASS_NO_COPY(LodStatsCounter);
 
+	[[nodiscard]] static uint32_t ReportBytes(uint64_t destination, uint32_t size);
 	[[nodiscard]] Buffer& CounterBuffer();
 	void Report(uint64_t destination, uint32_t size, uint32_t control);
 
