@@ -189,6 +189,11 @@ struct WalkerPageAnswer {
 	uint64_t       page    = ~uint64_t {0};
 	SrtWalkerPage  kind    = SrtWalkerPage::Direct;
 	const uint8_t* backing = nullptr;
+#if defined(ANYPS5_KYTY)
+	const uint8_t* around       = nullptr;
+	bool           around_known = false;
+	bool           around_clean = false;
+#endif
 };
 thread_local std::array<WalkerPageAnswer, 4> t_page_answers;
 #if defined(ANYPS5_KYTY)
@@ -201,6 +206,10 @@ struct WalkerCachedPage {
 	const uint8_t* backing = nullptr;
 };
 constexpr uint32_t WalkerPageCacheSlots = 4;
+
+#if defined(ANYPS5_KYTY)
+thread_local bool t_short_probe = false;
+#endif
 
 uint64_t KYTY_SYSV_ABI ProbeGuestLoad(uint64_t address, WalkerCachedPage* cache) {
 	constexpr uint64_t PageSize = 4096;
@@ -237,6 +246,25 @@ uint64_t KYTY_SYSV_ABI ProbeGuestLoad(uint64_t address, WalkerCachedPage* cache)
 		case SrtWalkerPage::PerLoad: break;
 	}
 #if defined(ANYPS5_KYTY)
+	if (t_short_probe && !t_walker_ahead && g_guest_memory.around_page != nullptr &&
+	    address - page <= PageSize - sizeof(value)) {
+		if (!answer.around_known) {
+			answer.around_known = true;
+			answer.around       = g_guest_memory.around_page(address, answer.around_clean);
+		}
+		if (answer.around != nullptr && answer.around_clean) {
+			if (cache != nullptr) {
+				auto& slot   = cache[(page / PageSize) % WalkerPageCacheSlots];
+				slot.page    = page / PageSize;
+				slot.backing = answer.around;
+			}
+			std::memcpy(&value, answer.around + (address - page), sizeof(value));
+			return uint64_t {1} << 32u | value;
+		}
+		if (answer.around != nullptr) {
+			return g_guest_memory.read_on_page(address, value, answer.around) ? uint64_t {1} << 32u | value : 0;
+		}
+	}
 	if (g_guest_memory.read(address, value, t_walker_ahead, answer.backing)) {
 		if (t_walker_around) t_around_loads.push_back(address);
 		return uint64_t {1} << 32u | value;
@@ -2020,7 +2048,11 @@ namespace {
 
 using Walker = const uint64_t* KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*, uint64_t*, uint64_t);
 
-const uint64_t* RunWalker(const Xbyak::CodeGenerator& code, const SrtRuntime& runtime, uint32_t* flat, uint64_t* scratch) {
+const uint64_t* RunWalker(const Xbyak::CodeGenerator& code, [[maybe_unused]] bool short_form, const SrtRuntime& runtime,
+                          uint32_t* flat, uint64_t* scratch) {
+#if defined(ANYPS5_KYTY)
+	t_short_probe = short_form;
+#endif
 	t_running_walker = &code;
 	++t_walk;
 	return code.getCode<Walker>()(runtime.user_data.data(), flat, scratch, runtime.shader_base);
@@ -2065,7 +2097,7 @@ void RunReference(const ResourcePlan& plan, const SrtRuntime& runtime, WalkRecor
 	const auto around   = t_around_loads.size();
 	t_walker_faulted    = false;
 	record.flat.assign(plan.srt_reads.size(), 0u);
-	const auto* end = RunWalker(*walker.code, runtime, record.flat.data(), scratch.data());
+	const auto* end = RunWalker(*walker.code, false, runtime, record.flat.data(), scratch.data());
 	RecordWalk(plan, walker.outputs, scratch.data(), scratch.data() + walker.captures / 8u, end, deferred, around, record);
 	t_deferred_loads.resize(std::min(deferred, t_deferred_loads.size()));
 	t_around_loads.resize(std::min(around, t_around_loads.size()));
@@ -2082,7 +2114,9 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	flat.assign(plan.srt_reads.size(), 0u);
 	const auto* code     = plan.srt_code.get();
 	auto        captures = plan.srt_captures;
-#if defined(ANYPS5_KYTY)
+#if !defined(ANYPS5_KYTY)
+	const bool short_form = true;
+#else
 	const auto* long_walker = plan.srt_long_walker.get();
 	const bool  short_form  = Common::RuntimeSwitches::On(Common::RuntimeSwitches::Switch::ShortSrtWalkers);
 	const bool  verify      = long_walker != nullptr && short_form && ShortWalkersMode() == SrtShortWalkers::Verify;
@@ -2103,7 +2137,7 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	if (verify) RunReference(plan, runtime, t_walk_records[0]);
 #endif
 	const auto* first = scratch.data() + captures / 8u;
-	const auto* end   = RunWalker(*code, runtime, flat.data(), scratch.data());
+	const auto* end   = RunWalker(*code, short_form, runtime, flat.data(), scratch.data());
 #if defined(ANYPS5_KYTY)
 	if (verify) {
 		auto& [reference, record, again] = t_walk_records;
