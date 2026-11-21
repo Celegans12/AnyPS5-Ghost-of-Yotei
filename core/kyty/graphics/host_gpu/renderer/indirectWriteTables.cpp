@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cstring>
+#include <utility>
 
 namespace Libs::Graphics {
 
@@ -154,8 +155,14 @@ bool IndirectWriteTables::Prepare(uint64_t address, uint64_t size) {
 	if (table->target_count == 0) {
 		return false;
 	}
-	m_pending_writes = true;
+	NotePendingWrites();
 	return true;
+}
+
+void IndirectWriteTables::NotePendingWrites() noexcept {
+	if (!std::exchange(m_pending_writes, true)) {
+		m_context.GetBufferCache().BeginIndirectWrites();
+	}
 }
 
 void IndirectWriteTables::NoteWrites(std::span<const uint64_t> pages) {

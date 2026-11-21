@@ -1131,6 +1131,7 @@ void RenderContext::RunGarbageCollector() {
 		m_buffer_cache.ProcessWriteBuffer([this](std::span<const uint64_t> pages) {
 			m_indirect_write_tables.NoteWrites(pages);
 		});
+		m_command_scheduler.DeferOperation([this] { m_buffer_cache.EndIndirectWrites(); });
 	}
 	m_texture_cache.ProcessDownloadImages();
 	m_texture_cache.RunGarbageCollector();

@@ -20,7 +20,7 @@ public:
 	KYTY_CLASS_NO_COPY(IndirectWriteTables);
 
 	bool Prepare(uint64_t address, uint64_t size);
-	void NotePendingWrites() noexcept { m_pending_writes = true; }
+	void NotePendingWrites() noexcept;
 	[[nodiscard]] bool TakePendingWrites() noexcept {
 		const bool pending = m_pending_writes;
 		m_pending_writes   = false;

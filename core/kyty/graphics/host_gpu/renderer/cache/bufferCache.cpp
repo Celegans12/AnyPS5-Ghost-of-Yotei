@@ -527,7 +527,7 @@ BufferCache::WriteFaultOwner BufferCache::InvalidateGuestWriteFault(uint64_t vad
 	uint64_t   mark = TRACKER_PAGE_SIZE;
 	if (!open_block && page >= TRACKER_PAGE_SIZE && GuestRange {page - TRACKER_PAGE_SIZE, end - page}.Valid() &&
 	    m_memory_tracker.IsRegionCpuModified(page - TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE) &&
-	    !m_memory_tracker.IsRegionGpuModified(page, end - page)) {
+	    !m_memory_tracker.IsRegionGpuModified(page, end - page) && MayMarkAhead()) {
 		mark = end - page;
 	}
 	auto& stats   = g_write_block_stats;
@@ -587,12 +587,16 @@ BufferCache::WriteFaultOwner BufferCache::InvalidateFaultedPage(uint64_t vaddr) 
 	const auto end  = Common::AlignDown(page, FaultBlockSize) + FaultBlockSize;
 	if (page >= TRACKER_PAGE_SIZE && GuestRange {page - TRACKER_PAGE_SIZE, end - page}.Valid() &&
 	    m_memory_tracker.IsRegionCpuModified(page - TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE) &&
-	    !m_memory_tracker.IsRegionGpuModified(page, end - page)) {
+	    !m_memory_tracker.IsRegionGpuModified(page, end - page) && MayMarkAhead()) {
 		InvalidateMemory(page, end - page, true);
 		return owner;
 	}
 	InvalidateMemory(vaddr, 1, true);
 	return owner;
+}
+
+bool BufferCache::MayMarkAhead() const noexcept {
+	return m_indirect_writes_pending.load(std::memory_order_acquire) == 0;
 }
 
 void BufferCache::CountWriteFault(WriteFaultOwner owner, bool image) {

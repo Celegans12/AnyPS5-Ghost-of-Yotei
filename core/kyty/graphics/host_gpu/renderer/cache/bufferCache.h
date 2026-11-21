@@ -270,6 +270,8 @@ public:
 			m_flush_requested = true;
 		}
 	}
+	void BeginIndirectWrites() noexcept { m_indirect_writes_pending.fetch_add(1, std::memory_order_acq_rel); }
+	void EndIndirectWrites() noexcept { m_indirect_writes_pending.fetch_sub(1, std::memory_order_acq_rel); }
 	void NoteDeviceAddressUse() noexcept {
 		m_device_address_pending = true;
 		if (m_device_address_hot != 0 &&
@@ -283,6 +285,7 @@ private:
 
 	bool IsBufferInvalid(BufferId id) const { return !id || m_slot_buffers[id].is_deleted; }
 	WriteFaultOwner InvalidateGuestWriteFault(uint64_t vaddr);
+	[[nodiscard]] bool MayMarkAhead() const noexcept;
 
 	using BufferMap = std::map<uint64_t, BufferId>;
 	struct OverlapResult {
@@ -423,6 +426,7 @@ private:
 	std::array<GpuLineRange, GpuLineRanges>       m_gpu_line_current_ranges {};
 	std::array<GpuLineRange, GpuLineRanges>       m_gpu_line_ever_ranges {};
 	std::atomic<bool>                             m_gpu_line_overflow {false};
+	std::atomic<uint32_t>                         m_indirect_writes_pending {0};
 	static constexpr size_t                       GpuLineMemo = 8;
 	std::array<GpuLineRange, GpuLineMemo>         m_gpu_line_memo {};
 	size_t                                        m_gpu_line_memo_next = 0;
