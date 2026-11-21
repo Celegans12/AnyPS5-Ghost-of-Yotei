@@ -542,6 +542,20 @@ add_test(NAME kyty_shim_uniform_scalar_loads COMMAND kyty_shim_uniform_scalar_lo
 set_tests_properties(kyty_shim_uniform_scalar_loads PROPERTIES TIMEOUT 60
         PASS_REGULAR_EXPRESSION "kyty_shim_uniform_scalar_loads: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
 
+add_test_executable(kyty_shim_short_srt_walkers_tests ${CMAKE_CURRENT_SOURCE_DIR}/ShortSrtWalkers.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+target_include_directories(kyty_shim_short_srt_walkers_tests PRIVATE ${LIBS_INCLUDE_DIR})
+configure_host_test_executable(kyty_shim_short_srt_walkers_tests)
+if(MINGW)
+    target_link_libraries(kyty_shim_short_srt_walkers_tests PRIVATE stdc++ gcc_eh)
+endif()
+target_link_libraries(kyty_shim_short_srt_walkers_tests PRIVATE Kyty::gpu libkernel libc)
+add_test(NAME kyty_shim_short_srt_walkers_ab COMMAND kyty_shim_short_srt_walkers_tests)
+set_tests_properties(kyty_shim_short_srt_walkers_ab PROPERTIES TIMEOUT 20 ENVIRONMENT "KYTY_AB=3:KYTY_SHORT_SRT_WALKERS"
+        PASS_REGULAR_EXPRESSION "kyty_shim_short_srt_walkers_ab: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED|mismatch")
+add_test(NAME kyty_shim_short_srt_walkers_verify COMMAND kyty_shim_short_srt_walkers_tests)
+set_tests_properties(kyty_shim_short_srt_walkers_verify PROPERTIES TIMEOUT 20 ENVIRONMENT "KYTY_SHORT_SRT_WALKERS=verify"
+        PASS_REGULAR_EXPRESSION "kyty_shim_short_srt_walkers_verify: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED|mismatch")
+
 add_test_executable(kyty_shim_ab_switches_tests ${CMAKE_CURRENT_SOURCE_DIR}/AbSwitches.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
 target_include_directories(kyty_shim_ab_switches_tests PRIVATE ${LIBS_INCLUDE_DIR})
 configure_host_test_executable(kyty_shim_ab_switches_tests)
