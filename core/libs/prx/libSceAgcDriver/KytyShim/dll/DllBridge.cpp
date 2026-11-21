@@ -16,6 +16,7 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/RunReport.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
@@ -549,6 +550,14 @@ std::uint64_t sceKernelGetProcessTime() {
 
 std::uint64_t sceKernelGetProcessTimeCounter() {
     return Host(__func__)->kernel_process_time_counter();
+}
+
+void LibcRunReportSetGpu_nid_no_patch(unsigned vendorId, const char* name, const char* driver, unsigned apiVersion) noexcept {
+    Host(__func__)->run_report_set_gpu(vendorId, name, driver, apiVersion);
+}
+
+void LibcRunReportFramePresented_nid_no_patch() noexcept {
+    Host(__func__)->run_report_frame_presented();
 }
 
 KernelEqueueRef EqueuePin_nid_postfix(KernelEqueue eq) {

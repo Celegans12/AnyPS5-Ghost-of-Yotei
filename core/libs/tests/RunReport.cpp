@@ -1230,6 +1230,29 @@ void FrameTimesReportTest() {
     Require(Contains(RunReport::Serialize(report, RunReport::HostIdentifiers{}), "\"p99\": 3.000"), "covered frame percentiles must be written");
 }
 
+void BackendCoverageTest() {
+    const auto own = RunReport::BackendCoverage(false);
+    Require(own.milestones && own.missing && own.shaders && own.unsupported && own.imageFormats && own.descriptors, "the default backend collects every section");
+    const auto kyty = RunReport::BackendCoverage(true);
+    Require(kyty.milestones && kyty.missing, "the Kyty backend collects the milestones, the frame counts and the missing functions");
+    Require(!kyty.shaders && !kyty.unsupported && !kyty.imageFormats && !kyty.descriptors, "the Kyty backend feeds no shader, format or descriptor counter");
+    Directory executable, user;
+    auto settings = Covered(executable.path, user.path, IdA);
+    settings.coverage = kyty;
+    RunReport::Collector collector(std::move(settings));
+    Require(collector.Start(), "the collector did not start");
+    collector.NoteShader(0);
+    collector.NoteGpu(RunReport::GpuInfo{"NVIDIA", "Test GPU", "NVIDIA 575.64.03", "1.3.280"});
+    collector.NoteFramePresented();
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    collector.NoteFramePresented();
+    collector.Finish(RunReport::Exit::Clean, {}, 0);
+    const auto text = Read(collector.ReportPath());
+    Require(Contains(text, "\"framesPresented\": 2") && Contains(text, "\"stage\": \"presents\"") && !Contains(text, "\"averageFps\": null"), "the frames of a Kyty run must be counted: " + text);
+    Require(Contains(text, "\"name\": \"Test GPU\"") && Contains(text, "\"driver\": \"NVIDIA 575.64.03\""), "the GPU of a Kyty run must be written: " + text);
+    Require(Contains(text, "\"shaders\": false") || Contains(text, "\"shaders\":false"), "the report must say that a Kyty run collected no shader section: " + text);
+}
+
 void CompileTimeTest() {
     Directory executable, user;
     RunReport::Collector collector(Covered(executable.path, user.path, IdA));
@@ -1637,6 +1660,7 @@ int main(int argc, char** argv) {
         Run("frame-percentile", FramePercentileTest);
         Run("frame-ring-wiring", FrameRingWiringTest);
         Run("frame-times-report", FrameTimesReportTest);
+        Run("backend-coverage", BackendCoverageTest);
         Run("compile-time-total", CompileTimeTest);
         Run("compile-time-report", CompileTimeReportTest);
         Run("slow-compile-count", SlowCompileTest);

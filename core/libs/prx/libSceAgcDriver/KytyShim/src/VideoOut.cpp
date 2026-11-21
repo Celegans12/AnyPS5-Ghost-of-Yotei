@@ -22,6 +22,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Presentation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "prx/libSceAgcDriver/KytyShim/src/Replay.hpp"
+#include "prx/libc/include/RunReport.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 
 #ifdef _WIN32
@@ -777,6 +778,12 @@ void PresentLayers(Libs::Graphics::Presenter& presenter, Libs::Graphics::Present
     presenter.Present(std::span(layers));
 }
 
+void PresentGuestLayers(Libs::Graphics::WindowContext& host, Libs::Graphics::Presenter& presenter, Libs::Graphics::Presenter::Frame& main, Libs::Graphics::Presenter::Frame* overlay) {
+    const auto before = host.loop.presented_frames.load(std::memory_order_relaxed);
+    PresentLayers(presenter, main, overlay);
+    if (host.loop.presented_frames.load(std::memory_order_relaxed) != before) LibcRunReportFramePresented_nid_no_patch();
+}
+
 }
 }
 
@@ -790,13 +797,13 @@ extern "C" void AgcDriverPresentBuffer_nid_postfix(const AgcDriver::Presentation
     const auto flip = KytyShim::Present::TakeReadyFlip(context, presenter);
     if (flip.has_value() && flip->frame != nullptr && flip->source == buffer) {
         const auto overlay = overlayImage.has_value() ? KytyShim::Present::PrepareGuestFrames(renderer, presenter, std::nullopt, overlayImage) : nullptr;
-        KytyShim::Present::PresentLayers(presenter, *flip->frame, overlay != nullptr ? overlay->overlay : nullptr);
+        KytyShim::Present::PresentGuestLayers(host, presenter, *flip->frame, overlay != nullptr ? overlay->overlay : nullptr);
         gpuReady(context);
         return;
     }
     if (flip.has_value() && flip->frame != nullptr) presenter.Discard(*flip->frame);
     const auto prepared = KytyShim::Present::PrepareGuestFrames(renderer, presenter, KytyShim::Present::DescribeGuestImage(&buffer), overlayImage);
-    KytyShim::Present::PresentLayers(presenter, *prepared->main, prepared->overlay);
+    KytyShim::Present::PresentGuestLayers(host, presenter, *prepared->main, prepared->overlay);
     gpuReady(context);
 }
 

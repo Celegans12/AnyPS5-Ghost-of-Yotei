@@ -1842,7 +1842,11 @@ bool StartRunReport() noexcept {
         if (APS5_REPORT_MODIFIED >= 0) settings.build.modified = APS5_REPORT_MODIFIED != 0;
         settings.game = ProvideGame;
         settings.requiredComponents = {"libkernel", "libSceVideoOut", "libSceAgcDriver"};
-        settings.coverage = {true, true, true, true, true, true};
+#if defined(ANYPS5_KYTY)
+        settings.coverage = RunReport::BackendCoverage(true);
+#else
+        settings.coverage = RunReport::BackendCoverage(false);
+#endif
         settings.arguments = arguments;
         settings.environment = RunReport::ProcessEnvironment();
         settings.configFiles = RunReport::ConfigFileNames(settings.environment);

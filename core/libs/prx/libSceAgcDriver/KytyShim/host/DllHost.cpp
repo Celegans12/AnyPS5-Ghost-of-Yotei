@@ -20,6 +20,7 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/RunReport.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
@@ -236,6 +237,8 @@ KytyDllHost MakeHost() {
     host.kernel_tsc_frequency = [] { return sceKernelGetTscFrequency(); };
     host.kernel_process_time = [] { return sceKernelGetProcessTime(); };
     host.kernel_process_time_counter = [] { return sceKernelGetProcessTimeCounter(); };
+    host.run_report_set_gpu = [](std::uint32_t vendorId, const char* name, const char* driver, std::uint32_t apiVersion) { LibcRunReportSetGpu_nid_no_patch(vendorId, name, driver, apiVersion); };
+    host.run_report_frame_presented = [] { LibcRunReportFramePresented_nid_no_patch(); };
     host.equeue_add_event = [](std::int64_t eq, const KytyDllEqueueEvent* event, int* result) {
         return Guard([&] {
             KernelEqueueEvent ours;

@@ -129,6 +129,10 @@ struct Coverage {
     bool milestones = false, missing = false, shaders = false, unsupported = false, imageFormats = false, descriptors = false;
 };
 
+inline constexpr Coverage BackendCoverage(bool kyty) noexcept {
+    return kyty ? Coverage{true, true, false, false, false, false} : Coverage{true, true, true, true, true, true};
+}
+
 struct Truncated {
     std::int64_t functions = 0, unsupported = 0, imageFormats = 0, descriptors = 0;
 };

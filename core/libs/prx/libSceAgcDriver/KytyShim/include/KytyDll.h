@@ -13,7 +13,7 @@
 extern "C" {
 #endif
 
-#define KYTY_DLL_ABI_VERSION 2u
+#define KYTY_DLL_ABI_VERSION 3u
 #define KYTY_DLL_CREATE_SYMBOL "KytyDllCreate"
 #define KYTY_DLL_FILE_NAME L"kyty_gpu.prx"
 
@@ -142,6 +142,8 @@ typedef struct KytyDllHost {
     uint64_t (*kernel_tsc_frequency)(void);
     uint64_t (*kernel_process_time)(void);
     uint64_t (*kernel_process_time_counter)(void);
+    void (*run_report_set_gpu)(uint32_t vendor_id, const char* name, const char* driver, uint32_t api_version);
+    void (*run_report_frame_presented)(void);
 
     KytyDllStatus (*equeue_add_event)(int64_t eq, const KytyDllEqueueEvent* event, int* result);
     KytyDllStatus (*equeue_delete_event)(int64_t eq, uintptr_t ident, int16_t filter, int* result);

@@ -8,6 +8,7 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/HostThread.hpp"
+#include "prx/libc/include/RunReport.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #include "prx/libkernel/Time/include/SleepWake.hpp"
@@ -92,6 +93,15 @@ bool HostWriteWatched(std::uintptr_t address, std::size_t bytes) {
     return Libs::LibKernel::Memory::GuestRangeWatched(address, bytes);
 }
 
+void NoteRunReportGpu(const Libs::Graphics::GraphicContext& graphics) {
+    VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &driver};
+    VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceProperties2(graphics.physical_device, &properties);
+    std::string driverText = std::string(driver.driverName) + " " + driver.driverInfo;
+    if (driver.driverName[0] == '\0' && driver.driverInfo[0] == '\0') driverText = std::to_string(properties.properties.driverVersion);
+    LibcRunReportSetGpu_nid_no_patch(properties.properties.vendorID, properties.properties.deviceName, driverText.c_str(), properties.properties.apiVersion);
+}
+
 void ReportKytyHost(const Libs::Graphics::GraphicContext& graphics) {
     static std::atomic<bool> printed{false};
     if (printed.exchange(true)) return;
@@ -145,6 +155,7 @@ void Initialize() {
     const auto height = Config::GetScreenHeight();
     auto& presenter = WindowInit(width, height);
     KytyShim::ReportNativeRayTracing(presenter.Renderer().GetGraphics());
+    KytyShim::Entry::NoteRunReportGpu(presenter.Renderer().GetGraphics());
     if (hostReport) KytyShim::Entry::ReportKytyHost(presenter.Renderer().GetGraphics());
     auto& video_out = VideoOut::VideoOutInit(width, height, presenter);
     g_renderer = &presenter.Renderer();

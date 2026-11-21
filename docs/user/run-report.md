@@ -74,6 +74,12 @@ Values pass through the same text filter as the report, so a path or a user name
 
 `coverage.milestones` is true on every system; it means the stage, the milestones the system records and the frame counts were collected. Read a missing `loaded` or `started` on Linux or Windows as "this system does not record it", never as "not reached": a report with `stage: first-draw` and no `loaded` is a run that drew. The report says only what was observed: any other milestone that is missing may mean the run did not reach it, and it may mean the system does not record it, so read the table before you read a gap. `firstDraw` in particular is not set by compute work that is submitted and waited for on its own.
 
+## With the Kyty backend
+
+A build with `-DANYPS5_GPU_BACKEND=kyty` (AnyKyty) feeds the report from the Kyty presenter. `milestones.firstPresent`, `framesPresented`, `averageFps`, `fpsWindowSeconds` and `frameMs` count the display buffers of the game that the Kyty swapchain accepted: a cleared or blank frame is not counted, and neither is a frame the swapchain dropped. `system.gpu` is the Vulkan device Kyty selected, which `ANYPS5_GPU` picks, with the driver's name and version. `milestones.firstDraw` is not recorded, so a run that presents has the stage `presents` and a run that stops before its first frame has the stage `unknown`.
+
+Kyty translates and compiles its own shaders, so the shader, instruction, format and descriptor counters of AnyPS5's driver stay at zero: `coverage.shaders`, `coverage.unsupported`, `coverage.imageFormats` and `coverage.descriptors` are `false`, and the `shaders` section of such a report says nothing about what was compiled. The missing functions are counted as with the default driver.
+
 ## What the runtime counts
 
 - `milestones.firstDraw` is set when a batch that carries a recorded guest draw or dispatch has been accepted by the GPU queue. A guest draw counts in either kind of batch the runtime submits; a guest compute dispatch counts only when it is recorded into the runtime's main batch (a dispatch that is submitted and waited for on its own does not set the milestone). `firstPresent` and `framesPresented` count guest display buffers that the swapchain queue accepted (a suboptimal one too); internal clears, test pixels and rejected presents are not counted. `loaded` and `started` come from the entry bridge of the converted executable; only the macOS bridge reports them so far, so on other systems those two are left out.
