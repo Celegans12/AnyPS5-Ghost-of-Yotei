@@ -547,6 +547,13 @@ public:
 		}
 	}
 
+	void MarkCpuDirtyUnlessGpuDirty(uint64_t offset, uint64_t size) KYTY_REQUIRES(lock) {
+		const auto [start, end] = GetPageRange(offset, size);
+		for (const auto [first, last]: RegionBits(~m_gpu_dirty, start, end)) {
+			ChangeState<DirtySource::Cpu, true>(first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
+		}
+	}
+
 	uint64_t SetInPlace(uint64_t offset, uint64_t size) KYTY_REQUIRES(lock) {
 		const auto [start, end] = GetPageRange(offset, size);
 		RegionBits newly(~m_in_place, start, end);

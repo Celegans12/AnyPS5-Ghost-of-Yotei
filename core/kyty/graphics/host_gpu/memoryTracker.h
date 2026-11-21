@@ -322,6 +322,13 @@ public:
 		}
 	}
 
+	void MarkRegionAsCpuModifiedUnlessGpuDirty(uint64_t vaddr, uint64_t size) noexcept {
+		Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			Common::ScopedLock lock(manager->lock);
+			manager->MarkCpuDirtyUnlessGpuDirty(offset, bytes);
+		});
+	}
+
 	template <typename Func>
 	void MarkRegionAsGpuModifiedUnlessCpuDirty(uint64_t vaddr, uint64_t size, Func&& func) {
 		std::vector<std::pair<uint64_t, uint64_t>> runs;

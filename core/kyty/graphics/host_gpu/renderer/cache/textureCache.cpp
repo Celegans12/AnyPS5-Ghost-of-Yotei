@@ -60,6 +60,11 @@ constexpr size_t   MaxParkedImages  = 8;
 constexpr uint64_t ParkedImageTicks = 2048;
 constexpr uint64_t LazyReadbackBytes = 256 * 1024;
 constexpr uint64_t PartialDirtyMinSize = uint64_t {8} << 20;
+
+void AddWrittenPages(RangeSet& written, uint64_t address, uint64_t size) {
+	const auto first = Common::AlignDown(address, TRACKER_PAGE_SIZE);
+	written.Add(first, Common::AlignUp(address + size, TRACKER_PAGE_SIZE) - first);
+}
 constexpr uint64_t PartialDirtyGranule = uint64_t {256} << 10;
 constexpr uint64_t PartialUploadMaxShare = 2;
 constexpr uint64_t PartialUploadChunk = uint64_t {64} << 20;
@@ -3204,15 +3209,16 @@ void PooledBytes::Return() noexcept {
 }
 
 void WriteBackChanged(uint64_t address, const uint8_t* result, const uint8_t* snapshot,
-                      uint64_t size) {
+                      uint64_t size, RangeSet& written) {
 	const auto current = PooledBytes::Acquire(size);
 	if (!LibKernel::Memory::TryReadBacking(address, current.Data(), size)) {
 		return;
 	}
 	const auto counts = CompareWriteBack(
 	    address, result, snapshot, current.Data(), size,
-	    [](uint64_t at, const uint8_t* data, uint64_t bytes) {
+	    [&written](uint64_t at, const uint8_t* data, uint64_t bytes) {
 		    LibKernel::Memory::WriteBacking(at, data, bytes);
+		    AddWrittenPages(written, at, bytes);
 	    });
 	if (counts.kept != 0) {
 		char detail[128];
@@ -3283,6 +3289,7 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	] {
 		    const auto range = write_back->range;
 		    download.buffer->Invalidate(download.offset, range.size);
+		    RangeSet written;
 		    {
 			    Common::ScopedLock publication_lock {write_back->publication_mutex};
 			    uint64_t cursor = range.address;
@@ -3294,11 +3301,12 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 				    const auto size = end - cursor;
 #if defined(ANYPS5_KYTY)
 				    if (snapshot) {
-					    WriteBackChanged(cursor, download.mapped + offset, snapshot.Data() + offset, size);
+					    WriteBackChanged(cursor, download.mapped + offset, snapshot.Data() + offset, size, written);
 					    return;
 				    }
 #endif
 				    LibKernel::Memory::WriteBacking(cursor, download.mapped + offset, size);
+				    AddWrittenPages(written, cursor, size);
 			    };
 			    write_back->superseded.ForEach([&](uint64_t begin, uint64_t end) {
 				    publish_until(begin);
@@ -3306,6 +3314,9 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 			    });
 			    publish_until(range.End());
 		    }
+		    written.ForEach([&](uint64_t begin, uint64_t end) {
+			    m_buffer_cache.InvalidateUnlessGpuModified(begin, end - begin);
+		    });
 		    if (trapped) {
 			    m_page_manager.UpdatePageWatchers<false, true>(range.address, range.size);
 		    }

@@ -505,7 +505,7 @@ void BufferCache::DiscardGpuWrites(uint64_t vaddr, uint64_t size) {
 
 void BufferCache::InvalidateUnlessGpuModified(uint64_t vaddr, uint64_t size) noexcept {
 	if (GuestRange {vaddr, size}.Valid()) {
-		m_memory_tracker.InvalidateRegion(vaddr, size, [] {});
+		m_memory_tracker.MarkRegionAsCpuModifiedUnlessGpuDirty(vaddr, size);
 	}
 }
 

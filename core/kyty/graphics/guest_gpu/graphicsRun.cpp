@@ -2467,6 +2467,7 @@ void CommandProcessor::EmitHleTlas() {
 				}
 			}
 			Libs::LibKernel::Memory::WriteBacking(build.header, header.data(), sizeof(header));
+			cache.InvalidateUnlessGpuModified(build.header, sizeof(header));
 			(void)cache.ObtainBuffer(build.header + 256u, size - 256u, true);
 			context.NoteHleTlas(build.header, size, build.count != 0 ? blases : std::vector<uint64_t> {});
 			recorded[index] = 1;
