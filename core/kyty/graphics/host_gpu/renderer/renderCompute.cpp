@@ -486,7 +486,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	const ShaderComputeInputInfo pristine = input_info;
 	const ShaderModule* compute_module = nullptr;
 	if (!TakeResolvedDispatch(input_info, compute_module)) {
-		compute_module = m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info);
+		compute_module = ResolveComputeHere(cs_regs, input_info);
 	}
 #if defined(ANYPS5_KYTY)
 	if (m_flat_defer_check != nullptr) {
@@ -779,7 +779,7 @@ void RenderExecutor::DispatchIndirectThreads(CommandBuffer& buffer, uint64_t arg
 		input_info.async_compute              = async_compute;
 		input_info.dispatch_thread_dimensions = true;
 		input_info.dispatch_indirect_threads  = true;
-		compute_module = m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info);
+		compute_module = ResolveComputeHere(cs_regs, input_info);
 	}
 #if defined(ANYPS5_KYTY)
 	if (m_flat_defer_check != nullptr) {
@@ -946,7 +946,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	const ShaderModule* compute_module = nullptr;
 	if (!TakeResolvedDispatch(input_info, compute_module)) {
 		input_info     = pristine;
-		compute_module = m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info);
+		compute_module = ResolveComputeHere(cs_regs, input_info);
 	}
 #if defined(ANYPS5_KYTY)
 	if (m_flat_defer_check != nullptr) {

@@ -48,6 +48,30 @@ struct KYTY_CAPABILITY("programs lock") ProgramSpinLock {
 	std::atomic_flag flag;
 };
 
+enum class AheadRefusal : uint8_t {
+	None,
+	Read,
+	Stage,
+	Compiling,
+	Shape,
+	Calls,
+	ImageHeap,
+	Materialize,
+	Variant,
+	GpuVariant,
+	Count
+};
+
+enum class StaleRead : uint8_t {
+	None,
+	Failed,
+	ZeroTest,
+	CpuWrite,
+	GpuWrite,
+	Strict,
+	Count
+};
+
 class GuestReadLog {
 public:
 	void Clear() {
@@ -59,6 +83,7 @@ public:
 		m_stage       = 0;
 		m_plan        = nullptr;
 		m_failed      = false;
+		m_refusal     = AheadRefusal::None;
 		m_gpu_written = false;
 #if defined(ANYPS5_KYTY)
 		m_deferred_words     = 0;
@@ -72,8 +97,13 @@ public:
 		m_stage = stage;
 		m_plan  = plan;
 	}
-	void               Fail() { m_failed = true; }
-	[[nodiscard]] bool Failed() const { return m_failed; }
+	void Fail(AheadRefusal why = AheadRefusal::Read) {
+		if (!m_failed) m_refusal = why;
+		m_failed = true;
+	}
+	[[nodiscard]] bool         Failed() const { return m_failed; }
+	[[nodiscard]] AheadRefusal Refusal() const { return m_refusal; }
+	[[nodiscard]] StaleRead    Stale() const { return m_stale; }
 	[[nodiscard]] bool MayHaveReadGpuWrites() const { return m_gpu_written; }
 	[[nodiscard]] bool StillValid() const;
 	[[nodiscard]] bool HasDescriptorRefresh() const { return !m_refresh.empty(); }
@@ -153,6 +183,8 @@ private:
 	uint32_t              m_stage       = 0;
 	const ShaderRecompiler::IR::ResourcePlan* m_plan = nullptr;
 	bool                  m_failed      = false;
+	AheadRefusal          m_refusal     = AheadRefusal::None;
+	mutable StaleRead     m_stale       = StaleRead::None;
 	bool                  m_gpu_written = false;
 #if defined(ANYPS5_KYTY)
 	uint32_t         m_deferred_words     = 0;

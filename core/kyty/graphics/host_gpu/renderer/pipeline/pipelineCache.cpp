@@ -660,14 +660,14 @@ void GuestReadLog::Append(uint64_t address, const void* data, uint32_t size, boo
 
 bool GuestReadLog::Read(uint64_t address, void* data, uint64_t size, bool strict) {
 	if (size == 0 || size > UINT32_MAX) {
-		m_failed = true;
+		Fail(AheadRefusal::Read);
 		return false;
 	}
 	const auto watched = strict && size >= StrictWatch::MinSize
 	                         ? Libs::LibKernel::Memory::WatchStrictRead(address, size)
 	                         : 0;
 	if (!Libs::LibKernel::Memory::TryReadBacking(address, data, size)) {
-		m_failed = true;
+		Fail(AheadRefusal::Read);
 		return false;
 	}
 	const bool ahead = t_ahead_guest_writes.Apply(address, data, size);
@@ -1094,7 +1094,9 @@ static bool SameGuestBytes(const void* guest, const uint8_t* recorded, uint32_t 
 
 bool GuestReadLog::StillValid() const {
 	m_refresh.clear();
+	m_stale = StaleRead::None;
 	if (m_failed) {
+		m_stale = StaleRead::Failed;
 		return false;
 	}
 	std::array<uint8_t, StrictCheckBytes> buffer {};
@@ -1111,6 +1113,7 @@ bool GuestReadLog::StillValid() const {
 		const auto* recorded = m_bytes.data() + entry.offset;
 		if (entry.zero_test) {
 			if (!ZeroTestHolds(entry)) {
+				m_stale = StaleRead::ZeroTest;
 				return false;
 			}
 			continue;
@@ -1144,6 +1147,7 @@ bool GuestReadLog::StillValid() const {
 				                             entry.address + done, buffer.data(), bytes);
 				if (around && std::memcmp(buffer.data(), recorded + done, bytes) != 0) {
 					if (!refreshable(entry)) {
+						m_stale = StaleRead::GpuWrite;
 						return false;
 					}
 					break;
@@ -1155,12 +1159,14 @@ bool GuestReadLog::StillValid() const {
 			if (!SameGuestBytes(reinterpret_cast<const void*>(entry.address), recorded,
 			                    entry.size) &&
 			    !refreshable(entry)) {
+				m_stale = StaleRead::CpuWrite;
 				return false;
 			}
 			continue;
 		}
 		if (!Libs::LibKernel::Memory::GpuCleanBackingEqualsSince(entry.address, recorded, entry.size, entry.watched,
 		                                                        ParallelEqual)) {
+			m_stale = StaleRead::Strict;
 			return false;
 		}
 	}
@@ -2303,7 +2309,7 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 		                           0, vertex_regs.ls_regs.data_addr,
 		                           [&] { vertex_params = PrepareTessellationPrograms(vertex_regs, context, vertex_info); })) {
 			vertex_info[0].stage = {};
-			if (ahead != nullptr) ahead->reads.Fail();
+			if (ahead != nullptr) ahead->reads.Fail(AheadRefusal::Stage);
 			return ahead == nullptr;
 		}
 #else
@@ -2312,7 +2318,7 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 #if defined(ANYPS5_KYTY)
 		const auto skip_tessellation = [&] {
 			vertex_info[0].stage = {};
-			if (ahead != nullptr) ahead->reads.Fail();
+			if (ahead != nullptr) ahead->reads.Fail(AheadRefusal::Stage);
 			return ahead == nullptr;
 		};
 		const uint64_t layout_key[] = {vertex_params[0].hash, vertex_params[1].hash,
@@ -2331,7 +2337,7 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 			if (ahead != nullptr) {
 				const auto found = m_tess_layouts.find(layout_hash);
 				if (found == m_tess_layouts.end()) {
-					ahead->reads.Fail();
+					ahead->reads.Fail(AheadRefusal::Stage);
 					return false;
 				}
 				tess = found->second;
@@ -2393,7 +2399,7 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 		                           0, vertex_regs.es_regs.data_addr,
 		                           [&] { vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]); })) {
 			vertex_info[0].stage = {};
-			if (ahead != nullptr) ahead->reads.Fail();
+			if (ahead != nullptr) ahead->reads.Fail(AheadRefusal::Stage);
 			return ahead == nullptr;
 		}
 #else
@@ -2438,7 +2444,7 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 				    vertex_params[0].hash));
 			}
 			if (ahead != nullptr) {
-				ahead->reads.Fail();
+				ahead->reads.Fail(AheadRefusal::Stage);
 			}
 			return false;
 		}
@@ -2468,7 +2474,7 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 		                           0, pixel_regs.ps_regs.data_addr,
 		                           [&] { pixel_params = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info); })) {
 			vertex_info[0].stage = {};
-			if (ahead != nullptr) ahead->reads.Fail();
+			if (ahead != nullptr) ahead->reads.Fail(AheadRefusal::Stage);
 			return ahead == nullptr;
 		}
 #else
@@ -2725,12 +2731,16 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 			t_ahead_missing = true;
 #endif
 		}
-		if (entry == m_program_cache.end() || ahead.stages == ProgramResolution::MaxStages ||
-		    entry->second.skip_dispatch || entry->second.call_source ||
-		    std::ranges::any_of(entry->second.modules, [](const ShaderModule& module) {
-			    return module.info.info.uses_image_heap;
-		    })) {
-			ahead.reads.Fail();
+		const auto refusal =
+		    entry == m_program_cache.end()                ? AheadRefusal::Compiling
+		    : ahead.stages == ProgramResolution::MaxStages || entry->second.skip_dispatch ? AheadRefusal::Shape
+		    : entry->second.call_source                   ? AheadRefusal::Calls
+		    : std::ranges::any_of(entry->second.modules,
+		                          [](const ShaderModule& module) { return module.info.info.uses_image_heap; })
+		        ? AheadRefusal::ImageHeap
+		        : AheadRefusal::None;
+		if (refusal != AheadRefusal::None) {
+			ahead.reads.Fail(refusal);
 			return nullptr;
 		}
 		program = &entry->second;
@@ -2767,7 +2777,7 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 #endif
 	if (!ShaderRecompiler::IR::MaterializeResources(program->resource_plan, runtime, resources,
 	                                                specialization)) {
-		ahead.reads.Fail();
+		ahead.reads.Fail(AheadRefusal::Materialize);
 		return nullptr;
 	}
 #if defined(ANYPS5_KYTY)
@@ -2794,18 +2804,19 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 		module = modules.end() - 1;
 	}
 	if (module != modules.end() && module->info.info.uses_image_heap) {
-		ahead.reads.Fail();
+		ahead.reads.Fail(AheadRefusal::ImageHeap);
 		return nullptr;
 	}
 #endif
 	if (module == modules.end()) {
 #if defined(ANYPS5_KYTY)
 		if (!program->failed_variants.empty() && program->Failed(specialization, push_data_cursor)) {
-			ahead.reads.Fail();
+			ahead.reads.Fail(AheadRefusal::Variant);
 			return nullptr;
 		}
 #endif
-		if (!ahead.reads.MayHaveReadGpuWrites() && !t_ahead_unread_load) {
+		const bool queued = !ahead.reads.MayHaveReadGpuWrites() && !t_ahead_unread_load;
+		if (queued) {
 #if defined(ANYPS5_KYTY)
 			auto promoted = specialization;
 			program->PromoteEmptyBuffers(resources, promoted, push_data_cursor);
@@ -2815,7 +2826,7 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 			QueueCompile(key, params, input_info, push_data_cursor, &specialization);
 #endif
 		}
-		ahead.reads.Fail();
+		ahead.reads.Fail(queued ? AheadRefusal::Variant : AheadRefusal::GpuVariant);
 		return nullptr;
 	}
 	last = static_cast<size_t>(module - modules.begin());
@@ -3819,7 +3830,7 @@ const ShaderModule* PipelineCache::GetComputeProgramAhead(const HW::ComputeShade
 	ShaderParams params;
 	if (!Common::Fallback::Run("draw or dispatch skipped: its shader stage could not be prepared", "PipelineCache::GetComputeProgramAhead", 0, regs.cs_regs.data_addr,
 	                           [&] { params = PrepareProgram(regs, input_info); })) {
-		ahead.reads.Fail();
+		ahead.reads.Fail(AheadRefusal::Stage);
 		return nullptr;
 	}
 #else

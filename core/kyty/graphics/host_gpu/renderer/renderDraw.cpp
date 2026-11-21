@@ -15,6 +15,7 @@
 #include "common/spscQueue.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "common/timer.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
@@ -706,6 +707,176 @@ RenderExecutor::ResolvedDraw* RenderExecutor::WaitResolvedDraw(ResolvedDraw* res
 	return state == ResolvedDraw::Ready ? resolved : nullptr;
 }
 
+namespace {
+constexpr size_t   RefusedCauses        = static_cast<size_t>(StaleRead::Count);
+constexpr size_t   ExecuteCauses        = 5;
+constexpr size_t   AheadRefusals        = static_cast<size_t>(AheadRefusal::Count);
+constexpr uint32_t RevalidationSampling = 16;
+
+struct alignas(64) ExecuteResolveCounters {
+	std::array<std::atomic<uint64_t>, 2>                                 used {};
+	std::array<std::atomic<uint64_t>, 2>                                 table {};
+	std::atomic<uint64_t>                                                table_bare {0};
+	std::array<std::atomic<uint64_t>, 2>                                 unused {};
+	std::array<std::array<std::atomic<uint64_t>, RefusedCauses>, 2>      refused {};
+	std::array<std::array<std::atomic<uint64_t>, ExecuteCauses>, 2>      here {};
+	std::array<std::atomic<uint64_t>, 2>                                 here_ns {};
+	std::atomic<uint64_t>                                                revalidation_ns {0};
+};
+
+struct alignas(64) AheadResolveCounters {
+	std::array<std::atomic<uint64_t>, 2>                                 prepared {};
+	std::array<std::array<std::atomic<uint64_t>, AheadRefusals>, 2>      refused {};
+	std::atomic<uint64_t>                                                table_skips {0};
+	std::array<std::atomic<uint64_t>, 2>                                 ns {};
+};
+
+ExecuteResolveCounters g_execute_resolve;
+AheadResolveCounters   g_ahead_resolve;
+std::atomic<uint64_t>  g_resolve_line {0};
+
+void Bump(std::atomic<uint64_t>& counter, uint64_t value = 1) {
+	counter.fetch_add(value, std::memory_order_relaxed);
+}
+
+uint64_t Take(std::atomic<uint64_t>& counter) {
+	return counter.exchange(0, std::memory_order_relaxed);
+}
+
+void NoteAheadRefusal(bool dispatch, AheadRefusal refusal) {
+	Bump(g_ahead_resolve.refused[dispatch ? 1 : 0][static_cast<size_t>(refusal)]);
+}
+}
+
+void RenderExecutor::NoteAhead(bool dispatch, AheadNote note, uint64_t ns) noexcept {
+	const size_t kind = dispatch ? 1 : 0;
+	if (note == AheadNote::Prepared) {
+		Bump(g_ahead_resolve.prepared[kind]);
+	} else if (note == AheadNote::TableSkip) {
+		Bump(g_ahead_resolve.table_skips);
+	}
+	Bump(g_ahead_resolve.ns[kind], ns);
+}
+
+void RenderExecutor::BeginAheadOperation(ResolvedDraw* resolved, AheadNote note) noexcept {
+	UseResolvedDraw(resolved);
+	m_ahead_note     = note;
+	m_ahead_present  = m_resolved_draw != nullptr;
+	m_ahead_dispatch = m_ahead_present && m_resolved_draw->compute_module != nullptr;
+	m_ahead_taken    = false;
+	m_ahead_table    = false;
+}
+
+void RenderExecutor::EndAheadOperation() noexcept {
+	if (m_ahead_present && !m_ahead_taken) {
+		const size_t kind = m_ahead_dispatch ? 1 : 0;
+		Bump(m_ahead_table ? g_execute_resolve.table[kind] : g_execute_resolve.unused[kind]);
+	} else if (!m_ahead_present && m_ahead_table) {
+		Bump(g_execute_resolve.table_bare);
+	}
+	m_resolved_draw = nullptr;
+	m_ahead_present = false;
+	m_ahead_taken   = false;
+	m_ahead_table   = false;
+}
+
+RenderExecutor::ExecuteCause RenderExecutor::MissingAheadCause() const noexcept {
+	if (m_ahead_taken) return ExecuteCause::Again;
+	switch (m_ahead_note) {
+		case AheadNote::TableSkip: return ExecuteCause::TableSkip;
+		case AheadNote::NotPrepared: return ExecuteCause::NotPrepared;
+		default: return ExecuteCause::Other;
+	}
+}
+
+bool RenderExecutor::RevalidateAhead(ResolvedDraw& resolved, bool dispatch) {
+	const bool sampled = m_revalidations++ % RevalidationSampling == 0;
+	const auto begin   = sampled ? Common::SteadyNs() : 0;
+#if defined(ANYPS5_KYTY)
+	const bool valid = dispatch ? resolved.programs.Revalidate(true, &resolved.compute_module->info)
+	                            : resolved.programs.Revalidate();
+#else
+	const bool valid = dispatch ? resolved.programs.Revalidate(true) : resolved.programs.Revalidate();
+#endif
+	if (sampled) Bump(g_execute_resolve.revalidation_ns, (Common::SteadyNs() - begin) * RevalidationSampling);
+	const size_t kind = dispatch ? 1 : 0;
+	if (valid) {
+		Bump(g_execute_resolve.used[kind]);
+	} else {
+		Bump(g_execute_resolve.refused[kind][static_cast<size_t>(resolved.programs.reads.Stale())]);
+	}
+	return valid;
+}
+
+const ShaderModule* RenderExecutor::ResolveComputeHere(const HW::ComputeShaderInfo& regs,
+                                                       ShaderComputeInputInfo&      input_info) {
+	const auto begin  = Common::SteadyNs();
+	const auto* module = m_context.GetPipelineCache().GetComputeProgram(regs, input_info);
+	Bump(g_execute_resolve.here_ns[1], Common::SteadyNs() - begin);
+	Bump(g_execute_resolve.here[1][static_cast<size_t>(m_execute_cause)]);
+	return module;
+}
+
+void RenderExecutor::LogResolveSummary() {
+	const auto now  = Common::SteadyNs();
+	auto       last = g_resolve_line.load(std::memory_order_relaxed);
+	if (last == 0) {
+		g_resolve_line.store(now, std::memory_order_relaxed);
+		m_resolve_frames = m_context.FrameNumber();
+		return;
+	}
+	if (now - last < 10'000'000'000ull) return;
+	g_resolve_line.store(now, std::memory_order_relaxed);
+	const auto frame_now = m_context.FrameNumber();
+	const auto frames    = frame_now - m_resolve_frames;
+	m_resolve_frames     = frame_now;
+	const auto per_frame = [&](uint64_t ns) {
+		return frames != 0 ? static_cast<double>(ns) / 1e6 / static_cast<double>(frames) : 0.0;
+	};
+	const auto execute_side = [&](size_t kind) {
+		std::array<uint64_t, RefusedCauses> refused {};
+		uint64_t                            refused_total = 0;
+		for (size_t i = 0; i < RefusedCauses; i++) refused_total += refused[i] = Take(g_execute_resolve.refused[kind][i]);
+		std::array<uint64_t, ExecuteCauses> here {};
+		uint64_t                            here_total = 0;
+		for (size_t i = 0; i < ExecuteCauses; i++) here_total += here[i] = Take(g_execute_resolve.here[kind][i]);
+		return fmt::format(
+		    "ahead used {}, dropped for the table path {}, dropped unused {}, refused by revalidation {} (shape {}, failed "
+		    "{}, zero test {}, CPU write {}, GPU write {}, strict read {}); resolved by execute {} (table hint skip {}, "
+		    "revalidation {}, not prepared {}, again in the operation {}, other {}){}",
+		    Take(g_execute_resolve.used[kind]), Take(g_execute_resolve.table[kind]), Take(g_execute_resolve.unused[kind]),
+		    refused_total, refused[0], refused[1], refused[2], refused[3], refused[4], refused[5], here_total, here[0],
+		    here[1], here[2], here[3], here[4],
+		    kind == 0 ? fmt::format(", table path with nothing prepared {}", Take(g_execute_resolve.table_bare))
+		              : std::string {});
+	};
+	const auto resolve_side = [&](size_t kind) {
+		std::array<uint64_t, AheadRefusals> refused {};
+		uint64_t                            total = 0;
+		for (size_t i = 0; i < AheadRefusals; i++) total += refused[i] = Take(g_ahead_resolve.refused[kind][i]);
+		return fmt::format("prepared {}, refused {} (read {}, stage {}, compiling {}, shape {}, calls {}, image heap {}, "
+		                   "materialize {}, variant {}, GPU read variant {}, other {})",
+		                   Take(g_ahead_resolve.prepared[kind]), total, refused[1], refused[2], refused[3], refused[4],
+		                   refused[5], refused[6], refused[7], refused[8], refused[9], refused[0]);
+	};
+	const auto draws_here      = Take(g_execute_resolve.here_ns[0]);
+	const auto dispatches_here = Take(g_execute_resolve.here_ns[1]);
+	const auto draws_ahead     = Take(g_ahead_resolve.ns[0]);
+	const auto dispatches_ahead = Take(g_ahead_resolve.ns[1]);
+	const auto execute_draws      = execute_side(0);
+	const auto execute_dispatches = execute_side(1);
+	const auto ahead_draws        = resolve_side(0);
+	const auto ahead_dispatches   = resolve_side(1);
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "[kyty-resolve] summary of the last {:.1f} s, {} frames: draws: {}; dispatches: {}; resolve thread: draws {}, "
+	    "skipped by the table hint {}; dispatches {}; ms per frame: execute resolution {:.2f} (draws {:.2f}, dispatches "
+	    "{:.2f}), execute revalidation {:.2f}, resolve thread resolution {:.2f} (draws {:.2f}, dispatches {:.2f})\n",
+	    static_cast<double>(now - last) / 1e9, frames, execute_draws, execute_dispatches, ahead_draws,
+	    Take(g_ahead_resolve.table_skips), ahead_dispatches, per_frame(draws_here + dispatches_here),
+	    per_frame(draws_here), per_frame(dispatches_here), per_frame(Take(g_execute_resolve.revalidation_ns)),
+	    per_frame(draws_ahead + dispatches_ahead), per_frame(draws_ahead), per_frame(dispatches_ahead)));
+}
+
 struct RenderExecutor::RenderTargetMemo {
 	struct MetadataEpoch {
 		GuestRange range;
@@ -920,11 +1091,21 @@ static void ResetDrawRenderState(DrawRenderState& state, bool tessellation_stage
 DrawRenderState& RenderExecutor::AcquireDrawRenderState(bool tessellation, bool& shaders_resolved,
                                                         const ShaderIndirectOffsets& indirect_offsets,
                                                         bool indirect_draw) {
-	auto* resolved = std::exchange(m_resolved_draw, nullptr);
-	shaders_resolved = resolved != nullptr && resolved->compute_module == nullptr &&
-	                   resolved->storage.state.indirect_offsets == indirect_offsets &&
-	                   resolved->storage.state.indirect_draw == indirect_draw &&
-	                   resolved->programs.Revalidate();
+	auto* resolved   = std::exchange(m_resolved_draw, nullptr);
+	shaders_resolved = false;
+	if (resolved == nullptr) {
+		m_execute_cause = MissingAheadCause();
+	} else if (resolved->compute_module != nullptr ||
+	           !(resolved->storage.state.indirect_offsets == indirect_offsets) ||
+	           resolved->storage.state.indirect_draw != indirect_draw) {
+		g_execute_resolve.refused[0][0].fetch_add(1, std::memory_order_relaxed);
+		m_execute_cause = ExecuteCause::Revalidation;
+	} else if (RevalidateAhead(*resolved, false)) {
+		shaders_resolved = true;
+	} else {
+		m_execute_cause = ExecuteCause::Revalidation;
+	}
+	m_ahead_taken = m_ahead_taken || resolved != nullptr;
 #if defined(ANYPS5_KYTY)
 	m_flat_defer_check = nullptr;
 	if (shaders_resolved) {
@@ -1549,6 +1730,8 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDrawAhead(
 	draw.state.store(ResolvedDraw::Ready, std::memory_order_relaxed);
 	if (!ResolveDrawPrograms(draw, context, user_config, shaders, indirect_offsets, indirect_draw, context_id,
 	                         user_config_id)) {
+		NoteAheadRefusal(false, draw.programs.reads.Refusal());
+		m_ahead_refused = true;
 		return nullptr;
 	}
 	draw.busy.store(true, std::memory_order_relaxed);
@@ -1649,6 +1832,8 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDispatchAhead(const HW::Con
 	    m_context.GetPipelineCache().GetComputeProgramAhead(cs_regs, slot.compute, slot.programs);
 	if (slot.programs.reads.Failed() || slot.compute_module == nullptr) {
 		slot.compute_module = nullptr;
+		NoteAheadRefusal(true, slot.programs.reads.Refusal());
+		m_ahead_refused = true;
 		return nullptr;
 	}
 	slot.busy.store(true, std::memory_order_relaxed);
@@ -1678,6 +1863,8 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveIndirectDispatchAhead(
 	    m_context.GetPipelineCache().GetComputeProgramAhead(cs_regs, slot.compute, slot.programs);
 	if (slot.programs.reads.Failed() || slot.compute_module == nullptr) {
 		slot.compute_module = nullptr;
+		NoteAheadRefusal(true, slot.programs.reads.Refusal());
+		m_ahead_refused = true;
 		return nullptr;
 	}
 	slot.busy.store(true, std::memory_order_relaxed);
@@ -1689,18 +1876,25 @@ bool RenderExecutor::TakeResolvedDispatch(ShaderComputeInputInfo& input_info,
 	auto* resolved = std::exchange(m_resolved_draw, nullptr);
 #if defined(ANYPS5_KYTY)
 	m_flat_defer_check = nullptr;
-	if (resolved == nullptr || resolved->compute_module == nullptr ||
-	    !resolved->programs.Revalidate(true, &resolved->compute_module->info)) {
+#endif
+	if (resolved == nullptr) {
+		m_execute_cause = MissingAheadCause();
 		return false;
 	}
+	m_ahead_taken = true;
+	if (resolved->compute_module == nullptr) {
+		g_execute_resolve.refused[1][0].fetch_add(1, std::memory_order_relaxed);
+		m_execute_cause = ExecuteCause::Revalidation;
+		return false;
+	}
+	if (!RevalidateAhead(*resolved, true)) {
+		m_execute_cause = ExecuteCause::Revalidation;
+		return false;
+	}
+#if defined(ANYPS5_KYTY)
 	if (const auto words = resolved->programs.reads.DeferredWords(); words != 0) {
 		NoteFlatDefer(words, resolved->programs.reads.DeferredGpuWords());
 		if (FlatDeferVerifies()) m_flat_defer_check = resolved;
-	}
-#else
-	if (resolved == nullptr || resolved->compute_module == nullptr ||
-	    !resolved->programs.Revalidate(true)) {
-		return false;
 	}
 #endif
 	input_info = resolved->compute;
@@ -1718,7 +1912,10 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, bool shaders_
 #endif
 	if (!shaders_resolved) {
 		m_context.GetImageHeap().BeginDraw();
+		const auto begin = Common::SteadyNs();
 		m_context.GetPipelineCache().GetGraphicsPrograms(buffer, state);
+		g_execute_resolve.here_ns[0].fetch_add(Common::SteadyNs() - begin, std::memory_order_relaxed);
+		g_execute_resolve.here[0][static_cast<size_t>(m_execute_cause)].fetch_add(1, std::memory_order_relaxed);
 	}
 	if (state.vertex_info[0].stage.module == nullptr) {
 		return false;

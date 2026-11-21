@@ -40,6 +40,7 @@ constexpr Entry Entries[] = {
     {"KYTY_FLAT_DEFER", ReadFlatDefer, "0", "1",
      "KYTY_AB: KYTY_FLAT_DEFER=verify is a check, not an arm of an A/B: set KYTY_FLAT_DEFER to 0 or 1", nullptr},
     {"KYTY_GENERIC_COMPUTE_VARIANT", ReadUnlessZero, "0", "1", nullptr, nullptr},
+    {"KYTY_RESOLVE_AHEAD_ALL", ReadUnlessZero, "0", "1", nullptr, nullptr},
 };
 
 static_assert(std::size(Entries) == SwitchCount);
@@ -56,7 +57,8 @@ Reading Initial(size_t index) {
 }
 
 namespace Detail {
-constinit std::atomic<bool> g_on[SwitchCount] {Default(Switch::FlatDefer), Default(Switch::GenericComputeVariant)};
+constinit std::atomic<bool> g_on[SwitchCount] {Default(Switch::FlatDefer), Default(Switch::GenericComputeVariant),
+                                               Default(Switch::ResolveAheadAll)};
 }
 
 namespace {

@@ -227,6 +227,13 @@ public:
 	}
 	static ResolvedDraw* WaitResolvedDraw(ResolvedDraw* resolved) noexcept;
 	static void ReleaseResolvedDraw(ResolvedDraw* resolved) noexcept;
+	enum class AheadNote : uint8_t { NotAttempted, Prepared, NotPrepared, TableSkip };
+	void BeginAheadOperation(ResolvedDraw* resolved, AheadNote note) noexcept;
+	void EndAheadOperation() noexcept;
+	void NoteTableServed() noexcept { m_ahead_table = true; }
+	[[nodiscard]] bool TakeAheadRefused() noexcept { return std::exchange(m_ahead_refused, false); }
+	static void NoteAhead(bool dispatch, AheadNote note, uint64_t ns) noexcept;
+	void LogResolveSummary();
 	void UseContextId(uint64_t context_id, uint64_t user_config_id = 0) noexcept {
 		m_context_id     = context_id;
 		m_user_config_id = user_config_id;
@@ -649,6 +656,19 @@ private:
 	std::unique_ptr<ResolvedDrawRing, void (*)(ResolvedDrawRing*)> m_resolved_ring {nullptr,
 	                                                                                nullptr};
 	ResolvedDraw*                                                  m_resolved_draw = nullptr;
+	enum class ExecuteCause : uint8_t { TableSkip, Revalidation, NotPrepared, Again, Other, Count };
+	[[nodiscard]] ExecuteCause MissingAheadCause() const noexcept;
+	[[nodiscard]] bool         RevalidateAhead(ResolvedDraw& resolved, bool dispatch);
+	const ShaderModule* ResolveComputeHere(const HW::ComputeShaderInfo& regs, ShaderComputeInputInfo& input_info);
+	AheadNote    m_ahead_note     = AheadNote::NotAttempted;
+	ExecuteCause m_execute_cause  = ExecuteCause::Other;
+	bool         m_ahead_present  = false;
+	bool         m_ahead_dispatch = false;
+	bool         m_ahead_taken    = false;
+	bool         m_ahead_table    = false;
+	bool         m_ahead_refused  = false;
+	uint32_t     m_revalidations  = 0;
+	uint64_t     m_resolve_frames = 0;
 #if defined(ANYPS5_KYTY)
 	ResolvedDraw* m_flat_defer_check = nullptr;
 #endif

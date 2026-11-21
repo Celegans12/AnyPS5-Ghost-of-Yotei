@@ -11,6 +11,7 @@
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "common/timer.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
@@ -485,6 +486,7 @@ void GuestGpu::ExecutionThread() {
 		m_executed.Publish(sequence);
 		if ((sequence & 1023u) == 0) {
 			BufferCache::LogReadbackSummary();
+			m_renderer.GetRenderExecutor().LogResolveSummary();
 #if defined(ANYPS5_KYTY)
 			CommandProcessor::LogLabelSummary();
 #endif
@@ -554,9 +556,13 @@ void GuestGpu::ResolveThread() {
 				}
 			}
 		}
+		const bool resolve_dispatch = operation->kind == GpuOperationKind::DispatchDirect ||
+		                              operation->kind == GpuOperationKind::DispatchIndirect;
+		const auto resolve_begin    = operation->kind != GpuOperationKind::Callback ? Common::SteadyNs() : 0;
 		if ((operation->kind == GpuOperationKind::DrawIndex ||
 		     operation->kind == GpuOperationKind::DrawIndirect) &&
-		    table_hint == 1u) {
+		    table_hint == 1u && !Common::RuntimeSwitches::On(Common::RuntimeSwitches::Switch::ResolveAheadAll)) {
+			operation->ahead_note = RenderExecutor::AheadNote::TableSkip;
 		} else if (operation->kind == GpuOperationKind::DrawIndex ||
 		           operation->kind == GpuOperationKind::DrawAuto) {
 			operation->resolved =
@@ -588,6 +594,13 @@ void GuestGpu::ResolveThread() {
 			}
 		}
 		if (operation->kind != GpuOperationKind::Callback) {
+			if (operation->resolved != nullptr) {
+				operation->ahead_note = RenderExecutor::AheadNote::Prepared;
+			} else if (executor.TakeAheadRefused() &&
+			           operation->ahead_note == RenderExecutor::AheadNote::NotAttempted) {
+				operation->ahead_note = RenderExecutor::AheadNote::NotPrepared;
+			}
+			RenderExecutor::NoteAhead(resolve_dispatch, operation->ahead_note, Common::SteadyNs() - resolve_begin);
 			const auto* next = m_operations.TryPeek();
 			operation->stream_in_place = next != nullptr && !IsDrawOperation(next->kind);
 		}
@@ -845,41 +858,41 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 	switch (operation.kind) {
 		case GpuOperationKind::DrawIndex:
 		case GpuOperationKind::DrawAuto: {
-			executor.UseResolvedDraw(operation.resolved);
+			executor.BeginAheadOperation(operation.resolved, operation.ahead_note);
 			if (operation.kind == GpuOperationKind::DrawIndex) {
 				ExecuteDrawIndex(operation, operation.draw_index);
 			} else {
 				ExecuteDrawAuto(operation, operation.draw_auto);
 			}
-			executor.UseResolvedDraw(nullptr);
+			executor.EndAheadOperation();
 			if (operation.resolved != nullptr) {
 				RenderExecutor::ReleaseResolvedDraw(operation.resolved);
 			}
 			break;
 		}
 		case GpuOperationKind::DrawIndirect:
-			executor.UseResolvedDraw(operation.resolved);
+			executor.BeginAheadOperation(operation.resolved, operation.ahead_note);
 			ExecuteDrawIndirect(operation);
-			executor.UseResolvedDraw(nullptr);
+			executor.EndAheadOperation();
 			if (operation.resolved != nullptr) {
 				RenderExecutor::ReleaseResolvedDraw(operation.resolved);
 			}
 			break;
 		case GpuOperationKind::DispatchDirect: {
 			const auto& dispatch = operation.dispatch;
-			executor.UseResolvedDraw(operation.resolved);
+			executor.BeginAheadOperation(operation.resolved, operation.ahead_note);
 			ExecuteDispatchDirect(operation, dispatch.thread_group_x, dispatch.thread_group_y,
 			                      dispatch.thread_group_z, dispatch.mode);
-			executor.UseResolvedDraw(nullptr);
+			executor.EndAheadOperation();
 			if (operation.resolved != nullptr) {
 				RenderExecutor::ReleaseResolvedDraw(operation.resolved);
 			}
 			break;
 		}
 		case GpuOperationKind::DispatchIndirect:
-			executor.UseResolvedDraw(operation.resolved);
+			executor.BeginAheadOperation(operation.resolved, operation.ahead_note);
 			ExecuteDispatchIndirect(operation);
-			executor.UseResolvedDraw(nullptr);
+			executor.EndAheadOperation();
 			if (operation.resolved != nullptr) {
 				RenderExecutor::ReleaseResolvedDraw(operation.resolved);
 			}
@@ -1865,6 +1878,7 @@ void CommandProcessor::ExecuteDrawIndex(const GpuOperation& operation, DrawIndex
 	auto& executor = m_renderer.GetRenderExecutor();
 	if (args.indirect.address == 0 &&
 	    executor.TableXprTry(CurrentBuffer(), 0, 1, 0, 0, 0, vk::IndexType::eUint16, &args, operation.clean)) {
+		executor.NoteTableServed();
 		return;
 	}
 	executor.DrawIndex(CurrentBuffer(), args);
@@ -2052,6 +2066,7 @@ void CommandProcessor::ExecuteDrawIndirect(const GpuOperation& operation) {
 		                         indirect.index_type == 0 ? vk::IndexType::eUint16 : vk::IndexType::eUint32,
 		                         nullptr, operation.clean, records.offsets, indirect.run_offsets)) {
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::IndirectDraws, indirect.max_count);
+			executor.NoteTableServed();
 			return;
 		}
 		while (indirect.run_offsets != nullptr && first_cpu_draw < indirect.max_count) {
