@@ -74,6 +74,11 @@ vk::Extent3D ImageInfo::MipExtent(uint32_t level) const {
 	        IsVolume() ? std::max(extent.depth >> level, 1u) : resources.layers};
 }
 
+bool ImageInfo::HasElementLayout() const {
+	TileTextureElementLayout element {};
+	return TileGetTextureElementLayout(guest_format, element);
+}
+
 bool ImageInfo::HasTiledLayout() const {
 	TileTextureElementLayout element {};
 	if (samples > 1 || !IsTiled() || (IsDepthPlane(*this) && resources.levels == 1) ||

@@ -47,6 +47,15 @@ void KnownTileModesWithoutBlocks() {
     Require(volume.HasTiledLayout(), "the 256-byte tile mode has a block for a 2D texture");
 }
 
+void FormatsWithoutElements() {
+    Require(!Texture(static_cast<uint32_t>(BufferFormat::k32_32_32Float), 0, 64, 64, 1).HasElementLayout(), "a 12-byte element has no layout");
+    Require(!Texture(static_cast<uint32_t>(BufferFormat::k32_32_32UInt), 21, 1009, 1, 14).HasElementLayout(), "a 12-byte element has no layout in an unknown tile mode");
+    Require(Texture(static_cast<uint32_t>(BufferFormat::k32_32_32UInt), 21, 1009, 1, 14).HasTiledLayout(), "a 12-byte element is not declined for its tile mode");
+    Require(!Texture(static_cast<uint32_t>(BufferFormat::k8_8_8_8UScaled), 9, 64, 64, 1).HasElementLayout(), "a scaled vertex format has no element layout");
+    Require(Texture(static_cast<uint32_t>(BufferFormat::k32_32_32_32Float), 9, 64, 64, 1).HasElementLayout(), "a 16-byte element has a layout");
+    Require(Texture(static_cast<uint32_t>(BufferFormat::kBc7UNorm), 9, 64, 64, 1).HasElementLayout(), "a compressed block has an element layout");
+}
+
 void LaidOut(ImageInfo info, const char* what) {
     Require(info.HasTiledLayout(), what);
     info.UpdateSize();
@@ -92,6 +101,7 @@ int main(int argc, char** argv) {
     }
     UnknownTileModes();
     KnownTileModesWithoutBlocks();
+    FormatsWithoutElements();
     TexturesWithLayouts();
     OtherStopsStay();
     std::puts("kyty_shim_tiled_layout: ok");
