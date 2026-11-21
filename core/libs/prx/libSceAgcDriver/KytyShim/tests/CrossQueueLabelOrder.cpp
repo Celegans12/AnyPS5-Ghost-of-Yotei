@@ -8,7 +8,6 @@
 #include "graphics/host_gpu/renderer/occlusionQueries.h"
 #include "prx/libc/include/GuestArena.hpp"
 
-#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
