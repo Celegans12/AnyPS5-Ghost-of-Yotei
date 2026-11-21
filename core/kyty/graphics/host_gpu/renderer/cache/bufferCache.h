@@ -144,7 +144,7 @@ public:
 	                                                        bool     is_texel_buffer = false,
 	                                                        BufferId id              = {});
 	[[nodiscard]] std::pair<Buffer*, uint64_t>
-	ObtainBufferWithFixedWrites(uint64_t vaddr, uint64_t size, std::span<const uint32_t> offsets,
+	ObtainBufferWithProvenWrites(uint64_t vaddr, uint64_t size, std::span<const GuestRange> writes,
 	                           BufferId id);
 	bool PrepareDeviceAddressRead(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] StreamBuffer&                GetUtilityBuffer(MemoryUsage usage) noexcept {

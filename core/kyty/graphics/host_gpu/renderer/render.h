@@ -242,7 +242,7 @@ public:
 
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	void FindBuffers(std::span<PreparedBindings* const> stages, bool find_buffers = true);
-	void                           RebindBuffers(PreparedBindings& bindings);
+	void                           RebindBuffers(PreparedBindings& bindings, uint64_t invocations_x = 0);
 	void                           RebindImages(PreparedBindings& bindings);
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,

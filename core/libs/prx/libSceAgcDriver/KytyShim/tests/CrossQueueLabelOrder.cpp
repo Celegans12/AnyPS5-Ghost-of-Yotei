@@ -13,11 +13,13 @@
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #include "prx/libkernel/include/Api.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <span>
 #include <stdexcept>
 
 using namespace Libs::Graphics;
@@ -166,7 +168,7 @@ const char* ProbeCrossQueueLabelOrder(GraphicContext& graphics) {
 	return failure;
 }
 
-const char* ProbeBufferWriteCoverage(GraphicContext& graphics) {
+const char* ProbeBufferWriteCoverageCase(GraphicContext& graphics, bool per_invocation) {
 	constexpr uint64_t Page = 0x4000;
 	constexpr int CpuReadWrite = 0x03;
 	constexpr uint32_t FirstWrite = 0x12345678u;
@@ -180,14 +182,30 @@ const char* ProbeBufferWriteCoverage(GraphicContext& graphics) {
 	    0xbf810000u,
 	};
 
+	constexpr std::array DispatchShaderCode {
+	    0x8f048804u, 0x34000082u, 0x4a000004u,
+	    0x7e0202ffu, FirstWrite,
+	    0xe0701004u, 0x80000100u,
+	    0x7e0202ffu, LastWrite,
+	    0xe0701300u, 0x80000100u,
+	    0xbf810000u,
+	};
+	constexpr uint32_t FirstWord = 1;
+	const auto last_word = per_invocation ? 192u : 4u;
+	const auto local_x   = per_invocation ? 64u : 1u;
+	const auto groups_x  = per_invocation ? 2u : 1u;
+	const auto words     = local_x * groups_x;
+	const auto shader    = per_invocation ? std::span<const uint32_t>(DispatchShaderCode)
+	                                      : std::span<const uint32_t>(ShaderCode);
+
 	void* guest = nullptr;
 	Require(sceKernelMapFlexibleMemory(&guest, 2 * Page, CpuReadWrite, 0) == 0 && guest != nullptr,
 	        "could not map guest backing for the storage buffer");
 	const auto code = reinterpret_cast<uint64_t>(guest);
 	const auto output = code + Page;
-	std::memcpy(guest, ShaderCode.data(), sizeof(ShaderCode));
+	std::memcpy(guest, shader.data(), shader.size_bytes());
 	ShaderMapUserData(code, {.type = Prospero::ShaderBinaryType::kCs,
-	                        .code_size_bytes = sizeof(ShaderCode)});
+	                        .code_size_bytes = static_cast<uint32_t>(shader.size_bytes())});
 
 	const char* failure = nullptr;
 	{
@@ -203,28 +221,46 @@ const char* ProbeBufferWriteCoverage(GraphicContext& graphics) {
 		    KYTY_PM4(4, Pm4::IT_SET_SH_REG, 0), 0x20c, static_cast<uint32_t>(code >> 8u),
 		    static_cast<uint32_t>(code >> 40u),
 		    KYTY_PM4(3, Pm4::IT_SET_SH_REG, 0), 0x212, 0,
-		    KYTY_PM4(3, Pm4::IT_SET_SH_REG, 0), 0x213, 4u << 1u,
-		    KYTY_PM4(5, Pm4::IT_SET_SH_REG, 0), 0x207, 1, 1, 1,
+		    KYTY_PM4(3, Pm4::IT_SET_SH_REG, 0), 0x213,
+		    (4u << 1u) | (uint32_t {per_invocation} << Pm4::COMPUTE_PGM_RSRC2_TGID_X_EN_SHIFT),
+		    KYTY_PM4(5, Pm4::IT_SET_SH_REG, 0), 0x207, local_x, 1, 1,
 		    KYTY_PM4(6, Pm4::IT_SET_SH_REG, 0), 0x240, static_cast<uint32_t>(output),
 		    static_cast<uint32_t>((output >> 32u) & 0xffffu), Page, Control,
-		    KYTY_PM4(5, Pm4::IT_DISPATCH_DIRECT, 0), 1, 1, 1, 0x41,
+		    KYTY_PM4(5, Pm4::IT_DISPATCH_DIRECT, 0), groups_x, 1, 1, 0x41,
 		};
 		Pm4Execution dispatch;
 		Require(producer.Process(dispatch, commands) == Pm4ProcessResult::Complete,
 		        "the storage-buffer dispatch did not finish recording");
-		Libs::LibKernel::Memory::WriteBacking(output + 8, &GuestWrite, sizeof(GuestWrite));
-		BufferCacheTestAccess::DiscardGpuWrites(renderer.GetBufferCache(), output + 24, Page - 24);
-		std::array<uint32_t, 6> backing {};
+		const std::array guest_words {0u, FirstWord + words, last_word + words};
+		for (const auto index: guest_words) {
+			Libs::LibKernel::Memory::WriteBacking(output + sizeof(uint32_t) * index, &GuestWrite,
+			                                     sizeof(GuestWrite));
+		}
+		std::array<uint32_t, 384> backing {};
+		BufferCacheTestAccess::DiscardGpuWrites(renderer.GetBufferCache(), output + sizeof(backing),
+		                                       Page - sizeof(backing));
 		if (!Libs::LibKernel::Memory::TryReadBacking(output, backing.data(), sizeof(backing))) {
 			failure = "could not read the guest backing";
-		} else if (backing[1] != FirstWrite || backing[4] != LastWrite) {
-			failure = "read-back missed the two compute stores";
-		} else if (backing[2] != GuestWrite) {
-			failure = "read-back overwrote a guest word between the two compute stores";
+		} else if (!std::ranges::all_of(std::span(backing).subspan(FirstWord, words),
+		                               [](uint32_t word) { return word == FirstWrite; }) ||
+		           !std::ranges::all_of(std::span(backing).subspan(last_word, words),
+		                               [](uint32_t word) { return word == LastWrite; })) {
+			failure = "read-back missed a compute store";
+		} else if (!std::ranges::all_of(guest_words, [&](uint32_t index) {
+			           return backing[index] == GuestWrite;
+		           })) {
+			failure = per_invocation ? "read-back overwrote a guest word outside the dispatch writes"
+			                         : "read-back overwrote a guest word outside the fixed stores";
 		}
 	}
 	Require(sceKernelMunmap(code, 2 * Page) == 0, "could not unmap the test backing");
 	return failure;
+}
+const char* ProbeBufferWriteCoverage(GraphicContext& graphics) {
+	if (const auto* failure = ProbeBufferWriteCoverageCase(graphics, false)) {
+		return failure;
+	}
+	return ProbeBufferWriteCoverageCase(graphics, true);
 }
 
 int RunProbe(const char* name, const char* (*probe)(GraphicContext&)) {

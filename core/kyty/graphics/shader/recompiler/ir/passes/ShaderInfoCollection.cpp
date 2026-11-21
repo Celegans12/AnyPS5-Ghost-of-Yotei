@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/RayQuery.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -641,9 +642,34 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 
 }
 
-static void CollectFixedBufferWrites(Program& program) {
-	if (program.stage != ShaderType::Compute || program.table_mode || program.dispatcher_fallback ||
-	    program.info.uses_dma || program.has_address_writes || program.blocks.size() != 2) {
+static std::optional<BufferWriteSpan> ProveBufferWrite(Value offset, uint64_t scalar_offset,
+                                                        uint64_t local_x) {
+	const auto affine = AffineIndex<4>(offset, [](Value value) { return value.Resolve(); },
+	    [](Value value) -> std::optional<size_t> {
+		    const auto* inst = value.TryInstruction();
+		    if (inst == nullptr || inst->GetOpcode() != ValueOpcode::GetBuiltin ||
+		        inst->Arg(1).Resolve() != Value(0u)) return {};
+		    const auto kind = inst->Arg(0).Resolve();
+		    if (kind == Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId))) return 1;
+		    if (kind == Value(static_cast<uint32_t>(StageInputKind::WorkgroupId))) return 2;
+		    if (kind == Value(static_cast<uint32_t>(StageInputKind::GlobalInvocationId))) return 3;
+		    return {};
+	    });
+	if (!affine) return {};
+	const auto [constant, local, group, global] = *affine;
+	const auto base = constant + scalar_offset;
+	if ((base & 3u) != 0 || base > UINT32_MAX - sizeof(uint32_t)) return {};
+	const bool varies = (local | group | global) != 0;
+	const uint64_t local_stride = local + global;
+	const uint64_t group_stride = group + global * local_x;
+	if (varies && (local_x == 0 || local_stride != sizeof(uint32_t) ||
+	               group_stride != sizeof(uint32_t) * local_x)) return {};
+	return BufferWriteSpan {static_cast<uint32_t>(base), varies};
+}
+
+static void CollectProvenBufferWrites(Program& program, const ShaderComputeInputInfo& input) {
+	if (program.table_mode || program.dispatcher_fallback || program.info.uses_dma ||
+	    program.has_address_writes || program.blocks.size() != 2) {
 		return;
 	}
 	const auto* entry = program.blocks.front();
@@ -653,7 +679,7 @@ static void CollectFixedBufferWrites(Program& program) {
 		return;
 	}
 
-	std::vector<std::vector<uint32_t>> writes(program.info.buffers.size());
+	std::vector<std::vector<BufferWriteSpan>> writes(program.info.buffers.size());
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			const auto op = inst.GetOpcode();
@@ -676,22 +702,21 @@ static void CollectFixedBufferWrites(Program& program) {
 			const auto offset = inst.Arg(2).Resolve();
 			const auto scalar = inst.Arg(3).Resolve();
 			const auto exec = inst.Arg(inst.NumArgs() - 1).Resolve();
-			if (!index.IsImmediate() || index.U32() != 0 || !offset.IsImmediate() ||
-			    !scalar.IsImmediate() || !exec.IsImmediate() || !exec.U1()) {
+			if (!index.IsImmediate() || index.U32() != 0 || !scalar.IsImmediate() ||
+			    !exec.IsImmediate() || !exec.U1()) {
 				return;
 			}
-			const auto address = uint64_t {offset.U32()} + scalar.U32() + mem.offset;
-			if ((address & 3u) != 0 || address > UINT32_MAX - sizeof(uint32_t)) {
-				return;
-			}
-			writes[mem.resource].push_back(static_cast<uint32_t>(address));
+			const auto span = ProveBufferWrite(offset, uint64_t {scalar.U32()} + mem.offset,
+			                                   input.threads_num[0]);
+			if (!span) return;
+			writes[mem.resource].push_back(*span);
 		}
 	}
 	for (size_t i = 0; i < writes.size(); ++i) {
-		auto& offsets = writes[i];
-		std::ranges::sort(offsets);
-		offsets.erase(std::unique(offsets.begin(), offsets.end()), offsets.end());
-		program.info.buffers[i].fixed_dword_writes = std::move(offsets);
+		auto& spans = writes[i];
+		std::ranges::sort(spans);
+		spans.erase(std::unique(spans.begin(), spans.end()), spans.end());
+		program.info.buffers[i].proven_writes = std::move(spans);
 	}
 }
 
@@ -726,7 +751,7 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 			Visit(program, input_info, inputs, inst);
 		}
 	}
-	CollectFixedBufferWrites(program);
+	if (program.stage == ShaderType::Compute) CollectProvenBufferWrites(program, *input_info.compute);
 	for (uint32_t index = 0; index < inputs.user_data.size(); index++) {
 		if (inputs.user_data[index]) info.user_data_registers.push_back(index);
 	}

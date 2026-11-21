@@ -575,7 +575,9 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		}
 		RebindImages(bindings);
 		BindSharedMemory(m_context, input_info, bindings);
-		RebindBuffers(bindings);
+		const uint64_t invocations_x = use_thread_dimensions ? 0u
+		    : uint64_t {input_info.threads_num[0]} * thread_group_x;
+		RebindBuffers(bindings, invocations_x);
 		m_context.GetOcclusionQueries().WriteForReaders();
 
 		const auto vk_buffer = buffer.Handle();

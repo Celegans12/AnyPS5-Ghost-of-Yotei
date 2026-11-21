@@ -335,9 +335,31 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 	       type == Prospero::ImageType::kColor2DMsaaArray;
 }
 
+static std::vector<GuestRange>
+BoundBufferWrites(const ShaderRecompiler::IR::BufferResource& resource, uint64_t address,
+                  uint64_t size, uint64_t invocations_x) {
+	std::vector<GuestRange> writes;
+	writes.reserve(resource.proven_writes.size());
+	for (const auto& span: resource.proven_writes) {
+		const auto words = span.per_invocation ? invocations_x : 1u;
+		if (words == 0 || span.offset >= size || words > (size - span.offset) / sizeof(uint32_t)) {
+			return {};
+		}
+		const GuestRange range {address + span.offset, words * sizeof(uint32_t)};
+		if (!writes.empty() && range.address <= writes.back().End()) {
+			auto& previous = writes.back();
+			previous.size = std::max(previous.End(), range.End()) - previous.address;
+		} else {
+			writes.push_back(range);
+		}
+	}
+	return writes;
+}
+
 static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
-                    const ShaderRecompiler::IR::BufferResource& resource, uint32_t& buffer_offset) {
+                    const ShaderRecompiler::IR::BufferResource& resource, uint32_t& buffer_offset,
+                    uint64_t invocations_x) {
 	buffer_offset = 0;
 
 	const auto& [address, size, id] = source;
@@ -357,10 +379,15 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	auto&      queries  = context.GetOcclusionQueries();
 	const bool counters = queries.PrepareRead(address, size);
 	auto& cache = context.GetBufferCache();
-	auto [buffer, offset] =
-	    resource.fixed_dword_writes.empty()
-	        ? cache.ObtainBuffer(address, size, resource.written, resource.formatted, id)
-	        : cache.ObtainBufferWithFixedWrites(address, size, resource.fixed_dword_writes, id);
+	auto [buffer, offset] = [&] {
+		if (!resource.proven_writes.empty()) {
+			const auto writes = BoundBufferWrites(resource, address, size, invocations_x);
+			if (!writes.empty()) {
+				return cache.ObtainBufferWithProvenWrites(address, size, writes, id);
+			}
+		}
+		return cache.ObtainBuffer(address, size, resource.written, resource.formatted, id);
+	}();
 	if (counters) {
 		queries.NoteReadTarget(address, size, *buffer, offset);
 	}
@@ -2799,7 +2826,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages, bool
 	}
 }
 
-void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
+void RenderExecutor::RebindBuffers(PreparedBindings& prepared, uint64_t invocations_x) {
 	KYTY_PROFILER_FUNCTION();
 	const auto& program  = prepared.runtime->module->info;
 	const auto& snapshot = *prepared.runtime->resources;
@@ -2849,7 +2876,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 			prepared.buffers[index] = shared->view;
 			buffer_offset           = shared->offset;
 		} else {
-			prepared.buffers[index] = NativeStorageBuffer(m_context, source, resource, buffer_offset);
+			prepared.buffers[index] = NativeStorageBuffer(m_context, source, resource, buffer_offset, invocations_x);
 			if (share && m_draw_buffer_view_count < m_draw_buffer_views.size()) {
 				m_draw_buffer_views[m_draw_buffer_view_count++] = {source.address, source.size, flags, buffer_offset,
 				                                                   prepared.buffers[index]};

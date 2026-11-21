@@ -154,6 +154,13 @@ inline constexpr uint32_t RuntimeBufferStride = BufferStrideMask;
 	return (packed_stride & BufferStrideMask) == RuntimeBufferStride;
 }
 
+struct BufferWriteSpan {
+	uint32_t offset         = 0;
+	bool     per_invocation = false;
+
+	auto operator<=>(const BufferWriteSpan&) const = default;
+};
+
 struct BufferResource {
 	static constexpr uint32_t NoIndirectBuffer = UINT32_MAX;
 
@@ -178,7 +185,7 @@ struct BufferResource {
 	std::vector<uint32_t>  indirect_resources;
 	bool                   indirect_write_table  = false;
 	uint32_t               indirect_table_offset = 0;
-	std::vector<uint32_t>  fixed_dword_writes;
+	std::vector<BufferWriteSpan> proven_writes;
 
 	bool operator==(const BufferResource& other) const = default;
 };

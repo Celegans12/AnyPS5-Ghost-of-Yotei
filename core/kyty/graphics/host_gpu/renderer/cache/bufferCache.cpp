@@ -1981,11 +1981,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainSynchronizedBuffer(
 }
 
 std::pair<Buffer*, uint64_t>
-BufferCache::ObtainBufferWithFixedWrites(uint64_t vaddr, uint64_t size,
-                                        std::span<const uint32_t> offsets, BufferId id) {
-	EXIT_IF(!(GuestRange {vaddr, size}.Valid()) || offsets.empty());
-	if (m_in_place || (vaddr & 3u) != 0 || size < sizeof(uint32_t) ||
-	    offsets.back() > size - sizeof(uint32_t)) {
+BufferCache::ObtainBufferWithProvenWrites(uint64_t vaddr, uint64_t size,
+                                         std::span<const GuestRange> writes, BufferId id) {
+	EXIT_IF(!(GuestRange {vaddr, size}.Valid()) || writes.empty());
+	if (m_in_place || (vaddr & 3u) != 0) {
 		return ObtainBuffer(vaddr, size, true, false, id);
 	}
 	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, size)) {
@@ -1996,16 +1995,14 @@ BufferCache::ObtainBufferWithFixedWrites(uint64_t vaddr, uint64_t size,
 	(void)SynchronizeBuffer(buffer, vaddr, size, false, false);
 
 	++m_gpu_write_generation;
-	for (const auto offset: offsets) {
-		const auto address = vaddr + offset;
-		constexpr uint64_t Bytes = sizeof(uint32_t);
-		m_scheduler.Context().CollectHotPageWrites(address, Bytes);
-		(void)SynchronizeBuffer(buffer, address, Bytes, true, false);
-		if (m_gpu_modified_ranges.Add(address, Bytes)) {
-			NoteGpuModifiedChange(address, Bytes, true);
+	for (const auto& range: writes) {
+		m_scheduler.Context().CollectHotPageWrites(range.address, range.size);
+		(void)SynchronizeBuffer(buffer, range.address, range.size, true, false);
+		if (m_gpu_modified_ranges.Add(range.address, range.size)) {
+			NoteGpuModifiedChange(range.address, range.size, true);
 		}
-		ForgetColorMetadataChecks(address, Bytes);
-		NoteWrite(address, Bytes);
+		ForgetColorMetadataChecks(range.address, range.size);
+		NoteWrite(range.address, range.size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }
