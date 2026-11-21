@@ -486,6 +486,10 @@ cache; `KYTY_LABELS_AROUND_GPU_WRITES=0`; the backing view does not hold it; onl
 GPU write in flight; its page is GPU-written in the cache and no label is pending. Then: how many drained labels lie
 under an in-place write in flight and how many only share its block, the drain waits in eight classes of duration (count
 and milliseconds), and the GPU writes to memory served in place that were noted over a completion write still pending.
+The line `[kyty-label-covers]` then splits the drained labels that lie under an in-place GPU write in flight by what
+noted that write: a `WRITE_DATA` done as a GPU copy, a `DMA_DATA` fill or copy, a buffer bound for writing (its whole
+bound range), a texel buffer filled from an image; and says whether the newest such write was noted in the label's own
+tick and whether one covers exactly the label's bytes.
 
 Labels deferred to their own tick in place: with `KYTY_IN_PLACE_LABEL_DEFER=1`, two of these reasons no longer drain while
 memory is served in place. A label whose bytes no in-place GPU write in flight covers, on a page the cache does not hold

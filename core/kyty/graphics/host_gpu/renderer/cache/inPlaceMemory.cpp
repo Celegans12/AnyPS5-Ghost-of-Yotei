@@ -243,7 +243,7 @@ void InPlaceMemory::Unregister(uint64_t bytes, uint64_t pages) noexcept {
 	s_pages_out.fetch_add(pages, std::memory_order_relaxed);
 }
 
-void InPlaceMemory::NoteGpuWrite(uint64_t vaddr, uint64_t size, uint64_t tick, uint64_t known) {
+void InPlaceMemory::NoteGpuWrite(uint64_t vaddr, uint64_t size, uint64_t tick, uint64_t known, WriteKind kind) {
 	if (size == 0) {
 		return;
 	}
@@ -252,10 +252,11 @@ void InPlaceMemory::NoteGpuWrite(uint64_t vaddr, uint64_t size, uint64_t tick, u
 	if (m_written_ranges.size() >= 256) {
 		std::erase_if(m_written_ranges, [known](const WrittenRange& range) { return range.tick <= known; });
 	}
-	if (!m_written_ranges.empty() && m_written_ranges.back().begin == vaddr && m_written_ranges.back().end == end) {
+	if (!m_written_ranges.empty() && m_written_ranges.back().begin == vaddr && m_written_ranges.back().end == end &&
+	    m_written_ranges.back().kind == kind) {
 		m_written_ranges.back().tick = std::max(m_written_ranges.back().tick, tick);
 	} else {
-		m_written_ranges.push_back({vaddr, end, tick});
+		m_written_ranges.push_back({vaddr, end, tick, kind});
 	}
 	for (auto block = vaddr >> BlockBits; block <= (vaddr + size - 1) >> BlockBits; ++block) {
 		auto& latest = m_writes[block];
@@ -285,19 +286,25 @@ uint64_t InPlaceMemory::PendingGpuWrite(uint64_t vaddr, uint64_t size, uint64_t 
 }
 
 uint64_t InPlaceMemory::PendingGpuWriteBytes(uint64_t vaddr, uint64_t size, uint64_t known) const {
+	return PendingGpuWriteCover(vaddr, size, known).tick;
+}
+
+InPlaceMemory::WriteCover InPlaceMemory::PendingGpuWriteCover(uint64_t vaddr, uint64_t size, uint64_t known) const {
+	WriteCover cover;
 	if (size == 0 || m_writes_max.load(std::memory_order_acquire) <= known) {
-		return 0;
+		return cover;
 	}
 	const auto      end = size > UINT64_MAX - vaddr ? UINT64_MAX : vaddr + size;
 	std::lock_guard lock(m_writes_mutex);
 	std::erase_if(m_written_ranges, [known](const WrittenRange& range) { return range.tick <= known; });
-	uint64_t latest = 0;
 	for (const auto& range: m_written_ranges) {
 		if (range.begin < end && vaddr < range.end) {
-			latest = std::max(latest, range.tick);
+			cover.tick = std::max(cover.tick, range.tick);
+			cover.kinds |= 1u << static_cast<uint32_t>(range.kind);
+			cover.exact = cover.exact || (range.begin == vaddr && range.end == end);
 		}
 	}
-	return latest;
+	return cover;
 }
 
 uint64_t InPlaceMemory::NoteDeferredLabel(uint64_t vaddr, uint64_t size, uint64_t expires) {

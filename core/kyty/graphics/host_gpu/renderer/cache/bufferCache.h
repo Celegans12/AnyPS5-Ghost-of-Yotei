@@ -103,6 +103,8 @@ public:
 	[[nodiscard]] uint64_t    InPlaceGpuWriteBytesTick(uint64_t vaddr, uint64_t size) const;
 	[[nodiscard]] bool        DeferredLabelPending(uint64_t vaddr, uint64_t size) const;
 	void                      NoteInPlaceGpuWrite(uint64_t vaddr, uint64_t size);
+	void                      NoteInPlaceGpuWrite(uint64_t vaddr, uint64_t size, InPlaceMemory::WriteKind kind);
+	[[nodiscard]] InPlaceMemory::WriteCover InPlaceGpuWriteCover(uint64_t vaddr, uint64_t size) const;
 	void                      ServeInPlaceConversions();
 	void NoteCommandBuffer(uint64_t vaddr, uint64_t size) {
 		if (size != 0 && GuestRange {vaddr, size}.Valid()) {
@@ -332,6 +334,7 @@ private:
 	void ReleaseReadback(uint64_t vaddr, uint64_t size, uint64_t pages_begin, uint64_t pages_end,
 	                     uint64_t tick, bool is_write);
 	std::unique_ptr<InPlaceMemory> m_in_place;
+	InPlaceMemory::WriteKind       m_in_place_write = InPlaceMemory::WriteKind::Binding;
 	struct CopyFeedback;
 	std::unique_ptr<CopyFeedback> m_copy_feedback;
 	size_t                        m_copy_feedback_entries = 0;

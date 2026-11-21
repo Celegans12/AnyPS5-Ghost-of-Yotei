@@ -43,7 +43,17 @@ public:
 	void                                  Register(uint64_t bytes, uint64_t pages) noexcept;
 	void                                  Unregister(uint64_t bytes, uint64_t pages) noexcept;
 
-	void                   NoteGpuWrite(uint64_t vaddr, uint64_t size, uint64_t tick, uint64_t known = 0);
+	enum class WriteKind : uint8_t { Binding, WriteData, DmaData, TexelBuffer, Count };
+
+	struct WriteCover {
+		uint64_t tick  = 0;
+		uint32_t kinds = 0;
+		bool     exact = false;
+	};
+
+	void                   NoteGpuWrite(uint64_t vaddr, uint64_t size, uint64_t tick, uint64_t known = 0,
+	                                    WriteKind kind = WriteKind::Binding);
+	[[nodiscard]] WriteCover PendingGpuWriteCover(uint64_t vaddr, uint64_t size, uint64_t known) const;
 	[[nodiscard]] uint64_t PendingGpuWrite(uint64_t vaddr, uint64_t size, uint64_t known) const;
 	[[nodiscard]] uint64_t PendingGpuWriteBytes(uint64_t vaddr, uint64_t size, uint64_t known) const;
 	static void            NoteGpuWriteOverPending() noexcept { s_writes_over_pending.fetch_add(1, std::memory_order_relaxed); }
@@ -98,6 +108,7 @@ private:
 		uint64_t begin = 0;
 		uint64_t end   = 0;
 		uint64_t tick  = 0;
+		WriteKind kind = WriteKind::Binding;
 	};
 
 	bool    Initialize(GraphicContext& graphics);
