@@ -251,6 +251,11 @@ void DefineImageArray(EmitterState& state, ImageDefinition& definition, const IR
 			return false;
 		}
 	}
+	for (const auto& sampler: info.samplers) {
+		if (sampler.indirect_root != IR::SamplerResource::NoIndirectSampler) {
+			return false;
+		}
+	}
 	uint64_t words = program.srt_reads.size();
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
