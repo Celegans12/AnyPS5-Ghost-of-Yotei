@@ -261,6 +261,7 @@ public:
 		m_table_store = false;
 	}
 	[[nodiscard]] bool TableStoreRequested() const noexcept { return m_table_store; }
+	void TableNoteNormalDraw(const DrawIndirectArgs& indirect, bool indexed, uint64_t started) noexcept;
 	[[nodiscard]] bool TableLikely(const HW::Shader& shaders) const noexcept;
 	[[nodiscard]] uint32_t TableHint(const HW::Shader& shaders) const noexcept;
 	[[nodiscard]] bool TableDrewDraws() const noexcept { return m_table_drew_draws.load(std::memory_order_relaxed); }
@@ -752,13 +753,15 @@ private:
 	                        std::array<vk::DeviceAddress, 2>& blocks, bool* writes);
 	void TableStore(CommandBuffer& buffer, const DrawRenderState& state, vk::PrimitiveTopology topology,
 	                bool primitive_restart_enable, const RenderState& rendering, const DynamicState& dynamic_state,
-	                bool storable);
+	                const char* unstorable);
 	std::array<std::atomic<uint64_t>, 16384> m_table_drawn {};
 	std::atomic<bool>                        m_table_drew_draws {false};
 	std::array<std::atomic<uint64_t>, 16384> m_table_mixed_until {};
 	std::array<uint64_t, 4096> m_table_refused {};
 	std::array<uint64_t, 4096> m_table_refused_generation {};
+	std::array<const char*, 4096> m_table_refused_why {};
 	bool                       m_table_try_refused = false;
+	const char*                m_table_try_refused_why = nullptr;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

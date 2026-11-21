@@ -2574,8 +2574,12 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	}
 	if (std::exchange(m_table_store, false)) {
 		TableStore(buffer, state, state.topology, primitive_restart_enable, rendering, dynamic_state,
-		           !mesh_active && draw.indexed && (emit.indirect.address != 0 || index_source.host_data == nullptr) &&
-		               draw_dwords == 0 && vertex_bindings.count == 0);
+		           mesh_active                                                          ? "unstorable: mesh shader"
+		           : !draw.indexed                                                      ? "unstorable: not indexed"
+		           : emit.indirect.address == 0 && index_source.host_data != nullptr ? "unstorable: host indices"
+		           : draw_dwords != 0                                                   ? "unstorable: draw data"
+		           : vertex_bindings.count != 0                                         ? "unstorable: vertex buffers"
+		                                                                                : nullptr);
 	}
 }
 
@@ -2609,8 +2613,19 @@ static std::optional<DrawEmitInfo> ResolveDrawEmit(const HW::UserConfig&        
 	return DrawEmitInfo {vertex_offset + first_vertex, instance_offset};
 }
 
+namespace {
+struct TableNormalDraw {
+	RenderExecutor&         executor;
+	const DrawIndirectArgs& indirect;
+	const bool              indexed;
+	const uint64_t          started;
+	~TableNormalDraw() { executor.TableNoteNormalDraw(indirect, indexed, started); }
+};
+}
+
 bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+	const TableNormalDraw table_normal {*this, args.indirect, true, TableCount::TableSampleStart()};
 
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
 	m_context.GetCommandScheduler().PopPendingOperations();
@@ -2710,6 +2725,7 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 
 bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+	const TableNormalDraw table_normal {*this, args.indirect, false, TableCount::TableSampleStart()};
 
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
 	m_context.GetCommandScheduler().PopPendingOperations();

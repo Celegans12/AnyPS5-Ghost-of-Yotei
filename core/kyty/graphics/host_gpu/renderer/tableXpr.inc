@@ -200,6 +200,7 @@ struct RenderExecutor::TablePair {
 	uint64_t                                                    vs = 0, ps = 0;
 	int32_t                                                     start_instance = -1;
 	bool                                                        refused  = false;
+	const char*                                                 refusal  = nullptr;
 	std::array<const ShaderRecompiler::IR::CompiledShaderInfo*, 2> programs {};
 	std::array<const ShaderModule*, 2>                              tables {};
 	std::array<const ShaderRecompiler::IR::ResourcePlan*, 2>        plans {};
@@ -527,7 +528,9 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 		TableReset(pair);
 	}
 	if (pair.refused) {
-		m_table_try_refused = true;
+		m_table_try_refused     = true;
+		m_table_try_refused_why = pair.refusal;
+		TableCount::Add(pair.refusal, TableCount::DrawRefused);
 		return Spec::Refuse("table: pair refused"), TableResult::Native;
 	}
 	if (FrameGen::Enabled() && pair.programs[0] != nullptr &&
@@ -620,7 +623,7 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 	if (cache.last_state == nullptr || cache.last_state_key != cache.state_key) {
 		const auto& states   = Catalog().NativeXprState().states;
 		const auto  state_it = states.find(cache.state_key);
-		if (state_it == states.end()) return request_store();
+		if (state_it == states.end()) return Spec::Refuse("table: no captured state"), request_store();
 		cache.last_state_key = cache.state_key;
 		cache.last_state     = state_it->second.get();
 	}
@@ -1797,7 +1800,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		size_t count = 1;
 		while (first + count < commands.size() && commands[first + count] == commands[first] + count * stride) ++count;
 		const auto [owner, offset] = obtain(table.args, commands[first], count * stride, [] {});
-		if (owner == nullptr) return TableResult::Native;
+		if (owner == nullptr) return Spec::Refuse("table: arguments buffer"), TableResult::Native;
 		arguments[groups]   = {owner, offset};
 		group_sizes[groups] = static_cast<uint32_t>(count);
 		++groups;
@@ -1816,10 +1819,10 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 			    !buffer_cache.IsRegionGpuModified(index_base, index_bytes))
 				buffer_cache.EnsureBufferContents(index_base, index_bytes);
 		});
-		if (indices.first == nullptr) return TableResult::Native;
+		if (indices.first == nullptr) return Spec::Refuse("table: index buffer"), TableResult::Native;
 	}
 	if (buffer_cache.RegistrationEpoch() != registration)
-		return LiveCounters::Add(LiveCounters::TableRegistered), TableResult::Native;
+		return LiveCounters::Add(LiveCounters::TableRegistered), Spec::Refuse("table: buffers registered"), TableResult::Native;
 	if (spec_state != nullptr && spec_state->refused != nullptr) return TableResult::Native;
 	phase.reset();
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1e, 4);
@@ -2084,9 +2087,18 @@ void RenderExecutor::TablePack(TablePair& pair, const std::array<TableFlatStage,
 	}
 }
 
+namespace {
+const char* TableIntern(std::string_view text) {
+	static std::mutex                               mutex;
+	static std::unordered_map<std::string, uint8_t> texts;
+	std::lock_guard                                 lock(mutex);
+	return texts.try_emplace(std::string(text), uint8_t {0}).first->first.c_str();
+}
+}
+
 void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& state, vk::PrimitiveTopology topology,
                                 bool primitive_restart_enable, const RenderState& rendering,
-                                const DynamicState& dynamic_state, bool storable) {
+                                const DynamicState& dynamic_state, const char* unstorable) {
 	auto& table = OwnTable();
 	auto* pair  = std::exchange(table.store, nullptr);
 	if (pair == nullptr) return;
@@ -2094,19 +2106,27 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
 	const auto& sh = buffer.GetShaders();
 	if (sh.GetVs().es_regs.data_addr != pair->vs || sh.GetPs().ps_regs.data_addr != pair->ps)
 		return Spec::Refuse("store: other pair"), void();
-	const auto refuse = [&](const char* reason) {
+	const auto refuse = [&](const char* reason, const char* cause) {
 		static std::atomic<uint32_t> reports {0};
 		if (reports.fetch_add(1, std::memory_order_relaxed) < 64)
 			std::printf("Table: VS 0x%llx PS 0x%llx refused: %s\n", static_cast<unsigned long long>(pair->vs),
 			            static_cast<unsigned long long>(pair->ps), reason);
 		pair->refused = true;
+		pair->refusal = cause;
+		TableCount::Add(cause, TableCount::PairRefused);
 		Spec::Refuse("store: pair refused");
 	};
-	if (!storable) return refuse("a draw table programs cannot make (vertex buffers, draw data, host indices)");
+	if (unstorable != nullptr) return refuse(unstorable, unstorable);
 	if (state.VertexStages().size() != 1 || state.vertex_info[0].stage.module == nullptr ||
 	    state.vertex_info[0].logical_stage == ShaderType::Mesh || state.vertex_info[0].user_clip_planes != 0 ||
-	    (state.ps_active && state.ps_input_info.stage.module == nullptr))
-		return refuse("stages");
+	    (state.ps_active && state.ps_input_info.stage.module == nullptr)) {
+		const char* cause = state.VertexStages().size() != 1                      ? "stages: more than one vertex stage"
+		                    : state.vertex_info[0].stage.module == nullptr           ? "stages: no vertex module"
+		                    : state.vertex_info[0].logical_stage == ShaderType::Mesh ? "stages: mesh vertex stage"
+		                    : state.vertex_info[0].user_clip_planes != 0             ? "stages: user clip planes"
+		                                                                             : "stages: no pixel module";
+		return refuse(cause, cause);
+	}
 	auto&       pipelines = m_context.GetPipelineCache();
 	const auto& ctx       = buffer.GetRegisters();
 	std::vector<uint32_t> key;
@@ -2141,7 +2161,7 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
 			              static_cast<unsigned long long>(state.vertex_info[0].stage.module->id),
 			              static_cast<const void*>(pixel_plan),
 			              static_cast<unsigned long long>(state.ps_active ? state.ps_input_info.stage.module->id : 0));
-			return refuse(why);
+			return refuse(why, "no resource plan");
 		}
 		const auto portable = [](const ShaderRecompiler::IR::ResourceSpecialization& specialization, uint32_t mask) {
 			auto result = specialization;
@@ -2162,8 +2182,11 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
 		const auto vertex = pipelines.GetVertexProgramTable(vertex_params, state.vertex_info[0], vertex_portable, cursor);
 		using Status = PipelineCache::TableStatus;
 		if (vertex.status == Status::Refused || (state.ps_active && pixel.status == Status::Refused)) {
-			const auto* why = vertex.status == Status::Refused ? vertex.refusal : pixel.refusal;
-			return refuse(why != nullptr ? why->c_str() : "table mode cannot serve it");
+			const auto* why  = vertex.status == Status::Refused ? vertex.refusal : pixel.refusal;
+			const auto  text = std::string(vertex.status == Status::Refused ? "program refused (vertex): "
+			                                                                : "program refused (pixel): ") +
+			                  (why != nullptr ? *why : std::string("table mode cannot serve it"));
+			return refuse(text.c_str(), TableIntern(text));
 		}
 		if (vertex.status == Status::Pending || (state.ps_active && pixel.status == Status::Pending)) {
 			pair->pending = true;
@@ -2175,7 +2198,15 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
 			return module != nullptr && module->info.table_mode && module->info.bindings.UsesPushData() &&
 			       !module->info.has_address_writes && !module->info.info.uses_gds;
 		};
-		if (!serves(vertex.module) || (state.ps_active && !serves(pixel.module))) return refuse("a program table mode cannot draw");
+		if (!serves(vertex.module) || (state.ps_active && !serves(pixel.module))) {
+			const auto* module = !serves(vertex.module) ? vertex.module : pixel.module;
+			const char* cause  = module == nullptr                       ? "program cannot draw: no module"
+			                     : !module->info.table_mode              ? "program cannot draw: not in table mode"
+			                     : !module->info.bindings.UsesPushData() ? "program cannot draw: no push data"
+			                     : module->info.has_address_writes       ? "program cannot draw: writes by address"
+			                                                             : "program cannot draw: GDS";
+			return refuse("a program table mode cannot draw", cause);
+		}
 		pair->pending     = false;
 		Spec::Refuse("store: programs set");
 		pair->tables      = {vertex.module, state.ps_active ? pixel.module : nullptr};
@@ -2233,6 +2264,117 @@ uint32_t TableXprMode() {
 }
 
 namespace {
+struct TableTime {
+	std::atomic<uint64_t> nanoseconds {0}, samples {0};
+};
+enum TableTimeKind : uint32_t { TableTimeDrawn, TableTimeRefused, TableTimeNormal, TableTimeKinds };
+std::array<TableTime, TableTimeKinds> g_table_times {};
+std::atomic<uint64_t>                 g_table_line {0};
+std::atomic<uint64_t>                 g_table_line_frame {0};
+
+using TableCount::TableNow;
+using TableCount::TableSampleStart;
+
+uint64_t TableNoteTime(TableTimeKind kind, uint64_t started) noexcept {
+	if (started == 0) return 0;
+	const auto now = TableNow();
+	g_table_times[kind].nanoseconds.fetch_add(now - started, std::memory_order_relaxed);
+	g_table_times[kind].samples.fetch_add(1, std::memory_order_relaxed);
+	return now;
+}
+
+using TableCounts = std::vector<std::pair<std::string_view, uint64_t>>;
+
+TableCounts TableTake(TableCount::Kind kind) {
+	TableCounts counts;
+	for (auto& slot: TableCount::g_slots[kind]) {
+		const char* what = slot.what.load(std::memory_order_acquire);
+		if (what == nullptr) continue;
+		if (const auto count = slot.count.exchange(0, std::memory_order_relaxed); count != 0) counts.emplace_back(what, count);
+	}
+	std::ranges::sort(counts);
+	TableCounts merged;
+	for (const auto& [what, count]: counts) {
+		if (!merged.empty() && merged.back().first == what) {
+			merged.back().second += count;
+		} else {
+			merged.emplace_back(what, count);
+		}
+	}
+	return merged;
+}
+
+uint64_t TableCountOf(const TableCounts& counts, std::string_view what) {
+	const auto at = std::ranges::lower_bound(counts, what, {}, &TableCounts::value_type::first);
+	return at != counts.end() && at->first == what ? at->second : 0;
+}
+
+std::string TableListOf(TableCounts counts) {
+	std::ranges::sort(counts, [](const auto& a, const auto& b) { return a.second > b.second; });
+	std::string text;
+	for (const auto& [what, count]: counts) text += fmt::format("{}{} = {}", text.empty() ? "" : "; ", what, count);
+	return text.empty() ? std::string("none") : text;
+}
+
+double TableMicroseconds(TableTimeKind kind) {
+	auto&      time    = g_table_times[kind];
+	const auto samples = time.samples.exchange(0, std::memory_order_relaxed);
+	const auto ns      = time.nanoseconds.exchange(0, std::memory_order_relaxed);
+	return samples != 0 ? static_cast<double>(ns) / static_cast<double>(samples) / 1000.0 : 0.0;
+}
+
+void TableReportIfDue(uint64_t frame, uint64_t now) {
+	auto last = g_table_line.load(std::memory_order_relaxed);
+	if (last == 0) {
+		if (g_table_line.compare_exchange_strong(last, now, std::memory_order_relaxed))
+			g_table_line_frame.store(frame, std::memory_order_relaxed);
+		return;
+	}
+	if (now < last || now - last < 10'000'000'000ull ||
+	    !g_table_line.compare_exchange_strong(last, now, std::memory_order_relaxed))
+		return;
+	const auto frames = frame - g_table_line_frame.exchange(frame, std::memory_order_relaxed);
+	const auto events = TableTake(TableCount::Event);
+	const auto pairs  = TableTake(TableCount::PairRefused);
+	const auto draws  = TableTake(TableCount::DrawRefused);
+	const auto at     = [&](std::string_view what) { return TableCountOf(events, what); };
+	const auto normal = at("normal: non-indexed") + at("normal: direct") + at("normal: indirect count in memory") +
+	                    at("normal: indirect over 64") + at("normal: indirect");
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "[kyty-table] summary of the last {:.1f} s, {} frames: draws: normal path {} (non-indexed {}, direct {}, indirect "
+	    "count in memory {}, indirect over 64 {}, other indirect {}), table tried {} (clean {}), drawn by the table {} "
+	    "(continued {}, tried {}, draws served {}), sent to learn {}, deferred {}, refused {}; refused before the table: "
+	    "off {}, stages {}, refused pair {}, direct shape {}, no indices {}, not a plain triangle list {}; pairs learnt {}, "
+	    "pairs refused {}; us per call: table drawn {:.2f}, table refused {:.2f}, normal path {:.2f}\n",
+	    static_cast<double>(now - last) / 1e9, frames, normal, at("normal: non-indexed"), at("normal: direct"),
+	    at("normal: indirect count in memory"), at("normal: indirect over 64"), at("normal: indirect"),
+	    at("xpr: draw runs tried"), at("xpr: clean draws"), at("xpr: drawn by continue") + at("xpr: drawn by try"),
+	    at("xpr: drawn by continue"), at("xpr: drawn by try"), at("xpr: draws served"), at("xpr: sent to learn"),
+	    at("xpr: deferred"), at("xpr: refused by the table"), at("xpr: off or invalid"),
+	    at("xpr: stages (no ES program)") + at("xpr: stages (tessellation)"),
+	    at("xpr: refused pair") + at("table: pair refused"),
+	    at("xpr: direct shape (indirect address)") + at("xpr: direct shape (offset source)") +
+	        at("xpr: direct shape (no indices)") + at("xpr: direct shape (empty)") +
+	        at("xpr: direct shape (first instance)") + at("xpr: direct shape (8-bit indices)"),
+	    at("xpr: no indices"), at("xpr: not a plain triangle list"), at("store: programs set"), at("store: pair refused"),
+	    TableMicroseconds(TableTimeDrawn), TableMicroseconds(TableTimeRefused), TableMicroseconds(TableTimeNormal)));
+	Log::WriteToConsoleAndLog(fmt::format("[kyty-table] draws of refused pairs, by cause: {}\n", TableListOf(draws)));
+	Log::WriteToConsoleAndLog(fmt::format("[kyty-table] pairs refused, by cause: {}\n", TableListOf(pairs)));
+	Log::WriteToConsoleAndLog(fmt::format("[kyty-table] table events: {}\n", TableListOf(events)));
+}
+}
+
+void RenderExecutor::TableNoteNormalDraw(const DrawIndirectArgs& indirect, bool indexed, uint64_t started) noexcept {
+	const auto now = TableNoteTime(TableTimeNormal, started);
+	Spec::Refuse(!indexed                         ? "normal: non-indexed"
+	             : indirect.address == 0          ? "normal: direct"
+	             : indirect.count_address != 0    ? "normal: indirect count in memory"
+	             : indirect.count > 64            ? "normal: indirect over 64"
+	                                              : "normal: indirect");
+	if (now != 0) TableReportIfDue(m_context.FrameNumber(), now);
+}
+
+namespace {
 uint64_t TableLikelyTag(const HW::Shader& shaders) noexcept {
 	return ((shaders.GetVs().es_regs.data_addr * 0x9e3779b97f4a7c15ull) ^ (shaders.GetPs().ps_regs.data_addr * 0xc2b2ae3d27d4eb4full)) | 1ull;
 }
@@ -2275,6 +2417,15 @@ bool RenderExecutor::TableXprTry(CommandBuffer& buffer, uint64_t args_addr, uint
 	const auto      likely_tag  = TableLikelyTag(buffer.GetShaders());
 	const auto      likely_slot = (likely_tag >> 40u) & (m_table_drawn.size() - 1);
 	const DrawnHint hint {m_table_drawn[likely_slot], m_table_mixed_until[likely_slot], likely_tag, m_context.FrameNumber(), drawn};
+	struct Timed {
+		const uint64_t started;
+		const bool&    drawn;
+		const uint64_t frame;
+		~Timed() {
+			if (const auto now = TableNoteTime(drawn ? TableTimeDrawn : TableTimeRefused, started); now != 0)
+				TableReportIfDue(frame, now);
+		}
+	} const timed {TableSampleStart(), drawn, m_context.FrameNumber()};
 	struct DrewDraws {
 		std::atomic<bool>& flag;
 		const bool&        drawn;
@@ -2289,21 +2440,30 @@ bool RenderExecutor::TableXprTry(CommandBuffer& buffer, uint64_t args_addr, uint
 	                          ? -1
 	                          : static_cast<int32_t>(uint32_t {offsets.instance} << 8u | offsets.vertex);
 	const auto mode = TableXprMode();
-	if (mode == 0 || buffer.IsInvalid()) return false;
+	if (mode == 0 || buffer.IsInvalid()) return Spec::Refuse("xpr: off or invalid"), false;
 	const auto& try_vs = buffer.GetShaders().GetVs();
-	if (try_vs.es_regs.data_addr == 0 || try_vs.ls_regs.data_addr != 0 || try_vs.hs_regs.data_addr != 0) return false;
+	if (try_vs.es_regs.data_addr == 0 || try_vs.ls_regs.data_addr != 0 || try_vs.hs_regs.data_addr != 0)
+		return Spec::Refuse(try_vs.es_regs.data_addr == 0 ? "xpr: stages (no ES program)" : "xpr: stages (tessellation)"), false;
 	const auto refused_tag =
 	    (likely_tag ^ (uint64_t {static_cast<uint32_t>(g_table_offsets_key)} * 0xff51afd7ed558ccdull)) | 1ull;
 	const auto refused_slot       = (refused_tag >> 40u) & (m_table_refused.size() - 1);
 	const auto refused_generation = ShaderMapGeneration();
-	if (m_table_refused[refused_slot] == refused_tag && m_table_refused_generation[refused_slot] == refused_generation)
-		return false;
+	if (m_table_refused[refused_slot] == refused_tag && m_table_refused_generation[refused_slot] == refused_generation) {
+		TableCount::Add(m_table_refused_why[refused_slot], TableCount::DrawRefused);
+		return Spec::Refuse("xpr: refused pair"), false;
+	}
 	NativeXprDirectDraw direct_draw;
 	if (direct != nullptr) {
 		if (direct->indirect.address != 0 || direct->offset_source != DrawOffsetSource::DrawState ||
 		    direct->index_addr == nullptr || direct->index_count == 0 || direct->instance_count == 0 ||
 		    direct->first_instance != 0 || direct->index_type_and_size > 1)
-			return false;
+			return Spec::Refuse(direct->indirect.address != 0                         ? "xpr: direct shape (indirect address)"
+			                    : direct->offset_source != DrawOffsetSource::DrawState ? "xpr: direct shape (offset source)"
+			                    : direct->index_addr == nullptr                        ? "xpr: direct shape (no indices)"
+			                    : direct->index_count == 0 || direct->instance_count == 0 ? "xpr: direct shape (empty)"
+			                    : direct->first_instance != 0                           ? "xpr: direct shape (first instance)"
+			                                                                            : "xpr: direct shape (8-bit indices)"),
+			       false;
 		index_base  = reinterpret_cast<uint64_t>(direct->index_addr);
 		index_bytes = uint64_t {direct->index_count} * (direct->index_type_and_size == 0 ? 2u : 4u);
 		index_type  = direct->index_type_and_size == 0 ? vk::IndexType::eUint16 : vk::IndexType::eUint32;
@@ -2314,7 +2474,7 @@ bool RenderExecutor::TableXprTry(CommandBuffer& buffer, uint64_t args_addr, uint
 		               .indexed        = true,
 		               .indirect       = false};
 	}
-	if (index_base == 0 || index_bytes == 0) return false;
+	if (index_base == 0 || index_bytes == 0) return Spec::Refuse("xpr: no indices"), false;
 	m_context.GetCommandScheduler().PopPendingOperations();
 	Common::LockGuard lock(m_context.GetMutex());
 	(void)NativeXprState();
@@ -2331,8 +2491,10 @@ bool RenderExecutor::TableXprTry(CommandBuffer& buffer, uint64_t args_addr, uint
 	TableResult result     = TableResult::Native;
 	Spec::Refuse("xpr: draw runs tried");
 	if (clean) Spec::Refuse("xpr: clean draws");
+	bool continued = false;
 	if (mode >= 2 && clean && TableContinue(buffer, commands, index_base, index_bytes, index_type, direct_ptr)) {
-		result = TableResult::Drawn;
+		result    = TableResult::Drawn;
+		continued = true;
 	} else {
 		const auto& ucfg = buffer.GetUserConfig();
 		const auto& ctx  = buffer.GetRegisters();
@@ -2344,16 +2506,25 @@ bool RenderExecutor::TableXprTry(CommandBuffer& buffer, uint64_t args_addr, uint
 			if (result == TableResult::Native && std::exchange(m_table_try_refused, false)) {
 				m_table_refused[refused_slot]            = refused_tag;
 				m_table_refused_generation[refused_slot] = refused_generation;
+				m_table_refused_why[refused_slot]        = std::exchange(m_table_try_refused_why, nullptr);
 			}
 		} else {
 			Spec::Refuse("xpr: not a plain triangle list");
+			Spec::Refuse(ucfg.GetPrimType() != Prospero::PrimitiveType::kTriList ? "xpr: plain list (primitive type)"
+			             : ctx.HasObjectPrimitiveIdOutput()                     ? "xpr: plain list (primitive id)"
+			             : ctx.GetColorControl().mode > 1u                      ? "xpr: plain list (color control mode)"
+			                                                                    : "xpr: plain list (primitive reset)");
 		}
 	}
 	switch (result) {
-		case TableResult::Drawn: drawn = true; return true;
-		case TableResult::Store: m_table_store = true; break;
-		case TableResult::Deferred: break;
-		case TableResult::Native: break;
+		case TableResult::Drawn:
+			drawn = true;
+			Spec::Refuse(continued ? "xpr: drawn by continue" : "xpr: drawn by try");
+			TableCount::Add("xpr: draws served", TableCount::Event, std::max<size_t>(commands.size(), 1));
+			return true;
+		case TableResult::Store: m_table_store = true; Spec::Refuse("xpr: sent to learn"); break;
+		case TableResult::Deferred: Spec::Refuse("xpr: deferred"); break;
+		case TableResult::Native: Spec::Refuse("xpr: refused by the table"); break;
 	}
 	return false;
 }

@@ -1,7 +1,9 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_CX_COMPAT_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_CX_COMPAT_H_
 
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <string_view>
 
@@ -14,6 +16,38 @@ inline volatile std::atomic_uint32_t kyty_local_speculations_live {0};
 
 namespace Libs::Graphics {
 
+namespace TableCount {
+enum Kind : uint32_t { Event, PairRefused, DrawRefused, Kinds };
+struct Slot {
+	std::atomic<const char*> what {nullptr};
+	std::atomic<uint64_t>    count {0};
+};
+inline constexpr size_t                            Slots = 256;
+inline std::array<std::array<Slot, Slots>, Kinds> g_slots {};
+inline void Add(const char* what, Kind kind = Event, uint64_t n = 1) noexcept {
+	if (what == nullptr || n == 0) return;
+	auto&  slots = g_slots[kind];
+	size_t at    = (reinterpret_cast<uintptr_t>(what) * 0x9e3779b97f4a7c15ull) >> 56u;
+	for (size_t probe = 0; probe < Slots; ++probe, at = (at + 1) & (Slots - 1)) {
+		auto&       slot = slots[at];
+		const char* held = slot.what.load(std::memory_order_acquire);
+		if (held == nullptr && slot.what.compare_exchange_strong(held, what, std::memory_order_acq_rel)) held = what;
+		if (held == what) {
+			slot.count.fetch_add(n, std::memory_order_relaxed);
+			return;
+		}
+	}
+}
+inline uint64_t TableNow() noexcept {
+	return static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+inline uint64_t TableSampleStart() noexcept {
+	static thread_local uint32_t calls = 0;
+	return (++calls & 15u) == 0 ? TableNow() : 0;
+}
+}
+
 namespace Spec {
 struct State {
 	const char* refused = nullptr;
@@ -24,7 +58,9 @@ struct State {
 };
 [[nodiscard]] inline State* Current() noexcept { return nullptr; }
 [[nodiscard]] inline bool   On() noexcept { return false; }
-inline void Refuse(const char*) noexcept {}
+inline void Refuse(const char* why) noexcept {
+	TableCount::Add(why);
+}
 }
 
 namespace LiveCounters {
