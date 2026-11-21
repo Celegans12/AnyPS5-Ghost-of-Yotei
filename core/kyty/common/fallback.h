@@ -10,16 +10,24 @@ namespace Common::Fallback {
 
 [[nodiscard]] bool Enabled();
 
+[[nodiscard]] bool Containable();
+
 [[nodiscard]] bool Guard(const char* fallback, const char* site, uint64_t shader_hash, uint64_t where,
-                         void (*body)(void*), void* context);
+                         bool optional, void (*body)(void*), void* context);
+
+template <class Body>
+[[nodiscard]] bool Run(const char* fallback, const char* site, uint64_t shader_hash, uint64_t where,
+                       bool optional, Body&& body) {
+	using Callable = std::remove_reference_t<Body>;
+	return Guard(fallback, site, shader_hash, where, optional,
+	             [](void* context) { (*static_cast<Callable*>(context))(); },
+	             const_cast<void*>(static_cast<const void*>(&body)));
+}
 
 template <class Body>
 [[nodiscard]] bool Run(const char* fallback, const char* site, uint64_t shader_hash, uint64_t where,
                        Body&& body) {
-	using Callable = std::remove_reference_t<Body>;
-	return Guard(fallback, site, shader_hash, where,
-	             [](void* context) { (*static_cast<Callable*>(context))(); },
-	             const_cast<void*>(static_cast<const void*>(&body)));
+	return Run(fallback, site, shader_hash, where, false, static_cast<Body&&>(body));
 }
 
 }

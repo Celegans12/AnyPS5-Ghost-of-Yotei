@@ -2344,6 +2344,17 @@ std::optional<uint32_t> EmptyBufferReadBits(const ResourceSpecialization::Buffer
 	return Format::FormattedConstantBits(format, source.kind);
 }
 
+bool SpecializedBuffersValid(const ResourceSpecialization& specialization, bool compute) {
+	return std::ranges::none_of(specialization.buffers, [&](const ResourceSpecialization::Buffer& buffer) {
+		if (!compute && (buffer.packed_stride & (1u << 20u)) != 0u) return true;
+		for (uint32_t component = 0; component < 4u; component++) {
+			const auto selector = GetDstSel(buffer.descriptor_swizzle, component);
+			if (selector == 2u || selector == 3u) return true;
+		}
+		return false;
+	});
+}
+
 bool EmptyBufferServes(const ResourcePlan& program, const ResourceSnapshot& snapshot, uint32_t index,
                        const ResourceSpecialization::Buffer& requested,
                        const ResourceSpecialization::Buffer& candidate) {

@@ -135,6 +135,15 @@ PipelineCache::StallScope::~StallScope() {
 
 #if defined(ANYPS5_KYTY)
 void PipelineCache::LogStallStats(bool force) {
+	const std::array<uint64_t, 3> speculative {m_speculative_failed.load(std::memory_order_relaxed),
+	                                           m_speculative_refused.load(std::memory_order_relaxed),
+	                                           m_speculative_skipped.load(std::memory_order_relaxed)};
+	if (force || speculative != m_speculative_logged) {
+		m_speculative_logged = speculative;
+		PrecompileLog("[kyty-spec-compile] compiles ahead failed {} and refused before compiling {}, each kept for its "
+		              "variant; {} later compiles ahead skipped as kept",
+		              speculative[0], speculative[1], speculative[2]);
+	}
 	StallStats stats;
 	{
 		std::scoped_lock lock(m_stall_mutex);

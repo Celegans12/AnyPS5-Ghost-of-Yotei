@@ -268,6 +268,25 @@ target_link_libraries(kyty_shim_gpu_control_loads_tests PRIVATE Kyty::gpu libker
 add_test(NAME kyty_shim_gpu_control_loads COMMAND kyty_shim_gpu_control_loads_tests)
 set_tests_properties(kyty_shim_gpu_control_loads PROPERTIES TIMEOUT 20
         PASS_REGULAR_EXPRESSION "kyty_shim_gpu_control_loads: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+add_test_executable(kyty_shim_speculative_compile_tests ${CMAKE_CURRENT_SOURCE_DIR}/SpeculativeCompile.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+target_include_directories(kyty_shim_speculative_compile_tests PRIVATE ${LIBS_INCLUDE_DIR})
+configure_host_test_executable(kyty_shim_speculative_compile_tests)
+if(MINGW)
+    target_link_libraries(kyty_shim_speculative_compile_tests PRIVATE stdc++ gcc_eh)
+endif()
+target_link_libraries(kyty_shim_speculative_compile_tests PRIVATE Kyty::gpu libkernel libc)
+if(NOT WIN32)
+    add_test(NAME kyty_shim_speculative_compile COMMAND kyty_shim_speculative_compile_tests)
+    set_tests_properties(kyty_shim_speculative_compile PROPERTIES TIMEOUT 60 ENVIRONMENT "KYTY_FALLBACKS=0"
+            PASS_REGULAR_EXPRESSION "kyty_shim_speculative_compile: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+else()
+    add_test(NAME kyty_shim_speculative_compile_uncontained COMMAND kyty_shim_speculative_compile_tests uncontained)
+    set_tests_properties(kyty_shim_speculative_compile_uncontained PROPERTIES TIMEOUT 60
+            PASS_REGULAR_EXPRESSION "kyty_shim_speculative_compile_uncontained: ok" FAIL_REGULAR_EXPRESSION "FAILED")
+endif()
+add_test(NAME kyty_shim_speculative_compile_required COMMAND kyty_shim_speculative_compile_tests required)
+set_tests_properties(kyty_shim_speculative_compile_required PROPERTIES TIMEOUT 60 ENVIRONMENT "KYTY_FALLBACKS=0"
+        PASS_REGULAR_EXPRESSION "buffer descriptor has reserved dst_sel" FAIL_REGULAR_EXPRESSION "did not stop")
 add_test_executable(kyty_shim_tiled_layout_tests ${CMAKE_CURRENT_SOURCE_DIR}/TiledLayout.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
 target_include_directories(kyty_shim_tiled_layout_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(kyty_shim_tiled_layout_tests PRIVATE Kyty::gpu libkernel libc)

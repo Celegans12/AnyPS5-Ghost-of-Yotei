@@ -88,6 +88,7 @@ void ShareNullBufferVariants(const ResourcePlan& program, ResourceSpecialization
                              bool runtime_stride);
 uint32_t FormattedReadComponents(const ResourcePlan& program, uint32_t index);
 std::optional<uint32_t> EmptyBufferReadBits(const ResourceSpecialization::Buffer& buffer, uint32_t component);
+bool SpecializedBuffersValid(const ResourceSpecialization& specialization, bool compute);
 bool EmptyBufferServes(const ResourcePlan& program, const ResourceSnapshot& snapshot, uint32_t index,
                        const ResourceSpecialization::Buffer& requested,
                        const ResourceSpecialization::Buffer& candidate);

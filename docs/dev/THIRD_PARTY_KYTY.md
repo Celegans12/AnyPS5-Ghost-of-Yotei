@@ -526,7 +526,15 @@ depends on it, the build skips that draw or dispatch instead and writes one `[HA
 naming the stop and its source line: a shader the recompiler cannot decode, translate or emit, and a shader stage whose
 inputs cannot be prepared. A failed shader is remembered (the whole program when no variant of it ever compiled,
 otherwise that variant), so it is not translated again for each draw; the other variants of the program keep drawing.
-A background compile that stops is dropped, and the draw compiles it again. A pipeline manifest record that stops while
+A background compile that stops is dropped, and the draw compiles it again. Work done ahead of execution is never
+required, so its stops are caught whatever `KYTY_FALLBACKS` says, wherever a stop can be caught (Linux): a compile
+queued by the resolution ahead or by a pipeline chain, and the preparation of a shader stage ahead. A compile ahead that
+stops is kept for its variant (its resources and push data) and never tried again ahead; the execution thread
+compiles what its draw needs as before, so a stop it hits itself still follows `KYTY_FALLBACKS`. A variant whose buffer
+descriptors no program of its stage compiles (`ADD_TID` outside compute, a reserved `dst_sel`) is refused before
+compiling and kept the same way, and a program with 64 failed variants is no longer compiled ahead. Where a stop cannot
+be caught (Windows), a variant of a resolution ahead that left a GPU-produced load unread is not compiled ahead.
+`[kyty-spec-compile]` counts these compiles every 10 s while they change. A pipeline manifest record that stops while
 it is replayed is dropped, as with exceptions enabled. The command processor ignores a write to a register it does not
 know (direct `SET_*_REG` packets and indirect register lists) and a GPU event type it does not know, with one `[HACK]`
 line per register or event; the packet lengths come from the headers, so the rest of the stream is read as before. The

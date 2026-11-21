@@ -32,10 +32,18 @@ bool Enabled() {
 	return enabled;
 }
 
-bool Guard(const char* fallback, const char* site, uint64_t shader_hash, uint64_t where,
+bool Containable() {
+#if defined(__cpp_exceptions) && !defined(_WIN32)
+	return true;
+#else
+	return false;
+#endif
+}
+
+bool Guard(const char* fallback, const char* site, uint64_t shader_hash, uint64_t where, bool optional,
            void (*body)(void*), void* context) {
 	void (*volatile call)(void*) = body;
-	if (!Enabled()) {
+	if (optional ? !Containable() : !Enabled()) {
 		call(context);
 		return true;
 	}
@@ -46,7 +54,9 @@ bool Guard(const char* fallback, const char* site, uint64_t shader_hash, uint64_
 		return true;
 	} catch (const SoftExitError& error) {
 		HackNotice::Report(fallback, site, shader_hash, where,
-		                   std::string(error.what()) + " (KYTY_FALLBACKS=0 stops here instead)");
+		                   std::string(error.what()) +
+		                       (optional ? " (work done ahead: dropped whatever KYTY_FALLBACKS says)"
+		                                 : " (KYTY_FALLBACKS=0 stops here instead)"));
 		return false;
 	}
 #else

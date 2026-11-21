@@ -558,13 +558,23 @@ private:
 			uint32_t                                     push_data_cursor = 0;
 			std::vector<uint32_t>                        function_code;
 		};
+		static constexpr size_t    SpeculativeFailureCap = 64;
 		std::vector<FailedVariant> failed_variants;
+		std::vector<FailedVariant> speculative_failures;
 		size_t                     served_module = SIZE_MAX;
 		uint64_t                   served_logged = 0;
 
 		[[nodiscard]] bool Failed(const ShaderRecompiler::IR::ResourceSpecialization& candidate,
 		                          uint32_t push_data_cursor) const;
 		void               NoteFailed(uint32_t push_data_cursor);
+		[[nodiscard]] bool SpeculativeFailed(const ShaderRecompiler::IR::ResourceSpecialization& candidate,
+		                                     uint32_t push_data_cursor) const;
+		void               NoteSpeculativeFailure(const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+		                                          uint32_t push_data_cursor);
+		enum class Speculation : uint8_t { Compile, Kept, Refused, Uncontained };
+		[[nodiscard]] Speculation JudgeSpeculativeCompile(ShaderType stage,
+		                                                  const ShaderRecompiler::IR::ResourceSpecialization& candidate,
+		                                                  uint32_t push_data_cursor, bool unread);
 		ShaderModule*      ShareModule(const ShaderRecompiler::IR::ResourceSpecialization& requested,
 		                               const ShaderRecompiler::IR::ResourceSnapshot&       snapshot,
 		                               uint32_t push_data_cursor, bool calls);
@@ -628,6 +638,14 @@ private:
 	struct CompileJob;
 	static constexpr uint32_t CompileWorkers = 6;
 	std::unordered_map<ProgramKey, uint32_t, ProgramKeyHash> m_in_flight KYTY_GUARDED_BY(m_program_lock);
+#if defined(ANYPS5_KYTY)
+	std::unordered_set<ProgramKey, ProgramKeyHash> m_speculative_failed_programs KYTY_GUARDED_BY(m_program_lock);
+	std::atomic<uint64_t> m_speculative_failed {0}, m_speculative_refused {0}, m_speculative_skipped {0};
+	std::array<uint64_t, 3> m_speculative_logged {};
+	[[nodiscard]] bool TakesSpeculativeCompile(Program& program, const ProgramKey& key,
+	                                           const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	                                           uint32_t push_data_cursor, bool unread) KYTY_REQUIRES(m_program_lock);
+#endif
 	std::mutex                                               m_job_mutex;
 	std::condition_variable                                  m_job_available;
 	std::deque<std::unique_ptr<CompileJob>>                  m_jobs;
@@ -673,7 +691,8 @@ private:
 	void QueueCompile(const ProgramKey& key, const ShaderParams& params, const InputInfo& input_info,
 	                  uint32_t                                            push_data_cursor,
 	                  const ShaderRecompiler::IR::ResourceSpecialization* specialization,
-	                  bool                                                guest_traversal = false)
+	                  bool                                                guest_traversal = false,
+	                  bool                                                speculative     = false)
 	    KYTY_REQUIRES(m_program_lock);
 	bool WaitForCompile(const ProgramKey& key) KYTY_REQUIRES(m_program_lock);
 	template <typename InputInfo>

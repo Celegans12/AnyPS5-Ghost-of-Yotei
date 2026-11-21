@@ -1265,6 +1265,52 @@ void PipelineCache::Program::NoteFailed(uint32_t push_data_cursor) {
 	                           .function_code    = {code.begin(), code.end()}});
 }
 
+bool PipelineCache::Program::SpeculativeFailed(const ShaderRecompiler::IR::ResourceSpecialization& candidate,
+                                               uint32_t push_data_cursor) const {
+	return speculative_failures.size() >= SpeculativeFailureCap ||
+	       std::ranges::any_of(speculative_failures, [&](const FailedVariant& variant) {
+		       return variant.push_data_cursor == push_data_cursor && variant.specialization == candidate &&
+		              std::ranges::equal(variant.function_code, FunctionCode());
+	       });
+}
+
+void PipelineCache::Program::NoteSpeculativeFailure(
+    const ShaderRecompiler::IR::ResourceSpecialization& failed, uint32_t push_data_cursor) {
+	if (SpeculativeFailed(failed, push_data_cursor)) return;
+	const auto code = FunctionCode();
+	speculative_failures.push_back({.specialization   = failed,
+	                                .push_data_cursor = push_data_cursor,
+	                                .function_code    = {code.begin(), code.end()}});
+}
+
+PipelineCache::Program::Speculation PipelineCache::Program::JudgeSpeculativeCompile(
+    ShaderType stage, const ShaderRecompiler::IR::ResourceSpecialization& candidate, uint32_t push_data_cursor,
+    bool unread) {
+	if (unread && !Common::Fallback::Containable()) return Speculation::Uncontained;
+	if (SpeculativeFailed(candidate, push_data_cursor)) return Speculation::Kept;
+	if (!ShaderRecompiler::IR::SpecializedBuffersValid(candidate, stage == ShaderType::Compute)) {
+		NoteSpeculativeFailure(candidate, push_data_cursor);
+		return Speculation::Refused;
+	}
+	return Speculation::Compile;
+}
+
+bool PipelineCache::TakesSpeculativeCompile(Program& program, const ProgramKey& key,
+                                            const ShaderRecompiler::IR::ResourceSpecialization& candidate,
+                                            uint32_t push_data_cursor, bool unread) {
+	switch (program.JudgeSpeculativeCompile(key.stage, candidate, push_data_cursor, unread)) {
+		case Program::Speculation::Compile: return true;
+		case Program::Speculation::Kept: m_speculative_skipped.fetch_add(1, std::memory_order_relaxed); break;
+		case Program::Speculation::Refused:
+			m_speculative_refused.fetch_add(1, std::memory_order_relaxed);
+			Common::HackNotice::Report("compile ahead refused: a buffer descriptor no program of this stage compiles",
+			                           "PipelineCache::TakesSpeculativeCompile", key.hash, 0);
+			break;
+		case Program::Speculation::Uncontained: break;
+	}
+	return false;
+}
+
 ShaderModule* PipelineCache::Program::ShareModule(const ShaderRecompiler::IR::ResourceSpecialization& requested,
                                                   const ShaderRecompiler::IR::ResourceSnapshot&       snapshot,
                                                   uint32_t push_data_cursor, bool calls) {
@@ -2366,7 +2412,7 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 		}
 #if defined(ANYPS5_KYTY)
 		if (!Common::Fallback::Run("draw or dispatch skipped: its shader stage could not be prepared", "PipelineCache::ResolveGraphicsPrograms",
-		                           0, vertex_regs.ls_regs.data_addr,
+		                           0, vertex_regs.ls_regs.data_addr, ahead != nullptr,
 		                           [&] { vertex_params = PrepareTessellationPrograms(vertex_regs, context, vertex_info); })) {
 			vertex_info[0].stage = {};
 			if (ahead != nullptr) ahead->reads.Fail(AheadRefusal::Stage);
@@ -2444,7 +2490,7 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 			if (!Common::Fallback::Run(
 			        "draw or dispatch skipped: its shader stage could not be prepared",
 			        "PipelineCache::ResolveGraphicsPrograms", vertex_params[1].hash,
-			        vertex_regs.ls_regs.data_addr,
+			        vertex_regs.ls_regs.data_addr, ahead != nullptr,
 			        [&] { ShaderRecompiler::RequireMergedHullLimits(tess, limits); })) {
 				return skip_tessellation();
 			}
@@ -2456,7 +2502,7 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 	} else {
 #if defined(ANYPS5_KYTY)
 		if (!Common::Fallback::Run("draw or dispatch skipped: its shader stage could not be prepared", "PipelineCache::ResolveGraphicsPrograms",
-		                           0, vertex_regs.es_regs.data_addr,
+		                           0, vertex_regs.es_regs.data_addr, ahead != nullptr,
 		                           [&] { vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]); })) {
 			vertex_info[0].stage = {};
 			if (ahead != nullptr) ahead->reads.Fail(AheadRefusal::Stage);
@@ -2531,7 +2577,7 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 		}
 #if defined(ANYPS5_KYTY)
 		if (!Common::Fallback::Run("draw or dispatch skipped: its shader stage could not be prepared", "PipelineCache::ResolveGraphicsPrograms",
-		                           0, pixel_regs.ps_regs.data_addr,
+		                           0, pixel_regs.ps_regs.data_addr, ahead != nullptr,
 		                           [&] { pixel_params = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info); })) {
 			vertex_info[0].stage = {};
 			if (ahead != nullptr) ahead->reads.Fail(AheadRefusal::Stage);
@@ -2787,9 +2833,15 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 		const ProgramLockMaybe lock(m_program_lock, unlocked);
 		const auto             entry = m_program_cache.find(key);
 		if (entry == m_program_cache.end() && ahead.stages != ProgramResolution::MaxStages) {
-			QueueCompile(key, params, input_info, push_data_cursor, nullptr);
 #if defined(ANYPS5_KYTY)
+			if (!m_speculative_failed_programs.contains(key)) {
+				QueueCompile(key, params, input_info, push_data_cursor, nullptr, false, true);
+			} else {
+				m_speculative_skipped.fetch_add(1, std::memory_order_relaxed);
+			}
 			t_ahead_missing = true;
+#else
+			QueueCompile(key, params, input_info, push_data_cursor, nullptr);
 #endif
 		}
 		heap_used = entry != m_program_cache.end() &&
@@ -2895,8 +2947,10 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 #if defined(ANYPS5_KYTY)
 			auto promoted = specialization;
 			program->PromoteEmptyBuffers(resources, promoted, push_data_cursor);
-			QueueCompile(key, params, input_info, push_data_cursor, &promoted);
-			t_ahead_missing = true;
+			if (TakesSpeculativeCompile(*program, key, promoted, push_data_cursor, t_ahead_unread_load)) {
+				QueueCompile(key, params, input_info, push_data_cursor, &promoted, false, true);
+				t_ahead_missing = true;
+			}
 #else
 			QueueCompile(key, params, input_info, push_data_cursor, &specialization);
 #endif
@@ -2920,6 +2974,7 @@ struct PipelineCache::CompileJob {
 	std::optional<ShaderRecompiler::IR::ResourceSpecialization> specialization;
 	TableVariant*                                               table = nullptr;
 	bool                                                        guest_traversal = false;
+	bool                                                        speculative     = false;
 };
 
 #if defined(ANYPS5_KYTY)
@@ -2949,7 +3004,7 @@ void PipelineCache::QueueCompile(const ProgramKey& key, const ShaderParams& para
                                  const InputInfo&                                    input_info,
                                  uint32_t                                            push_data_cursor,
                                  const ShaderRecompiler::IR::ResourceSpecialization* specialization,
-                                 bool                                                guest_traversal) {
+                                 bool guest_traversal, bool speculative) {
 	if (m_in_flight.contains(key)) {
 		return;
 	}
@@ -2958,6 +3013,7 @@ void PipelineCache::QueueCompile(const ProgramKey& key, const ShaderParams& para
 	job->params           = params;
 	job->push_data_cursor = push_data_cursor;
 	job->guest_traversal  = guest_traversal;
+	job->speculative      = speculative;
 	if (specialization != nullptr) {
 		job->specialization = *specialization;
 	}
@@ -3067,8 +3123,11 @@ void PipelineCache::RunCompileJob(CompileJob& job, InputInfo& input_info) {
 		}
 #if defined(ANYPS5_KYTY)
 	};
-	if (!Common::Fallback::Run("background shader compile dropped: the shader recompiler stopped",
-	                           "PipelineCache::RunCompileJob", job.params.hash, 0, compile)) {
+	const bool compiled = Common::Fallback::Run(
+	    job.speculative ? "compile ahead dropped: the shader recompiler stopped"
+	                    : "background shader compile dropped: the shader recompiler stopped",
+	    "PipelineCache::RunCompileJob", job.params.hash, 0, job.speculative, compile);
+	if (!compiled) {
 		module.reset();
 	}
 #else
@@ -3076,6 +3135,16 @@ void PipelineCache::RunCompileJob(CompileJob& job, InputInfo& input_info) {
 #endif
 	const ShaderModule* ahead = nullptr;
 	LockPrograms();
+#if defined(ANYPS5_KYTY)
+	if (!compiled && job.speculative) {
+		m_speculative_failed.fetch_add(1, std::memory_order_relaxed);
+		if (!job.specialization) {
+			m_speculative_failed_programs.insert(job.key);
+		} else if (const auto entry = m_program_cache.find(job.key); entry != m_program_cache.end()) {
+			entry->second.NoteSpeculativeFailure(*job.specialization, job.push_data_cursor);
+		}
+	}
+#endif
 	if (module) {
 		auto entry = m_program_cache.find(job.key);
 		if (entry == m_program_cache.end()) {
@@ -3307,14 +3376,22 @@ const ShaderModule* PipelineCache::ChainModule(const ShaderParams& params, Input
 			UnlockPrograms();
 			continue;
 		}
-		m_in_flight[key]++;
 #if defined(ANYPS5_KYTY)
 		if (program != nullptr && materialized) {
 			program->PromoteEmptyBuffers(resources, specialization, push_data_cursor);
 		}
+		if (program != nullptr ? !TakesSpeculativeCompile(*program, key, specialization, push_data_cursor, false)
+		                       : m_speculative_failed_programs.contains(key)) {
+			UnlockPrograms();
+			return nullptr;
+		}
 #endif
+		m_in_flight[key]++;
 		UnlockPrograms();
 		CompileJob job {.key = key, .params = params, .push_data_cursor = push_data_cursor};
+#if defined(ANYPS5_KYTY)
+		job.speculative = true;
+#endif
 		if (materialized) {
 			job.specialization = specialization;
 		}
@@ -3904,7 +3981,7 @@ const ShaderModule* PipelineCache::GetComputeProgramAhead(const HW::ComputeShade
 #if defined(ANYPS5_KYTY)
 	ShaderParams params;
 	if (!Common::Fallback::Run("draw or dispatch skipped: its shader stage could not be prepared", "PipelineCache::GetComputeProgramAhead", 0, regs.cs_regs.data_addr,
-	                           [&] { params = PrepareProgram(regs, input_info); })) {
+	                           true, [&] { params = PrepareProgram(regs, input_info); })) {
 		ahead.reads.Fail(AheadRefusal::Stage);
 		return nullptr;
 	}
