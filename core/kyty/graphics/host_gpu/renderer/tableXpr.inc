@@ -1,12 +1,3 @@
-#ifndef KYTY_CX_INTERCHANGE
-#define KYTY_CX_INTERCHANGE 0
-#endif
-#ifndef KYTY_CX_INDIRECT
-#define KYTY_CX_INDIRECT 0
-#endif
-#ifndef KYTY_CX_SCOUT
-#define KYTY_CX_SCOUT 1
-#endif
 using HashedKey = NativeXprKeyHash;
 
 static uint64_t TableValidity(const Image& image) {
@@ -180,21 +171,6 @@ struct RenderExecutor::TableImageSet {
 	const PipelineCache::Pipeline*                  pipeline = nullptr;
 };
 
-#if KYTY_CX_INTERCHANGE
-static bool TableInterchangeable(const ShaderRecompiler::IR::CompiledShaderInfo& a,
-                                 const ShaderRecompiler::IR::CompiledShaderInfo& b) {
-	const auto& x = a.bindings;
-	const auto& y = b.bindings;
-	return a.table_mode && b.table_mode && a.stage == b.stage && a.shader_hash == b.shader_hash &&
-	       a.user_data_base == b.user_data_base && a.table_plan == b.table_plan && a.info.buffers == b.info.buffers &&
-	       a.info.images.size() == b.info.images.size() && a.info.samplers.size() == b.info.samplers.size() &&
-	       x.push_data_start_dword == y.push_data_start_dword &&
-	       x.memory_offset_dword == y.memory_offset_dword && x.memory_offset_count == y.memory_offset_count &&
-	       x.buffer_word_count == y.buffer_word_count && x.lod_stats_count == y.lod_stats_count &&
-	       x.table_block_dwords == y.table_block_dwords && x.user_data_registers == y.user_data_registers;
-}
-#endif
-
 struct RenderExecutor::TableFlatStage {
 	struct Operand {
 		uint32_t index = 0;
@@ -274,9 +250,6 @@ struct RenderExecutor::TablePair {
 			side->previous_set.fill(nullptr);
 		}
 	}
-#if KYTY_CX_INTERCHANGE
-	ShaderProgram                           compute_program;
-#endif
 	std::array<uint32_t, 2> portable {};
 	bool                    respecialize = false;
 	std::shared_ptr<const std::atomic<bool>> waiting;
@@ -369,10 +342,6 @@ struct RenderExecutor::TableXpr {
 	std::array<ShaderStageRuntime, 2>                     runtimes;
 	std::array<PreparedBindings, 2>                       prepared;
 	ShaderRecompiler::IR::ResourceSpecialization          specialization;
-	std::array<std::vector<ShaderRecompiler::IR::DescriptorValue>, 2> indirect;
-#if KYTY_CX_INDIRECT
-	ShaderRecompiler::IR::AddressProbeCandidates                      probe;
-#endif
 };
 void RenderExecutor::TableMemoRetired() {
 	if (m_table_xpr) ++m_table_xpr->memo_epoch;
@@ -388,18 +357,14 @@ static void TableMemoChecked(uint32_t differ, uint64_t vs, uint64_t ps, uint64_t
 		            (differ & 4u) != 0 ? 1 : 0);
 }
 
-#if KYTY_CX_SCOUT
 template <typename Pair>
 static uint64_t TableScoutHash(const Pair& pair) {
 	const std::array<uint64_t, 3> key {pair.vs, pair.ps, static_cast<uint32_t>(pair.start_instance)};
 	return XXH3_64bits(key.data(), sizeof(key));
 }
-#endif
 
 void RenderExecutor::TableReset(TablePair& pair) {
-#if KYTY_CX_SCOUT
 	if (pair.scout_version != 0) Scout::Retire(TableScoutHash(pair), pair.scout_version);
-#endif
 	auto& table = *m_table_xpr;
 	EXIT_IF(Role() != 0);
 	++table.memo_epoch;
@@ -446,9 +411,7 @@ void RenderExecutor::TableSweepPairs() {
 	std::erase_if(table->pairs, [&](auto& item) {
 		auto& pair = item.second;
 		if (pair.used_frame + TableXpr::PairKeepFrames >= frame || pair.waiting) return false;
-#if KYTY_CX_SCOUT
 		if (pair.scout_version != 0) Scout::Retire(TableScoutHash(pair), pair.scout_version);
-#endif
 		for (auto& [words, set]: pair.sets) NativeXprRetireSet(set->pool, set->set);
 		return true;
 	});
@@ -474,45 +437,6 @@ RenderExecutor::TableXpr& RenderExecutor::OwnTable() {
 	return *m_table_xpr;
 }
 
-#if 0
-void RenderExecutor::DropStaleCatalog() {
-	auto* catalog = CatalogTable();
-	auto& table   = OwnTable();
-	if (Role() == 0 || catalog == nullptr || catalog->epoch == table.seen_epoch) return;
-	table.seen_epoch = catalog->epoch;
-	table.last_pair  = nullptr;
-	table.last_state = nullptr;
-	table.last_set   = nullptr;
-	++table.memo_epoch;
-	table.memo_set = nullptr;
-}
-
-void RenderExecutor::ForgetStaleCatalog() {
-	if (Role() == 0) return;
-	const auto read    = CatalogRead();
-	auto*      catalog = CatalogTable();
-	if (catalog == nullptr || m_table_xpr == nullptr || catalog->epoch == m_table_xpr->seen_epoch) return;
-	auto& table              = *m_table_xpr;
-	table.seen_epoch         = catalog->epoch;
-	table.pair_cache         = {};
-	table.found_key          = {};
-	table.found_pair         = nullptr;
-	table.store              = nullptr;
-	table.gathered           = nullptr;
-	table.last_pair          = nullptr;
-	table.last_state         = nullptr;
-	table.last_set           = nullptr;
-	table.memo_set           = nullptr;
-	++table.memo_epoch;
-	if (m_native_xpr) {
-		m_native_xpr->emit           = {};
-		m_native_xpr->last_state     = nullptr;
-		m_native_xpr->last_state_key = 0;
-	}
-}
-
-#endif
-
 template <typename Pair>
 static void TablePrefetchPair(const Pair& pair) {
 	for (size_t line = 0; line < sizeof(Pair); line += 64) __builtin_prefetch(reinterpret_cast<const char*>(&pair) + line);
@@ -534,18 +458,6 @@ static void TablePrefetchArrays(const Pair& pair, const Set* set) {
 		__builtin_prefetch(set);
 		lines(set->words);
 	}
-}
-
-template <typename Pair>
-static void TablePrefetchNext(Pair*& previous, Pair& pair) {
-	if (previous != nullptr && previous != &pair) previous->next = &pair;
-	previous = &pair;
-	auto* const next = pair.next;
-	if (next == nullptr || next == &pair) return;
-	using Set = std::remove_pointer_t<std::remove_cvref_t<decltype(next->last_set)>>;
-	TablePrefetchArrays(*next, static_cast<const Set*>(nullptr));
-	__builtin_prefetch(next->last_set);
-	if (auto* const after = next->next; after != nullptr && after != &pair && after != next) TablePrefetchPair(*after);
 }
 
 RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std::span<const uint64_t> commands,
@@ -1164,65 +1076,6 @@ bool RenderExecutor::TableEvaluate(TablePair& pair, std::array<std::span<const u
 			for (uint32_t w = 0; w < descriptor.count; ++w) words.push_back(value(descriptor.words[w]));
 		return true;
 	};
-#if KYTY_CX_INDIRECT
-	const auto indirect = [&](uint32_t st) {
-		const auto& program = *pair.programs[st];
-		auto&       out     = table.indirect[st];
-		out.clear();
-		if (program.table_plan.indirect.empty()) return true;
-		thread_local const auto runtime = [] {
-			ShaderRecompiler::IR::SrtRuntime value;
-			MaterializationReaders(value);
-			return value;
-		}();
-		const auto& slots   = table.blocks[st];
-		const auto  operand = [&](const ShaderRecompiler::IR::TablePlan::Operand& value) -> uint32_t {
-			if (value.kind == Kind::Immediate) return value.value;
-			if (value.kind == Kind::Slot) return slots[value.value];
-			if (TableCodeOperand(value)) return TableCodeWord(value, st == 0 ? pair.vs : pair.ps);
-			const auto index = value.value - program.user_data_base;
-			return index < user_data[st].size() ? user_data[st][index] : 0;
-		};
-		const auto address = [&](const ShaderRecompiler::IR::TablePlan::Operand& low,
-		                         const ShaderRecompiler::IR::TablePlan::Operand& high) {
-			return (uint64_t {operand(low)} | uint64_t {operand(high)} << 32u) & 0x0000ffffffffffffull;
-		};
-		using Plan = ShaderRecompiler::IR::TablePlan;
-		for (const auto& entry: program.table_plan.indirect) {
-			auto& found = table.probe;
-			if (!ShaderRecompiler::IR::EnumerateAddressProbe(entry.probe, program.info.images[entry.root],
-			                                                 address(entry.records_low, entry.records_high),
-			                                                 address(entry.heap_low, entry.heap_high), runtime, found))
-				return false;
-			const auto count = static_cast<uint32_t>(found.descriptors.size());
-			if (count == 0 || count > Plan::IndirectCapacity || found.keys.size() > Plan::IndirectMaxKeys ||
-			    found.candidates.size() != found.keys.size())
-				return false;
-			std::array<uint32_t, Plan::IndirectCapacity> order {}, position {};
-			for (uint32_t j = 0; j < count; ++j) order[j] = j;
-			std::sort(order.begin() + 1, order.begin() + count,
-			          [&](uint32_t a, uint32_t b) { return found.descriptors[a].dwords < found.descriptors[b].dwords; });
-			for (uint32_t j = 0; j < count; ++j) position[order[j]] = j;
-			for (uint32_t j = 0; j < count; ++j) out.push_back(found.descriptors[order[j]]);
-			std::array<uint32_t, Plan::IndirectMaxKeys> by_key {};
-			const auto keys = static_cast<uint32_t>(found.keys.size());
-			for (uint32_t k = 0; k < keys; ++k) by_key[k] = k;
-			std::sort(by_key.begin(), by_key.begin() + keys,
-			          [&](uint32_t a, uint32_t b) { return found.keys[a] < found.keys[b]; });
-			auto* mapping = table.blocks[st].data() + entry.mapping;
-			mapping[0]    = keys;
-			for (uint32_t k = 0; k < keys; ++k) {
-				mapping[1 + 2 * k] = found.keys[by_key[k]];
-				mapping[2 + 2 * k] = position[found.candidates[by_key[k]]];
-			}
-			words.push_back(count);
-			for (const auto& candidate: out) words.insert(words.end(), candidate.dwords.begin(), candidate.dwords.end());
-		}
-		return true;
-	};
-#else
-	const auto indirect = [&](uint32_t) { return true; };
-#endif
 	for (uint32_t st = 0; st < stages; ++st) {
 		const auto& program = *pair.programs[st];
 		const auto& form    = pair.packed[st];
@@ -1231,7 +1084,7 @@ bool RenderExecutor::TableEvaluate(TablePair& pair, std::array<std::span<const u
 		if (table.addresses.size() < pair.runs[st].size()) table.addresses.resize(pair.runs[st].size());
 		if (!form.valid || form.runs.size() != pair.runs[st].size() || user_data[st].size() < form.user_words ||
 		    user_data[st].size() > 64) {
-			if (!by_operands(st) || !indirect(st)) return false;
+			if (!by_operands(st)) return false;
 			continue;
 		}
 		const std::array<const uint32_t*, 3> bases {user_data[st].data(), slots.data(), form.constants.data()};
@@ -1264,7 +1117,6 @@ bool RenderExecutor::TableEvaluate(TablePair& pair, std::array<std::span<const u
 			if (i < program.bindings.mip_stats_count) lod_stats(image, count);
 		}
 		for (; at < form.image_words.size(); ++at) out[at] = get(form.image_words[at]);
-		if (!indirect(st)) return false;
 	}
 	return true;
 }
@@ -1691,7 +1543,6 @@ bool RenderExecutor::TableTransit(const TableImageSet& set, CommandRecorder vk_b
 	return true;
 }
 
-#if KYTY_CX_SCOUT
 template <typename Pair>
 static void TableScoutPublish(Pair& pair) {
 	if (!Scout::Running() || pair.programs[0] == nullptr) return;
@@ -1703,9 +1554,6 @@ static void TableScoutPublish(Pair& pair) {
 		const auto& plan    = program.table_plan;
 		const auto& form    = pair.packed[st];
 		if (!form.valid || form.runs.size() != pair.runs[st].size() || form.user_words > 32 ||
-#if KYTY_CX_INDIRECT
-		    !plan.indirect.empty() ||
-#endif
 		    form.buffer_words.size() != 4 * plan.buffers.size())
 			return;
 		auto& stage = view->stage[st];
@@ -1826,7 +1674,6 @@ static void TableScoutApply(Table& table, const Pair& pair, const Scout::Ticket&
 		TableScoutSlots(slots.data(), in, segments, ticket.segments[st]);
 		in += ticket.slot_words[st];
 		segments += ticket.segments[st];
-		table.indirect[st].clear();
 	}
 	in = segments;
 	table.words.assign(in, in + ticket.image_words);
@@ -1845,8 +1692,6 @@ static void TableScoutApply(Table& table, const Pair& pair, const Scout::Ticket&
 	}
 	table.gathered = &pair;
 }
-
-#endif
 
 RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, TablePair& pair, TableVariant& variant,
                                                       const NativeXprDrawState& draw_state,
@@ -1871,7 +1716,6 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	}
 	std::optional<LiveCensus::Scope> phase;
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1e, 1);
-#if KYTY_CX_SCOUT
 	const auto* scout = Scout::Running() && spec_state == nullptr
 	                        ? TableScoutTicket(pair, user_data, stages, m_context, static_cast<const Scout::Ticket*>(m_table_ticket))
 	                        : nullptr;
@@ -1883,14 +1727,6 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		if (!evaluated)
 			return LiveCounters::Add(LiveCounters::TableDrawNative), Spec::Refuse("table: evaluation"), TableResult::Native;
 	}
-#else
-	{
-		const bool evaluated = TableEvaluate(pair, user_data);
-		if (evaluated) TableGather(pair, user_data);
-		if (!evaluated)
-			return LiveCounters::Add(LiveCounters::TableDrawNative), Spec::Refuse("table: evaluation"), TableResult::Native;
-	}
-#endif
 	phase.reset();
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1e, 2);
 	auto* set = TableSet(buffer, pair, &variant, &draw_state);
@@ -2350,9 +2186,7 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
 		pair->has_pixel   = state.ps_active;
 		pair->code_hashes = {ShaderHashAt(pair->vs), state.ps_active ? ShaderHashAt(pair->ps) : 0};
 		TableRuns(*pair);
-#if KYTY_CX_SCOUT
 		TableScoutPublish(*pair);
-#endif
 	}
 	auto variant = std::ranges::find(pair->variants, table.store_state, &TableVariant::state);
 	if (variant == pair->variants.end()) variant = pair->variants.insert(variant, {.state = table.store_state});
