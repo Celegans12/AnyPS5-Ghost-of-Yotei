@@ -974,6 +974,13 @@ struct Program: ResourcePlan {
 	Bindings                      bindings;
 	bool                          table_mode = false;
 	TablePlan                     table_plan;
+	bool                          table_gpu_reads = false;
+	bool                          table_plain_roots = false;
+	bool                          table_keep_buffers = false;
+	bool                          table_page_table = false;
+	bool                          table_page_per_buffer = false;
+	bool                          table_page_plain = false;
+	std::vector<uint8_t>          table_gpu_slots;
 
 };
 

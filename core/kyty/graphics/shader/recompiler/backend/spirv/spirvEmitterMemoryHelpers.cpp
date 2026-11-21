@@ -1,6 +1,9 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
+
+static uint32_t EmitGpuReadPage(EmitterState& state, uint32_t address);
 
 uint32_t EmitPushDataLoad(EmitterState& state, uint32_t index) {
 	const auto pointer = state.builder.AllocateId();
@@ -192,7 +195,7 @@ uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resour
 }
 
 void EmitMemoryBindings(EmitterState& state) {
-	if (state.program.table_mode) return;
+	if (state.program.table_mode && !state.program.table_gpu_reads) return;
 	const auto count = state.program.bindings.descriptor_counts[static_cast<size_t>(IR::DescriptorBindingKind::Buffers)];
 	state.memory_byte_offsets.resize(count);
 	state.memory_byte_sizes.resize(count);
@@ -277,8 +280,8 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
                                                          const IR::MemoryInfo& mem,
                                                          BufferDefinition& buffer,
                                                          uint32_t array_index) {
-	if (state.program.table_mode) {
-		if (mem.resource >= state.table_bases.size() || array_index != 0u) {
+	if (PhysicalBuffer(state, mem.resource)) {
+		if (mem.resource >= state.table_bases.size() || state.table_bases[mem.resource] == 0u || array_index != 0u) {
 			ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
 			                             "table mode buffer is missing");
 		}
@@ -289,15 +292,28 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 		    .kind = mem.kind,
 		    .memory_access = mem.coherent ? spv::MemoryAccessVolatileMask : spv::MemoryAccessMaskNone,
 		    .physical = true};
-		access.object_pointer = Unary(state, spv::OpConvertUToPtr, TypePhysicalStorageBufferPointer(state, bits),
-		                              state.table_bases[mem.resource]);
+		if (state.program.table_page_table && !state.program.table_page_per_buffer) {
+			(void)TypePhysicalStorageBufferPointer(state, bits);
+			access.guest_base     = state.table_bases[mem.resource];
+			access.object_pointer = access.guest_base;
+		} else {
+			access.object_pointer = Unary(state, spv::OpConvertUToPtr, TypePhysicalStorageBufferPointer(state, bits),
+			                              state.table_bases[mem.resource]);
+		}
 		access.element_bits   = bits;
 		const auto dwords = state.table_lengths[mem.resource];
-		access.length     = bits == 32u ? dwords
-		                    : bits == 64u
-		                        ? Binary(state, spv::OpShiftRightLogical, TypeU32(state), dwords, ConstantU32(state, 1))
-		                        : Binary(state, spv::OpShiftLeftLogical, TypeU32(state), dwords,
-		                                 ConstantU32(state, bits == 8u ? 2u : 1u));
+		if (mem.resource < state.gpu_read_bytes.size() && state.gpu_read_bytes[mem.resource] != 0u) {
+			const auto bytes = state.gpu_read_bytes[mem.resource];
+			access.length    = bits == 8u ? bytes
+			                              : Binary(state, spv::OpShiftRightLogical, TypeU32(state), bytes,
+			                                       ConstantU32(state, bits == 16u ? 1u : bits == 32u ? 2u : 3u));
+		} else {
+			access.length = bits == 32u ? dwords
+			                : bits == 64u
+			                    ? Binary(state, spv::OpShiftRightLogical, TypeU32(state), dwords, ConstantU32(state, 1))
+			                    : Binary(state, spv::OpShiftLeftLogical, TypeU32(state), dwords,
+			                             ConstantU32(state, bits == 8u ? 2u : 1u));
+		}
 		access.byte_offset = ConstantU32(state, 0);
 		return access;
 	}
@@ -446,6 +462,13 @@ uint32_t EmitStorageBufferElementPointer(EmitterState& state,
 		                     : access.element_bits == 64u ? state.storage_buffers[3].element_type
 		                                                  : TypeU32(state);
 		pointer_type = TypePointer(state, spv::StorageClassPhysicalStorageBuffer, element);
+		if (access.guest_base != 0u) {
+			const auto bytes   = Binary(state, spv::OpIMul, TypeU64(state), Unary(state, spv::OpUConvert, TypeU64(state), index),
+			                            ConstantU64(state, access.element_bits / 8u));
+			const auto address = Binary(state, spv::OpIAdd, TypeU64(state), access.guest_base, bytes);
+			return Unary(state, spv::OpConvertUToPtr, pointer_type,
+			             state.program.table_page_plain ? EmitGpuReadPage(state, address) : GetBdaPointer(state, address));
+		}
 	}
 	const auto pointer = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, pointer_type, pointer, access.object_pointer,
@@ -887,9 +910,164 @@ void EmitAccessStore(EmitterState& state, uint32_t pointer, uint32_t value, cons
 	}
 }
 
+static uint32_t EmitGpuReadPage(EmitterState& state, uint32_t address) {
+	const auto u64      = TypeU64(state);
+	const auto extended = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), address,
+	                             ConstantU64(state, LibKernel::Memory::kExtendedMemoryBase));
+	const auto packed   = Select(state, u64, extended,
+	                             Binary(state, spv::OpISub, u64, address,
+	                                    ConstantU64(state, LibKernel::Memory::kExtendedMemoryBase - LOWER_ADDRESS_SIZE)),
+	                             address);
+	const auto page     = Unary(state, spv::OpUConvert, TypeU32(state),
+	                            Binary(state, spv::OpShiftRightLogical, u64, packed,
+	                                   ConstantU64(state, BufferCache::CACHING_PAGEBITS)));
+	const auto entry    = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state, 64), entry,
+	                          state.bda_pagetable_variable, ConstantU32(state, 0), page);
+	const auto base = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, u64, base, entry);
+	return Binary(state, spv::OpIAdd, u64, base,
+	              Binary(state, spv::OpBitwiseAnd, u64, address, ConstantU64(state, BufferCache::CACHING_PAGESIZE - 1)));
+}
+
+static uint32_t EmitGpuReadOperand(EmitterState& state, const IR::TablePlan::Operand& operand, uint32_t depth) {
+	using Kind = IR::TablePlan::Operand::Kind;
+	if (operand.kind == Kind::Immediate) return ConstantU32(state, operand.value);
+	if (operand.kind == Kind::Slot) return EmitGpuReadSlot(state, operand.value, depth + 1u);
+	if (operand.kind != Kind::UserData) return ConstantU32(state, 0);
+	const auto& registers = state.program.info.user_data_registers;
+	const auto  found     = std::lower_bound(registers.begin(), registers.end(), operand.value);
+	if (found == registers.end() || *found != operand.value) return ConstantU32(state, 0);
+	return EmitShaderDataDwordLoad(state, static_cast<uint32_t>(found - registers.begin()));
+}
+
+uint32_t EmitGpuReadSlot(EmitterState& state, uint32_t slot, uint32_t depth) {
+	const auto& plan = state.program.table_plan;
+	if (slot >= plan.slots.size() || depth > 64u) return ConstantU32(state, 0);
+	const auto& read = plan.slots[slot];
+	const auto  u32  = TypeU32(state);
+	const auto  u64  = TypeU64(state);
+	if (const auto root = state.program.table_plain_roots ? -1 : IR::GpuReadRootOf(plan, state.gpu_read_roots, slot);
+	    root >= 0 && state.uniform_buffer_variable != 0) {
+		const auto dword   = static_cast<uint32_t>((int64_t {read.offset.value & ~3u} + read.immediate) / 4);
+		const auto index   = Binary(state, spv::OpIAdd, u32, ConstantU32(state, dword),
+		                            state.gpu_read_residuals[static_cast<size_t>(root)]);
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypePointer(state, spv::StorageClassUniform, u32), pointer,
+		                          state.uniform_buffer_variable,
+		                          ConstantU32(state, state.gpu_read_root_base + static_cast<uint32_t>(root)),
+		                          ConstantU32(state, 0), index);
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, u32, value, pointer);
+		return value;
+	}
+	const auto low    = EmitGpuReadOperand(state, read.low, depth);
+	const auto high   = EmitGpuReadOperand(state, read.high, depth);
+	const auto offset = read.offset.kind == IR::TablePlan::Operand::Kind::Immediate
+	                        ? ConstantU32(state, read.offset.value & ~3u)
+	                        : Binary(state, spv::OpBitwiseAnd, u32, EmitGpuReadOperand(state, read.offset, depth),
+	                                 ConstantU32(state, ~3u));
+	const auto base = Binary(state, spv::OpBitwiseAnd, u64, PackU64(state, low, high),
+	                         ConstantU64(state, 0x0000fffffffffffcull));
+	auto address = Binary(state, spv::OpIAdd, u64, base, Unary(state, spv::OpUConvert, u64, offset));
+	address      = Binary(state, spv::OpIAdd, u64, address,
+	                      ConstantU64(state, static_cast<uint64_t>(int64_t {read.immediate})));
+	if (!state.program.table_page_table) address = Binary(state, spv::OpIAdd, u64, address, state.gpu_read_mirror);
+	const auto load = [&] {
+		if (state.program.table_page_plain) {
+			const auto pointer = Unary(state, spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), EmitGpuReadPage(state, address));
+			const auto value   = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLoad, u32, value, pointer, spv::MemoryAccessAlignedMask,
+			                          static_cast<uint32_t>(sizeof(uint32_t)));
+			return value;
+		}
+		if (state.program.table_page_table) {
+			auto [entry, inserted] = state.bda_load_functions.try_emplace(std::array {0u, 0u}, 0u);
+			if (inserted) entry->second = state.builder.AllocateId();
+			const auto result = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpFunctionCall, u32, result, entry->second, address);
+			return result;
+		}
+		const auto pointer = Unary(state, spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), address);
+		const auto value   = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, u32, value, pointer, spv::MemoryAccessAlignedMask,
+		                          static_cast<uint32_t>(sizeof(uint32_t)));
+		return value;
+	};
+	if (!read.bounded) return load();
+	if (read.immediate < 0) return ConstantU32(state, 0);
+	const auto stride  = Binary(state, spv::OpBitwiseAnd, u32,
+	                            Binary(state, spv::OpShiftRightLogical, u32, high, ConstantU32(state, 16)),
+	                            ConstantU32(state, 0x3fffu));
+	const auto records = EmitGpuReadOperand(state, read.records, depth);
+	const auto size    = Select(state, u32, Binary(state, spv::OpIEqual, TypeBool(state), stride, ConstantU32(state, 0)),
+	                            records, Binary(state, spv::OpIMul, u32, stride, records));
+	const auto inside  = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), size,
+	                            ConstantU32(state, static_cast<uint32_t>(read.immediate) + 4u));
+	return EmitValueOrZeroIfCondition(state, inside, load);
+}
+
+void EmitGpuReadHandle(EmitterState& state, uint32_t resource, const std::array<uint32_t, 4>& words) {
+	const auto& program = state.program;
+	const auto  u32     = TypeU32(state);
+	const auto  u64     = TypeU64(state);
+	if (resource >= state.table_bases.size()) return;
+	const auto base   = Binary(state, spv::OpBitwiseAnd, u64, PackU64(state, words[0], words[1]),
+	                           ConstantU64(state, 0x0000ffffffffffffull));
+	const auto stride = Binary(state, spv::OpBitwiseAnd, u32,
+	                           Binary(state, spv::OpShiftRightLogical, u32, words[1], ConstantU32(state, 16)),
+	                           ConstantU32(state, 0x3fffu));
+	const auto bytes  = Select(state, u32, Binary(state, spv::OpIEqual, TypeBool(state), stride, ConstantU32(state, 0)),
+	                           words[2], Binary(state, spv::OpIMul, u32, stride, words[2]));
+	const auto typed  = Binary(state, spv::OpINotEqual, TypeBool(state),
+	                           Binary(state, spv::OpShiftRightLogical, u32, words[3], ConstantU32(state, 30)),
+	                           ConstantU32(state, 0));
+	const auto null   = Binary(state, spv::OpLogicalOr, TypeBool(state), typed,
+	                           Binary(state, spv::OpIEqual, TypeBool(state), base, ConstantU64(state, 0)));
+	state.table_bases[resource]   = program.table_page_per_buffer ? GetBdaPointer(state, base)
+	                                : program.table_page_table    ? base
+	                                                              : Binary(state, spv::OpIAdd, u64, base, state.gpu_read_mirror);
+	const auto missing = program.table_page_per_buffer
+	                         ? Binary(state, spv::OpLogicalOr, TypeBool(state), null,
+	                                  Binary(state, spv::OpIEqual, TypeBool(state), state.table_bases[resource], ConstantU64(state, 0)))
+	                         : null;
+	state.table_lengths[resource] = Select(state, u32, missing, ConstantU32(state, 0),
+	                                       Binary(state, spv::OpShiftRightLogical, u32, bytes, ConstantU32(state, 2)));
+	state.table_strides[resource] = Select(state, u32, typed, ConstantU32(state, 0), stride);
+	if (resource < state.gpu_read_bytes.size()) {
+		state.gpu_read_bytes[resource] = Select(state, u32, missing, ConstantU32(state, 0), bytes);
+	}
+	state.table_buffer_words[resource] = 0;
+	if (resource < 32 && ((program.table_plan.runtime_formats >> resource) & 1u) != 0 &&
+	    program.info.buffers[resource].descriptor_format == Prospero::BufferFormat::kInvalid) {
+		state.table_buffer_words[resource] = Select(state, u32, typed, ConstantU32(state, 0), words[3]);
+	}
+}
+
+static void EmitGpuReads(EmitterState& state) {
+	const auto& program = state.program;
+	const auto  block   = program.bindings.TableBlockDword();
+	state.gpu_read_mirror      = PackU64(state, EmitShaderDataDwordLoad(state, block), EmitShaderDataDwordLoad(state, block + 1u));
+	state.gpu_read_shader_base = PackU64(state, EmitShaderDataDwordLoad(state, block + 2u), EmitShaderDataDwordLoad(state, block + 3u));
+	state.gpu_read_residuals.assign(state.gpu_read_roots.size(), 0);
+	for (size_t root = 0; root < state.gpu_read_roots.size(); ++root) {
+		state.gpu_read_residuals[root] = EmitShaderDataDwordLoad(state, block + 4u + static_cast<uint32_t>(root));
+	}
+	state.table_slot_values.assign(program.table_plan.slots.size(), 0);
+	state.table_bases.assign(program.info.buffers.size(), 0);
+	state.table_lengths.assign(program.info.buffers.size(), 0);
+	state.table_strides.assign(program.info.buffers.size(), 0);
+	state.table_buffer_words.assign(program.info.buffers.size(), 0);
+	state.gpu_read_bytes.assign(program.info.buffers.size(), 0);
+}
+
 void EmitTableMode(EmitterState& state) {
 	const auto& program = state.program;
 	if (!program.table_mode) return;
+	if (program.table_gpu_reads) {
+		EmitGpuReads(state);
+		return;
+	}
 	const auto& plan = program.table_plan;
 	const auto  u64  = TypeU64(state);
 	const auto  low  = Unary(state, spv::OpUConvert, u64,

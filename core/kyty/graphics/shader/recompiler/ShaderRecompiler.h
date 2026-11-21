@@ -31,6 +31,13 @@ struct CompileOptions {
 	bool                        ray_stats                  = false;
 	uint32_t                    rt_oracle                  = 0;
 	bool                        table_mode                 = false;
+	bool                        gpu_reads                  = false;
+	bool                        gpu_reads_plain_roots      = false;
+	bool                        gpu_reads_keep_buffers     = false;
+	bool                        gpu_reads_page_table       = false;
+	bool                        gpu_reads_page_per_buffer  = false;
+	bool                        gpu_reads_page_plain       = false;
+	std::span<const uint8_t>    gpu_reads_slots;
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
 	ShaderStageInputInfo        input_info;

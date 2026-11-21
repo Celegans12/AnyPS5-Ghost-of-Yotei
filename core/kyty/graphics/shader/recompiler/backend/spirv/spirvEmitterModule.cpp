@@ -285,14 +285,22 @@ void DefineDescriptors(EmitterState& state) {
 	auto& counts = bindings.descriptor_counts;
 	auto& buffer_count = counts[static_cast<size_t>(Kind::Buffers)];
 	const bool table = state.program.table_mode;
+	const bool gpu_reads = state.program.table_gpu_reads;
 	for (auto& buffer: info.buffers) {
-		buffer.descriptor_index = buffer.live && !table ? buffer_count++ : UINT32_MAX;
+		const bool bound = !table || (gpu_reads && (state.program.table_keep_buffers ||
+		                                            buffer.indirect_root != IR::BufferResource::NoIndirectBuffer));
+		buffer.descriptor_index = buffer.live && bound ? buffer_count++ : UINT32_MAX;
 	}
 	auto& uniform_count = counts[static_cast<size_t>(Kind::UniformBuffers)];
 	for (auto& buffer: info.buffers) {
 		buffer.uniform_index = state.profile.robust_buffer_access &&
 		                               buffer.descriptor_index != UINT32_MAX && buffer.constant_only
 		                           ? uniform_count++ : UINT32_MAX;
+	}
+	if (state.program.table_gpu_reads && !state.program.table_plain_roots) {
+		state.gpu_read_roots     = IR::GpuReadRoots(state.program.table_plan);
+		state.gpu_read_root_base = uniform_count;
+		uniform_count += static_cast<uint32_t>(state.gpu_read_roots.size());
 	}
 	std::array<const IR::ImageResource*, IR::ImageBindingCount> image_types {};
 	for (auto& image: info.images) {
@@ -334,7 +342,7 @@ void DefineDescriptors(EmitterState& state) {
 	    info.uses_lds && state.lds_storage_class == spv::StorageClassStorageBuffer;
 	counts[static_cast<size_t>(Kind::BdaPagetable)] = info.uses_dma;
 	counts[static_cast<size_t>(Kind::FaultBuffer)] = info.uses_dma;
-	counts[static_cast<size_t>(Kind::FlattenedSrt)] = info.uses_flattened_srt && !table;
+	counts[static_cast<size_t>(Kind::FlattenedSrt)] = info.uses_flattened_srt && (!table || gpu_reads);
 	bindings.flattened_srt_uniform =
 	    counts[static_cast<size_t>(Kind::FlattenedSrt)] != 0 && FlattenedSrtFitsUniform(state.program);
 	bindings.memory_offset_dword = static_cast<uint32_t>(info.user_data_registers.size());
@@ -355,7 +363,7 @@ void DefineDescriptors(EmitterState& state) {
 	    })) {
 		bindings.stride_count = counts[static_cast<size_t>(Kind::Buffers)];
 	}
-	bindings.table_block_dwords = table ? 2u : 0u;
+	bindings.table_block_dwords = !table ? 0u : gpu_reads ? 4u + static_cast<uint32_t>(state.gpu_read_roots.size()) : 2u;
 	bindings.push_data_start_dword =
 	    IR::PushData::StartFor(bindings.push_data_start_dword, bindings.ShaderDataDwords());
 	counts[static_cast<size_t>(Kind::ShaderData)] =

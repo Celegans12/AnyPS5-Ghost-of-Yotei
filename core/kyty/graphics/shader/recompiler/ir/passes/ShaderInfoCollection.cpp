@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/RayQuery.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/TableMode.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -671,6 +672,12 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 		for (const auto& inst: *block) {
 			Visit(program, input_info, inputs, inst);
 		}
+	}
+	if (program.table_gpu_reads) {
+		for (const auto index: GpuReadRegisters(program.table_plan)) {
+			if (index < inputs.user_data.size()) inputs.user_data[index] = true;
+		}
+		if (program.table_page_table) info.uses_dma = true;
 	}
 	for (uint32_t index = 0; index < inputs.user_data.size(); index++) {
 		if (inputs.user_data[index]) info.user_data_registers.push_back(index);

@@ -9,6 +9,7 @@
 #include "graphics/shader/recompiler/backend/spirv/SpirvWaveSplit.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/shader/recompiler/ir/passes/TableMode.h"
 
 #include <algorithm>
 #include <array>
@@ -213,6 +214,16 @@ struct EmitterState {
 	std::vector<uint32_t>                            table_lengths;
 	std::vector<uint32_t>                            table_strides;
 	std::vector<uint32_t>                            table_buffer_words;
+	uint32_t                                         gpu_read_mirror         = 0;
+	uint32_t                                         gpu_read_shader_base    = 0;
+	uint32_t                                         gpu_read_root_base      = 0;
+	std::vector<IR::GpuReadRoot>                     gpu_read_roots;
+	std::vector<uint32_t>                            gpu_read_residuals;
+	std::vector<uint32_t>                            gpu_read_bytes;
+	struct GpuReadHandleValues {
+		uint32_t base = 0, length = 0, stride = 0, word = 0, bytes = 0;
+	};
+	std::map<std::pair<const IR::Inst*, uint32_t>, GpuReadHandleValues> gpu_read_handles;
 	uint32_t                                         uniform_buffer_variable = 0;
 	spv::StorageClass                                lds_storage_class = spv::StorageClassFunction;
 	spv::StorageClass                                scratch_storage_class = spv::StorageClassFunction;
@@ -522,11 +533,23 @@ struct MemoryResourceAccess {
 	bool                  non_uniform      = false;
 	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;
 	bool                  physical         = false;
+	uint32_t              guest_base       = 0;
 };
 
 uint32_t EmitAccessLoad(EmitterState& state, uint32_t type, uint32_t pointer, const MemoryResourceAccess& access);
 void     EmitAccessStore(EmitterState& state, uint32_t pointer, uint32_t value, const MemoryResourceAccess& access);
 void EmitTableMode(EmitterState& state);
+uint32_t EmitGpuReadSlot(EmitterState& state, uint32_t slot, uint32_t depth = 0);
+void     EmitGpuReadHandle(EmitterState& state, uint32_t resource, const std::array<uint32_t, 4>& words);
+inline bool GpuReadSlot(const EmitterState& state, uint32_t slot) {
+	const auto& slots = state.program.table_gpu_slots;
+	return state.program.table_gpu_reads && (slots.empty() || (slot < slots.size() && slots[slot] != 0));
+}
+inline bool PhysicalBuffer(const EmitterState& state, uint32_t resource) {
+	return state.program.table_mode &&
+	       (!state.program.table_gpu_reads || resource >= state.program.info.buffers.size() ||
+	        state.program.info.buffers[resource].descriptor_index == UINT32_MAX);
+}
 uint32_t TypePhysicalStorageBufferPointer(EmitterState& state, uint32_t bits);
 
 uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,

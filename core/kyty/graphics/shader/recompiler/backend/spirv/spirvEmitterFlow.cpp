@@ -947,6 +947,7 @@ uint32_t EmitGetInterpolationParameter(ValueEmitContext& ctx, const IR::Inst& in
 }
 
 uint32_t EmitGetShaderBase(ValueEmitContext& ctx) {
+	if (ctx.state.program.table_gpu_reads && ctx.state.gpu_read_shader_base != 0) return ctx.state.gpu_read_shader_base;
 	return ctx.Def(IR::Value(uint64_t {0}));
 }
 

@@ -748,6 +748,44 @@ void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
 		ctx.Define(inst, ctx.other_half->Result(inst));
 		return;
 	}
+	if (ctx.state.program.table_gpu_reads && ctx.state.program.table_page_per_buffer &&
+	    op == IR::ValueOpcode::GetBufferResource && inst.NumArgs() == 4) {
+		auto&      state    = ctx.state;
+		const auto resource = inst.Flags<uint32_t>();
+		const bool used     = std::ranges::any_of(inst.Uses(), [&](const IR::Use& use) {
+			const auto& memory = state.program.memory_info[use.user->Flags<IR::MemoryFlags>().index];
+			return (memory.kind == IR::ResourceKind::Buffer || memory.kind == IR::ResourceKind::ScalarBuffer) &&
+			       !memory.planning_only;
+		});
+		if (used && resource < state.program.info.buffers.size() && PhysicalBuffer(state, resource)) {
+			EmitGpuReadHandle(state, resource, {ctx.Arg(inst, 0), ctx.Arg(inst, 1), ctx.Arg(inst, 2), ctx.Arg(inst, 3)});
+			state.gpu_read_handles[{&inst, ctx.half}] = {state.table_bases[resource], state.table_lengths[resource],
+			                                             state.table_strides[resource], state.table_buffer_words[resource],
+			                                             state.gpu_read_bytes[resource]};
+		}
+	}
+	if (ctx.state.program.table_gpu_reads && inst.NumArgs() != 0 &&
+	    (IR::BufferComponentCount(op) != 0 || op == IR::ValueOpcode::ReadConstBuffer ||
+	     IR::BufferAccessOf(op) != IR::BufferAccess::None)) {
+		const auto* handle = inst.Arg(0).Resolve().TryInstruction();
+		const auto& memory = ctx.Memory(inst);
+		if (handle != nullptr && handle->GetOpcode() == IR::ValueOpcode::GetBufferResource && handle->NumArgs() == 4 &&
+		    (memory.kind == IR::ResourceKind::Buffer || memory.kind == IR::ResourceKind::ScalarBuffer) &&
+		    !memory.planning_only && PhysicalBuffer(ctx.state, memory.resource)) {
+			auto& state = ctx.state;
+			if (const auto found = state.gpu_read_handles.find({handle, ctx.half});
+			    found != state.gpu_read_handles.end() && handle->Flags<uint32_t>() == memory.resource) {
+				state.table_bases[memory.resource]        = found->second.base;
+				state.table_lengths[memory.resource]      = found->second.length;
+				state.table_strides[memory.resource]      = found->second.stride;
+				state.table_buffer_words[memory.resource] = found->second.word;
+				state.gpu_read_bytes[memory.resource]     = found->second.bytes;
+			} else {
+				EmitGpuReadHandle(state, memory.resource,
+				                  {ctx.Arg(*handle, 0), ctx.Arg(*handle, 1), ctx.Arg(*handle, 2), ctx.Arg(*handle, 3)});
+			}
+		}
+	}
 	switch (op) {
 #define VALUE_OPCODE(name, ...)                                                                    \
 	case IR::ValueOpcode::name: return Invoke(Emit##name, ctx, inst);
@@ -943,6 +981,7 @@ void EmitOutlinedFunction(ValueEmitContext& ctx, OutlinedRegion& region) {
 	state.current_block = nullptr;
 	EmitLabel(state, state.builder.AllocateId());
 	EmitFunctionEntryValues(state);
+	if (state.program.table_gpu_reads) EmitTableMode(state);
 	EmitMemoryBindings(state);
 	uint32_t member = 0;
 	for (const auto* input: region.inputs) {

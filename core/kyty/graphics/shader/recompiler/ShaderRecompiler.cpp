@@ -765,11 +765,18 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	auto& ir = translated.program;
 	const auto* stage = StageName(ir.stage);
 	IR::ApplyResourceSpecialization(ir, specialization);
-	if (options.table_mode) {
+	if (options.table_mode || options.gpu_reads) {
 		CompileResult refused;
-		if (!IR::EnterTableMode(ir, refused.table_refusal)) {
+		if (!IR::EnterTableMode(ir, refused.table_refusal, options.gpu_reads)) {
 			return refused;
 		}
+		ir.table_gpu_reads    = options.gpu_reads;
+		ir.table_plain_roots  = options.gpu_reads && options.gpu_reads_plain_roots;
+		ir.table_keep_buffers = options.gpu_reads && options.gpu_reads_keep_buffers;
+		ir.table_page_table   = options.gpu_reads && options.gpu_reads_page_table;
+		ir.table_page_per_buffer = ir.table_page_table && options.gpu_reads_page_per_buffer;
+		ir.table_page_plain      = ir.table_page_table && options.gpu_reads_page_plain;
+		ir.table_gpu_slots.assign(options.gpu_reads_slots.begin(), options.gpu_reads_slots.end());
 	}
 	for (auto& inst: ir.value_storage) {
 		inst.Invalidate();
@@ -786,6 +793,10 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 					continue;
 				}
 				const auto resource = inst.Flags<uint32_t>();
+				if (options.gpu_reads && !options.gpu_reads_keep_buffers && resource < ir.info.buffers.size() &&
+				    ir.info.buffers[resource].indirect_root == IR::BufferResource::NoIndirectBuffer) {
+					continue;
+				}
 				first               = resource < ir.info.buffers.size() &&
 				                              ir.info.buffers[resource].indirect_root == resource
 				                          ? 1u

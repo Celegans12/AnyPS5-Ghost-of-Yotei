@@ -52,7 +52,7 @@ std::optional<TablePlan::Operand> TableOperand(Value value, size_t slots) {
 
 }
 
-bool EnterTableMode(Program& program, std::string& reason) {
+bool EnterTableMode(Program& program, std::string& reason, bool gpu_reads) {
 	const auto refuse = [&](const char* why) {
 		reason = why;
 		return false;
@@ -108,6 +108,7 @@ bool EnterTableMode(Program& program, std::string& reason) {
 		return true;
 	};
 	for (const auto& buffer: program.info.buffers) {
+		if (gpu_reads) break;
 		if (buffer.indirect_root != BufferResource::NoIndirectBuffer ||
 		    buffer.indirect_write_table || (buffer.packed_stride & ((1u << 14u) | (1u << 20u))) != 0)
 			return refuse("an aliased, indirect, swizzled or ADD_TID buffer");
@@ -115,6 +116,7 @@ bool EnterTableMode(Program& program, std::string& reason) {
 			return refuse("a buffer descriptor table mode cannot evaluate");
 	}
 	for (const auto& image: program.info.images) {
+		if (gpu_reads) break;
 		if (image.mip_mode != ImageMipMode::None || image.indirect_root != ImageResource::NoIndirectImage ||
 		    image.indirect_search_iterations != 0 || image.table_capacity != 0)
 			return refuse("an indirect image or one of dynamic mip levels");
@@ -130,6 +132,7 @@ bool EnterTableMode(Program& program, std::string& reason) {
 			return refuse("an image descriptor table mode cannot evaluate");
 	}
 	for (const auto& sampler: program.info.samplers) {
+		if (gpu_reads) break;
 		if (sampler.indirect_root != SamplerResource::NoIndirectSampler) return refuse("an indirect sampler");
 		auto& descriptor = plan.samplers.emplace_back();
 		descriptor.count = 4;
@@ -192,6 +195,50 @@ bool EnterTableMode(Program& program, std::string& reason) {
 	program.table_plan = std::move(plan);
 	program.table_mode = true;
 	return true;
+}
+
+std::vector<GpuReadRoot> GpuReadRoots(const TablePlan& plan) {
+	std::vector<GpuReadRoot> roots;
+	for (size_t slot = 0; slot < plan.slots.size(); ++slot) {
+		const auto& read = plan.slots[slot];
+		if (slot < plan.cpu.size() && plan.cpu[slot] == 0) continue;
+		if (read.bounded || read.low.kind != TablePlan::Operand::Kind::UserData ||
+		    read.high.kind != TablePlan::Operand::Kind::UserData || read.offset.kind != TablePlan::Operand::Kind::Immediate)
+			continue;
+		const auto bytes = int64_t {read.offset.value & ~3u} + read.immediate;
+		if (bytes < 0 || bytes + 4 > int64_t {UniformBufferBytes} - int64_t {UniformBufferBaseSlack}) continue;
+		const GpuReadRoot root {read.low.value, read.high.value};
+		if (std::ranges::find(roots, root) == roots.end()) roots.push_back(root);
+	}
+	return roots;
+}
+
+int32_t GpuReadRootOf(const TablePlan& plan, const std::vector<GpuReadRoot>& roots, size_t slot) {
+	const auto& read = plan.slots[slot];
+	if (read.bounded || read.low.kind != TablePlan::Operand::Kind::UserData ||
+	    read.high.kind != TablePlan::Operand::Kind::UserData || read.offset.kind != TablePlan::Operand::Kind::Immediate)
+		return -1;
+	const auto bytes = int64_t {read.offset.value & ~3u} + read.immediate;
+	if (bytes < 0 || bytes + 4 > int64_t {UniformBufferBytes} - int64_t {UniformBufferBaseSlack}) return -1;
+	const auto found = std::ranges::find(roots, GpuReadRoot {read.low.value, read.high.value});
+	return found == roots.end() ? -1 : static_cast<int32_t>(found - roots.begin());
+}
+
+std::vector<uint32_t> GpuReadRegisters(const TablePlan& plan) {
+	std::vector<uint32_t> registers;
+	const auto            note = [&](const TablePlan::Operand& operand) {
+		if (operand.kind == TablePlan::Operand::Kind::UserData) registers.push_back(operand.value);
+	};
+	for (size_t slot = 0; slot < plan.slots.size(); ++slot) {
+		if (slot < plan.cpu.size() && plan.cpu[slot] == 0) continue;
+		const auto& read = plan.slots[slot];
+		for (const auto* operand: {&read.low, &read.high, &read.offset, &read.records}) note(*operand);
+	}
+	for (const auto& words: plan.buffers)
+		for (const auto& word: words) note(word);
+	std::ranges::sort(registers);
+	registers.erase(std::unique(registers.begin(), registers.end()), registers.end());
+	return registers;
 }
 
 }

@@ -104,7 +104,7 @@ uint32_t BufferByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR
 	}
 	const bool swizzle = stride != 0u && (packed & (1u << 14u)) != 0u;
 	uint32_t stride_value = 0;
-	if (state.program.table_mode && !swizzle && mem.resource < state.table_strides.size()) {
+	if (PhysicalBuffer(state, mem.resource) && !swizzle && mem.resource < state.table_strides.size()) {
 		stride_value = state.table_strides[mem.resource];
 	} else if (IR::HasRuntimeStride(packed)) {
 		const auto binding = state.program.info.buffers[mem.resource].descriptor_index;
@@ -397,8 +397,8 @@ uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memo
 	if (mem.kind == IR::ResourceKind::Buffer) {
 		const auto resource = ctx.state.program.info.buffers.at(mem.resource).descriptor_index;
 		if (prefix == 0u) {
-			prefix = ctx.state.program.table_mode ? ConstantU32(ctx.state, 0)
-			                                      : ctx.state.memory_byte_offsets[resource];
+			prefix = PhysicalBuffer(ctx.state, mem.resource) ? ConstantU32(ctx.state, 0)
+			                                                 : ctx.state.memory_byte_offsets[resource];
 		}
 		const auto address = Binary(ctx.state, spv::OpIAdd, TypeU32(ctx.state),
 		                            BufferByteAddress(ctx, inst, mem), prefix);
@@ -2466,7 +2466,10 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 
 uint32_t EmitReadConst(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& state = ctx.state;
-	if (state.program.table_mode) {
+	if (state.program.table_gpu_reads) {
+		const auto slot = inst.Arg(1).Resolve();
+		if (slot.IsImmediate() && GpuReadSlot(state, slot.U32())) return EmitGpuReadSlot(state, slot.U32());
+	} else if (state.program.table_mode) {
 		const auto slot = inst.Arg(1).Resolve().U32();
 		return slot < state.table_slot_values.size() && state.table_slot_values[slot] != 0
 		           ? state.table_slot_values[slot]
