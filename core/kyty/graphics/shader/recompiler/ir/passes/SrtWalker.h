@@ -113,6 +113,10 @@ enum class SrtWalkerPage : uint8_t { Direct, Backing, PerLoad };
 struct SrtWalkerGuestMemory {
 	SrtWalkerPage (*page)(uint64_t address, bool ahead, const uint8_t*& backing) = nullptr;
 	bool (*read)(uint64_t address, uint32_t& value, bool ahead, const uint8_t* backing) = nullptr;
+#if defined(ANYPS5_KYTY)
+	const uint8_t* (*around_page)(uint64_t address, bool& clean) = nullptr;
+	bool (*read_on_page)(uint64_t address, uint32_t& value, const uint8_t* backing) = nullptr;
+#endif
 };
 void SetSrtWalkerGuestMemory(const SrtWalkerGuestMemory& memory);
 #if defined(ANYPS5_KYTY)
