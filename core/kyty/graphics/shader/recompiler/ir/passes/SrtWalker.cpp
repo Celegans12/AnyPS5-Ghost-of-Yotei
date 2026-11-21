@@ -174,6 +174,7 @@ thread_local bool                         t_walker_faulted = false;
 thread_local bool (*t_gpu_produced)(uint64_t address)   = nullptr;
 thread_local bool (*t_pending_write)(uint64_t address, uint32_t& value) = nullptr;
 constexpr uint64_t GuestMemoryStart = SrtGuestMemoryStart;
+constexpr uint32_t ControlOnlySlot  = UINT32_MAX - 2u;
 
 SrtWalkerGuestMemory    g_guest_memory;
 std::atomic_bool        g_guest_memory_set {false};
@@ -811,33 +812,54 @@ void WalkerCompiler::FindFlatOnlyNodes(std::span<const Operand> conditions,
 			}
 		}
 	}
-	std::vector<bool> exact(m_nodes.size(), false);
-	const auto        need_exact = [&](const Operand& operand) {
-		if (operand.kind == Kind::Node && operand.value < exact.size()) exact[operand.value] = true;
+	std::vector<bool>     data(m_nodes.size(), false);
+	std::vector<uint32_t> pending;
+	const auto            need_data = [&](const Operand& operand) {
+		if (operand.kind != Kind::Node || operand.value >= data.size() || data[operand.value]) return;
+		data[operand.value] = true;
+		pending.push_back(static_cast<uint32_t>(operand.value));
+	};
+	const auto is_load = [&](size_t index) {
+		const auto op = m_nodes[index].inst->GetOpcode();
+		return m_nodes[index].result == Operand {Kind::Node, index} &&
+		       (op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer ||
+		        op == ValueOpcode::LoadBufferU32);
+	};
+	const auto need_inputs = [&](size_t index) {
+		const auto& node = m_nodes[index];
+		if (node.result != Operand {Kind::Node, index}) {
+			need_data(node.result);
+			return;
+		}
+		for (const auto& arg: node.args) need_data(arg);
 	};
 	for (const auto& words: descriptors) {
-		for (const auto& operand: words) need_exact(operand);
+		for (const auto& operand: words) need_data(operand);
 	}
-	for (const auto& operand: outputs) need_exact(operand);
-	for (size_t index = 0; index < m_nodes.size(); ++index) {
-		const auto& node = m_nodes[index];
-		if (node.result != Operand {Kind::Node, index} || control[index]) continue;
-		const auto op        = node.inst->GetOpcode();
-		const bool zero_test = (op == ValueOpcode::ULessThan32 || op == ValueOpcode::ULessThanEqual32) &&
-		                       node.args.size() == 2 && node.args[1].kind == Kind::Unknown;
-		for (size_t k = 0; k < node.args.size(); ++k) {
-			if (!(zero_test && k == 0)) need_exact(node.args[k]);
+	for (const auto& operand: outputs) need_data(operand);
+	for (const auto& operand: reads) {
+		if (operand.kind != Kind::Node || operand.value >= m_nodes.size()) continue;
+		if (is_load(operand.value)) {
+			need_inputs(operand.value);
+		} else {
+			need_data(operand);
 		}
+	}
+	while (!pending.empty()) {
+		const auto index = pending.back();
+		pending.pop_back();
+		need_inputs(index);
 	}
 	m_gpu_control.assign(m_nodes.size(), NoFlatSlot);
 	for (size_t index = 0; index < m_nodes.size(); ++index) {
 		const auto& node = m_nodes[index];
-		const auto  op   = node.inst->GetOpcode();
-		const bool  load = !node.referenced && !masks.contains(node.inst) &&
-		                  (op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer ||
-		                   op == ValueOpcode::LoadBufferU32);
-		if (load && node.result == Operand {Kind::Node, index} && !exact[index] && !m_zero_tested[index] &&
-		    flat_reads[index] == 1 && uses[index] > 1 && flat_of[index] != NoFlatSlot) {
+		if (!is_load(index) || node.referenced || masks.contains(node.inst) || data[index] || m_zero_tested[index] ||
+		    uses[index] <= flat_reads[index]) {
+			continue;
+		}
+		if (flat_reads[index] == 0) {
+			m_gpu_control[index] = ControlOnlySlot;
+		} else if (flat_reads[index] == 1 && flat_of[index] != NoFlatSlot) {
 			m_gpu_control[index] = flat_of[index];
 		}
 	}
@@ -1238,11 +1260,13 @@ void WalkerCompiler::SkipGpuControlLoad(const Xbyak::RegExp& address, uint32_t f
 		c.pop(reg);
 	}
 	c.jz(load, Near);
-	++m_captures;
-	c.mov(c.qword[c.r8], c.r10);
-	c.mov(c.dword[c.r8 + 8], 0);
-	c.mov(c.dword[c.r8 + 12], flat_slot);
-	c.add(c.r8, 16);
+	if (flat_slot != ControlOnlySlot) {
+		++m_captures;
+		c.mov(c.qword[c.r8], c.r10);
+		c.mov(c.dword[c.r8 + 8], 0);
+		c.mov(c.dword[c.r8 + 12], flat_slot);
+		c.add(c.r8, 16);
+	}
 	c.mov(c.byte[c.rdx + state], 3);
 	c.jmp(m_ret, Near);
 	c.L(load);

@@ -342,7 +342,10 @@ void LearnGpuProducedBound(uint64_t address) {
 }
 
 bool AheadGpuProduced(uint64_t address) {
-	if (!ThreadAheadWrites().Contains(address) && !g_gpu_produced_bounds.Contains(address)) return false;
+	if (!ThreadAheadWrites().Contains(address) && !g_gpu_produced_bounds.Contains(address) &&
+	    !Libs::LibKernel::Memory::MayFaultOnGpuRead(address, sizeof(uint32_t))) {
+		return false;
+	}
 	t_ahead_unread_load = true;
 	return true;
 }
@@ -2889,7 +2892,7 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 			return nullptr;
 		}
 #endif
-		const bool queued = !ahead.reads.MayHaveReadGpuWrites() && !t_ahead_unread_load;
+		const bool queued = t_ahead_unread_load || !ahead.reads.MayHaveReadGpuWrites();
 		if (queued) {
 #if defined(ANYPS5_KYTY)
 			auto promoted = specialization;
