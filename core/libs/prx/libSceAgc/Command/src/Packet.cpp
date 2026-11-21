@@ -15,6 +15,16 @@
 #include <thread>
 #include <vector>
 
+#if defined(ANYPS5_KYTY) && defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 namespace Agc::Command {
 
 void Require(bool condition, const char* function, const char* reason) {
@@ -59,12 +69,28 @@ std::uint32_t available(const CommandBuffer& buffer, const char* function) {
 }
 
 #if defined(ANYPS5_KYTY)
+#if defined(_WIN32)
+struct NotedSlots {
+    DWORD bottom = TlsAlloc();
+    DWORD top = TlsAlloc();
+};
+
+void NoteSegment(const CommandBuffer& buffer) {
+    static const NotedSlots slots;
+    if (slots.bottom == TLS_OUT_OF_INDEXES || slots.top == TLS_OUT_OF_INDEXES) return;
+    const void* bottom = TlsGetValue(slots.bottom);
+    const void* top = TlsGetValue(slots.top);
+    if (static_cast<const void*>(buffer.bottom) == bottom && static_cast<const void*>(buffer.top) == top) return;
+    TlsSetValue(slots.bottom, const_cast<void*>(static_cast<const void*>(buffer.bottom)));
+    TlsSetValue(slots.top, const_cast<void*>(static_cast<const void*>(buffer.top)));
+#else
 void NoteSegment(const CommandBuffer& buffer) {
     thread_local const std::uint32_t* noted_bottom = nullptr;
     thread_local const std::uint32_t* noted_top = nullptr;
     if (buffer.bottom == noted_bottom && buffer.top == noted_top) return;
     noted_bottom = buffer.bottom;
     noted_top = buffer.top;
+#endif
     if (buffer.bottom != nullptr && buffer.top > buffer.bottom) {
         AgcDriverNoteCommandSegment_nid_no_patch(reinterpret_cast<std::uint64_t>(buffer.bottom),
                                                  static_cast<std::size_t>(buffer.top - buffer.bottom) * sizeof(std::uint32_t));
