@@ -363,14 +363,6 @@ static bool WriteFaultBlocks() {
 	return on;
 }
 
-static bool WriteFaultFastPath() {
-	static const bool on = [] {
-		const char* value = std::getenv("KYTY_WRITE_FAULT_FAST_PATH");
-		return value == nullptr || value[0] != '0';
-	}();
-	return on;
-}
-
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                          PageManager& page_manager, TextureCache& texture_cache, RenderContext* resources)
     : m_graphics(graphics), m_scheduler(scheduler), m_resources(resources),
@@ -385,7 +377,6 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache) {
 	(void)WriteFaultBlocks();
-	(void)WriteFaultFastPath();
 	if (InPlaceMemory::Requested()) {
 		m_in_place = std::make_unique<InPlaceMemory>();
 	}
@@ -558,41 +549,21 @@ BufferCache::WriteFaultOwner BufferCache::InvalidateGuestWriteFault(uint64_t vad
 BufferCache::WriteFaultOwner BufferCache::InvalidateFaultedPage(uint64_t vaddr) {
 	static constexpr uint64_t FaultBlockSize = CommandBlocks::BlockSize;
 	static_assert(TRACKER_REGION_SIZE % FaultBlockSize == 0);
-	const auto page  = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
-	auto       owner = WriteFaultOwner::Other;
-	if (GuestGpu::IsGpuThread() || GuestGpu::IsCommandProcessorThread() ||
-	    !GuestRange {Common::AlignDown(page, FaultBlockSize), FaultBlockSize}.Valid()) {
-		m_memory_tracker.NoteGuestWriteFault(page);
-	} else if (WriteFaultFastPath()) {
+	const auto page = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	if (!GuestGpu::IsGpuThread() && !GuestGpu::IsCommandProcessorThread() &&
+	    GuestRange {Common::AlignDown(page, FaultBlockSize), FaultBlockSize}.Valid()) {
 		return InvalidateGuestWriteFault(vaddr);
-	} else {
-		const bool command = m_memory_tracker.IsCommandBlock(page);
-		const bool segment = !command && m_memory_tracker.IsSegmentBlock(page);
-		const auto probe   = m_memory_tracker.OpenWriteBlock(page, FaultBlockSize, (command || segment) && WriteFaultBlocks());
-		if (m_in_place && (command || segment) && probe.tracked) {
-			m_in_place->RequestConversion(page);
-		}
-		owner              = command       ? WriteFaultOwner::CommandBuffer
-		                     : segment       ? WriteFaultOwner::CommandSegment
-		                     : probe.gpu     ? WriteFaultOwner::GpuNeighbor
-		                     : probe.tracked ? WriteFaultOwner::Buffer
-		                                     : WriteFaultOwner::Other;
-		if (probe.opened != 0) {
-			auto& stats = g_write_block_stats;
-			stats.blocks.fetch_add(1, std::memory_order_relaxed);
-			stats.pages.fetch_add(probe.opened, std::memory_order_relaxed);
-			return owner;
-		}
 	}
-	const auto end  = Common::AlignDown(page, FaultBlockSize) + FaultBlockSize;
+	m_memory_tracker.NoteGuestWriteFault(page);
+	const auto end = Common::AlignDown(page, FaultBlockSize) + FaultBlockSize;
 	if (page >= TRACKER_PAGE_SIZE && GuestRange {page - TRACKER_PAGE_SIZE, end - page}.Valid() &&
 	    m_memory_tracker.IsRegionCpuModified(page - TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE) &&
 	    !m_memory_tracker.IsRegionGpuModified(page, end - page) && MayMarkAhead()) {
 		InvalidateMemory(page, end - page, true);
-		return owner;
+		return WriteFaultOwner::Other;
 	}
 	InvalidateMemory(vaddr, 1, true);
-	return owner;
+	return WriteFaultOwner::Other;
 }
 
 bool BufferCache::MayMarkAhead() const noexcept {

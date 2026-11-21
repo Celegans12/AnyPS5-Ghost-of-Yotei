@@ -777,20 +777,6 @@ uint64_t CommandProcessor::EmitCallback(GpuCallback&& callback, const GpuGuestWr
 	return Emit(std::move(operation));
 }
 
-#if defined(ANYPS5_KYTY)
-static bool IdleSubmitEnabled() {
-	static const bool enabled = [] {
-		const char*            value = std::getenv("KYTY_IDLE_SUBMIT");
-		const std::string_view text {value == nullptr ? "" : value};
-		if (!text.empty() && text != "0" && text != "1") {
-			EXIT("invalid KYTY_IDLE_SUBMIT: %s (0 or 1)\n", value);
-		}
-		return text != "0";
-	}();
-	return enabled;
-}
-
-#endif
 void CommandProcessor::Execute(GpuOperation& operation) {
 	EXIT_IF(operation.processor != this);
 	if (operation.scout_packet != nullptr && Scout::Running())
@@ -821,8 +807,7 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 	}
 	m_renderer.GetBufferCache().SetStreamInPlace(operation.stream_in_place);
 #if defined(ANYPS5_KYTY)
-	const bool submit_when_idle =
-	    IdleSubmitEnabled() && operation.kind != GpuOperationKind::Callback;
+	const bool submit_when_idle = operation.kind != GpuOperationKind::Callback;
 #else
 	const bool submit_when_idle = false;
 #endif
