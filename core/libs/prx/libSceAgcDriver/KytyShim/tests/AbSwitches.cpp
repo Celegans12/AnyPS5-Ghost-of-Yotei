@@ -1,5 +1,6 @@
 #include "common/runtimeSwitches.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <chrono>
 #include <cstdio>
@@ -54,7 +55,7 @@ std::string Refused(const char* ab, const char* start = "", const char* settle =
 }
 
 void Refusals() {
-	const std::string listed = "settings KYTY_AB can change: KYTY_GENERIC_COMPUTE_VARIANT";
+	const std::string listed = "settings KYTY_AB can change: KYTY_GENERIC_COMPUTE_VARIANT, KYTY_SHORT_SRT_WALKERS";
 	Check(Contains(Refused("KYTY_GENERIC_COMPUTE_VARIANT"), "expected <seconds>:<setting>"),
 	      "a value without a phase length is refused");
 	Check(Contains(Refused("0.5:KYTY_GENERIC_COMPUTE_VARIANT"), "at least 1 s"), "a phase under 1 s is refused");
@@ -82,6 +83,7 @@ void Refusals() {
 	               "KYTY_AB_START: 'x' is neither a present index nor <n>s"),
 	      "a start that is neither a present nor seconds is refused");
 	Check(Refused(" 30 : KYTY_GENERIC_COMPUTE_VARIANT ", "12s", "4").empty(), "spaces around the name are accepted");
+	Check(Refused("30:KYTY_SHORT_SRT_WALKERS").empty(), "KYTY_SHORT_SRT_WALKERS can be an arm");
 	Ab::Config config;
 	Check(Ab::Parse("45:KYTY_GENERIC_COMPUTE_VARIANT", "12s", "", config).empty() && config.start_seconds == 12.0 &&
 	          config.settle_seconds == 2.0 && config.phase_seconds == 45.0,
@@ -96,6 +98,8 @@ void Defaults() {
 	Check(IR::GenericComputeVariants(), "the compute variants see KYTY_GENERIC_COMPUTE_VARIANT on");
 	Check(Switches::Find("KYTY_GENERIC_COMPUTE_VARIANT") == Switch::GenericComputeVariant,
 	      "KYTY_GENERIC_COMPUTE_VARIANT is a runtime switch");
+	Check(Switches::On(Switch::ShortSrtWalkers) && IR::SrtShortWalkersMode() == IR::SrtShortWalkers::On,
+	      "KYTY_SHORT_SRT_WALKERS is on without the variable");
 	Check(!Switches::Find("KYTY_RELAXED_SHADER_FLOAT").has_value(), "KYTY_RELAXED_SHADER_FLOAT is not a runtime switch");
 	Check(!Ab::Configured() && Ab::AtFlip().empty() && !Ab::Listed(Switch::GenericComputeVariant),
 	      "without KYTY_AB a flip prints nothing and changes nothing");
@@ -204,6 +208,7 @@ int Flips() {
 int main() {
 	if (const char* ab = std::getenv("KYTY_AB"); ab != nullptr && *ab != '\0') return Flips();
 	SetVariable("KYTY_GENERIC_COMPUTE_VARIANT", nullptr);
+	SetVariable("KYTY_SHORT_SRT_WALKERS", nullptr);
 	Switches::Reload();
 	Defaults();
 	Refusals();

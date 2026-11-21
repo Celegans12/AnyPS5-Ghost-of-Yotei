@@ -39,8 +39,9 @@ On by default unless the row says otherwise.
 ## Comparing two settings in one run
 
 `KYTY_AB` alternates two arms inside one session, so both play the same scene. Phase A keeps the listed settings as set,
-phase B turns them over, at a flip, between two submissions. Only `KYTY_GENERIC_COMPUTE_VARIANT` can change while the
-title runs; any other name stops at start with the list ([why](THIRD_PARTY_KYTY.md#details)).
+phase B turns them over, at a flip, between two submissions. Only `KYTY_GENERIC_COMPUTE_VARIANT` and
+`KYTY_SHORT_SRT_WALKERS` can change while the title runs; any other name stops at start with the list
+([why](THIRD_PARTY_KYTY.md#details)).
 
 | Variable | Values | Effect |
 |---|---|---|
