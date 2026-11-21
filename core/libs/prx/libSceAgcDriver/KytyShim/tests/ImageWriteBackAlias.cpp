@@ -127,6 +127,60 @@ const char* CheckWriteBackOrder(GraphicContext& graphics, uint64_t address) {
 	return nullptr;
 }
 
+const char* CheckWriteBackRefreshesBufferCopy(GraphicContext& graphics, uint64_t address) {
+	RenderContext renderer(graphics);
+	CommandProcessor producer(renderer, 0);
+	producer.Reset();
+	auto& scheduler = renderer.GetCommandScheduler();
+	auto& textures = renderer.GetTextureCache();
+	auto& buffers = renderer.GetBufferCache();
+	scheduler.Begin(producer.GetCtx(), producer.GetUcfg(), producer.GetShCtx());
+
+	constexpr uint64_t Bytes = ImageWords * sizeof(uint32_t);
+	constexpr uint64_t CoverBytes = GuestBytes / 4;
+	(void)buffers.ObtainBuffer(address, CoverBytes, false);
+	const bool clean = !buffers.IsRegionCpuDirty(address, CoverBytes);
+
+	ImageInfo info;
+	info.data.address = address;
+	info.pixel_format = vk::Format::eR32Uint;
+	info.guest_format = Prospero::BufferFormat::k32UInt;
+	info.extent = vk::Extent3D {ImageWords, 1, 1};
+	info.pitch = ImageWords;
+	info.UpdateSize();
+	const auto id = TextureCacheTestAccess::Create(textures, info);
+	auto& image = textures.GetImage(id);
+	const auto native = scheduler.Current().Handle();
+	image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, native);
+	const vk::ClearColorValue clear {.uint32 = {std::array<uint32_t, 4> {ImageValue, 0, 0, 0}}};
+	const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	native.clearColorImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal, &clear, 1, &range);
+	textures.MarkGpuWritten(id);
+	const bool queued = TextureCacheTestAccess::QueueDownload(textures, id);
+	const auto tick = scheduler.CurrentTick();
+	scheduler.Wait(tick);
+	scheduler.WaitPriorityOperations(tick);
+	const bool invalidated = buffers.IsRegionCpuDirty(address, Bytes);
+
+	const auto [buffer, offset] = buffers.ObtainBuffer(address, CoverBytes, false);
+	Buffer copied(graphics, scheduler, MemoryUsage::Download, 0, vk::BufferUsageFlagBits::eTransferDst, Bytes);
+	copied.CopyFrom(scheduler.Current(), *buffer, offset, 0, Bytes);
+	const auto last = scheduler.CurrentTick();
+	scheduler.Wait(last);
+	scheduler.WaitPriorityOperations(last);
+	(void)buffers.DropFreedRange(address, CoverBytes, nullptr, nullptr);
+	if (!clean) return "the buffer read did not leave the image pages clean";
+	if (!queued) return "the second image write-back was not queued";
+	if (!invalidated) return "the image write-back left the pages of an older buffer copy clean";
+	copied.Invalidate(0, Bytes);
+	std::array<uint32_t, ImageWords> values {};
+	std::memcpy(values.data(), copied.Mapped().data(), sizeof(values));
+	for (const auto value: values) {
+		if (value != ImageValue) return "a buffer read after the image write-back served the copy from before it";
+	}
+	return nullptr;
+}
+
 }
 
 extern "C" int RunKytyImageWriteBackAliasTest() {
@@ -151,7 +205,10 @@ extern "C" int RunKytyImageWriteBackAliasTest() {
 		return 1;
 	}
 	const auto address = reinterpret_cast<uint64_t>(guest);
-	const auto* failure = CheckWriteBackOrder(graphics, address);
+	auto failure = CheckWriteBackOrder(graphics, address);
+	if (failure == nullptr) {
+		failure = CheckWriteBackRefreshesBufferCopy(graphics, address + GuestBytes / 4);
+	}
 	if (sceKernelMunmap(address, GuestBytes) != 0) {
 		std::fputs("kyty_shim_image_write_back_alias: FAILED: could not unmap guest backing\n", stderr);
 		return 1;
