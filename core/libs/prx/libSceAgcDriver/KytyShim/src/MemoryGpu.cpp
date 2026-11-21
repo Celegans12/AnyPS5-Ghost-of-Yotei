@@ -1,11 +1,13 @@
 #include "kernel/memory.h"
 
 #include "MemoryShim.hpp"
+#include "common/runtimeSwitches.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/scout.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
+#include <atomic>
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
@@ -195,6 +197,48 @@ bool TryReadAroundGpuWrites(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+namespace {
+
+struct AheadAroundCounters {
+	std::atomic<uint64_t> read {0};
+	std::atomic<uint64_t> gpu_bytes {0};
+	std::atomic<uint64_t> image_page {0};
+};
+
+AheadAroundCounters g_ahead_around;
+
+}
+
+const uint8_t* FindAheadAroundBackingPage(uint64_t vaddr) {
+	constexpr uint64_t PageSize = 4096;
+	const auto         page     = vaddr & ~(PageSize - 1);
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(page, PageSize)) return nullptr;
+	if (GetGpuResources().GetTextureCache().MayHoldImages(page, PageSize)) {
+		g_ahead_around.image_page.fetch_add(1, std::memory_order_relaxed);
+		return nullptr;
+	}
+	return static_cast<const uint8_t*>(FindBackingPointer(page, PageSize));
+}
+
+bool TryReadAroundGpuWritesAhead(uint64_t vaddr, void* data, uint64_t size, const uint8_t* page_backing) {
+	if (page_backing == nullptr || g_gpu_resources == nullptr || ((vaddr ^ (vaddr + size - 1)) & ~uint64_t {0xfff}) != 0) {
+		return false;
+	}
+	if (!GetGpuResources().GetBufferCache().NoGpuBytesNow(vaddr, size)) {
+		g_ahead_around.gpu_bytes.fetch_add(1, std::memory_order_relaxed);
+		return false;
+	}
+	std::memcpy(data, page_backing + (vaddr & 0xfffu), size);
+	g_ahead_around.read.fetch_add(1, std::memory_order_relaxed);
+	return true;
+}
+
+AheadAroundReads TakeAheadAroundReads() {
+	return {.read       = g_ahead_around.read.exchange(0, std::memory_order_relaxed),
+	        .gpu_bytes  = g_ahead_around.gpu_bytes.exchange(0, std::memory_order_relaxed),
+	        .image_page = g_ahead_around.image_page.exchange(0, std::memory_order_relaxed)};
+}
+
 const uint8_t* FindAroundBackingPage(uint64_t vaddr) {
 	constexpr uint64_t PageSize = 4096;
 	const auto page = vaddr & ~(PageSize - 1);
@@ -234,13 +278,18 @@ Graphics::ShaderRecompiler::IR::SrtWalkerPage WalkerGuestPage(uint64_t address, 
 		return Graphics::ShaderRecompiler::IR::SrtWalkerPage::Direct;
 	}
 	if (!Graphics::GuestGpu::IsGpuThread()) {
-		return ahead ? Graphics::ShaderRecompiler::IR::SrtWalkerPage::PerLoad : Graphics::ShaderRecompiler::IR::SrtWalkerPage::Direct;
+		if (!ahead) return Graphics::ShaderRecompiler::IR::SrtWalkerPage::Direct;
+		if (Common::RuntimeSwitches::On(Common::RuntimeSwitches::Switch::ResolveGpuReads)) {
+			backing = FindAheadAroundBackingPage(address);
+		}
+		return Graphics::ShaderRecompiler::IR::SrtWalkerPage::PerLoad;
 	}
 	return ahead ? Graphics::ShaderRecompiler::IR::SrtWalkerPage::Direct : Graphics::ShaderRecompiler::IR::SrtWalkerPage::PerLoad;
 }
 
-bool WalkerGuestRead(uint64_t address, uint32_t& value, bool ahead, const uint8_t*) {
-	return !ahead && MayFaultOnGpuRead(address, sizeof(value)) && TryReadAroundGpuWrites(address, &value, sizeof(value));
+bool WalkerGuestRead(uint64_t address, uint32_t& value, bool ahead, const uint8_t* backing) {
+	if (ahead) return TryReadAroundGpuWritesAhead(address, &value, sizeof(value), backing);
+	return MayFaultOnGpuRead(address, sizeof(value)) && TryReadAroundGpuWrites(address, &value, sizeof(value));
 }
 
 }

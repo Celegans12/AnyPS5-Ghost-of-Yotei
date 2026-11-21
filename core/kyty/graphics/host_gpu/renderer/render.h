@@ -658,6 +658,7 @@ private:
 	ResolvedDraw*                                                  m_resolved_draw = nullptr;
 	[[nodiscard]] ExecuteCause MissingAheadCause() const noexcept;
 	[[nodiscard]] bool         RevalidateAhead(ResolvedDraw& resolved, bool dispatch);
+	[[nodiscard]] bool         ReplayAheadHeap(const ProgramResolution& programs, bool dispatch);
 	const ShaderModule* ResolveComputeHere(const HW::ComputeShaderInfo& regs, ShaderComputeInputInfo& input_info);
 	AheadNote    m_ahead_note     = AheadNote::NotAttempted;
 	ExecuteCause m_execute_cause  = ExecuteCause::Other;

@@ -52,10 +52,23 @@ struct ImageHeapList {
 	std::span<const DescriptorValue> values;
 };
 
+struct ImageHeapPrediction {
+	bool                         acquired   = false;
+	uint64_t                     slots      = 0;
+	uint32_t                     slot_count = 0;
+	std::vector<DescriptorValue> kinds;
+};
+
 class ImageHeapSource {
 public:
 	virtual bool Acquire(const ImageHeapRequest& request, ImageHeapView& view) = 0;
 	virtual bool AcquireList(const ImageHeapList& , ImageHeapView& ) {
+		return false;
+	}
+	virtual bool Predict(const ImageHeapRequest& , ImageHeapPrediction& ) {
+		return false;
+	}
+	virtual bool PredictList(const ImageHeapList& , ImageHeapPrediction& ) {
 		return false;
 	}
 
@@ -80,6 +93,7 @@ struct SrtRuntime {
 	bool image_table_heap = false;
 #if defined(ANYPS5_KYTY)
 	bool defer_flat_loads = false;
+	bool note_around_loads = false;
 #endif
 };
 
@@ -118,6 +132,7 @@ void SetSrtWalkerGuestMemory(const SrtWalkerGuestMemory& memory);
 enum class SrtFlatDefer : uint8_t { Off, On, Verify };
 [[nodiscard]] SrtFlatDefer           SrtFlatDeferMode();
 [[nodiscard]] std::vector<uint64_t>& SrtDeferredLoadsOfThread();
+[[nodiscard]] std::vector<uint64_t>& SrtAroundLoadsOfThread();
 #endif
 uint32_t SrtWalkerLoadLength(uint64_t rip);
 uint32_t SrtWalkerAheadLoadLength(uint64_t rip, uint64_t address);

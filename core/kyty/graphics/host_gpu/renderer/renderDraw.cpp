@@ -716,6 +716,8 @@ constexpr uint32_t RevalidationSampling = 16;
 
 struct alignas(64) ExecuteResolveCounters {
 	std::array<std::atomic<uint64_t>, 2>                                 used {};
+	std::array<std::atomic<uint64_t>, 2>                                 used_around {};
+	std::array<std::atomic<uint64_t>, 2>                                 used_heap {};
 	std::array<std::atomic<uint64_t>, 2>                                 table {};
 	std::atomic<uint64_t>                                                table_bare {0};
 	std::array<std::atomic<uint64_t>, 2>                                 unused {};
@@ -791,19 +793,52 @@ RenderExecutor::ExecuteCause RenderExecutor::MissingAheadCause() const noexcept 
 	}
 }
 
+bool RenderExecutor::ReplayAheadHeap(const ProgramResolution& programs, bool dispatch) {
+	if (programs.refreshed_words) return false;
+	auto& heap = m_context.GetImageHeap();
+	if (!dispatch) heap.BeginDraw();
+	for (const auto& acquisition: programs.heap) {
+		ShaderRecompiler::IR::ImageHeapView view;
+		auto                                request = acquisition.request;
+		request.root                                = &acquisition.root;
+		const bool acquired = acquisition.list ? heap.AcquireList({.owner    = acquisition.owner,
+		                                                           .resource = acquisition.resource,
+		                                                           .root     = &acquisition.root,
+		                                                           .values   = acquisition.values},
+		                                                          view)
+		                                       : heap.Acquire(request, view);
+		const auto& predicted = acquisition.predicted;
+		if (acquired != predicted.acquired ||
+		    (acquired && (view.slots != predicted.slots || view.slot_count != predicted.slot_count ||
+		                  !std::ranges::equal(view.kinds, predicted.kinds)))) {
+			return false;
+		}
+	}
+	return true;
+}
+
 bool RenderExecutor::RevalidateAhead(ResolvedDraw& resolved, bool dispatch) {
 	const bool sampled = m_revalidations++ % RevalidationSampling == 0;
 	const auto begin   = sampled ? Common::SteadyNs() : 0;
 #if defined(ANYPS5_KYTY)
-	const bool valid = dispatch ? resolved.programs.Revalidate(true, &resolved.compute_module->info)
-	                            : resolved.programs.Revalidate();
+	bool valid = dispatch ? resolved.programs.Revalidate(true, &resolved.compute_module->info)
+	                      : resolved.programs.Revalidate();
 #else
-	const bool valid = dispatch ? resolved.programs.Revalidate(true) : resolved.programs.Revalidate();
+	bool valid = dispatch ? resolved.programs.Revalidate(true) : resolved.programs.Revalidate();
 #endif
+	if (valid && !resolved.programs.heap.empty()) {
+		valid = ReplayAheadHeap(resolved.programs, dispatch);
+		if (valid) {
+			Bump(g_execute_resolve.used_heap[dispatch ? 1 : 0]);
+		} else {
+			resolved.programs.reads.MarkStale(StaleRead::ImageHeap);
+		}
+	}
 	if (sampled) Bump(g_execute_resolve.revalidation_ns, (Common::SteadyNs() - begin) * RevalidationSampling);
 	const size_t kind = dispatch ? 1 : 0;
 	if (valid) {
 		Bump(g_execute_resolve.used[kind]);
+		if (resolved.programs.reads.ReadAroundGpuWrites()) Bump(g_execute_resolve.used_around[kind]);
 	} else {
 		Bump(g_execute_resolve.refused[kind][static_cast<size_t>(resolved.programs.reads.Stale())]);
 	}
@@ -843,12 +878,14 @@ void RenderExecutor::LogResolveSummary() {
 		uint64_t                            here_total = 0;
 		for (size_t i = 0; i < ExecuteCauses; i++) here_total += here[i] = Take(g_execute_resolve.here[kind][i]);
 		return fmt::format(
-		    "ahead used {}, dropped for the table path {}, dropped unused {}, refused by revalidation {} (shape {}, failed "
-		    "{}, zero test {}, CPU write {}, GPU write {}, strict read {}); resolved by execute {} (table hint skip {}, "
-		    "revalidation {}, not prepared {}, again in the operation {}, other {}){}",
-		    Take(g_execute_resolve.used[kind]), Take(g_execute_resolve.table[kind]), Take(g_execute_resolve.unused[kind]),
-		    refused_total, refused[0], refused[1], refused[2], refused[3], refused[4], refused[5], here_total, here[0],
-		    here[1], here[2], here[3], here[4],
+		    "ahead used {} (read around GPU writes {}, image heap taken at execution {}), dropped for the table path {}, "
+		    "dropped unused {}, refused by revalidation {} (shape {}, failed {}, zero test {}, CPU write {}, GPU write {}, "
+		    "strict read {}, GPU write since the read around it {}, image heap changed {}); resolved by execute {} (table "
+		    "hint skip {}, revalidation {}, not prepared {}, again in the operation {}, other {}){}",
+		    Take(g_execute_resolve.used[kind]), Take(g_execute_resolve.used_around[kind]),
+		    Take(g_execute_resolve.used_heap[kind]), Take(g_execute_resolve.table[kind]),
+		    Take(g_execute_resolve.unused[kind]), refused_total, refused[0], refused[1], refused[2], refused[3], refused[4],
+		    refused[5], refused[6], refused[7], here_total, here[0], here[1], here[2], here[3], here[4],
 		    kind == 0 ? fmt::format(", table path with nothing prepared {}", Take(g_execute_resolve.table_bare))
 		              : std::string {});
 	};
@@ -869,12 +906,16 @@ void RenderExecutor::LogResolveSummary() {
 	const auto execute_dispatches = execute_side(1);
 	const auto ahead_draws        = resolve_side(0);
 	const auto ahead_dispatches   = resolve_side(1);
+	const auto around             = Libs::LibKernel::Memory::TakeAheadAroundReads();
 	Log::WriteToConsoleAndLog(fmt::format(
 	    "[kyty-resolve] summary of the last {:.1f} s, {} frames: draws: {}; dispatches: {}; resolve thread: draws {}, "
-	    "skipped by the table hint {}; dispatches {}; ms per frame: execute resolution {:.2f} (draws {:.2f}, dispatches "
-	    "{:.2f}), execute revalidation {:.2f}, resolve thread resolution {:.2f} (draws {:.2f}, dispatches {:.2f})\n",
+	    "skipped by the table hint {}; dispatches {}; walker loads on GPU written pages: read around GPU writes {}, "
+	    "refused on GPU written lines {}, pages refused for images {}; ms per frame: execute resolution {:.2f} (draws "
+	    "{:.2f}, dispatches {:.2f}), execute revalidation {:.2f}, resolve thread resolution {:.2f} (draws {:.2f}, "
+	    "dispatches {:.2f})\n",
 	    static_cast<double>(now - last) / 1e9, frames, execute_draws, execute_dispatches, ahead_draws,
-	    Take(g_ahead_resolve.table_skips), ahead_dispatches, per_frame(draws_here + dispatches_here),
+	    Take(g_ahead_resolve.table_skips), ahead_dispatches, around.read, around.gpu_bytes, around.image_page,
+	    per_frame(draws_here + dispatches_here),
 	    per_frame(draws_here), per_frame(dispatches_here), per_frame(Take(g_execute_resolve.revalidation_ns)),
 	    per_frame(draws_ahead + dispatches_ahead), per_frame(draws_ahead), per_frame(dispatches_ahead)));
 }

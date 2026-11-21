@@ -163,6 +163,14 @@ bool                   TryReadAroundGpuWrites(uint64_t vaddr, void* data, uint64
 [[nodiscard]] const uint8_t* FindAroundBackingPage(uint64_t vaddr);
 bool TryReadAroundGpuWritesOnPage(uint64_t vaddr, void* data, uint64_t size,
                                   const uint8_t* page_backing);
+[[nodiscard]] const uint8_t* FindAheadAroundBackingPage(uint64_t vaddr);
+bool TryReadAroundGpuWritesAhead(uint64_t vaddr, void* data, uint64_t size, const uint8_t* page_backing);
+struct AheadAroundReads {
+	uint64_t read       = 0;
+	uint64_t gpu_bytes  = 0;
+	uint64_t image_page = 0;
+};
+[[nodiscard]] AheadAroundReads TakeAheadAroundReads();
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
 bool                   IsBackingReadable(uint64_t vaddr, uint64_t size);

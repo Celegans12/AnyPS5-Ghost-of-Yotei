@@ -69,6 +69,8 @@ enum class StaleRead : uint8_t {
 	CpuWrite,
 	GpuWrite,
 	Strict,
+	AroundGpuWrite,
+	ImageHeap,
 	Count
 };
 
@@ -86,6 +88,7 @@ public:
 		m_refusal     = AheadRefusal::None;
 		m_stale       = StaleRead::None;
 		m_gpu_written = false;
+		m_around      = false;
 #if defined(ANYPS5_KYTY)
 		m_deferred_words     = 0;
 		m_deferred_gpu_words = 0;
@@ -105,7 +108,10 @@ public:
 	[[nodiscard]] bool         Failed() const { return m_failed; }
 	[[nodiscard]] AheadRefusal Refusal() const { return m_refusal; }
 	[[nodiscard]] StaleRead    Stale() const { return m_stale; }
+	void                       MarkStale(StaleRead why) const { m_stale = why; }
 	[[nodiscard]] bool MayHaveReadGpuWrites() const { return m_gpu_written; }
+	[[nodiscard]] bool ReadAroundGpuWrites() const { return m_around; }
+	void               NoteAroundLoads(std::span<uint64_t> addresses);
 	[[nodiscard]] bool StillValid() const;
 	[[nodiscard]] bool HasDescriptorRefresh() const { return !m_refresh.empty(); }
 	void RefreshDescriptorWords(std::span<ShaderRecompiler::IR::ResourceSnapshot>          resources,
@@ -145,6 +151,7 @@ private:
 		uint32_t offset  = 0;
 		bool     strict  = false;
 		bool     zero_test = false;
+		bool     around    = false;
 		uint64_t watched = 0;
 		uint32_t words_begin = 0;
 		uint32_t words_end   = 0;
@@ -187,10 +194,21 @@ private:
 	AheadRefusal          m_refusal     = AheadRefusal::None;
 	mutable StaleRead     m_stale       = StaleRead::None;
 	bool                  m_gpu_written = false;
+	bool                  m_around      = false;
 #if defined(ANYPS5_KYTY)
 	uint32_t         m_deferred_words     = 0;
 	mutable uint32_t m_deferred_gpu_words = 0;
 #endif
+};
+
+struct AheadHeapAcquisition {
+	bool                                              list = false;
+	ShaderRecompiler::IR::ImageHeapRequest            request;
+	ShaderRecompiler::IR::ImageResource               root;
+	const void*                                       owner    = nullptr;
+	uint32_t                                          resource = 0;
+	std::vector<ShaderRecompiler::IR::DescriptorValue> values;
+	ShaderRecompiler::IR::ImageHeapPrediction         predicted;
 };
 
 struct ProgramResolution {
@@ -200,11 +218,13 @@ struct ProgramResolution {
 	std::array<ShaderRecompiler::IR::ResourceSpecialization, MaxStages> specializations;
 	std::array<const ShaderRecompiler::IR::ResourcePlan*, MaxStages>    plans {};
 	GuestReadLog                                                        reads;
+	std::vector<AheadHeapAcquisition>                                   heap;
 	uint32_t                                                            stages = 0;
 	bool                                                                refreshed_words = false;
 
 	void Reset() {
 		reads.Clear();
+		heap.clear();
 		stages          = 0;
 		refreshed_words = false;
 	}

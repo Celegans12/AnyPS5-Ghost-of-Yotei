@@ -13,6 +13,7 @@
 #include "common/hackNotice.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/runtimeSwitches.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -376,6 +377,46 @@ void RecordAheadLoad(void* userdata, uint64_t address, uint32_t value, uint32_t 
 void RecordAheadLoads(void* userdata, std::span<const uint64_t> loads) {
 	static_cast<GuestReadLog*>(userdata)->RecordLoads(loads);
 }
+
+class AheadImageHeap final: public ShaderRecompiler::IR::ImageHeapSource {
+public:
+	AheadImageHeap(ShaderRecompiler::IR::ImageHeapSource& heap, std::vector<AheadHeapAcquisition>& acquisitions)
+	    : m_heap(heap), m_acquisitions(acquisitions) {}
+
+	bool Acquire(const ShaderRecompiler::IR::ImageHeapRequest& request, ShaderRecompiler::IR::ImageHeapView& view) override {
+		auto& acquisition   = m_acquisitions.emplace_back();
+		acquisition.request = request;
+		if (request.root != nullptr) acquisition.root = *request.root;
+		acquisition.request.root = nullptr;
+		return Predicted(request.root != nullptr && m_heap.Predict(request, acquisition.predicted), acquisition, view);
+	}
+
+	bool AcquireList(const ShaderRecompiler::IR::ImageHeapList& list, ShaderRecompiler::IR::ImageHeapView& view) override {
+		auto& acquisition    = m_acquisitions.emplace_back();
+		acquisition.list     = true;
+		acquisition.owner    = list.owner;
+		acquisition.resource = list.resource;
+		if (list.root != nullptr) acquisition.root = *list.root;
+		acquisition.values.assign(list.values.begin(), list.values.end());
+		return Predicted(list.root != nullptr && m_heap.PredictList(list, acquisition.predicted), acquisition, view);
+	}
+
+	[[nodiscard]] bool Unpredicted() const { return m_unpredicted; }
+
+private:
+	bool Predicted(bool known, const AheadHeapAcquisition& acquisition, ShaderRecompiler::IR::ImageHeapView& view) {
+		m_unpredicted = m_unpredicted || !known;
+		if (!known || !acquisition.predicted.acquired) return false;
+		view = {.slots      = acquisition.predicted.slots,
+		        .slot_count = acquisition.predicted.slot_count,
+		        .kinds      = acquisition.predicted.kinds};
+		return true;
+	}
+
+	ShaderRecompiler::IR::ImageHeapSource& m_heap;
+	std::vector<AheadHeapAcquisition>&     m_acquisitions;
+	bool                                   m_unpredicted = false;
+};
 
 class ProgramLockMaybe {
 public:
@@ -822,6 +863,18 @@ void GuestReadLog::NoteDeferredLoads(std::span<uint64_t> addresses) {
 	}
 }
 
+void GuestReadLog::NoteAroundLoads(std::span<uint64_t> addresses) {
+	if (addresses.empty()) return;
+	std::ranges::sort(addresses);
+	for (auto& entry: m_entries) {
+		if (entry.strict) continue;
+		const auto first = std::ranges::lower_bound(addresses, entry.address);
+		if (first == addresses.end() || *first - entry.address >= entry.size) continue;
+		entry.around = true;
+		m_around     = true;
+	}
+}
+
 void GuestReadLog::ReadGuestNow(uint64_t address, void* bytes, uint32_t size) {
 	if (!Libs::LibKernel::Memory::MayFaultOnGpuRead(address, size) ||
 	    !Libs::LibKernel::Memory::TryReadAroundGpuWrites(address, bytes, size)) {
@@ -1113,7 +1166,7 @@ bool GuestReadLog::StillValid() const {
 		const auto* recorded = m_bytes.data() + entry.offset;
 		if (entry.zero_test) {
 			if (!ZeroTestHolds(entry)) {
-				m_stale = StaleRead::ZeroTest;
+				m_stale = entry.around ? StaleRead::AroundGpuWrite : StaleRead::ZeroTest;
 				return false;
 			}
 			continue;
@@ -1147,7 +1200,7 @@ bool GuestReadLog::StillValid() const {
 				                             entry.address + done, buffer.data(), bytes);
 				if (around && std::memcmp(buffer.data(), recorded + done, bytes) != 0) {
 					if (!refreshable(entry)) {
-						m_stale = StaleRead::GpuWrite;
+						m_stale = entry.around ? StaleRead::AroundGpuWrite : StaleRead::GpuWrite;
 						return false;
 					}
 					break;
@@ -1159,7 +1212,7 @@ bool GuestReadLog::StillValid() const {
 			if (!SameGuestBytes(reinterpret_cast<const void*>(entry.address), recorded,
 			                    entry.size) &&
 			    !refreshable(entry)) {
-				m_stale = StaleRead::CpuWrite;
+				m_stale = entry.around ? StaleRead::AroundGpuWrite : StaleRead::CpuWrite;
 				return false;
 			}
 			continue;
@@ -2720,8 +2773,11 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 	key.user_data_count = params.user_data_count;
 	BuildStageStaticKey(input_info, key.static_state);
 	AppendNativeRayTracingKey(key.stage, key.static_state);
-	const bool unlocked = t_ahead_unlocked;
-	Program*   program  = nullptr;
+	const bool unlocked   = t_ahead_unlocked;
+	const bool heap_ahead = m_image_heap != nullptr &&
+	                        Common::RuntimeSwitches::On(Common::RuntimeSwitches::Switch::ResolveImageHeap);
+	Program*   program    = nullptr;
+	bool       heap_used  = false;
 	{
 		const ProgramLockMaybe lock(m_program_lock, unlocked);
 		const auto             entry = m_program_cache.find(key);
@@ -2731,14 +2787,15 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 			t_ahead_missing = true;
 #endif
 		}
+		heap_used = entry != m_program_cache.end() &&
+		            std::ranges::any_of(entry->second.modules,
+		                                [](const ShaderModule& module) { return module.info.info.uses_image_heap; });
 		const auto refusal =
 		    entry == m_program_cache.end()                ? AheadRefusal::Compiling
 		    : ahead.stages == ProgramResolution::MaxStages || entry->second.skip_dispatch ? AheadRefusal::Shape
 		    : entry->second.call_source                   ? AheadRefusal::Calls
-		    : std::ranges::any_of(entry->second.modules,
-		                          [](const ShaderModule& module) { return module.info.info.uses_image_heap; })
-		        ? AheadRefusal::ImageHeap
-		        : AheadRefusal::None;
+		    : heap_used && !heap_ahead                    ? AheadRefusal::ImageHeap
+		                                                  : AheadRefusal::None;
 		if (refusal != AheadRefusal::None) {
 			ahead.reads.Fail(refusal);
 			return nullptr;
@@ -2772,11 +2829,23 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 	t_ahead_unread_load = false;
 #if defined(ANYPS5_KYTY)
 	const bool defers = ShaderRecompiler::IR::SrtFlatDeferMode() != ShaderRecompiler::IR::SrtFlatDefer::Off;
-	runtime.defer_flat_loads = defers;
+	runtime.defer_flat_loads  = defers;
+	runtime.note_around_loads = true;
 	if (defers) ShaderRecompiler::IR::SrtDeferredLoadsOfThread().clear();
+	ShaderRecompiler::IR::SrtAroundLoadsOfThread().clear();
 #endif
-	if (!ShaderRecompiler::IR::MaterializeResources(program->resource_plan, runtime, resources,
-	                                                specialization)) {
+	std::optional<AheadImageHeap> heap;
+	if (heap_ahead && heap_used) {
+		heap.emplace(*m_image_heap, ahead.heap);
+		runtime.image_heap = &*heap;
+	}
+	const bool materialized =
+	    ShaderRecompiler::IR::MaterializeResources(program->resource_plan, runtime, resources, specialization);
+	if (heap && heap->Unpredicted()) {
+		ahead.reads.Fail(AheadRefusal::ImageHeap);
+		return nullptr;
+	}
+	if (!materialized) {
 		ahead.reads.Fail(AheadRefusal::Materialize);
 		return nullptr;
 	}
@@ -2784,6 +2853,7 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 	if (defers && !ShaderRecompiler::IR::SrtDeferredLoadsOfThread().empty()) {
 		ahead.reads.NoteDeferredLoads(ShaderRecompiler::IR::SrtDeferredLoadsOfThread());
 	}
+	ahead.reads.NoteAroundLoads(ShaderRecompiler::IR::SrtAroundLoadsOfThread());
 #endif
 	NoteAheadWrites(program->resource_plan, resources);
 	const auto matches = [&](const ShaderModule& candidate) {
@@ -2803,7 +2873,7 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 	if (module == modules.end() && program->ShareModule(specialization, resources, push_data_cursor, false)) {
 		module = modules.end() - 1;
 	}
-	if (module != modules.end() && module->info.info.uses_image_heap) {
+	if (module != modules.end() && module->info.info.uses_image_heap && !heap) {
 		ahead.reads.Fail(AheadRefusal::ImageHeap);
 		return nullptr;
 	}

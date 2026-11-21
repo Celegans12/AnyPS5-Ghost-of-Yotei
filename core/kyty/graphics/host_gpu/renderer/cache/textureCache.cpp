@@ -299,6 +299,12 @@ bool TextureCache::RegisteredPageCounts::Any(size_t first, size_t last_exclusive
 	return false;
 }
 
+bool TextureCache::MayHoldImages(uint64_t address, uint64_t size) const noexcept {
+	ImagePageTable::PageRange pages {};
+	return !ImagePageTable::TryGetPageRange(address, size, pages) ||
+	       m_registered_pages.Any(pages.first, pages.last_exclusive);
+}
+
 bool TextureCache::IsSampledImageCurrent(ImageId id, const ImageDesc& desc) {
 	Common::ScopedLock lock {m_lock};
 	if (m_scheduler.Current().IsInvalid() || desc.type != BindingType::Texture ||

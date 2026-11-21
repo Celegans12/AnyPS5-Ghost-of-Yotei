@@ -92,6 +92,7 @@ public:
 	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
 	[[nodiscard]] bool HasGpuWrittenImages(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
+	[[nodiscard]] bool MayHoldImages(uint64_t address, uint64_t size) const noexcept;
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);

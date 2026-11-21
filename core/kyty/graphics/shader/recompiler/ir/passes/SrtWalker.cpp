@@ -185,6 +185,10 @@ struct WalkerPageAnswer {
 	const uint8_t* backing = nullptr;
 };
 thread_local std::array<WalkerPageAnswer, 4> t_page_answers;
+#if defined(ANYPS5_KYTY)
+thread_local bool                  t_walker_around = false;
+thread_local std::vector<uint64_t> t_around_loads;
+#endif
 
 struct WalkerCachedPage {
 	uint64_t       page    = ~uint64_t {0};
@@ -228,6 +232,7 @@ uint64_t KYTY_SYSV_ABI ProbeGuestLoad(uint64_t address, WalkerCachedPage* cache)
 	}
 #if defined(ANYPS5_KYTY)
 	if (g_guest_memory.read(address, value, t_walker_ahead, answer.backing)) {
+		if (t_walker_around) t_around_loads.push_back(address);
 		return uint64_t {1} << 32u | value;
 	}
 	if (t_walker_ahead) {
@@ -1727,7 +1732,8 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	t_gpu_produced   = runtime.gpu_produced;
 	t_pending_write  = runtime.pending_write;
 #if defined(ANYPS5_KYTY)
-	t_walker_defer = t_walker_ahead && runtime.defer_flat_loads;
+	t_walker_defer  = t_walker_ahead && runtime.defer_flat_loads;
+	t_walker_around = t_walker_ahead && runtime.note_around_loads;
 #endif
 	++t_walk;
 	const auto* end = plan.srt_code->getCode<Walker>()(runtime.user_data.data(), flat.data(),
@@ -1737,7 +1743,8 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	t_gpu_produced   = nullptr;
 	t_pending_write  = nullptr;
 #if defined(ANYPS5_KYTY)
-	t_walker_defer = false;
+	t_walker_defer  = false;
+	t_walker_around = false;
 #endif
 	if (end == nullptr || t_walker_faulted) return false;
 	const auto* first = scratch.data() + plan.srt_captures / 8u;
@@ -1813,6 +1820,10 @@ SrtFlatDefer SrtFlatDeferMode() {
 
 std::vector<uint64_t>& SrtDeferredLoadsOfThread() {
 	return t_deferred_loads;
+}
+
+std::vector<uint64_t>& SrtAroundLoadsOfThread() {
+	return t_around_loads;
 }
 #endif
 
