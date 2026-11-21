@@ -2138,7 +2138,11 @@ void TextureCache::ReleaseDepthCopies(ImageId color_id) {
 		auto& copy             = m_slot_images[copy_id];
 		copy.depth_copy_source = {};
 		copy.binding.needs_rebind = true;
+#if defined(ANYPS5_KYTY)
+		copy.HeapChanged();
+#else
 		copy.StateChanged();
+#endif
 		if (m_scheduler.Active()) {
 			m_scheduler.DeferHostOperation([this, copy_id] { m_slot_images.erase(copy_id); });
 		} else {
@@ -2470,7 +2474,11 @@ void TextureCache::ReleaseStencilCopies(ImageId association) {
 		auto& copy                = m_slot_images[copy_id];
 		copy.depth_copy_source    = {};
 		copy.binding.needs_rebind = true;
+#if defined(ANYPS5_KYTY)
+		copy.HeapChanged();
+#else
 		copy.StateChanged();
+#endif
 		if (m_scheduler.Active()) {
 			m_scheduler.DeferHostOperation([this, copy_id] { m_slot_images.erase(copy_id); });
 		} else {
