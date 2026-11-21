@@ -243,11 +243,21 @@ void InPlaceMemory::Unregister(uint64_t bytes, uint64_t pages) noexcept {
 	s_pages_out.fetch_add(pages, std::memory_order_relaxed);
 }
 
-void InPlaceMemory::NoteGpuWrite(uint64_t vaddr, uint64_t size, uint64_t tick) {
+void InPlaceMemory::NoteGpuWrite(uint64_t vaddr, uint64_t size, uint64_t tick, uint64_t known, WriteKind kind) {
 	if (size == 0) {
 		return;
 	}
 	std::lock_guard lock(m_writes_mutex);
+	const auto end = size > UINT64_MAX - vaddr ? UINT64_MAX : vaddr + size;
+	if (m_written_ranges.size() >= 256) {
+		std::erase_if(m_written_ranges, [known](const WrittenRange& range) { return range.tick <= known; });
+	}
+	if (!m_written_ranges.empty() && m_written_ranges.back().begin == vaddr && m_written_ranges.back().end == end &&
+	    m_written_ranges.back().kind == kind) {
+		m_written_ranges.back().tick = std::max(m_written_ranges.back().tick, tick);
+	} else {
+		m_written_ranges.push_back({vaddr, end, tick, kind});
+	}
 	for (auto block = vaddr >> BlockBits; block <= (vaddr + size - 1) >> BlockBits; ++block) {
 		auto& latest = m_writes[block];
 		latest       = std::max(latest, tick);
@@ -273,6 +283,52 @@ uint64_t InPlaceMemory::PendingGpuWrite(uint64_t vaddr, uint64_t size, uint64_t 
 		}
 	}
 	return latest;
+}
+
+uint64_t InPlaceMemory::PendingGpuWriteBytes(uint64_t vaddr, uint64_t size, uint64_t known) const {
+	return PendingGpuWriteCover(vaddr, size, known).tick;
+}
+
+InPlaceMemory::WriteCover InPlaceMemory::PendingGpuWriteCover(uint64_t vaddr, uint64_t size, uint64_t known) const {
+	WriteCover cover;
+	if (size == 0 || m_writes_max.load(std::memory_order_acquire) <= known) {
+		return cover;
+	}
+	const auto      end = size > UINT64_MAX - vaddr ? UINT64_MAX : vaddr + size;
+	std::lock_guard lock(m_writes_mutex);
+	std::erase_if(m_written_ranges, [known](const WrittenRange& range) { return range.tick <= known; });
+	for (const auto& range: m_written_ranges) {
+		if (range.begin < end && vaddr < range.end) {
+			cover.tick = std::max(cover.tick, range.tick);
+			cover.kinds |= 1u << static_cast<uint32_t>(range.kind);
+			cover.exact = cover.exact || (range.begin == vaddr && range.end == end);
+		}
+	}
+	return cover;
+}
+
+uint64_t InPlaceMemory::NoteDeferredLabel(uint64_t vaddr, uint64_t size) {
+	std::lock_guard lock(s_deferred_labels_mutex);
+	const auto      id = ++s_next_deferred_label;
+	s_deferred_labels.push_back({id, vaddr, size > UINT64_MAX - vaddr ? UINT64_MAX : vaddr + size});
+	s_deferred_label_count.store(s_deferred_labels.size(), std::memory_order_release);
+	return id;
+}
+
+void InPlaceMemory::ForgetDeferredLabel(uint64_t id) {
+	std::lock_guard lock(s_deferred_labels_mutex);
+	std::erase_if(s_deferred_labels, [id](const DeferredLabel& label) { return label.id == id; });
+	s_deferred_label_count.store(s_deferred_labels.size(), std::memory_order_release);
+}
+
+bool InPlaceMemory::MeetsDeferredLabel(uint64_t vaddr, uint64_t size) {
+	if (size == 0 || s_deferred_label_count.load(std::memory_order_acquire) == 0) {
+		return false;
+	}
+	const auto      end = size > UINT64_MAX - vaddr ? UINT64_MAX : vaddr + size;
+	std::lock_guard lock(s_deferred_labels_mutex);
+	return std::ranges::any_of(s_deferred_labels,
+	                           [vaddr, end](const DeferredLabel& label) { return label.begin < end && vaddr < label.end; });
 }
 
 void InPlaceMemory::RequestConversion(uint64_t page) noexcept {

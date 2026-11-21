@@ -56,6 +56,20 @@ if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
             PASS_REGULAR_EXPRESSION "kyty_shim_buffer_write_coverage: ok" FAIL_REGULAR_EXPRESSION "FAILED")
 endif()
 
+if(NOT ANYPS5_KYTY_DLL)
+    add_test_executable(kyty_shim_in_place_labels_tests ${CMAKE_CURRENT_SOURCE_DIR}/InPlaceLabels.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+    target_include_directories(kyty_shim_in_place_labels_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    configure_host_test_executable(kyty_shim_in_place_labels_tests)
+    if(MINGW)
+        target_link_libraries(kyty_shim_in_place_labels_tests PRIVATE stdc++ gcc_eh)
+    endif()
+    target_link_libraries(kyty_shim_in_place_labels_tests PRIVATE Kyty::gpu libkernel libc)
+    add_test(NAME kyty_shim_in_place_labels COMMAND kyty_shim_in_place_labels_tests)
+    set_tests_properties(kyty_shim_in_place_labels PROPERTIES TIMEOUT 20
+            PASS_REGULAR_EXPRESSION "kyty_shim_in_place_labels: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+endif()
+
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
     add_test_executable(kyty_shim_signal_safety_tests ${CMAKE_CURRENT_SOURCE_DIR}/SignalSafety.cpp)
     target_include_directories(kyty_shim_signal_safety_tests PRIVATE ${LIBS_INCLUDE_DIR})
