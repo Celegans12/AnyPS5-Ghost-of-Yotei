@@ -126,7 +126,10 @@ Module Compile(uint32_t host_subgroup) {
 		messages += message;
 		messages += '\n';
 	});
-	Check(tools.Validate(compiled.spirv), "subgroup " + std::to_string(host_subgroup) + ": invalid SPIR-V: " + messages);
+	spvtools::ValidatorOptions validator;
+	validator.SetUniformBufferStandardLayout(true);
+	Check(tools.Validate(compiled.spirv.data(), compiled.spirv.size(), validator),
+	      "subgroup " + std::to_string(host_subgroup) + ": invalid SPIR-V: " + messages);
 	return Inspect(std::move(compiled.spirv));
 }
 
