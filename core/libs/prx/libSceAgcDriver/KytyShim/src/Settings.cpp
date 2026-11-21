@@ -48,6 +48,7 @@ constexpr std::string_view Names[] = {
     "KYTY_GPU_PIPELINE",
     "KYTY_GPU_SPIN_US",
     "KYTY_GPU_THREAD_CPUS",
+    "KYTY_GPU_TIME",
     "KYTY_GRAPHICS_DEBUG_DUMP",
     "KYTY_HDR",
     "KYTY_HOT_PAGE_WRITE_WATCH",

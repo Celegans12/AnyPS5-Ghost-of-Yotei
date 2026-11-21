@@ -143,6 +143,8 @@ public:
 	}
 
 	void Execute(GpuOperation& operation);
+	void PushGpuTimeMarker(const char* text, size_t max_bytes);
+	void PopGpuTimeMarker();
 
 #if defined(ANYPS5_KYTY)
 	void WaitForRewind(bool valid, const uint32_t* control);
@@ -248,6 +250,7 @@ private:
 
 	uint64_t m_submit_id      = 0;
 	uint64_t        m_scout_sequence = 0;
+	std::vector<uint32_t> m_gpu_time_markers;
 	bool     m_predicate_skip = false;
 	std::unique_ptr<DrawStateObserver> m_draw_observer;
 	bool     m_occlusion_wait_requested = false;

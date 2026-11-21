@@ -7,6 +7,7 @@
 #include "common/profiler.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
+#include "graphics/host_gpu/renderer/gpuTime.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "libs/agc.h"
@@ -1212,6 +1213,10 @@ KYTY_CP_OP_PARSER(CpOpPopMarker) {
 
 	auto dw_num = (cmd_id >> 16u) & 0x3fffu;
 
+	if (GpuTime::Enabled()) {
+		cp.PopGpuTimeMarker();
+	}
+
 	return dw_num + 1;
 }
 
@@ -1219,6 +1224,10 @@ KYTY_CP_OP_PARSER(CpOpPushMarker) {
 	KYTY_PROFILER_FUNCTION();
 
 	auto dw_num = (cmd_id >> 16u) & 0x3fffu;
+
+	if (GpuTime::Enabled()) {
+		cp.PushGpuTimeMarker(reinterpret_cast<const char*>(buffer), (dw_num + 1) * sizeof(uint32_t));
+	}
 
 	return dw_num + 1;
 }
