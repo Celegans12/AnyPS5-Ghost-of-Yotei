@@ -76,26 +76,8 @@ inline std::string ReplaceStr(std::string text, std::string_view old_str,
 	return text;
 }
 
-inline std::string DirectoryWithoutFilename(std::string_view text) {
-	const auto pos = text.find_last_of('/');
-	return pos == std::string_view::npos ? std::string() : std::string(text.substr(0, pos + 1));
-}
-
-inline std::string FilenameWithoutDirectory(std::string_view text) {
-	const auto pos = text.find_last_of('/');
-	return pos == std::string_view::npos ? std::string(text) : std::string(text.substr(pos + 1));
-}
-
 inline std::string FixFilenameSlash(std::string_view text) {
 	return ReplaceChar(text, '\\', '/');
-}
-
-inline std::string FixDirectorySlash(std::string_view text) {
-	auto ret = FixFilenameSlash(text);
-	if (!ret.ends_with('/')) {
-		ret += '/';
-	}
-	return ret;
 }
 
 inline std::vector<std::string> Split(std::string_view text, std::string_view sep,

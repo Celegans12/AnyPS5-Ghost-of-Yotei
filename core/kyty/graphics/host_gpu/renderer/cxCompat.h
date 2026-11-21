@@ -65,9 +65,7 @@ inline double HitchThreshold() noexcept { return 0.0; }
 namespace FrameGen {
 inline bool Enabled() noexcept { return false; }
 inline bool WantsCamera() noexcept { return false; }
-inline bool IsTaaShader(uint64_t) noexcept { return false; }
 inline bool IsGbufferVertexShader(uint64_t) noexcept { return false; }
-inline void NoteScene() noexcept {}
 }
 
 }

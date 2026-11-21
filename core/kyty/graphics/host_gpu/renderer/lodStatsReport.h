@@ -27,21 +27,6 @@ constexpr uint32_t NoCounterFlag = 0x8000u;
 	return id | (base_level << 8u) | (min_lod << 16u);
 }
 
-inline void RecordSample(uint32_t* words, uint32_t field, float lod) {
-	if ((field & NoCounterFlag) != 0u) {
-		return;
-	}
-	const uint32_t counter   = field & 0xffu;
-	const float    absolute  = lod + static_cast<float>((field >> 8u) & 0xfu);
-	const float    clamped   = std::clamp(absolute, 0.0f, 14.0f);
-	const auto     level     = static_cast<uint32_t>(clamped);
-	const float    threshold = static_cast<float>((field >> 16u) & 0xfffu) / 256.0f;
-	words[counter]           = std::min(words[counter], level);
-	if (clamped < threshold) {
-		words[Entries + counter]++;
-	}
-}
-
 [[nodiscard]] inline uint64_t PackEntry(uint32_t finest, uint32_t count, uint32_t counter) {
 	const uint64_t level = finest == Unsampled ? 0xfu : std::min<uint32_t>(finest, 14u);
 	return (level << 56u) | (uint64_t {counter & 0xffu} << 24u) |

@@ -1244,7 +1244,6 @@ void RenderExecutor::TableGather(const TablePair& pair, std::array<std::span<con
 
 bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data,
                                  std::array<vk::DeviceAddress, 2>& blocks, bool* writes) {
-	using Kind         = ShaderRecompiler::IR::TablePlan::Operand::Kind;
 	auto&      table        = OwnTable();
 	auto&      buffer_cache = m_context.GetBufferCache();
 	auto&      textures     = m_context.GetTextureCache();

@@ -663,15 +663,6 @@ public:
 	void SetViewportZMax(uint32_t viewport_id, float zmax) {
 		m_screen_viewport.viewports[viewport_id].zmax = zmax;
 	}
-	void SetViewportScaleOffset(uint32_t viewport_id, float xscale, float xoffset, float yscale,
-	                            float yoffset, float zscale, float zoffset) {
-		m_screen_viewport.viewports[viewport_id].xscale  = xscale;
-		m_screen_viewport.viewports[viewport_id].xoffset = xoffset;
-		m_screen_viewport.viewports[viewport_id].yscale  = yscale;
-		m_screen_viewport.viewports[viewport_id].yoffset = yoffset;
-		m_screen_viewport.viewports[viewport_id].zscale  = zscale;
-		m_screen_viewport.viewports[viewport_id].zoffset = zoffset;
-	}
 	void SetViewportXScale(uint32_t viewport_id, float xscale) {
 		m_screen_viewport.viewports[viewport_id].xscale = xscale;
 	}

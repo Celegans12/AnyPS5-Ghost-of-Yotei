@@ -569,7 +569,6 @@ void VisitComputeInput(V& v, ShaderComputeInputInfo& info, const ShaderComputeIn
 
 class ElementWriter {
 public:
-	static constexpr bool Reading = false;
 	std::string           text;
 
 	void Value(std::string_view key, std::string_view value) {
@@ -607,7 +606,6 @@ public:
 
 class ElementReader {
 public:
-	static constexpr bool Reading = true;
 	bool                  ok      = true;
 
 	explicit ElementReader(std::string_view text) {

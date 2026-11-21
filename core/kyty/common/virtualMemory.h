@@ -18,11 +18,6 @@ enum class Mode : uint32_t {
 	ExecuteReadWrite = Execute | Read | Write,
 };
 
-inline bool IsExecute(Mode mode) {
-	return (mode == Mode::Execute || mode == Mode::ExecuteRead || mode == Mode::ExecuteWrite ||
-	        mode == Mode::ExecuteReadWrite);
-}
-
 bool AllocFixed(uint64_t address, uint64_t size, Mode mode);
 bool Free(uint64_t address, uint64_t size);
 bool Protect(uint64_t address, uint64_t size, Mode mode);

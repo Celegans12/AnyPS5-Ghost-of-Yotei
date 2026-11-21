@@ -181,7 +181,6 @@ public:
 	explicit CommandRecorder(vk::CommandBuffer direct) noexcept: m_direct(direct) {}
 	explicit CommandRecorder(CommandStream* stream) noexcept: m_stream(stream) {}
 
-	[[nodiscard]] bool IsDirect() const noexcept { return m_stream == nullptr; }
 	[[nodiscard]] bool operator==(std::nullptr_t) const noexcept {
 		return m_stream == nullptr && m_direct == nullptr;
 	}
