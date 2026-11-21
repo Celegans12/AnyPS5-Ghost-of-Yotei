@@ -165,6 +165,13 @@ if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
     set_tests_properties(kyty_shim_buffer_cache_pages PROPERTIES TIMEOUT 25 SKIP_RETURN_CODE 77
             ENVIRONMENT "KYTY_GPU_PIPELINE=0"
             PASS_REGULAR_EXPRESSION "kyty_shim_buffer_cache_pages: ok" FAIL_REGULAR_EXPRESSION "FAILED")
+    target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/WriteTicks.cpp)
+    add_test_executable(kyty_shim_write_ticks_tests ${CMAKE_CURRENT_SOURCE_DIR}/WriteTicksMain.cpp)
+    configure_host_test_executable(kyty_shim_write_ticks_tests)
+    target_link_libraries(kyty_shim_write_ticks_tests PRIVATE libSceAgcDriver libkernel libc)
+    add_test(NAME kyty_shim_write_ticks COMMAND kyty_shim_write_ticks_tests)
+    set_tests_properties(kyty_shim_write_ticks PROPERTIES TIMEOUT 60
+            PASS_REGULAR_EXPRESSION "kyty_shim_write_ticks: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
 endif()
 
 if(WIN32)

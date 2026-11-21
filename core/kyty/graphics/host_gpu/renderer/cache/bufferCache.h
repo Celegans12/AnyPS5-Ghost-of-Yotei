@@ -289,6 +289,7 @@ public:
 
 private:
 	friend struct BufferCacheTestAccess;
+	friend struct WriteTicksTestAccess;
 	friend class TextureCache;
 
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainSynchronizedBuffer(
@@ -387,14 +388,23 @@ private:
 	class WriteTicks {
 	public:
 		void Assign(uint64_t begin, uint64_t end, uint64_t tick);
+		void AssignRecycled(uint64_t begin, uint64_t end, uint64_t tick);
 		[[nodiscard]] uint64_t Latest(uint64_t begin, uint64_t end) const;
+		[[nodiscard]] bool     SameRanges(const WriteTicks& other) const;
+		[[nodiscard]] size_t   RangeCount() const { return m_ranges.size(); }
+		uint64_t               reused    = 0;
+		uint64_t               allocated = 0;
 
 	private:
 		struct Range {
 			uint64_t end  = 0;
 			uint64_t tick = 0;
 		};
-		std::map<uint64_t, Range> m_ranges;
+		using Ranges = std::map<uint64_t, Range>;
+		Ranges::iterator Put(Ranges::const_iterator hint, uint64_t begin, const Range& range);
+		Ranges::iterator Drop(Ranges::iterator it);
+		Ranges                          m_ranges;
+		std::vector<Ranges::node_type> m_spare;
 		struct Recent {
 			uint64_t begin = 0;
 			uint64_t end   = 0;
@@ -456,6 +466,11 @@ private:
 	MemoryTracker                                     m_memory_tracker;
 	uint64_t                                           m_gpu_write_generation = 0;
 	WriteTicks                                        m_write_ticks;
+	uint8_t                                           m_write_tick_mode = WriteTickRecycleMode();
+	struct WriteTickCheck;
+	std::unique_ptr<WriteTickCheck>                   m_write_tick_check;
+	[[nodiscard]] static uint8_t                      WriteTickRecycleMode();
+	void                                              AssignPendingRecycled(uint64_t tick);
 	std::vector<std::pair<uint64_t, uint64_t>>        m_pending_writes;
 	struct InFlightReadback {
 		uint64_t begin = 0;

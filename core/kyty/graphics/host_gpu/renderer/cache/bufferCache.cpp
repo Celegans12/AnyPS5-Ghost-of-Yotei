@@ -29,6 +29,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -2198,6 +2199,138 @@ void BufferCache::WriteTicks::Assign(uint64_t begin, uint64_t end, uint64_t tick
 	m_ranges.emplace(begin, Range {end, tick});
 }
 
+BufferCache::WriteTicks::Ranges::iterator BufferCache::WriteTicks::Put(Ranges::const_iterator hint, uint64_t begin,
+                                                                       const Range& range) {
+	if (m_spare.empty()) {
+		++allocated;
+		return m_ranges.emplace_hint(hint, begin, range);
+	}
+	++reused;
+	auto node = std::move(m_spare.back());
+	m_spare.pop_back();
+	node.key()    = begin;
+	node.mapped() = range;
+	return m_ranges.insert(hint, std::move(node));
+}
+
+BufferCache::WriteTicks::Ranges::iterator BufferCache::WriteTicks::Drop(Ranges::iterator it) {
+	if (m_spare.size() == m_spare.capacity()) {
+		return m_ranges.erase(it);
+	}
+	const auto next = std::next(it);
+	m_spare.push_back(m_ranges.extract(it));
+	return next;
+}
+
+void BufferCache::WriteTicks::AssignRecycled(uint64_t begin, uint64_t end, uint64_t tick) {
+	if (begin >= end) {
+		return;
+	}
+	auto& recent = m_recent[((begin ^ (end << 24u)) * 0x9e3779b97f4a7c15ull) >> 56u];
+	if (recent.begin == begin && recent.end == end && recent.tick == tick) {
+		return;
+	}
+	recent = {begin, end, tick};
+	auto it = m_ranges.lower_bound(begin);
+	if (it != m_ranges.end() && it->first == begin && it->second.end == end) {
+		it->second.tick = tick;
+		return;
+	}
+	if (m_spare.capacity() == 0) {
+		m_spare.reserve(64);
+	}
+	if (it != m_ranges.begin()) {
+		const auto previous = std::prev(it);
+		if (previous->second.end > begin) {
+			const auto right     = previous->second;
+			previous->second.end = begin;
+			it                   = Put(it, begin, right);
+		}
+	}
+	while (it != m_ranges.end() && it->first < end) {
+		if (it->second.end > end) {
+			const auto tail = it->second;
+			const auto next = Drop(it);
+			it              = Put(next, end, tail);
+			break;
+		}
+		it = Drop(it);
+	}
+	Put(it, begin, Range {end, tick});
+}
+
+bool BufferCache::WriteTicks::SameRanges(const WriteTicks& other) const {
+	return std::ranges::equal(m_ranges, other.m_ranges, [](const auto& a, const auto& b) {
+		return a.first == b.first && a.second.end == b.second.end && a.second.tick == b.second.tick;
+	});
+}
+
+uint8_t BufferCache::WriteTickRecycleMode() {
+	static const uint8_t mode = [] {
+		const char*            value = std::getenv("KYTY_WRITE_TICK_RECYCLE");
+		const std::string_view text {value == nullptr ? "" : value};
+		if (text.empty() || text == "0") {
+			return uint8_t {0};
+		}
+		if (text == "1") {
+			return uint8_t {1};
+		}
+		if (text != "verify") {
+			EXIT("invalid KYTY_WRITE_TICK_RECYCLE: %s (0, 1 or verify)\n", value);
+		}
+		return uint8_t {2};
+	}();
+	return mode;
+}
+
+struct BufferCache::WriteTickCheck {
+	WriteTicks                            reference;
+	uint64_t                              commits    = 0;
+	uint64_t                              assigns    = 0;
+	uint64_t                              compares   = 0;
+	uint64_t                              mismatches = 0;
+	std::chrono::steady_clock::time_point logged     = std::chrono::steady_clock::now();
+};
+
+[[gnu::noinline]] void BufferCache::AssignPendingRecycled(uint64_t tick) {
+	for (const auto& [vaddr, size]: m_pending_writes) {
+		m_write_ticks.AssignRecycled(vaddr, vaddr + size, tick);
+	}
+	if (m_write_tick_mode != 2) {
+		return;
+	}
+	if (m_write_tick_check == nullptr) {
+		m_write_tick_check = std::make_unique<WriteTickCheck>();
+	}
+	auto& check = *m_write_tick_check;
+	for (const auto& [vaddr, size]: m_pending_writes) {
+		check.reference.Assign(vaddr, vaddr + size, tick);
+	}
+	check.assigns += m_pending_writes.size();
+	if (++check.commits % 64u == 0u) {
+		++check.compares;
+		if (!m_write_ticks.SameRanges(check.reference)) {
+			if (check.mismatches++ < 8u) {
+				::Log::WriteToConsoleAndLog(fmt::format(
+				    "[kyty-write-ticks] verify: the recycled ranges differ from the reference at tick {} ({} against {} "
+				    "ranges)\n",
+				    tick, m_write_ticks.RangeCount(), check.reference.RangeCount()));
+			}
+		}
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now - check.logged >= std::chrono::seconds(10)) {
+		::Log::WriteToConsoleAndLog(fmt::format(
+		    "[kyty-write-ticks] verify summary of the last {:.0f} s: {} commits, {} ranges assigned, {} full compares, {} "
+		    "mismatches in total; {} ranges held, {} nodes reused, {} allocated\n",
+		    std::chrono::duration<double>(now - check.logged).count(), check.commits, check.assigns, check.compares,
+		    check.mismatches, m_write_ticks.RangeCount(), m_write_ticks.reused, m_write_ticks.allocated));
+		check.logged  = now;
+		check.commits = check.assigns = check.compares = 0;
+		m_write_ticks.reused = m_write_ticks.allocated = 0;
+	}
+}
+
 uint64_t BufferCache::WriteTicks::Latest(uint64_t begin, uint64_t end) const {
 	auto it = m_ranges.upper_bound(begin);
 	if (it != m_ranges.begin()) {
@@ -2270,8 +2403,12 @@ bool BufferCache::CommitWriteTicks() {
 		return TakeFlushRequest();
 	}
 	const auto tick = m_scheduler.CurrentTick();
-	for (const auto& [vaddr, size]: m_pending_writes) {
-		m_write_ticks.Assign(vaddr, vaddr + size, tick);
+	if (m_write_tick_mode != 0) {
+		AssignPendingRecycled(tick);
+	} else {
+		for (const auto& [vaddr, size]: m_pending_writes) {
+			m_write_ticks.Assign(vaddr, vaddr + size, tick);
+		}
 	}
 	if (!m_mirror_lines.empty()) {
 		for (const auto& [vaddr, size]: m_pending_writes) {
