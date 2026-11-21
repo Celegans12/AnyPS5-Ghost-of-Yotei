@@ -1,10 +1,10 @@
+#include "TestVulkanDevice.h"
 #include "common/emulatorConfig.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/graphicContext.h"
-#include "graphics/presentation/window.h"
 #include "kernel/memory.h"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #include "prx/libkernel/include/Api.hpp"
@@ -14,9 +14,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <string>
 
 namespace Libs::Graphics {
+
+struct BufferCacheTestAccess {
+	static void DiscardGpuWrites(BufferCache& cache, uint64_t address, uint64_t size) {
+		cache.DiscardGpuWrites(address, size);
+	}
+};
 
 struct TextureCacheTestAccess {
 	static ImageId Create(TextureCache& cache, const ImageInfo& info) {
@@ -45,16 +50,6 @@ constexpr uint32_t WriteWords = 4;
 constexpr uint32_t ImageValue = 0x19283746;
 constexpr uint32_t CopyValue = 0xdecafbad;
 constexpr uint32_t FillValue = 0x1234fedc;
-
-struct HeadlessDevice {
-	GraphicContext graphics;
-
-	~HeadlessDevice() {
-		if (graphics.allocator) graphics.DestroyAllocator();
-		if (graphics.device) graphics.device.destroy();
-		if (graphics.instance) graphics.instance.destroy();
-	}
-};
 
 const char* CheckWriteBackOrder(GraphicContext& graphics, uint64_t address) {
 	RenderContext renderer(graphics);
@@ -104,7 +99,8 @@ const char* CheckWriteBackOrder(GraphicContext& graphics, uint64_t address) {
 	const auto last = scheduler.CurrentTick();
 	scheduler.Wait(last);
 	scheduler.WaitPriorityOperations(last);
-	(void)buffers.DropFreedRange(address, GuestBytes, false, nullptr, nullptr);
+	BufferCacheTestAccess::DiscardGpuWrites(buffers, address, GuestBytes);
+	(void)buffers.DropFreedRange(address, GuestBytes, nullptr, nullptr);
 	if (!queued) return "the image write-back was not pending before the buffer writes";
 	if (!same_tick) return "the image download and buffer transfers did not share a tick";
 	copied.Invalidate(0, 2 * Bytes);
@@ -137,16 +133,14 @@ extern "C" int RunKytyImageWriteBackAliasTest() {
 	Common::InitializeThreads();
 	Config::Initialize();
 	Config::Load(Config::ConfigOptions {});
-	HeadlessDevice gpu;
+	KytyShimTests::TestVulkanDevice gpu;
 	auto& graphics = gpu.graphics;
-	std::string error;
-	if (!CreateHeadlessVulkan(graphics, nullptr, error)) {
+	if (const auto* unavailable = gpu.Initialize()) {
 		const bool required = std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr;
 		std::fprintf(stderr, "kyty_shim_image_write_back_alias: %s, no usable Vulkan device (%s)\n",
-		             required ? "FAILED" : "skipped", error.c_str());
+		             required ? "FAILED" : "skipped", unavailable);
 		return required ? 1 : 77;
 	}
-	graphics.device.getQueue(graphics.queue_family, 0, &graphics.queue);
 	if (!graphics.CreateAllocator()) {
 		std::fputs("kyty_shim_image_write_back_alias: FAILED: could not create the allocator\n", stderr);
 		return 1;
