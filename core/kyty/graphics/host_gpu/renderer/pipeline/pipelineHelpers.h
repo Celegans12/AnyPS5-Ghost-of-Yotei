@@ -6,7 +6,6 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
-#include <string_view>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -58,8 +57,6 @@ private:
 [[nodiscard]] uint32_t PipelineHelperProcesses(const GraphicContext& graphics);
 
 [[nodiscard]] uint32_t PipelineHelperProcessesAlone(uint32_t processes);
-
-int RunPipelineHelper(std::string_view spec, Config::ConfigOptions config);
 
 }
 

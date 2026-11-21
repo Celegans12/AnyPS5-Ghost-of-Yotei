@@ -250,9 +250,6 @@ set(KYTY_GPU_EXCEPTIONS
     graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
     graphics/presentation/window/swapchain.cpp
 )
-if(WIN32)
-    list(APPEND KYTY_GPU_EXCEPTIONS graphics/host_gpu/renderer/pipeline/pipelineHelpers.cpp)
-endif()
 list(TRANSFORM KYTY_GPU_EXCEPTIONS PREPEND "${KYTY_DIR}/")
 set_source_files_properties(${KYTY_COMMON_SOURCES} ${KYTY_GPU_EXCEPTIONS} PROPERTIES COMPILE_OPTIONS -fexceptions)
 

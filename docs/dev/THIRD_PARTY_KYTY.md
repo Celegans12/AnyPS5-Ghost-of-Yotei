@@ -103,16 +103,16 @@ model on MinGW, which libstdc++ uses), `-fno-zero-initialized-in-bss` (GCC puts 
 section, and GNU ld only merges sections of one name) and `-mno-red-zone`. The shim is compiled with
 `-fno-extern-tls-init`, and `MemoryTracker::s_deferred` is declared without `inline` for GCC there, because GCC on
 MinGW emits the initialisation function of an inline `thread_local` variable once per translation unit. ThinLTO is off:
-lld cannot pre-link COFF objects with `-r`. `pipelineHelpers.cpp` is compiled with `-fexceptions`, as its Windows part
-uses `try`.
+lld cannot pre-link COFF objects with `-r`.
 
 The second view of guest memory (`DirectMemoryEnableView`) is a reserved range. Anonymous guest memory in the arena is
 mapped from pagefile-backed sections of 1 GiB, each created and mapped into the view when memory is first committed in
 its range, and each direct memory backing is mapped at its physical offset after the guest range. A section page cannot
 be given back to the system, so a page that held data is zeroed when it is unmapped and stays committed. Access
 violations reach `KytyShim::HandleHostFault` from libc's vectored exception handler through
-`GuestArenaSetGpuFaultHandler`. KytyPS5's pipeline helper processes are not used (`PipelineHelperProcesses` returns 0):
-a helper is the executable started again with `--pipeline-helper`, and here the executable is the converted title.
+`GuestArenaSetGpuFaultHandler`. KytyPS5's pipeline helper processes are not built (`PipelineHelpers` starts none and
+`PipelineHelperProcesses` returns 0): a helper is the executable started again with `--pipeline-helper`, and here the
+executable is the converted title.
 
 ## Third-party code
 
