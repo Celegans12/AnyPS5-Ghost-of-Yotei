@@ -424,6 +424,7 @@ enum class DescriptorBindingKind : uint32_t {
 };
 
 inline constexpr uint32_t UniformBufferBytes = 65536u;
+inline constexpr uint32_t FlattenedSrtUniformWords = 4096u;
 inline constexpr uint32_t UniformBufferBaseSlack = 256u;
 
 static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 51u);
@@ -597,6 +598,7 @@ struct Bindings {
 	uint32_t table_block_dwords  = 0;
 	uint32_t mip_stats_count = 0;
 	uint32_t stride_count = 0;
+	bool     flattened_srt_uniform = false;
 
 	[[nodiscard]] uint32_t MemorySizeDword() const {
 		return memory_offset_dword +

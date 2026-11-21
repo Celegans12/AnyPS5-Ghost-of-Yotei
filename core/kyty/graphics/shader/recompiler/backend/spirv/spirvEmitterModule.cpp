@@ -236,6 +236,43 @@ void DefineImageArray(EmitterState& state, ImageDefinition& definition, const IR
 	definition.pointer_type = TypePointer(state, spv::StorageClassUniformConstant, definition.type);
 }
 
+[[nodiscard]] bool FlattenedSrtFitsUniform(const IR::Program& program) {
+	const auto& info = program.info;
+	if (info.uses_image_heap) {
+		return false;
+	}
+	for (const auto& image: info.images) {
+		if (image.heap || image.table_capacity != 0u || image.indirect_root != IR::ImageResource::NoIndirectImage) {
+			return false;
+		}
+	}
+	for (const auto& buffer: info.buffers) {
+		if (buffer.indirect_root != IR::BufferResource::NoIndirectBuffer) {
+			return false;
+		}
+	}
+	uint64_t words = program.srt_reads.size();
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			const auto opcode = inst.GetOpcode();
+			if (opcode == IR::ValueOpcode::ReadConst) {
+				const auto slot = inst.Arg(1).Resolve();
+				if (!slot.IsImmediate()) {
+					return false;
+				}
+				words = std::max<uint64_t>(words, uint64_t {slot.U32()} + 1u);
+			} else if (opcode == IR::ValueOpcode::ReadCallWord) {
+				const auto word = inst.Arg(0);
+				if (!word.IsImmediate()) {
+					return false;
+				}
+				words = std::max<uint64_t>(words, program.srt_reads.size() + uint64_t {word.U32()} + 1u);
+			}
+		}
+	}
+	return words <= IR::FlattenedSrtUniformWords;
+}
+
 void DefineDescriptors(EmitterState& state) {
 	using Kind = IR::DescriptorBindingKind;
 	auto& info = state.program.info;
@@ -293,6 +330,8 @@ void DefineDescriptors(EmitterState& state) {
 	counts[static_cast<size_t>(Kind::BdaPagetable)] = info.uses_dma;
 	counts[static_cast<size_t>(Kind::FaultBuffer)] = info.uses_dma;
 	counts[static_cast<size_t>(Kind::FlattenedSrt)] = info.uses_flattened_srt && !table;
+	bindings.flattened_srt_uniform =
+	    counts[static_cast<size_t>(Kind::FlattenedSrt)] != 0 && FlattenedSrtFitsUniform(state.program);
 	bindings.memory_offset_dword = static_cast<uint32_t>(info.user_data_registers.size());
 	if (info.uses_dispatch_threads) {
 		bindings.dispatch_thread_dword = bindings.memory_offset_dword;
@@ -378,8 +417,20 @@ void DefineDescriptors(EmitterState& state) {
 				    Define(StorageBufferType(state, state.storage_buffers[2]), "mip_stats");
 				break;
 			case IR::DescriptorBindingKind::FlattenedSrt:
-				state.flattened_srt_variable =
-				    Define(StorageBufferType(state, state.storage_buffers[2]), "flattened_srt");
+				if (bindings.flattened_srt_uniform) {
+					const auto array = state.builder.DecoratedType(
+					    spv::OpTypeArray, {{spv::OpDecorate, {spv::DecorationArrayStride, 4u}}}, TypeU32(state),
+					    ConstantU32(state, IR::FlattenedSrtUniformWords));
+					const auto block = state.builder.DecoratedType(
+					    spv::OpTypeStruct, {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
+					                        {spv::OpDecorate, {spv::DecorationBlock}}}, array);
+					state.flattened_srt_variable = Define(block, "flattened_srt", spv::StorageClassUniform);
+					state.flattened_srt_pointer  = TypePointer(state, spv::StorageClassUniform, TypeU32(state));
+				} else {
+					state.flattened_srt_variable =
+					    Define(StorageBufferType(state, state.storage_buffers[2]), "flattened_srt");
+					state.flattened_srt_pointer = TypeStorageBufferElementPointer(state);
+				}
 				break;
 			case IR::DescriptorBindingKind::Samplers:
 				state.sampler_type = state.builder.Type(spv::OpTypeSampler);

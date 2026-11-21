@@ -473,6 +473,17 @@ add_test(NAME kyty_shim_generic_compute_variants_off COMMAND kyty_shim_generic_c
 set_tests_properties(kyty_shim_generic_compute_variants_off PROPERTIES TIMEOUT 20 ENVIRONMENT "KYTY_GENERIC_COMPUTE_VARIANT=0"
         PASS_REGULAR_EXPRESSION "kyty_shim_generic_compute_variants_off: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
 
+add_test_executable(kyty_shim_flattened_srt_uniform_tests ${CMAKE_CURRENT_SOURCE_DIR}/FlattenedSrtUniform.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+target_include_directories(kyty_shim_flattened_srt_uniform_tests PRIVATE ${LIBS_INCLUDE_DIR})
+configure_host_test_executable(kyty_shim_flattened_srt_uniform_tests)
+if(MINGW)
+    target_link_libraries(kyty_shim_flattened_srt_uniform_tests PRIVATE stdc++ gcc_eh)
+endif()
+target_link_libraries(kyty_shim_flattened_srt_uniform_tests PRIVATE Kyty::gpu libkernel libc)
+add_test(NAME kyty_shim_flattened_srt_uniform COMMAND kyty_shim_flattened_srt_uniform_tests)
+set_tests_properties(kyty_shim_flattened_srt_uniform PROPERTIES TIMEOUT 60
+        PASS_REGULAR_EXPRESSION "kyty_shim_flattened_srt_uniform: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+
 add_test_executable(kyty_shim_ab_switches_tests ${CMAKE_CURRENT_SOURCE_DIR}/AbSwitches.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
 target_include_directories(kyty_shim_ab_switches_tests PRIVATE ${LIBS_INCLUDE_DIR})
 configure_host_test_executable(kyty_shim_ab_switches_tests)

@@ -139,6 +139,13 @@ vk::DescriptorType NativeDescriptorType(BindingKind kind) {
 	EXIT("invalid native descriptor binding kind");
 }
 
+vk::DescriptorType NativeDescriptorType(const ShaderRecompiler::IR::Bindings& bindings, BindingKind kind) {
+	if (kind == BindingKind::FlattenedSrt && bindings.flattened_srt_uniform) {
+		return vk::DescriptorType::eUniformBuffer;
+	}
+	return NativeDescriptorType(kind);
+}
+
 template <typename Fn>
 void ForEachImageTable(const std::vector<ShaderRecompiler::IR::ImageResource>& images, Fn&& fn) {
 	for (uint32_t i = 0; i < images.size(); i++) {
@@ -2882,6 +2889,11 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
 		prepared.flattened_srt       = NativeUpload(m_context, snapshot.flattened_srt);
+		if (layout.flattened_srt_uniform) {
+			prepared.flattened_srt.range = std::min<vk::DeviceSize>(
+			    prepared.flattened_srt.range,
+			    m_context.GetGraphics().GetPhysicalDeviceProperties().limits.maxUniformBufferRange);
+		}
 		prepared.flattened_srt_known = snapshot.gpu_flat_loads.empty();
 		if (!snapshot.gpu_flat_loads.empty()) {
 			CopyGpuFlatLoads(m_context, prepared.flattened_srt, snapshot.gpu_flat_loads);
@@ -3334,7 +3346,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			const auto kind = static_cast<BindingKind>(index);
 			vk::WriteDescriptorSet write {};
 			write.dstBinding = ShaderRecompiler::IR::NativeBinding(program.stage, kind);
-			write.descriptorType = NativeDescriptorType(kind);
+			write.descriptorType = NativeDescriptorType(program.bindings, kind);
 			write.descriptorCount = program.bindings.descriptor_counts[index];
 			const auto image_start = image_cursor;
 			if (ShaderRecompiler::IR::ImageBindingResourceClass(kind) !=

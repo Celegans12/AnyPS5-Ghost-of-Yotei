@@ -106,6 +106,8 @@ struct PreparedBindings {
 
 [[nodiscard]] vk::DescriptorType
 NativeDescriptorType(ShaderRecompiler::IR::DescriptorBindingKind kind);
+[[nodiscard]] vk::DescriptorType NativeDescriptorType(const ShaderRecompiler::IR::Bindings&       bindings,
+                                                      ShaderRecompiler::IR::DescriptorBindingKind kind);
 [[nodiscard]] vk::DescriptorImageInfo MakeImageInfo(const TextureBinding& texture,
                                                     uint32_t              element = 0);
 

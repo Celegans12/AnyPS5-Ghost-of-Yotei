@@ -171,9 +171,11 @@ static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descr
 	for (auto mask = program.bindings.descriptor_mask; mask != 0; mask &= mask - 1) {
 		const auto index = std::countr_zero(mask);
 		const auto kind = static_cast<Kind>(index);
-		const auto type = native_bindings && (kind == Kind::FlattenedSrt || kind == Kind::ShaderData)
-		                      ? vk::DescriptorType::eStorageBufferDynamic
-		                      : NativeDescriptorType(kind);
+		const auto native = NativeDescriptorType(program.bindings, kind);
+		const auto type   = !native_bindings || (kind != Kind::FlattenedSrt && kind != Kind::ShaderData)
+		                        ? native
+		                    : native == vk::DescriptorType::eUniformBuffer ? vk::DescriptorType::eUniformBufferDynamic
+		                                                                   : vk::DescriptorType::eStorageBufferDynamic;
 		descriptor_bindings.push_back({ShaderRecompiler::IR::NativeBinding(program.stage, kind), type,
 		                               program.bindings.descriptor_counts[index], stage, nullptr});
 	}

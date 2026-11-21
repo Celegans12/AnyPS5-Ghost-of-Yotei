@@ -288,7 +288,7 @@ uint32_t ResultVector(ValueEmitContext& ctx, uint32_t value,
 uint32_t ImageTableSlot(EmitterState& state, const IR::ImageResource& image, uint32_t key) {
 	const auto LoadTableMapping = [&](uint32_t index) {
 		const auto pointer = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+		state.builder.AddFunction(spv::OpAccessChain, state.flattened_srt_pointer,
 		                          pointer, state.flattened_srt_variable, ConstantU32(state, 0),
 		                          index);
 		const auto value = state.builder.AllocateId();

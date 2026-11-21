@@ -204,6 +204,7 @@ struct EmitterState {
 	uint32_t                                         mip_stats_variable      = 0;
 	bool                                             mip_stats_records       = true;
 	uint32_t                                         flattened_srt_variable  = 0;
+	uint32_t                                         flattened_srt_pointer   = 0;
 	uint32_t                                         table_block             = 0;
 	std::vector<uint32_t>                            table_slot_values;
 	std::vector<uint32_t>                            table_bases;

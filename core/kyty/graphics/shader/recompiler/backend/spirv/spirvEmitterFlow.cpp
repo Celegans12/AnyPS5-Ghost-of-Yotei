@@ -955,7 +955,7 @@ uint32_t EmitReadCallWord(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (state.flattened_srt_variable == 0) ctx.Fail(inst, "requires the flattened SRT descriptor");
 	const auto index   = static_cast<uint32_t>(state.program.srt_reads.size()) + inst.Arg(0).U32();
 	const auto pointer = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+	state.builder.AddFunction(spv::OpAccessChain, state.flattened_srt_pointer, pointer,
 	                          state.flattened_srt_variable, ConstantU32(state, 0),
 	                          ConstantU32(state, index));
 	const auto value = state.builder.AllocateId();
