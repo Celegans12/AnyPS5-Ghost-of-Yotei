@@ -6,6 +6,7 @@
 #include "common/common.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/drawTemplates.h"
+#include "graphics/host_gpu/renderer/e2Stats.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/tableResolutionCache.h"
@@ -189,7 +190,10 @@ struct Request;
 
 class RenderExecutor {
 public:
-	explicit RenderExecutor(RenderContext& context): m_context(context) { ConfigureTableResolutions(); }
+	explicit RenderExecutor(RenderContext& context): m_context(context) {
+		ConfigureTableResolutions();
+		E2Stats::Configure();
+	}
 	~RenderExecutor();
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
@@ -226,7 +230,12 @@ public:
 	static void ReleaseResolvedDraw(ResolvedDraw* resolved) noexcept;
 	enum class AheadNote : uint8_t { NotAttempted, Prepared, NotPrepared, TableSkip };
 	enum class ExecuteCause : uint8_t { TableSkip, Revalidation, NotPrepared, Again, Other, Count };
-	void BeginAheadOperation(ResolvedDraw* resolved, AheadNote note) noexcept;
+	void BeginAheadOperation(ResolvedDraw* resolved, AheadNote note, const E2Stats::Refusal& e2 = {}) noexcept;
+	[[nodiscard]] E2Stats::Refusal TakeAheadE2() noexcept {
+		const auto e2     = m_ahead_e2;
+		m_ahead_e2.cause = E2Stats::Cause::None;
+		return e2;
+	}
 	void EndAheadOperation() noexcept;
 	void NoteTableServed() noexcept { m_ahead_table = true; }
 	static void NoteAhead(bool dispatch, AheadNote note, uint64_t ns) noexcept;
@@ -657,6 +666,10 @@ private:
 	[[nodiscard]] ExecuteCause MissingAheadCause() const noexcept;
 	[[nodiscard]] bool         RevalidateAhead(ResolvedDraw& resolved, bool dispatch);
 	const ShaderModule* ResolveComputeHere(const HW::ComputeShaderInfo& regs, ShaderComputeInputInfo& input_info);
+	void                NoteAheadE2(const ProgramResolution& programs, bool dispatch) noexcept;
+	void                NoteRevalidationE2(const ProgramResolution& programs, bool dispatch) noexcept;
+	E2Stats::Refusal    m_e2;
+	E2Stats::Refusal    m_ahead_e2;
 	AheadNote    m_ahead_note     = AheadNote::NotAttempted;
 	ExecuteCause m_execute_cause  = ExecuteCause::Other;
 	bool         m_ahead_present  = false;

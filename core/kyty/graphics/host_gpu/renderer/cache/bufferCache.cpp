@@ -629,12 +629,27 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 	}, false);
 }
 
+namespace {
+thread_local uint64_t t_readbacks   = 0;
+thread_local uint64_t t_readback_ns = 0;
+}
+
+uint64_t BufferCache::ThreadReadbacks() noexcept {
+	return t_readbacks;
+}
+
+uint64_t BufferCache::ThreadReadbackNs() noexcept {
+	return t_readback_ns;
+}
+
 void BufferCache::ReadMemoryAsync(uint64_t vaddr, uint64_t size, bool is_write, bool guest_fault) {
 	const bool command_processor = GuestGpu::IsCommandProcessorThread();
 	const auto started           = SteadyNs();
 	ReadMemoryAsyncTimed(vaddr, size, is_write, guest_fault, command_processor);
 	auto&      stats   = g_readback_stats;
 	const auto elapsed = static_cast<uint64_t>(SteadyNs() - started);
+	t_readbacks++;
+	t_readback_ns += elapsed;
 	(command_processor ? stats.cp_reads : stats.other_reads).fetch_add(1, std::memory_order_relaxed);
 	(command_processor ? stats.cp_ns : stats.other_ns).fetch_add(elapsed, std::memory_order_relaxed);
 }

@@ -4,6 +4,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
+#include <array>
 #include <span>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -132,6 +133,38 @@ struct SrtWalkerChecks {
 [[nodiscard]] SrtShortWalkers SrtShortWalkersMode();
 [[nodiscard]] SrtWalkerChecks SrtWalkerChecksSoFar();
 #endif
+enum class SrtLoadClass : uint8_t { Address, VSharp, Args, KeyTable, ImageTable, TSharp, Data, Other, Count };
+inline constexpr uint32_t SrtLoadClassCount = static_cast<uint32_t>(SrtLoadClass::Count);
+inline constexpr uint32_t SrtUnknownLoad    = UINT32_MAX;
+inline constexpr uint16_t SrtWrittenVSharpSink = 0x100u;
+constexpr uint8_t SrtLoadBit(SrtLoadClass load_class) {
+	return static_cast<uint8_t>(1u << static_cast<uint32_t>(load_class));
+}
+struct SrtRefusalClasses {
+	SrtLoadClass                             first = SrtLoadClass::Count;
+	uint8_t                                  mask  = 0;
+	uint16_t                                 written_vsharp_loads = 0;
+	std::array<uint16_t, SrtLoadClassCount> loads {};
+};
+[[nodiscard]] SrtLoadClass      SrtLoadClassOf(uint16_t sinks);
+[[nodiscard]] SrtRefusalClasses ClassifySrtRefusal(std::span<const uint16_t> load_sinks,
+                                                   std::span<const uint32_t> faulted_loads);
+void                            SetSrtLoadFaultRecording(bool on);
+[[nodiscard]] bool              SrtLoadFaultRecording();
+[[nodiscard]] std::span<const uint32_t> SrtFaultedLoadsOfThread();
+void                                    ClearSrtFaultedLoadsOfThread();
+class SrtTableReads {
+public:
+	explicit SrtTableReads(SrtLoadClass load_class);
+	~SrtTableReads();
+	SrtTableReads(const SrtTableReads&)            = delete;
+	SrtTableReads& operator=(const SrtTableReads&) = delete;
+
+private:
+	uint8_t m_previous = 0;
+	bool    m_on       = false;
+};
+[[nodiscard]] uint8_t SrtTableReadTag();
 uint32_t SrtWalkerLoadLength(uint64_t rip);
 uint32_t SrtWalkerAheadLoadLength(uint64_t rip, uint64_t address);
 

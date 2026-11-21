@@ -633,6 +633,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
                                    std::vector<DescriptorValue>& descriptors,
                                    std::vector<Specialization>&  specializations,
                                    Normalize&& normalize) {
+	const SrtTableReads tag {SrtLoadClass::KeyTable};
 	const auto& indirect = *program.descriptor_sources[source_index].indirect_descriptor;
 	const auto  descriptor_bytes = read_dwords * sizeof(uint32_t);
 	const auto& sources = indirect.sources;
@@ -1304,6 +1305,7 @@ bool MaterializeImageTable(const ResourcePlan& program,
                            ResourceSpecialization& specialization,
                            std::vector<ImageTableSnapshot>& previous,
                            std::vector<uint32_t>& mapping_offsets) {
+	const SrtTableReads  tag {SrtLoadClass::ImageTable};
 	ShaderBufferResource table;
 	if (table_value.dword_count != 4u || !DecodeBufferDescriptor(table_value, table) ||
 	    (indirect.table_offset & 31u) != 0u) {
@@ -1421,6 +1423,7 @@ bool MaterializeImageTableHeap(const ResourcePlan& program,
                                const DescriptorValue& table_value, uint32_t image_index,
                                const SrtRuntime& runtime, ResourceSnapshot& snapshot,
                                ResourceSpecialization& specialization) {
+	const SrtTableReads  tag {SrtLoadClass::ImageTable};
 	const auto&          root = program.info.images[image_index];
 	ShaderBufferResource table;
 	if (!runtime.image_table_heap || root.resource_class != ImageResourceClass::Sampled ||
@@ -2473,6 +2476,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		for (uint32_t source = 0; source < program.descriptor_sources.size(); ++source) {
 			if (!WalkedActive(program, source) ||
 			    !uses_workgroup_count(program.descriptor_sources[source])) continue;
+			const SrtTableReads tag {SrtLoadClass::Args};
 			if ((runtime.indirect_args_address & 3u) != 0u ||
 			    !ReadTable(runtime.indirect_args_address, sizeof(workgroup_counts), 0u,
 			               observed, workgroup_counts)) return false;

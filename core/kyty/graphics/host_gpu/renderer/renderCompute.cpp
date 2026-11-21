@@ -7,6 +7,7 @@
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "common/timer.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
@@ -378,7 +379,15 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 	}
 	auto& cache = context.GetBufferCache();
 	if (indirect_args != 0) {
-		cache.ReadMemory(indirect_args, sizeof(vk::DispatchIndirectCommand));
+		if (E2Stats::Enabled()) {
+			const bool gpu_written =
+			    Libs::LibKernel::Memory::MayBeGpuWritten(indirect_args, sizeof(vk::DispatchIndirectCommand));
+			const auto begin = Common::SteadyNs();
+			cache.ReadMemory(indirect_args, sizeof(vk::DispatchIndirectCommand));
+			E2Stats::NoteArgsRead(gpu_written, Common::SteadyNs() - begin);
+		} else {
+			cache.ReadMemory(indirect_args, sizeof(vk::DispatchIndirectCommand));
+		}
 		std::memcpy(input.workgroup_counts, reinterpret_cast<const void*>(indirect_args),
 		            sizeof(input.workgroup_counts));
 	}

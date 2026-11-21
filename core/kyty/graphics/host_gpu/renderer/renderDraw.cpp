@@ -628,7 +628,11 @@ void RenderExecutor::NoteAhead(bool dispatch, AheadNote note, uint64_t ns) noexc
 	Bump(g_ahead_resolve.ns[kind], ns);
 }
 
-void RenderExecutor::BeginAheadOperation(ResolvedDraw* resolved, AheadNote note) noexcept {
+void RenderExecutor::BeginAheadOperation(ResolvedDraw* resolved, AheadNote note, const E2Stats::Refusal& e2) noexcept {
+	if (E2Stats::Enabled()) {
+		m_e2 = e2;
+		if (e2.cause != E2Stats::Cause::None) E2Stats::NoteRefusal(e2);
+	}
 	UseResolvedDraw(resolved);
 	m_ahead_note     = note;
 	m_ahead_present  = m_resolved_draw != nullptr;
@@ -648,6 +652,38 @@ void RenderExecutor::EndAheadOperation() noexcept {
 	m_ahead_present = false;
 	m_ahead_taken   = false;
 	m_ahead_table   = false;
+	m_e2.cause      = E2Stats::Cause::None;
+}
+
+void RenderExecutor::NoteAheadE2(const ProgramResolution& programs, bool dispatch) noexcept {
+	m_ahead_e2.cause = E2Stats::Cause::None;
+	if (programs.e2_classes.mask == 0) return;
+	m_ahead_e2 = {.hash     = programs.e2_hash,
+	              .classes  = programs.e2_classes,
+	              .cause    = E2Stats::Cause::AheadWalk,
+	              .dispatch = dispatch};
+}
+
+void RenderExecutor::NoteRevalidationE2(const ProgramResolution& programs, bool dispatch) noexcept {
+	const auto stale = programs.reads.Stale();
+	if (stale != StaleRead::GpuWrite && stale != StaleRead::AroundGpuWrite && stale != StaleRead::Strict) return;
+	const auto entry = programs.reads.StaleEntryInfo();
+	if (!entry) return;
+	if (stale == StaleRead::Strict && !Libs::LibKernel::Memory::MayBeGpuWritten(entry->address, entry->size)) return;
+	E2Stats::Refusal refusal {.hash     = programs.stages != 0 && programs.plans[0] != nullptr ? programs.plans[0]->shader_hash : 0,
+	                          .cause    = E2Stats::Cause::RevalidationWalk,
+	                          .dispatch = dispatch};
+	if (entry->strict) {
+		const auto load_class = entry->table != 0
+		                            ? static_cast<ShaderRecompiler::IR::SrtLoadClass>(entry->table - 1u)
+		                            : ShaderRecompiler::IR::SrtLoadClass::Other;
+		refusal.cause                 = E2Stats::Cause::RevalidationTable;
+		refusal.classes.first         = load_class;
+		refusal.classes.mask          = ShaderRecompiler::IR::SrtLoadBit(load_class);
+		refusal.classes.loads[static_cast<uint32_t>(load_class)] = 1;
+	}
+	m_e2 = refusal;
+	E2Stats::NoteRefusal(refusal);
 }
 
 RenderExecutor::ExecuteCause RenderExecutor::MissingAheadCause() const noexcept {
@@ -682,9 +718,17 @@ bool RenderExecutor::RevalidateAhead(ResolvedDraw& resolved, bool dispatch) {
 
 const ShaderModule* RenderExecutor::ResolveComputeHere(const HW::ComputeShaderInfo& regs,
                                                        ShaderComputeInputInfo&      input_info) {
+	const bool e2          = m_e2.cause != E2Stats::Cause::None;
+	const auto readbacks   = e2 ? BufferCache::ThreadReadbacks() : 0;
+	const auto readback_ns = e2 ? BufferCache::ThreadReadbackNs() : 0;
 	const auto begin  = Common::SteadyNs();
 	const auto* module = m_context.GetPipelineCache().GetComputeProgram(regs, input_info);
-	Bump(g_execute_resolve.here_ns[1], Common::SteadyNs() - begin);
+	const auto elapsed = Common::SteadyNs() - begin;
+	Bump(g_execute_resolve.here_ns[1], elapsed);
+	if (e2) {
+		E2Stats::NoteExecuteResolution(m_e2, elapsed, BufferCache::ThreadReadbacks() - readbacks,
+		                               BufferCache::ThreadReadbackNs() - readback_ns);
+	}
 	Bump(g_execute_resolve.here[1][static_cast<size_t>(m_execute_cause)]);
 	return module;
 }
@@ -742,6 +786,11 @@ void RenderExecutor::LogResolveSummary() {
 	const auto ahead_draws        = resolve_side(0);
 	const auto ahead_dispatches   = resolve_side(1);
 	const auto around             = Libs::LibKernel::Memory::TakeAheadAroundReads();
+	if (E2Stats::Enabled()) {
+		for (const auto& line: E2Stats::TakeSummary(static_cast<double>(now - last) / 1e9, frames)) {
+			Log::WriteToConsoleAndLog(line + "\n");
+		}
+	}
 	Log::WriteToConsoleAndLog(fmt::format(
 	    "[kyty-resolve] summary of the last {:.1f} s, {} frames: draws: {}; dispatches: {}; resolve thread: draws {}, "
 	    "skipped by the table hint {}; dispatches {}; walker loads on GPU written pages: read around GPU writes {}, "
@@ -983,6 +1032,7 @@ DrawRenderState& RenderExecutor::AcquireDrawRenderState(bool tessellation, bool&
 		shaders_resolved = true;
 	} else {
 		m_execute_cause = ExecuteCause::Revalidation;
+		if (E2Stats::Enabled()) NoteRevalidationE2(resolved->programs, false);
 	}
 	m_ahead_taken = m_ahead_taken || m_ahead_present;
 #if defined(ANYPS5_KYTY)
@@ -1606,6 +1656,7 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDrawAhead(
 	if (!ResolveDrawPrograms(draw, context, user_config, shaders, indirect_offsets, indirect_draw, context_id,
 	                         user_config_id)) {
 		NoteAheadRefusal(false, draw.programs.reads.Refusal());
+		if (E2Stats::Enabled()) NoteAheadE2(draw.programs, false);
 		return nullptr;
 	}
 	draw.busy.store(true, std::memory_order_relaxed);
@@ -1707,6 +1758,7 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDispatchAhead(const HW::Con
 	if (slot.programs.reads.Failed() || slot.compute_module == nullptr) {
 		slot.compute_module = nullptr;
 		NoteAheadRefusal(true, slot.programs.reads.Refusal());
+		if (E2Stats::Enabled()) NoteAheadE2(slot.programs, true);
 		return nullptr;
 	}
 	slot.busy.store(true, std::memory_order_relaxed);
@@ -1737,6 +1789,7 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveIndirectDispatchAhead(
 	if (slot.programs.reads.Failed() || slot.compute_module == nullptr) {
 		slot.compute_module = nullptr;
 		NoteAheadRefusal(true, slot.programs.reads.Refusal());
+		if (E2Stats::Enabled()) NoteAheadE2(slot.programs, true);
 		return nullptr;
 	}
 	slot.busy.store(true, std::memory_order_relaxed);
@@ -1758,6 +1811,7 @@ bool RenderExecutor::TakeResolvedDispatch(ShaderComputeInputInfo& input_info,
 	}
 	if (!RevalidateAhead(*resolved, true)) {
 		m_execute_cause = ExecuteCause::Revalidation;
+		if (E2Stats::Enabled()) NoteRevalidationE2(resolved->programs, true);
 		return false;
 	}
 #if defined(ANYPS5_KYTY)
@@ -1775,9 +1829,17 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, bool shaders_
                                             DrawRenderState&    state) {
 	if (!shaders_resolved) {
 		m_context.GetImageHeap().BeginDraw();
+		const bool e2          = m_e2.cause != E2Stats::Cause::None;
+		const auto readbacks   = e2 ? BufferCache::ThreadReadbacks() : 0;
+		const auto readback_ns = e2 ? BufferCache::ThreadReadbackNs() : 0;
 		const auto begin = Common::SteadyNs();
 		m_context.GetPipelineCache().GetGraphicsPrograms(buffer, state);
-		Bump(g_execute_resolve.here_ns[0], Common::SteadyNs() - begin);
+		const auto elapsed = Common::SteadyNs() - begin;
+		Bump(g_execute_resolve.here_ns[0], elapsed);
+		if (e2) {
+			E2Stats::NoteExecuteResolution(m_e2, elapsed, BufferCache::ThreadReadbacks() - readbacks,
+			                               BufferCache::ThreadReadbackNs() - readback_ns);
+		}
 		Bump(g_execute_resolve.here[0][static_cast<size_t>(m_execute_cause)]);
 	}
 	if (state.vertex_info[0].stage.module == nullptr) {

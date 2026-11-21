@@ -211,7 +211,21 @@ constexpr uint32_t WalkerPageCacheSlots = 4;
 thread_local bool t_short_probe = false;
 #endif
 
-uint64_t KYTY_SYSV_ABI ProbeGuestLoad(uint64_t address, WalkerCachedPage* cache) {
+struct FaultedLoads {
+	static constexpr uint32_t        Capacity = 64;
+	std::array<uint32_t, Capacity> loads {};
+	uint32_t                         count = 0;
+};
+std::atomic_bool          g_record_faults {false};
+thread_local FaultedLoads t_faulted_loads;
+
+void NoteFaultedLoad(uint32_t load) {
+	if (!g_record_faults.load(std::memory_order_relaxed)) return;
+	auto& faulted = t_faulted_loads;
+	if (faulted.count < FaultedLoads::Capacity) faulted.loads[faulted.count++] = load;
+}
+
+uint64_t KYTY_SYSV_ABI ProbeGuestLoad(uint64_t address, WalkerCachedPage* cache, uint32_t load) {
 	constexpr uint64_t PageSize = 4096;
 	if (address < GuestMemoryStart) {
 		return 0;
@@ -271,6 +285,7 @@ uint64_t KYTY_SYSV_ABI ProbeGuestLoad(uint64_t address, WalkerCachedPage* cache)
 	}
 	if (t_walker_ahead) {
 		t_walker_faulted = true;
+		NoteFaultedLoad(load);
 		return uint64_t {1} << 32u;
 	}
 	return 0;
@@ -289,12 +304,14 @@ bool DefersFlatLoad(uint32_t slot) {
 	return slot != NoFlatSlot && slot != ZeroTestSlot && !IsDescriptorSlot(slot);
 }
 
-uint64_t KYTY_SYSV_ABI ProbeFlatGuestLoad(uint64_t address, WalkerCachedPage* cache) {
-	const bool before = t_walker_faulted;
-	t_walker_faulted  = false;
-	const auto result = ProbeGuestLoad(address, cache);
+uint64_t KYTY_SYSV_ABI ProbeFlatGuestLoad(uint64_t address, WalkerCachedPage* cache, uint32_t load) {
+	const bool before  = t_walker_faulted;
+	const auto noted   = t_faulted_loads.count;
+	t_walker_faulted   = false;
+	const auto result  = ProbeGuestLoad(address, cache, load);
 	if (t_walker_faulted && t_walker_defer) {
 		t_deferred_loads.push_back(address);
+		t_faulted_loads.count = noted;
 		t_walker_faulted = before;
 		return result;
 	}
@@ -303,7 +320,8 @@ uint64_t KYTY_SYSV_ABI ProbeFlatGuestLoad(uint64_t address, WalkerCachedPage* ca
 }
 #endif
 
-void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& cache, [[maybe_unused]] uint32_t slot, bool short_form) {
+void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& cache, [[maybe_unused]] uint32_t slot, bool short_form,
+               uint32_t load) {
 	Xbyak::Label direct, done, slow;
 	code.mov(code.rax, code.r10);
 	code.shr(code.rax, 12);
@@ -334,6 +352,7 @@ void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& cache, [[maybe_u
 	code.and_(code.rsp, -16);
 	code.mov(code.rdi, code.r10);
 	code.lea(code.rsi, code.ptr[cache]);
+	code.mov(code.edx, load);
 #if defined(ANYPS5_KYTY)
 	code.mov(code.rax, reinterpret_cast<uint64_t>(DefersFlatLoad(slot) ? &ProbeFlatGuestLoad : &ProbeGuestLoad));
 #else
@@ -632,7 +651,9 @@ private:
 		return static_cast<uint32_t>(m_masks.size() - 1u);
 	}
 
-	void AddOutput(Value value, uint32_t gate);
+	void AddOutput(Value value, uint32_t gate, SrtLoadClass sink);
+	void ClassifyLoads(std::span<const Operand> conditions, std::span<const Operand> reads,
+	                   std::span<const std::vector<Operand>> descriptors, std::span<const Operand> outputs);
 	void FindFlatOnlyNodes(std::span<const Operand> conditions, std::span<const Operand> reads,
 	                       std::span<const std::vector<Operand>> descriptors,
 	                       std::span<const Operand> outputs);
@@ -663,6 +684,7 @@ private:
 	std::vector<std::vector<uint32_t>>                m_output_gates;
 	std::map<std::pair<uint64_t, uint64_t>, uint32_t> m_bases;
 	std::deque<Stub>                                  m_stubs;
+	std::vector<uint16_t>                             m_output_sinks;
 	Xbyak::Label                                      m_ret;
 	uint32_t m_shader_base = 0, m_page_cache = 0, m_reach = 0, m_states = 0, m_states_end = 0, m_bias = 0;
 	uint32_t m_user_data = 0, m_captures = 0, m_captures_offset = 0;
@@ -672,7 +694,7 @@ private:
 	std::vector<uint32_t> m_gpu_control;
 };
 
-void WalkerCompiler::AddOutput(Value value, uint32_t gate) {
+void WalkerCompiler::AddOutput(Value value, uint32_t gate, SrtLoadClass sink) {
 	const auto* inst = value.Resolve().TryInstruction();
 	if (inst == nullptr) return;
 	auto index = inst->WalkOutput();
@@ -681,8 +703,10 @@ void WalkerCompiler::AddOutput(Value value, uint32_t gate) {
 		inst->SetWalkOutput(index);
 		m_outputs.push_back(value.Resolve());
 		m_output_gates.emplace_back();
+		m_output_sinks.push_back(0);
 	}
 	m_output_gates[index].push_back(gate);
+	m_output_sinks[index] |= SrtLoadBit(sink);
 }
 
 void WalkerCompiler::Consume(std::vector<std::vector<uint32_t>>& gates) {
@@ -705,9 +729,10 @@ void WalkerCompiler::Consume(std::vector<std::vector<uint32_t>>& gates) {
 			}
 		}
 		for (const auto source: indirect->sources) add(source);
-		AddOutput(indirect->key_count, root);
-		AddOutput(indirect->selector_first, root);
-		AddOutput(indirect->selector_mask, root);
+		const auto sink = indirect->table_array ? SrtLoadClass::ImageTable : SrtLoadClass::KeyTable;
+		AddOutput(indirect->key_count, root, sink);
+		AddOutput(indirect->selector_first, root, sink);
+		AddOutput(indirect->selector_mask, root, sink);
 	};
 	for (const auto& buffer: m_plan.info.buffers) consume(buffer.source);
 	for (const auto& image: m_plan.info.images) consume(image.source);
@@ -722,9 +747,9 @@ void WalkerCompiler::Consume(std::vector<std::vector<uint32_t>>& gates) {
 	}
 	const auto& fill = m_plan.uniform_fill;
 	if (fill.fill.words != 0) {
-		AddOutput(fill.pattern_size, UINT32_MAX);
-		AddOutput(fill.element_count, UINT32_MAX);
-		for (const auto value: fill.values) AddOutput(value, UINT32_MAX);
+		AddOutput(fill.pattern_size, UINT32_MAX, SrtLoadClass::Other);
+		AddOutput(fill.element_count, UINT32_MAX, SrtLoadClass::Other);
+		for (const auto value: fill.values) AddOutput(value, UINT32_MAX, SrtLoadClass::Other);
 	}
 }
 
@@ -908,6 +933,98 @@ void WalkerCompiler::FindFlatOnlyNodes(std::span<const Operand> conditions,
 			m_gpu_control[index] = flat_of[index];
 		}
 	}
+}
+
+void WalkerCompiler::ClassifyLoads(std::span<const Operand> conditions, std::span<const Operand> reads,
+                                   std::span<const std::vector<Operand>> descriptors,
+                                   std::span<const Operand> outputs) {
+	const auto&          sources = m_plan.descriptor_sources;
+	std::vector<uint16_t> roles(sources.size(), 0);
+	const auto            role = [&](uint32_t source, SrtLoadClass sink, uint16_t extra = 0) {
+		if (source < roles.size()) roles[source] |= SrtLoadBit(sink) | extra;
+	};
+	const auto indirect_role = [&](const DescriptorSource::IndirectDescriptor& indirect, SrtLoadClass sink) {
+		role(indirect.table_source, sink);
+		if (indirect.selector) {
+			role(indirect.selector->source, sink);
+			if (indirect.selector->rows) role(indirect.selector->rows->source, sink);
+			if (indirect.selector->ranks) role(indirect.selector->ranks->source, sink);
+		}
+		for (const auto source: indirect.sources) role(source, sink);
+	};
+	const auto indirect_of = [&](uint32_t source) -> const DescriptorSource::IndirectDescriptor* {
+		return source < sources.size() && sources[source].indirect_descriptor ? &*sources[source].indirect_descriptor
+		                                                                      : nullptr;
+	};
+	for (const auto& buffer: m_plan.info.buffers) {
+		if (const auto* indirect = indirect_of(buffer.source)) {
+			indirect_role(*indirect, SrtLoadClass::KeyTable);
+		} else {
+			role(buffer.source, SrtLoadClass::VSharp, buffer.written ? SrtWrittenVSharpSink : 0);
+		}
+	}
+	for (const auto& image: m_plan.info.images) {
+		if (const auto* indirect = indirect_of(image.source)) {
+			indirect_role(*indirect, indirect->table_array ? SrtLoadClass::ImageTable : SrtLoadClass::KeyTable);
+		} else {
+			role(image.source, SrtLoadClass::TSharp);
+		}
+	}
+	for (const auto& sampler: m_plan.info.samplers) {
+		const auto* indirect = indirect_of(sampler.source);
+		if (indirect == nullptr) {
+			role(sampler.source, SrtLoadClass::TSharp);
+		} else if (indirect->sources.empty()) {
+			indirect_role(*indirect, SrtLoadClass::KeyTable);
+		} else {
+			role(indirect->sources[0], SrtLoadClass::TSharp);
+		}
+	}
+	std::vector<uint16_t> sinks(m_nodes.size(), 0);
+	const auto            sink = [&](const Operand& operand, uint16_t bits) {
+		if (operand.kind == Kind::Node && operand.value < sinks.size()) sinks[operand.value] |= bits;
+	};
+	constexpr auto data = SrtLoadBit(SrtLoadClass::Data);
+	for (const auto& operand: conditions) sink(operand, data);
+	for (const auto& operand: reads) sink(operand, data);
+	for (uint32_t source = 0; source < descriptors.size(); ++source) {
+		const uint16_t bits = roles[source] != 0 ? roles[source] : SrtLoadBit(SrtLoadClass::Other);
+		for (const auto& operand: descriptors[source]) sink(operand, bits);
+	}
+	for (uint32_t index = 0; index < outputs.size(); ++index) {
+		sink(outputs[index],
+		     index < m_output_sinks.size() ? m_output_sinks[index] : SrtLoadBit(SrtLoadClass::Other));
+	}
+	std::unordered_set<const Inst*> masks;
+	for (const auto& mask: m_masks) {
+		if (const auto* inst = mask.Resolve().TryInstruction()) masks.insert(inst);
+	}
+	for (size_t index = 0; index < m_nodes.size(); ++index) {
+		if (masks.contains(m_nodes[index].inst)) sinks[index] |= data;
+	}
+	constexpr auto address = SrtLoadBit(SrtLoadClass::Address);
+	for (bool changed = true; changed;) {
+		changed = false;
+		for (size_t index = 0; index < m_nodes.size(); ++index) {
+			const auto& node = m_nodes[index];
+			if (node.result != Operand {Kind::Node, index}) continue;
+			const auto op      = node.inst->GetOpcode();
+			const bool load    = op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer ||
+			                     op == ValueOpcode::LoadBufferU32;
+			const bool guarded = op == ValueOpcode::LoadBufferU32;
+			for (size_t k = 0; k < node.args.size(); ++k) {
+				const auto& arg = node.args[k];
+				if (arg.kind != Kind::Node || arg.value >= sinks.size()) continue;
+				const uint16_t bits = !load                ? sinks[index]
+				                      : guarded && k == 0u ? uint16_t {data}
+				                                           : static_cast<uint16_t>(sinks[index] | address);
+				if ((sinks[arg.value] | bits) == sinks[arg.value]) continue;
+				sinks[arg.value] |= bits;
+				changed = true;
+			}
+		}
+	}
+	m_plan.srt_load_sinks = std::move(sinks);
 }
 
 WalkerCompiler::Ref WalkerCompiler::Evaluate(Value value, uint32_t context) {
@@ -1424,7 +1541,7 @@ void WalkerCompiler::EmitRead(const Node& node, uint32_t index) {
 		if (index < m_gpu_control.size() && m_gpu_control[index] != NoFlatSlot) {
 			SkipGpuControlLoad(c.r10, m_gpu_control[index], node.state);
 		}
-		LoadGuest(c, At(m_page_cache), flat_slot, m_short);
+		LoadGuest(c, At(m_page_cache), flat_slot, m_short, index);
 		++m_captures;
 		c.mov(c.qword[c.r8], c.r10);
 		c.mov(c.dword[c.r8 + 8], c.eax);
@@ -1661,7 +1778,7 @@ WalkerCompiler::Result WalkerCompiler::Compile(std::span<const Value> values) {
 	const bool  resources = values.empty();
 	std::vector<std::vector<uint32_t>> gates(sources.size());
 	if (resources) Consume(gates);
-	for (const auto value: values) AddOutput(value, UINT32_MAX);
+	for (const auto value: values) AddOutput(value, UINT32_MAX, SrtLoadClass::Other);
 	std::vector<Operand>              conditions, reads, outputs;
 	std::vector<std::vector<Operand>> descriptors(sources.size());
 	if (resources) {
@@ -1675,6 +1792,7 @@ WalkerCompiler::Result WalkerCompiler::Compile(std::span<const Value> values) {
 	}
 	for (const auto value: m_outputs) outputs.push_back(Evaluate(value, 0).operand);
 	FindFlatOnlyNodes(conditions, reads, descriptors, outputs);
+	ClassifyLoads(conditions, reads, descriptors, outputs);
 	Layout();
 
 	Xbyak::Label             pass, fail, reset;
@@ -2239,7 +2357,10 @@ bool ValidateWaveUniformValue(const ResourcePlan& program, Value value) {
 uint32_t SrtWalkerAheadLoadLength(uint64_t rip, uint64_t address) {
 	if (!t_walker_ahead || address < GuestMemoryStart) return 0;
 	const auto length = SrtWalkerLoadLength(rip);
-	if (length != 0) t_walker_faulted = true;
+	if (length != 0) {
+		t_walker_faulted = true;
+		NoteFaultedLoad(SrtUnknownLoad);
+	}
 	return length;
 }
 
@@ -2270,6 +2391,63 @@ void SetSrtWalkerGuestMemory(const SrtWalkerGuestMemory& memory) {
 	g_guest_memory = memory;
 	g_guest_memory_set.store(memory.page != nullptr && memory.read != nullptr,
 	                         std::memory_order_release);
+}
+
+SrtLoadClass SrtLoadClassOf(uint16_t sinks) {
+	for (const auto load_class: {SrtLoadClass::Other, SrtLoadClass::TSharp, SrtLoadClass::ImageTable,
+	                             SrtLoadClass::VSharp, SrtLoadClass::KeyTable, SrtLoadClass::Args,
+	                             SrtLoadClass::Address, SrtLoadClass::Data}) {
+		if ((sinks & SrtLoadBit(load_class)) != 0) return load_class;
+	}
+	return SrtLoadClass::Other;
+}
+
+SrtRefusalClasses ClassifySrtRefusal(std::span<const uint16_t> load_sinks, std::span<const uint32_t> faulted_loads) {
+	SrtRefusalClasses result;
+	for (const auto load: faulted_loads) {
+		const uint16_t sinks      = load < load_sinks.size() ? load_sinks[load] : SrtLoadBit(SrtLoadClass::Other);
+		const auto     load_class = SrtLoadClassOf(sinks);
+		if ((sinks & SrtWrittenVSharpSink) != 0 && result.written_vsharp_loads != UINT16_MAX) {
+			result.written_vsharp_loads++;
+		}
+		if (result.first == SrtLoadClass::Count) result.first = load_class;
+		result.mask |= SrtLoadBit(load_class);
+		auto& count = result.loads[static_cast<uint32_t>(load_class)];
+		if (count != UINT16_MAX) count++;
+	}
+	return result;
+}
+
+void SetSrtLoadFaultRecording(bool on) {
+	g_record_faults.store(on, std::memory_order_relaxed);
+}
+
+bool SrtLoadFaultRecording() {
+	return g_record_faults.load(std::memory_order_relaxed);
+}
+
+thread_local uint8_t t_table_read_tag = 0;
+
+SrtTableReads::SrtTableReads(SrtLoadClass load_class): m_on(g_record_faults.load(std::memory_order_relaxed)) {
+	if (!m_on) return;
+	m_previous       = t_table_read_tag;
+	t_table_read_tag = static_cast<uint8_t>(static_cast<uint32_t>(load_class) + 1u);
+}
+
+SrtTableReads::~SrtTableReads() {
+	if (m_on) t_table_read_tag = m_previous;
+}
+
+uint8_t SrtTableReadTag() {
+	return t_table_read_tag;
+}
+
+void ClearSrtFaultedLoadsOfThread() {
+	t_faulted_loads.count = 0;
+}
+
+std::span<const uint32_t> SrtFaultedLoadsOfThread() {
+	return std::span(t_faulted_loads.loads).first(std::min(t_faulted_loads.count, FaultedLoads::Capacity));
 }
 
 uint32_t SrtWalkerLoadLength(uint64_t rip) {

@@ -930,6 +930,7 @@ struct ResourcePlan {
 	UniformFillPlan                     uniform_fill;
 	std::vector<DescriptorRefresh>      descriptor_refresh;
 	std::vector<uint32_t>               descriptor_word_flat;
+	std::vector<uint16_t>               srt_load_sinks;
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;
 	std::unique_ptr<SrtWalkerVariant>     srt_long_walker;
 	uint32_t                              srt_user_data = 0;

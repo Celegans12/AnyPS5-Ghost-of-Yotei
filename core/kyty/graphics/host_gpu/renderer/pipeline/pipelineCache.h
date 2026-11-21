@@ -86,6 +86,7 @@ public:
 		m_failed      = false;
 		m_refusal     = AheadRefusal::None;
 		m_stale       = StaleRead::None;
+		m_stale_entry = UINT32_MAX;
 		m_gpu_written = false;
 		m_around      = false;
 #if defined(ANYPS5_KYTY)
@@ -107,6 +108,13 @@ public:
 	[[nodiscard]] bool         Failed() const { return m_failed; }
 	[[nodiscard]] AheadRefusal Refusal() const { return m_refusal; }
 	[[nodiscard]] StaleRead    Stale() const { return m_stale; }
+	struct StaleEntry {
+		uint64_t address = 0;
+		uint32_t size    = 0;
+		uint8_t  table   = 0;
+		bool     strict  = false;
+	};
+	[[nodiscard]] std::optional<StaleEntry> StaleEntryInfo() const;
 	[[nodiscard]] bool MayHaveReadGpuWrites() const { return m_gpu_written; }
 	[[nodiscard]] bool ReadAroundGpuWrites() const { return m_around; }
 	void               NoteAroundLoads(std::span<uint64_t> addresses);
@@ -144,6 +152,7 @@ private:
 		bool     strict  = false;
 		bool     zero_test = false;
 		bool     around    = false;
+		uint8_t  table     = 0;
 		uint64_t watched = 0;
 		uint32_t words_begin = 0;
 		uint32_t words_end   = 0;
@@ -187,6 +196,7 @@ private:
 	bool                  m_failed      = false;
 	AheadRefusal          m_refusal     = AheadRefusal::None;
 	mutable StaleRead     m_stale       = StaleRead::None;
+	mutable uint32_t      m_stale_entry = UINT32_MAX;
 	bool                  m_gpu_written = false;
 	bool                  m_around      = false;
 #if defined(ANYPS5_KYTY)
@@ -204,11 +214,14 @@ struct ProgramResolution {
 	GuestReadLog                                                        reads;
 	uint32_t                                                            stages = 0;
 	bool                                                                refreshed_words = false;
+	ShaderRecompiler::IR::SrtRefusalClasses                             e2_classes;
+	uint64_t                                                            e2_hash = 0;
 
 	void Reset() {
 		reads.Clear();
 		stages          = 0;
 		refreshed_words = false;
+		e2_classes.mask = 0;
 	}
 #if defined(ANYPS5_KYTY)
 	[[nodiscard]] bool Revalidate(bool gpu_flat_loads = false,

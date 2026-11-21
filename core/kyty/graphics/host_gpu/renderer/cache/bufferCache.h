@@ -134,6 +134,8 @@ public:
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false,
 	                                  bool guest_fault = false);
 	static void            LogReadbackSummary();
+	[[nodiscard]] static uint64_t ThreadReadbacks() noexcept;
+	[[nodiscard]] static uint64_t ThreadReadbackNs() noexcept;
 	static void            LogWriteBlockSummary();
 	static void            NoteStagedCommandProcessorRead();
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }

@@ -615,6 +615,8 @@ void GuestGpu::ResolveThread() {
 		if (operation->kind != GpuOperationKind::Callback) {
 			if (operation->resolved != nullptr) {
 				operation->ahead_note = RenderExecutor::AheadNote::Prepared;
+			} else if (E2Stats::Enabled()) {
+				operation->e2 = executor.TakeAheadE2();
 			}
 			RenderExecutor::NoteAhead(resolve_dispatch, operation->ahead_note, Common::SteadyNs() - resolve_begin);
 			const auto* next = m_operations.TryPeek();
@@ -881,7 +883,7 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 	switch (operation.kind) {
 		case GpuOperationKind::DrawIndex:
 		case GpuOperationKind::DrawAuto: {
-			executor.BeginAheadOperation(operation.resolved, operation.ahead_note);
+			executor.BeginAheadOperation(operation.resolved, operation.ahead_note, operation.e2);
 			if (operation.kind == GpuOperationKind::DrawIndex) {
 				ExecuteDrawIndex(operation, operation.draw_index);
 			} else {
@@ -894,7 +896,7 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 			break;
 		}
 		case GpuOperationKind::DrawIndirect:
-			executor.BeginAheadOperation(operation.resolved, operation.ahead_note);
+			executor.BeginAheadOperation(operation.resolved, operation.ahead_note, operation.e2);
 			ExecuteDrawIndirect(operation);
 			executor.EndAheadOperation();
 			if (operation.resolved != nullptr) {
@@ -903,7 +905,7 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 			break;
 		case GpuOperationKind::DispatchDirect: {
 			const auto& dispatch = operation.dispatch;
-			executor.BeginAheadOperation(operation.resolved, operation.ahead_note);
+			executor.BeginAheadOperation(operation.resolved, operation.ahead_note, operation.e2);
 			ExecuteDispatchDirect(operation, dispatch.thread_group_x, dispatch.thread_group_y,
 			                      dispatch.thread_group_z, dispatch.mode);
 			executor.EndAheadOperation();
@@ -913,7 +915,7 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 			break;
 		}
 		case GpuOperationKind::DispatchIndirect:
-			executor.BeginAheadOperation(operation.resolved, operation.ahead_note);
+			executor.BeginAheadOperation(operation.resolved, operation.ahead_note, operation.e2);
 			ExecuteDispatchIndirect(operation);
 			executor.EndAheadOperation();
 			if (operation.resolved != nullptr) {

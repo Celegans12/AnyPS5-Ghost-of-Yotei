@@ -301,6 +301,7 @@ This build does not read KytyPS5's `KYTY_PIPELINE_PRECOMPILE`: stopping the game
 | `KYTY_AB_START` | flip count from 1, or `<n>s`, else stops | `0` | Flip at which `KYTY_AB` starts, or `<n>s` for `<n>` seconds after the first flip | debug | all | AnyKyty |
 | `KYTY_TILED_DIAG` | unset, empty or a value that starts with `0`: off; anything else: on | unset | Names the descriptor behind a texture whose tile mode has no layout: the readers of record tables, pointer tables and image tables print the guest address of such a candidate (at most 256 lines), the image heap prints the table memory or candidate list that holds one, the `[kyty-tiled]` line of a declined candidate gets a second line with its source, descriptor index and address, and a stop at the tiled layout in `ImageInfo::UpdateSize` prints the resolve path, shader and descriptor words | debug | all | AnyKyty |
 | `KYTY_GPU_TIME` | `0` or `1`, empty counts as unset, else stops | `0` | GPU time per shader: the renderer's command buffers get a bottom-of-pipe timestamp at their start and end, and one before and one after each guest draw (`ExecutePreparedDraw`) and dispatch (direct, indirect and indirect by threads), written through the recorder's replay stream into 6 timestamp query pools of 65536 queries (a pool is reset in the stream at the start of the command buffer that opens it and hands over to the next after half of it is used). A reader thread waits for each closed pool's last tick on the scheduler's timeline semaphore, reads its results without waiting and charges the time between two timestamps to the work that ends at the second: the draw (key: first vertex-stage hash and pixel hash) or dispatch (compute hash), the work before it (barriers, copies, clears, uploads, helper passes), the end of the buffer, or the gap between two command buffers (not counted as measured). Every 10 s `[kyty-gpu-time]` prints a summary (flips, measured GPU ms per flip, draws, dispatches, the work outside them, the gap, timestamps per flip, dropped and unread ones), the top 25 shaders by GPU time (count, total ms, ms per flip, mean us, share of measured time) and, when the game's PM4 debug markers (`PUSH_MARKER`/`POP_MARKER`) name passes, the top 25 innermost markers. About 2 timestamps per draw or dispatch; a timestamp waits for the work before it, so overlapping work is charged where it ends and totals can rise slightly against a run without the switch | debug | all | AnyKyty, after joshweible's KytyPS5 `KYTY_GPU_PROFILE` |
+| `KYTY_E2_STATS` | `0` or `1`, else stops | `0` | Counts the draws and dispatches whose resolution ahead of execution is refused, or whose revalidation fails, because of a GPU-written word, by the class of what that word feeds, and logs `[kyty-e2]` lines beside every `[kyty-resolve]` line. See [below](#details) | debug | all | AnyKyty |
 
 ### AnyPS5 settings that an AnyKyty session also reads
 
@@ -432,6 +433,24 @@ program), which it then reads on the CPU. Native XPR relocation does not take a 
 (+0.17 img/s with drift cancelled, standard error 0.20, same scene); a check mode then compared 714,094 deferred
 resolutions of that title with full ones without a mismatch, and Stray deferred none. The setting and its check mode were
 removed after these measurements. The idea of GPU-read SRT words is Erlou's (Kyty `740ce47c`).
+
+GPU-written words that still reach the CPU (`KYTY_E2_STATS=1`, step E2 of the architecture plan in simnJS/AnyPS5#168):
+when the SRT walker of the resolve thread stops at a load on a line holding GPU-written bytes, the load is classed by what
+its word feeds in the program's resource plan, followed through later loads whose address it forms: `address_only` (only
+addresses of later loads whose words are flat data or control), `vsharp_key` (a buffer V#, whose fields feed the module
+key), `key_tables` (the descriptors, counts and selectors of an indirect descriptor key search), `image_tables` (a bindless
+image table), and outside that list `tsharp_ssharp`, `data` (flat data or control the walk could not leave to the GPU)
+and `other`. A word that feeds several takes the last of `data`, `address_only`, `indirect_args`, `key_tables`,
+`vsharp_key`, `image_tables`, `tsharp_ssharp`, `other`. A revalidation on the execution thread that fails on a table read
+the GPU wrote takes the class of that table (`indirect_args`, `key_tables`, `image_tables`); one that fails on a word of
+the walker is counted apart, without a class. Every 10 s, for draws and for dispatches, four lines follow: the refusals and
+the time the execution thread spends resolving those operations itself (with its readbacks), and the refusals with a
+GPU-formed V# of a buffer the program writes; per class, the refusals in which it was the first blocking class and those
+it was involved in, its distinct programs, its refused loads and that time; the refusals that would be left with no
+blocking load if a set of classes were read by the shader (a written GPU-formed V# keeps a refusal uncovered); and the 10
+programs that cost the execution thread most, with their loads per class. A fifth line counts the indirect dispatch
+arguments the execution thread reads to size the shared memory of a dispatch, and how many the GPU wrote. With the
+setting off, the walker records nothing and the renderer takes none of these branches.
 
 Suspend points: KytyPS5 makes `sceAgcSuspendPoint` (`GuestGpu::SuspendPoint`) acquire a binary semaphore that its
 priority thread releases once the GPU has finished the work queued before the previous suspend point, so a title can

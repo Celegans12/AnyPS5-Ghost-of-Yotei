@@ -676,6 +676,7 @@ bool GuestReadLog::Read(uint64_t address, void* data, uint64_t size, bool strict
 	}
 	const bool ahead = t_ahead_guest_writes.Apply(address, data, size);
 	Append(address, data, static_cast<uint32_t>(size), strict);
+	if (const auto tag = ShaderRecompiler::IR::SrtTableReadTag(); tag != 0) m_entries.back().table = tag;
 	if (watched != 0 && !ahead) {
 		m_entries.back().watched = watched;
 	}
@@ -1127,7 +1128,8 @@ bool GuestReadLog::StillValid() const {
 		const auto* recorded = m_bytes.data() + entry.offset;
 		if (entry.zero_test) {
 			if (!ZeroTestHolds(entry)) {
-				m_stale = entry.around ? StaleRead::AroundGpuWrite : StaleRead::ZeroTest;
+				m_stale       = entry.around ? StaleRead::AroundGpuWrite : StaleRead::ZeroTest;
+				m_stale_entry = static_cast<uint32_t>(&entry - m_entries.data());
 				return false;
 			}
 			continue;
@@ -1161,7 +1163,8 @@ bool GuestReadLog::StillValid() const {
 				                             entry.address + done, buffer.data(), bytes);
 				if (around && std::memcmp(buffer.data(), recorded + done, bytes) != 0) {
 					if (!refreshable(entry)) {
-						m_stale = entry.around ? StaleRead::AroundGpuWrite : StaleRead::GpuWrite;
+						m_stale       = entry.around ? StaleRead::AroundGpuWrite : StaleRead::GpuWrite;
+						m_stale_entry = static_cast<uint32_t>(&entry - m_entries.data());
 						return false;
 					}
 					break;
@@ -1180,18 +1183,26 @@ bool GuestReadLog::StillValid() const {
 			if (!SameGuestBytes(reinterpret_cast<const void*>(entry.address), recorded,
 			                    entry.size) &&
 			    !refreshable(entry)) {
-				m_stale = entry.around ? StaleRead::AroundGpuWrite : StaleRead::CpuWrite;
+				m_stale       = entry.around ? StaleRead::AroundGpuWrite : StaleRead::CpuWrite;
+				m_stale_entry = static_cast<uint32_t>(&entry - m_entries.data());
 				return false;
 			}
 			continue;
 		}
 		if (!Libs::LibKernel::Memory::GpuCleanBackingEqualsSince(entry.address, recorded, entry.size, entry.watched,
 		                                                        ParallelEqual)) {
-			m_stale = StaleRead::Strict;
+			m_stale       = StaleRead::Strict;
+			m_stale_entry = static_cast<uint32_t>(&entry - m_entries.data());
 			return false;
 		}
 	}
 	return true;
+}
+
+std::optional<GuestReadLog::StaleEntry> GuestReadLog::StaleEntryInfo() const {
+	if (m_stale_entry >= m_entries.size()) return std::nullopt;
+	const auto& entry = m_entries[m_stale_entry];
+	return StaleEntry {.address = entry.address, .size = entry.size, .table = entry.table, .strict = entry.strict};
 }
 
 #if !defined(ANYPS5_KYTY)
@@ -2854,9 +2865,18 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 	ShaderRecompiler::IR::SrtDeferredLoadsOfThread().clear();
 	ShaderRecompiler::IR::SrtAroundLoadsOfThread().clear();
 #endif
+	const bool e2_stats = ShaderRecompiler::IR::SrtLoadFaultRecording();
+	if (e2_stats) ShaderRecompiler::IR::ClearSrtFaultedLoadsOfThread();
 	if (!ShaderRecompiler::IR::MaterializeResources(program->resource_plan, runtime, resources,
 	                                                specialization)) {
 		ahead.reads.Fail(AheadRefusal::Materialize);
+		if (e2_stats) {
+			const auto faulted = ShaderRecompiler::IR::SrtFaultedLoadsOfThread();
+			if (!faulted.empty() && ahead.e2_classes.mask == 0) {
+				ahead.e2_classes = ShaderRecompiler::IR::ClassifySrtRefusal(program->resource_plan.srt_load_sinks, faulted);
+				ahead.e2_hash    = params.hash;
+			}
+		}
 		return nullptr;
 	}
 #if defined(ANYPS5_KYTY)

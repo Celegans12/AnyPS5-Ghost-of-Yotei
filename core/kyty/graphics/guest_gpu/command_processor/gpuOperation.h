@@ -88,6 +88,7 @@ struct GpuOperation {
 	GpuNumInstances   num_instances;
 	RenderExecutor::ResolvedDraw* resolved = nullptr;
 	RenderExecutor::AheadNote     ahead_note = RenderExecutor::AheadNote::NotAttempted;
+	E2Stats::Refusal              e2;
 	bool after_wait = false;
 	bool guest_sync = true;
 	bool clean = false;
