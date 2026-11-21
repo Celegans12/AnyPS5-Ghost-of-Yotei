@@ -332,8 +332,7 @@ void DefineDescriptors(EmitterState& state) {
 		buffer.descriptor_index = buffer.live && !table ? buffer_count++ : UINT32_MAX;
 	}
 	auto& uniform_count = counts[static_cast<size_t>(Kind::UniformBuffers)];
-	const auto scalar_reads = state.profile.uniform_scalar_loads ? BuffersReadOnlyByScalarLoads(state.program)
-	                                                             : std::vector<bool>(info.buffers.size());
+	const auto scalar_reads = BuffersReadOnlyByScalarLoads(state.program);
 	for (size_t index = 0; index < info.buffers.size(); ++index) {
 		auto&      buffer   = info.buffers[index];
 		const bool constant = state.profile.robust_buffer_access && buffer.constant_only;
@@ -384,10 +383,10 @@ void DefineDescriptors(EmitterState& state) {
 	counts[static_cast<size_t>(Kind::FlattenedSrt)] = info.uses_flattened_srt && !table;
 	bindings.flattened_srt_uniform =
 	    counts[static_cast<size_t>(Kind::FlattenedSrt)] != 0 && FlattenedSrtFitsUniform(state.program);
-	bindings.flattened_srt_uniform_index =
-	    state.profile.uniform_scalar_loads && counts[static_cast<size_t>(Kind::FlattenedSrt)] != 0 &&
-	            !bindings.flattened_srt_uniform && ReadsFlattenedSrtConstantSlots(state.program)
-	        ? uniform_count++ : UINT32_MAX;
+	bindings.flattened_srt_uniform_index = counts[static_cast<size_t>(Kind::FlattenedSrt)] != 0 &&
+	                                               !bindings.flattened_srt_uniform &&
+	                                               ReadsFlattenedSrtConstantSlots(state.program)
+	                                           ? uniform_count++ : UINT32_MAX;
 	bindings.memory_offset_dword = static_cast<uint32_t>(info.user_data_registers.size());
 	if (info.uses_dispatch_threads) {
 		bindings.dispatch_thread_dword = bindings.memory_offset_dword;

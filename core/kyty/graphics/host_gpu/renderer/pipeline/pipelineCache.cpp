@@ -13,7 +13,6 @@
 #include "common/hackNotice.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
-#include "common/runtimeSwitches.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -568,7 +567,6 @@ std::vector<vk::Format> VertexInputFormats(const ShaderVertexInputInfo&         
 }
 
 constexpr uint32_t LanePairsKey = 0x574c5052u;
-constexpr std::array<uint32_t, 2> ScalarLoadsInStorageKey {0x53534c30u, ~0x53534c30u};
 
 void SkipCallExpansionFailure(uint64_t hash, const ShaderRecompiler::ShaderSource& source) {
 	Common::HackNotice::Report("dispatch whose call tables do not expand skipped",
@@ -592,9 +590,6 @@ void AppendNativeRayTracingKey(ShaderType stage, std::vector<uint32_t>& key, boo
 		if (const auto oracle = Config::RayTracingOracle(); oracle != 0) {
 			key.push_back(0x52544f00u | oracle);
 		}
-	}
-	if (!Common::RuntimeSwitches::On(Common::RuntimeSwitches::Switch::UniformScalarLoads)) {
-		key.insert(key.end(), ScalarLoadsInStorageKey.begin(), ScalarLoadsInStorageKey.end());
 	}
 }
 
@@ -1403,7 +1398,6 @@ ShaderModule PipelineCache::BuildModule(const ProgramKey&                       
 	auto       compile_options = options;
 	compile_options.profile    = &profile;
 	compile_options.plain_mip_stats_variant = key.stage == ShaderType::Pixel;
-	compile_options.uniform_scalar_loads    = std::ranges::search(key.static_state, ScalarLoadsInStorageKey).empty();
 	auto result = ShaderRecompiler::CompileProgram(std::move(translated), compile_options,
 	                                               specialization, push_data_cursor);
 	if (compile_options.table_mode && result.spirv.empty()) {

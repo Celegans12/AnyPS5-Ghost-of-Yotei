@@ -19,7 +19,6 @@ struct Profile {
 	bool relaxed_float = false;
 	bool ray_query = false;
 	bool lds_lane_sync = true;
-	bool uniform_scalar_loads = true;
 };
 
 inline constexpr Profile DefaultProfile {};
