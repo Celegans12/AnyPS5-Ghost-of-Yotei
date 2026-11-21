@@ -27,6 +27,7 @@
 #include "graphics/host_gpu/renderer/dynamicState.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/drawTemplates.h"
+#include "graphics/host_gpu/renderer/gpuTime.h"
 #include "graphics/host_gpu/renderer/meshDrawSplit.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -2383,6 +2384,12 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	}
 	buffer.BeginRendering(rendering);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+#if defined(ANYPS5_KYTY)
+	const bool gpu_time = GpuTime::Enabled();
+	if (gpu_time) {
+		GpuTime::BeforeWork(buffer);
+	}
+#endif
 	if (mesh_task) {
 		vk_buffer.drawMeshTasksEXT(emit.indirect.count, 1, 1);
 	} else if (mesh_active) {
@@ -2415,6 +2422,12 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		vk_buffer.drawIndirect(args_buffer.first->Handle(), args_buffer.second,
 		                       emit.indirect.count, emit.indirect.stride);
 	}
+#if defined(ANYPS5_KYTY)
+	if (gpu_time) {
+		GpuTime::AfterDraw(buffer, state.vertex_info[0].stage.module->info.shader_hash,
+		                   state.ps_active ? state.ps_input_info.stage.module->info.shader_hash : 0);
+	}
+#endif
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
 

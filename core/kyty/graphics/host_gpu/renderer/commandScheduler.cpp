@@ -6,6 +6,7 @@
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/inPlaceMemory.h"
+#include "graphics/host_gpu/renderer/gpuTime.h"
 #if defined(ANYPS5_KYTY)
 #include "graphics/guest_gpu/graphicsRun.h"
 #endif
@@ -326,6 +327,9 @@ static bool EarlyFlipEnabled() {
 void CommandScheduler::DeferFlipCompletion(Common::UniqueFunction<void>&& complete) {
 	CheckActive();
 	EXIT_IF(!complete);
+	if (GpuTime::Enabled()) {
+		GpuTime::NoteFlip();
+	}
 	const uint64_t previous = std::exchange(m_last_flip_tick, CurrentTick());
 	if (!m_flips_in_place && InPlaceMemory::Live() && previous < CurrentTick()) {
 		if (EarlyFlipEnabled()) {
@@ -585,6 +589,11 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 		m_command.m_buffer = m_command_pool.Commit();
 	}
 	m_command.Begin();
+#if defined(ANYPS5_KYTY)
+	if (GpuTime::Enabled()) {
+		GpuTime::BeginBuffer(*this, m_command);
+	}
+#endif
 	m_dynamic_state.Invalidate();
 	return m_command;
 }
@@ -603,6 +612,11 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		                                   1, &host, 0, nullptr, 0, nullptr);
 	}
 
+#if defined(ANYPS5_KYTY)
+	if (GpuTime::Enabled()) {
+		GpuTime::EndBuffer(*this, m_command);
+	}
+#endif
 	m_command.End();
 	const auto     tick = m_master.NextTick();
 	if (m_deferred) {
