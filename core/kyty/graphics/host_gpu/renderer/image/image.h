@@ -234,6 +234,7 @@ public:
 	ImageId          depth_copy_source {};
 	uint64_t         depth_copy_writes  = UINT64_MAX;
 	bool             is_stencil_copy     = false;
+	bool             retile_stencil_copy = false;
 	uint64_t         stencil_copy_writes = 0;
 	std::vector<ImageId> stencil_ids;
 	ImageSubresourceRange stencil_subresources;

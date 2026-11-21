@@ -2241,12 +2241,16 @@ void TextureCache::DiscardParkedImages(uint64_t address, uint64_t size) {
 	});
 }
 
-ImageId TextureCache::FindStencilCopy(ImageId association, const ImageInfo& requested) {
+ImageId TextureCache::FindStencilCopy(ImageId association, const ImageInfo& requested,
+                                       bool retile) {
 	auto& copies = m_stencil_copies[association];
 	for (const auto copy_id: copies) {
-		const auto& copy = m_slot_images[copy_id].info;
-		if (copy.pixel_format == requested.pixel_format && copy.type == requested.type &&
-		    copy.extent == requested.extent && copy.resources == requested.resources) {
+		const auto& copy = m_slot_images[copy_id];
+		const auto& info = copy.info;
+		if (info.pixel_format == requested.pixel_format && info.type == requested.type &&
+		    info.extent == requested.extent && info.resources == requested.resources &&
+		    copy.retile_stencil_copy == retile &&
+		    (!retile || (info.tile_mode == requested.tile_mode && info.pitch == requested.pitch))) {
 			return copy_id;
 		}
 	}
@@ -2257,8 +2261,9 @@ ImageId TextureCache::FindStencilCopy(ImageId association, const ImageInfo& requ
 	const auto copy_id = m_slot_images.insert(m_graphics, m_scheduler, info);
 	AttachImageVersion(copy_id);
 	auto& copy             = m_slot_images[copy_id];
-	copy.is_stencil_copy   = true;
-	copy.depth_copy_source = association;
+	copy.is_stencil_copy     = true;
+	copy.retile_stencil_copy = retile;
+	copy.depth_copy_source   = association;
 	copies.push_back(copy_id);
 	return copy_id;
 }
@@ -2271,11 +2276,53 @@ ImageId TextureCache::FindLiveStencilStorageCopy(ImageId association, const Imag
 	    depth.info.metadata.stencil_compressed || depth.backing.samples != 1 ||
 	    desc.info.pixel_format != vk::Format::eR8Uint || desc.info.data != plane.info.data ||
 	    desc.info.type != plane.info.type || desc.info.extent != plane.info.extent ||
-	    desc.info.resources != plane.info.resources || desc.info.tile_mode != plane.info.tile_mode ||
-	    desc.info.pitch != plane.info.pitch) {
+	    desc.info.resources != plane.info.resources) {
 		return {};
 	}
-	return FindStencilCopy(association, desc.info);
+	if (desc.info.tile_mode == plane.info.tile_mode && desc.info.pitch == plane.info.pitch) {
+		return FindStencilCopy(association, desc.info);
+	}
+	if (!desc.info.IsTiled() || !plane.info.IsTiled() || desc.info.samples != 1 ||
+	    desc.info.type != Prospero::ImageType::kColor2D || desc.info.resources != ImageSubresources {} ||
+	    desc.info.HasMetadata() || desc.view_info.base_level != 0 || desc.view_info.base_layer != 0) {
+		return {};
+	}
+	return FindStencilCopy(association, desc.info, true);
+}
+
+void TextureCache::RetileStencilCopy(Image& copy, const Image& association, Image& depth,
+                                    bool write_back) {
+	const auto& plane = association.info;
+	auto        view  = copy.info;
+	view.data         = plane.data;
+	const auto [backing, backing_offset] =
+	    m_buffer_cache.ObtainSynchronizedBuffer(plane.data.address, plane.data.size, true, false);
+
+	const auto tile_image = [&](Image& image, const ImageInfo& layout, uint32_t base_layer) {
+		auto regions = layout.BufferCopies();
+		regions.front().imageSubresource.baseArrayLayer = base_layer;
+		const auto linear = m_tiler.GetScratchBuffer(layout.LinearSize());
+		image.Download(regions, linear.buffer, linear.offset, linear.size);
+#if defined(ANYPS5_KYTY)
+		m_tiler.Tile(linear.buffer, linear.offset, linear.size, *backing, backing_offset,
+		             plane.data.size, layout);
+#else
+		m_tiler.Tile(linear.buffer, linear.offset, linear.size, backing->Handle(), backing_offset,
+		             plane.data.size, layout);
+#endif
+	};
+
+	const auto layer = association.stencil_subresources.base_layer;
+	tile_image(depth, plane, layer);
+	if (write_back) {
+		tile_image(copy, view, 0);
+	}
+	const auto& layout = write_back ? plane : view;
+	const auto  texels = m_tiler.Detile(backing->Handle(), backing_offset, layout);
+	auto        regions = layout.BufferCopies(texels.offset);
+	regions.front().imageSubresource.baseArrayLayer = write_back ? layer : 0;
+	auto& destination = write_back ? depth : copy;
+	destination.Upload(regions, texels.buffer, texels.offset, texels.size);
 }
 
 void TextureCache::RefreshStencilCopy(ImageId copy_id) {
@@ -2290,6 +2337,12 @@ void TextureCache::RefreshStencilCopy(ImageId copy_id) {
 	auto&      copy  = m_slot_images[copy_id];
 	if (depth.write_count == copy.depth_copy_writes ||
 	    copy.write_count != copy.stencil_copy_writes) {
+		return;
+	}
+	if (copy.retile_stencil_copy) {
+		RetileStencilCopy(copy, *association, depth, false);
+		copy.depth_copy_writes   = depth.write_count;
+		copy.stencil_copy_writes = copy.write_count;
 		return;
 	}
 	const auto levels = std::min(copy.backing.mip_levels, range.level_count);
@@ -2348,6 +2401,12 @@ bool TextureCache::WriteBackStencilCopy(ImageId copy_id) {
 	const auto& association = m_slot_images[copy.depth_copy_source];
 	const auto  range       = association.stencil_subresources;
 	auto&       depth       = m_slot_images[association.depth_id];
+	if (copy.retile_stencil_copy) {
+		RetileStencilCopy(copy, association, depth, true);
+		copy.stencil_copy_writes = copy.write_count;
+		copy.depth_copy_writes   = depth.write_count;
+		return true;
+	}
 	const auto  levels      = std::min(copy.backing.mip_levels, range.level_count);
 	const auto  layers      = std::min(copy.backing.layers, range.layer_count);
 	EXIT_IF(levels == 0 || layers == 0 || depth.backing.samples != 1 || copy.backing.samples != 1);
@@ -2386,6 +2445,9 @@ bool TextureCache::WriteBackStencilCopy(ImageId copy_id) {
 }
 
 void TextureCache::FinishStencilStorageWrite(ImageId copy_id) {
+	if (m_slot_images[copy_id].retile_stencil_copy) {
+		CollectHotPagesOf(copy_id);
+	}
 	Common::ScopedLock lock {m_lock};
 	const auto association_id = m_slot_images[copy_id].depth_copy_source;
 	if (!association_id) {
@@ -2759,7 +2821,10 @@ void TextureCache::CollectHotPagesOf(ImageId id) {
 	uint64_t end   = 0;
 	{
 		Common::ScopedLock lock {m_lock};
-		const auto&      info = m_slot_images[id].info;
+		const auto&      image = m_slot_images[id];
+		const auto&      info = image.retile_stencil_copy && image.depth_copy_source
+		                            ? m_slot_images[image.depth_copy_source].info
+		                            : image.info;
 		begin                 = info.data.address;
 		end                   = info.data.End();
 		if (info.HasStencil()) {

@@ -1812,6 +1812,11 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (is_written) {
 		m_scheduler.Context().CollectHotPageWrites(vaddr, size);
 	}
+	return ObtainSynchronizedBuffer(vaddr, size, is_written, is_texel_buffer, id);
+}
+
+std::pair<Buffer*, uint64_t> BufferCache::ObtainSynchronizedBuffer(
+    uint64_t vaddr, uint64_t size, bool is_written, bool is_texel_buffer, BufferId id) {
 	if (m_in_place && !is_texel_buffer) {
 		const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
 		if (owner != nullptr && *owner && m_slot_buffers[*owner].InPlace() &&

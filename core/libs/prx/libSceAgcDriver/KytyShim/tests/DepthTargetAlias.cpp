@@ -34,10 +34,13 @@ constexpr std::uint64_t Commands = GuestBase + 0x1000;
 constexpr std::uint64_t Depth = GuestBase + Block;
 constexpr std::uint64_t Stencil = GuestBase + 5 * Block;
 constexpr std::uint64_t Color = GuestBase + 6 * Block;
-constexpr std::uint64_t PrimerColor = GuestBase + 7 * Block;
-constexpr std::uint64_t GuestBytes = 8 * Block;
+constexpr std::uint64_t PrimerColor = GuestBase + 10 * Block;
+constexpr std::uint64_t GuestBytes = 14 * Block;
 constexpr std::uint32_t Width = 64;
 constexpr std::uint32_t Height = 4;
+constexpr std::uint32_t RetiledWidth = 256;
+constexpr std::uint32_t RetiledHeight = 208;
+constexpr std::uint32_t RetiledWriteX = 48;
 constexpr std::uint32_t EndProgram = 0xbf810000;
 constexpr std::uint32_t StencilValue = 0x5a;
 constexpr std::string_view Notice = "view that would replace the bound depth target bound as null image";
@@ -52,7 +55,14 @@ constexpr std::array<std::uint32_t, 7> StencilWriteWords{
     0x7e040300u, 0x7e060301u, 0x7e0802ffu, StencilValue, 0xf0201108u, 0x00020402u, EndProgram,
 };
 
-enum class Variant { Control, Sample, Storage, Mips, Stencil, StencilFilled, StencilEmpty, StencilWrite };
+constexpr std::array<std::uint32_t, 6> RetiledStencilWriteWords{
+    0x4a0400b0u, 0x7e060301u, 0x7e080280u, 0xf0201108u, 0x00020402u, EndProgram,
+};
+
+enum class Variant {
+    Control, Sample, Storage, Mips, Stencil, StencilFilled, StencilEmpty, StencilWrite,
+    RetiledSeed, RetiledReference, RetiledWrite,
+};
 
 struct Case {
     const char* name;
@@ -69,6 +79,9 @@ constexpr std::array Cases{
     Case{"stencil-filled", Variant::StencilFilled, false},
     Case{"stencil-empty", Variant::StencilEmpty, false},
     Case{"stencil-write", Variant::StencilWrite, false},
+    Case{"retiled-seed", Variant::RetiledSeed, false},
+    Case{"retiled-reference", Variant::RetiledReference, false},
+    Case{"retiled-write", Variant::RetiledWrite, false},
 };
 
 std::uint32_t low(std::uint64_t address) {
@@ -88,18 +101,37 @@ void append(std::vector<std::uint32_t>& words, std::uint32_t opcode, std::initia
     words.insert(words.end(), payload);
 }
 
-bool usesStencilTest(Variant variant) {
-    return variant == Variant::StencilFilled || variant == Variant::StencilEmpty || variant == Variant::StencilWrite;
+bool usesRetiledStencil(Variant variant) {
+    return variant == Variant::RetiledSeed || variant == Variant::RetiledReference ||
+           variant == Variant::RetiledWrite;
 }
 
-void appendStencilWrite(std::vector<std::uint32_t>& words) {
+bool writesStencil(Variant variant) {
+    return variant == Variant::StencilWrite || variant == Variant::RetiledWrite;
+}
+
+std::uint32_t standard4kbOffset(std::uint32_t x, std::uint32_t y) {
+    const auto tile = (y / 64u) * (RetiledWidth / 64u) + x / 64u;
+    const auto offset = (x & 0xfu) | ((x & 0x10u) << 5u) | ((x & 0x20u) << 6u) |
+                        ((y & 0x1fu) << 4u) | ((y & 0x20u) << 5u);
+    return tile * 4096u + offset;
+}
+
+bool usesStencilTest(Variant variant) {
+    return variant == Variant::StencilFilled || variant == Variant::StencilEmpty || writesStencil(variant) ||
+           usesRetiledStencil(variant);
+}
+
+void appendStencilWrite(std::vector<std::uint32_t>& words, std::uint32_t width,
+                        std::uint32_t height, bool retiled) {
     constexpr std::uint32_t Format8UInt = 5;
     append(words, 0x76, {0x20c, low(ComputeCode), high(ComputeCode)});
     append(words, 0x76, {0x212, 0u, (16u << 1u) | (1u << 11u)});
     append(words, 0x76, {0x207, Width, Height, 1u});
     append(words, 0x76,
-           {0x248, low(Stencil), high(Stencil) | (Format8UInt << 20u) | (((Width - 1u) & 3u) << 30u),
-            ((Width - 1u) >> 2u) | ((Height - 1u) << 14u), 0x91800004u, 0u, 0u, 0u, 0u});
+           {0x248, low(Stencil), high(Stencil) | (Format8UInt << 20u) | (((width - 1u) & 3u) << 30u),
+            ((width - 1u) >> 2u) | ((height - 1u) << 14u), retiled ? 0x90500004u : 0x91800004u,
+            0u, 0u, 0u, 0u});
     append(words, 0x15, {1u, 1u, 1u, 0x41u});
 }
 
@@ -121,7 +153,7 @@ std::array<std::uint32_t, 16> pixelWords(Variant variant) {
     return words;
 }
 
-std::vector<std::uint32_t> drawWords(Variant variant) {
+std::vector<std::uint32_t> drawWords(Variant variant, std::uint32_t width, std::uint32_t height) {
     std::vector<std::uint32_t> words;
     const bool stencil_test = usesStencilTest(variant);
     const bool stencil = variant == Variant::Stencil || stencil_test;
@@ -134,19 +166,19 @@ std::vector<std::uint32_t> drawWords(Variant variant) {
         {0x206, 0x43f}, {0x204, 0x80000}, {0x205, 0x240},
         {0x8e, 0xf}, {0x8f, 0xf}, {0x202, 0xcc0010},
         {0x1c4, 0}, {0x1c5, 9}, {0x1c3, 4}, {0x31c, 0x28628},
-        {0x31b, 0}, {0x31d, 0}, {0x3b0, ((Width - 1u) << 14u) | (Height - 1u)},
+        {0x31b, 0}, {0x31d, 0}, {0x3b0, ((width - 1u) << 14u) | (height - 1u)},
         {0x3b8, 0x906c000}, {0x1e0, 0},
-        {0xc, 0}, {0xd, (Height << 16u) | Width},
-        {0x81, 0x80000000}, {0x82, (Height << 16u) | Width},
-        {0x90, 0x80000000}, {0x91, (Height << 16u) | Width},
-        {0x94, 0x80000000}, {0x95, (Height << 16u) | Width},
-        {0x10f, bits(Width / 2.0f)}, {0x110, bits(Width / 2.0f)},
-        {0x111, bits(-(Height / 2.0f))}, {0x112, bits(Height / 2.0f)},
+        {0xc, 0}, {0xd, (height << 16u) | width},
+        {0x81, 0x80000000}, {0x82, (height << 16u) | width},
+        {0x90, 0x80000000}, {0x91, (height << 16u) | width},
+        {0x94, 0x80000000}, {0x95, (height << 16u) | width},
+        {0x10f, bits(width / 2.0f)}, {0x110, bits(width / 2.0f)},
+        {0x111, bits(-(height / 2.0f))}, {0x112, bits(height / 2.0f)},
         {0x113, bits(0.5f)}, {0x114, bits(0.25f)},
         {0xb4, 0}, {0xb5, bits(1.0f)},
         {0x2fe, 0}, {0x302, 0}, {0x306, 0}, {0x30a, 0},
         {0x318, low(Color)}, {0x390, high(Color)}, {0x292, 2},
-        {0x000, 0}, {0x002, 0}, {0x007, ((Height - 1u) << 16u) | (Width - 1u)},
+        {0x000, 0}, {0x002, 0}, {0x007, ((height - 1u) << 16u) | (width - 1u)},
         {0x008, 0}, {0x009, bits(1.0f)}, {0x00a, 0}, {0x00b, 0},
         {0x010, 3}, {0x011, stencil ? 1u : 0u},
         {0x012, low(Depth)}, {0x014, low(Depth)}, {0x01a, high(Depth)}, {0x01c, high(Depth)},
@@ -163,8 +195,8 @@ std::vector<std::uint32_t> drawWords(Variant variant) {
     const std::uint32_t last_level = variant == Variant::Mips || variant == Variant::Stencil ? 1u : 0u;
     const std::array<std::uint32_t, 8> texture{
         low(Depth),
-        high(Depth) | (format << 20u) | (((Width - 1u) & 3u) << 30u),
-        ((Width - 1u) >> 2u) | ((Height - 1u) << 14u),
+        high(Depth) | (format << 20u) | (((width - 1u) & 3u) << 30u),
+        ((width - 1u) >> 2u) | ((height - 1u) << 14u),
         0x91800000u | (last_level << 16u) | swizzle,
         0,
         last_level << 4u,
@@ -183,7 +215,7 @@ std::vector<std::uint32_t> drawWords(Variant variant) {
         append(words, 0x69, {0x390, high(PrimerColor)});
         append(words, 0x69, {0x200, 0x773u});
         append(words, 0x2d, {3, 2});
-        if (variant == Variant::StencilWrite) appendStencilWrite(words);
+        if (writesStencil(variant)) appendStencilWrite(words, width, height, usesRetiledStencil(variant));
         append(words, 0x69, {0x318, low(Color)});
         append(words, 0x69, {0x390, high(Color)});
         append(words, 0x69, {0x200, 0x213u});
@@ -230,15 +262,34 @@ void makeCapture(const std::filesystem::path& path, Variant variant) {
     using AgcDriver::FrameCallKind;
     auto memory = std::vector<std::byte>(GuestBytes);
     const auto pixel = pixelWords(variant);
-    const auto commands = drawWords(variant);
+    const auto width = usesRetiledStencil(variant) ? RetiledWidth : Width;
+    const auto height = usesRetiledStencil(variant) ? RetiledHeight : Height;
+    const auto commands = drawWords(variant, width, height);
     writeShader(memory, VertexHeader, VertexCode, 2, VertexWords);
     writeShader(memory, PixelHeader, PixelCode, 1, pixel);
-    if (variant == Variant::StencilWrite) writeShader(memory, ComputeHeader, ComputeCode, 0, StencilWriteWords);
+    if (writesStencil(variant)) {
+        const auto shader = variant == Variant::RetiledWrite ? std::span<const std::uint32_t>(RetiledStencilWriteWords)
+                                                            : std::span<const std::uint32_t>(StencilWriteWords);
+        writeShader(memory, ComputeHeader, ComputeCode, 0, shader);
+    }
     write(memory, Commands, std::span(commands));
     std::vector<std::uint32_t> depth((Stencil - Depth) / sizeof(std::uint32_t), bits(0.75f));
     write(memory, Depth, std::span<const std::uint32_t>(depth));
     if (variant == Variant::StencilFilled) {
         std::fill_n(memory.begin() + (Stencil - GuestBase), Block, static_cast<std::byte>(StencilValue));
+    }
+    if (usesRetiledStencil(variant)) {
+        for (std::uint32_t offset = 0; offset < Block; ++offset) {
+            memory[Stencil - GuestBase + offset] = (offset / 29u + offset / 239u) % 5u == 0u
+                ? std::byte{0} : static_cast<std::byte>(StencilValue);
+        }
+    }
+    if (variant == Variant::RetiledReference) {
+        for (std::uint32_t y = 0; y < Height; ++y) {
+            for (std::uint32_t x = RetiledWriteX; x < RetiledWriteX + Width; ++x) {
+                memory[Stencil - GuestBase + standard4kbOffset(x, y)] = std::byte{0};
+            }
+        }
     }
 
     AgcDriver::FrameCaptureWriter writer(path);
@@ -253,17 +304,17 @@ void makeCapture(const std::filesystem::path& path, Variant variant) {
     };
     emit({.kind = FrameCallKind::RegisterShader, .address = VertexHeader});
     emit({.kind = FrameCallKind::RegisterShader, .address = PixelHeader});
-    if (variant == Variant::StencilWrite) emit({.kind = FrameCallKind::RegisterShader, .address = ComputeHeader});
+    if (writesStencil(variant)) emit({.kind = FrameCallKind::RegisterShader, .address = ComputeHeader});
     emit({.kind = FrameCallKind::RegisterVideoOutput, .values = {7}});
     emit({.kind = FrameCallKind::DisplayBuffer, .address = Color,
-          .values = {0, 0x8000000022000000ull, Width, Height, 0, 0, 0, 0, 0}});
+          .values = {0, 0x8000000022000000ull, width, height, 0, 0, 0, 0, 0}});
     emit({.kind = FrameCallKind::FrameStart, .values = {1}});
     emit({.kind = FrameCallKind::Submit, .address = Commands, .size = commands.size()});
     emit({.kind = FrameCallKind::Flip, .accepted = 1, .cpuFlip = true, .values = {7, UINT64_MAX, 1, 0}});
     emit({.kind = FrameCallKind::End, .accepted = 2});
     writer.Finish("{\"magic\":\"aps5-frame-capture 1\",\"arena_base\":65536,\"arena_bytes\":1082331693056,"
                   "\"start_boundary\":1,\"frames\":1,\"calls\":2,\"prologue_calls\":" +
-                  std::to_string(variant == Variant::StencilWrite ? 5 : 4) + ",\"ranges\":1,"
+                  std::to_string(writesStencil(variant) ? 5 : 4) + ",\"ranges\":1,"
                   "\"snapshot_bytes\":" + std::to_string(snapshot) +
                   ",\"unreadable_bytes\":0,\"host_only_sample_bytes\":0,\"warnings\":[]}\n");
 }
@@ -336,6 +387,8 @@ int main(int argc, char** argv) {
         const bool vulkan_required = std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr;
         std::string control_frame;
         std::string stencil_filled_frame;
+        std::string retiled_seed_frame;
+        std::string retiled_reference_frame;
         int failures = 0;
         for (const auto& test : Cases) {
             const auto result = replay(tool, root, test);
@@ -361,11 +414,19 @@ int main(int argc, char** argv) {
                 failure = "stencil-test controls did not distinguish the filled and empty planes";
             } else if (test.variant == Variant::StencilWrite && result.frame != stencil_filled_frame) {
                 failure = "the compute-written stencil did not match the filled-plane control";
+            } else if (test.variant == Variant::RetiledReference && result.frame == retiled_seed_frame) {
+                failure = "standard-layout writes did not select visible stencil texels";
+            } else if (test.variant == Variant::RetiledWrite && result.frame != retiled_reference_frame) {
+                failure = "the retiled storage write did not match the guest-byte reference";
             } else if (usesStencilTest(test.variant) && result.log.find("VUID-") != std::string::npos) {
                 failure = "stencil replay logged a Vulkan validation error";
             }
             if (test.variant == Variant::StencilFilled) {
                 stencil_filled_frame = result.frame;
+            } else if (test.variant == Variant::RetiledSeed) {
+                retiled_seed_frame = result.frame;
+            } else if (test.variant == Variant::RetiledReference) {
+                retiled_reference_frame = result.frame;
             }
             if (failure.empty()) {
                 std::cout << test.name << ": ok\n";

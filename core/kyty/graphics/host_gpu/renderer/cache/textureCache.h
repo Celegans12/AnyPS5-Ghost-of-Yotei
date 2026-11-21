@@ -405,7 +405,10 @@ private:
 	void                  DiscardParkedImage(ImageId id) KYTY_REQUIRES(m_lock);
 	void                  StencilPlanesChanged(const Image& depth);
 	void                  DiscardParkedImages(uint64_t address, uint64_t size) KYTY_REQUIRES(m_lock);
-	[[nodiscard]] ImageId FindStencilCopy(ImageId association, const ImageInfo& requested);
+	[[nodiscard]] ImageId FindStencilCopy(ImageId association, const ImageInfo& requested,
+	                                      bool retile = false);
+	void                  RetileStencilCopy(Image& copy, const Image& association, Image& depth,
+	                                        bool write_back);
 	[[nodiscard]] ImageId FindLiveStencilStorageCopy(ImageId association, const ImageDesc& desc);
 	void                  RefreshStencilCopy(ImageId copy_id);
 	[[nodiscard]] bool    WriteBackStencilCopy(ImageId copy_id);
