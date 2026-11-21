@@ -214,14 +214,6 @@ def declaring_headers(qualified, headers):
     return found
 
 
-def parse_excluded(path):
-    if not path.exists():
-        return []
-    text = path.read_text()
-    match = re.search(r"set\(KYTY_GPU_EXCLUDED(.*?)\)", text, re.S)
-    return [token.strip('"') for token in match.group(1).split()] if match else []
-
-
 def main():
     parser = argparse.ArgumentParser(description="Undefined symbols of kyty_gpu, grouped by origin and package")
     parser.add_argument("--archive", required=True, type=Path)
@@ -251,7 +243,7 @@ def main():
             third.setdefault(symbol, name)
     names = demangle(external)
     sources = upstream_sources(args.ref, args.tag)
-    compiled = {str(p.relative_to(args.kyty)) for p in args.kyty.rglob("*.cpp")} - set(parse_excluded(args.kyty / "KytyGpuSources.cmake"))
+    compiled = {str(p.relative_to(args.kyty)) for p in args.kyty.rglob("*.cpp")}
     headers = {str(p.relative_to(args.contract)): p.read_text() for p in args.contract.rglob("*.h")}
 
     rows = []

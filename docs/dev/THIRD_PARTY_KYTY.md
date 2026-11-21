@@ -23,7 +23,7 @@ verbatim at their top:
 |---|---|---|
 | `core/kyty/graphics/` | `src/graphics/` | every file |
 | `core/kyty/common/` | `src/common/` | every file except `CMakeLists.txt` |
-| `core/kyty/cmake/` | `src/` | `embed_spirv.cmake`, `embed_localization.cmake`, `cmake_config.h.in`, `kytyGitVersion.h.in` |
+| `core/kyty/cmake/` | `src/` | `embed_spirv.cmake`, `cmake_config.h.in`, `kytyGitVersion.h.in` |
 | `core/libs/prx/libSceAgcDriver/KytyShim/include/kernel/` | `src/kernel/` | `eventQueue.h`, `fileSystem.h`, `guestPause.h`, `memory.h`, `pthread.h` |
 | `core/libs/prx/libSceAgcDriver/KytyShim/include/libs/` | `src/libs/` | `agc.h`, `controller.h`, `errno.h`, `hmd2.h`, `ime.h`, `imeCommon.h`, `imeDialog.h`, `libs.h` |
 | `core/libs/prx/libSceAgcDriver/KytyShim/include/loader/` | `src/loader/` | `demonsSoulsPageFree.h`, `demonsSoulsTitle.h`, `guestOodle.h`, `systemContent.h`, `timer.h` |
@@ -36,9 +36,9 @@ Outside those folders, code adapted from the Kyty core is built only with `-DANY
 
 The headers under `KytyShim/include/` are the contract of the shim: they are the declarations of the KytyPS5 kernel,
 library and loader functions that `graphics/` and `common/` call, and the shim implements them on top of AnyPS5.
-`libs/dialog.h` is left out: only `graphics/presentation/systemOverlay.cpp`, which `kyty_gpu` does not build, includes
-it, and its `ErrorDialogOpen` and `ErrorDialogClose` would be second declarations of AnyPS5 exports for
-`core/libs/tests/test_public_headers.py`, which reads every header under `core/` without namespaces.
+`libs/dialog.h` is left out: no source of `kyty_gpu` includes it, and its `ErrorDialogOpen` and `ErrorDialogClose` would
+be second declarations of AnyPS5 exports for `core/libs/tests/test_public_headers.py`, which reads every header under
+`core/` without namespaces.
 
 ## Changes from the import
 
@@ -88,8 +88,10 @@ on GCC. Clang is given `--gcc-install-dir` of the GCC that builds AnyPS5, so bot
 The sub-build uses upstream's compiler options (`-march=x86-64-v3 -ffp-contract=off -fno-rtti -fno-exceptions -g`,
 `-fexceptions` for `common/`, `descriptors.cpp` and `pipelineCache.cpp`), Tracy on demand, and its own SPIRV-Tools and
 glslang (with the optimizer, for `glslangValidator -Os` on upstream's utility shaders). `Kyty::gpu` is the interface
-target that links the resulting archives into AnyPS5. `core/kyty/KytyGpuSources.cmake` lists the imported sources left
-out of `kyty_gpu`, and `core/kyty/tools/kyty_frontier.py` lists the symbols `kyty_gpu` still needs from the shim.
+target that links the resulting archives into AnyPS5. `kyty_gpu` builds every source under `graphics/` and `common/`:
+the imported sources it had no use for (the window, input, overlays, OpenXR, RenderDoc, trophies, localization and the
+upstream log) are not in the tree. `core/kyty/tools/kyty_frontier.py` lists the symbols `kyty_gpu` still needs from the
+shim.
 `kyty_gpu` is compiled with the profile of `core/kyty/pgo/` by default ([profile-guided optimization](KYTY_PGO.md)).
 
 ### Windows

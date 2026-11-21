@@ -30,7 +30,7 @@ CONTRACT = (
     "loader/systemContent.h",
     "loader/timer.h",
 )
-SCRIPTS = ("embed_spirv.cmake", "embed_localization.cmake", "cmake_config.h.in", "kytyGitVersion.h.in")
+SCRIPTS = ("embed_spirv.cmake", "cmake_config.h.in", "kytyGitVersion.h.in")
 KYTY_DIR = PurePosixPath("core/kyty")
 CONTRACT_DIR = PurePosixPath("core/libs/prx/libSceAgcDriver/KytyShim/include")
 RAW_PREFIXES = {"R", "u8R", "uR", "UR", "LR"}

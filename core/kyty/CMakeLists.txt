@@ -244,12 +244,12 @@ kyty_embed_shader(gpu_blit_shaders gpu_cmaa2 gpu_cmaa2.frag)
 add_custom_target(kyty_gpu_shaders DEPENDS ${KYTY_SHADER_HEADERS})
 
 file(GLOB_RECURSE KYTY_GPU_SOURCES CONFIGURE_DEPENDS "${KYTY_DIR}/graphics/*.cpp" "${KYTY_DIR}/common/*.cpp")
-include("${KYTY_DIR}/KytyGpuSources.cmake")
-foreach(excluded IN LISTS KYTY_GPU_EXCLUDED)
-    list(REMOVE_ITEM KYTY_GPU_SOURCES "${KYTY_DIR}/${excluded}")
-endforeach()
 file(GLOB_RECURSE KYTY_COMMON_SOURCES CONFIGURE_DEPENDS "${KYTY_DIR}/common/*.cpp")
-list(APPEND KYTY_GPU_EXCEPTIONS graphics/presentation/window/swapchain.cpp)
+set(KYTY_GPU_EXCEPTIONS
+    graphics/host_gpu/renderer/pipeline/descriptors.cpp
+    graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
+    graphics/presentation/window/swapchain.cpp
+)
 if(WIN32)
     list(APPEND KYTY_GPU_EXCEPTIONS graphics/host_gpu/renderer/pipeline/pipelineHelpers.cpp)
 endif()
