@@ -108,6 +108,14 @@ constexpr std::array<std::uint32_t, 84> MaskScalarCode{
     0x7e060230u, 0xe0701034u, 0x80010301u, 0xbf810000u,
 };
 
+constexpr std::array<std::uint32_t, 40> WaveBranchCode{
+    0x2c020086u, 0x7e120501u, 0x360400bfu, 0xd5430003u, 0x021d0700u, 0x7e080280u, 0x7e0a0280u, 0xbf0d8009u,
+    0xbf840006u, 0xd760000bu, 0x00014b03u, 0x7e08020bu, 0x7d8804b2u, 0xbe8c106au, 0x7e0a020cu, 0xbf068009u,
+    0xbf840003u, 0xd760000du, 0x00017f03u, 0x4a0a0a0du, 0x340c0082u, 0xd8340000u, 0x00000306u, 0xbf8cc07fu,
+    0xbf8a0000u, 0x4a0e00c0u, 0x360e0effu, 0x000000ffu, 0x340e0e82u, 0xd8d80000u, 0x08000007u, 0xbf8cc07fu,
+    0x34020084u, 0xe0701000u, 0x80010401u, 0xe0701004u, 0x80010501u, 0xe0701008u, 0x80010801u, 0xbf810000u,
+};
+
 using Words = std::span<const std::uint32_t>;
 using Check = std::function<std::string(Words)>;
 
@@ -455,6 +463,27 @@ std::string checkMaskScalar(Words output) {
     return {};
 }
 
+std::string checkWaveBranch(Words output) {
+    const auto value = [](std::uint32_t thread) { return 3u * thread + 7u; };
+    for (std::uint32_t thread = 0; thread < 256; ++thread) {
+        const auto wave = thread / 64u;
+        const bool odd = (wave & 1u) != 0;
+        const std::array<std::pair<std::uint32_t, const char*>, 3> expected{{
+            {odd ? value(wave * 64u + 37u) : 0u, "V_READLANE_B32 lane 37 in a branch only odd waves take"},
+            {(odd ? 50u : 0u) + (wave == 0 ? value(63u) : 0u),
+             "S_BCNT1_I32_B64 of a vote in the odd waves, plus V_READLANE_B32 lane 63 in wave 0 only"},
+            {value((thread + 64u) & 255u), "DS_READ_B32 after S_BARRIER of a word the next wave wrote"},
+        }};
+        for (std::uint32_t slot = 0; slot < expected.size(); ++slot) {
+            if (auto failure = compare(output, thread, 4, slot, expected[slot].first, expected[slot].second);
+                !failure.empty()) {
+                return failure;
+            }
+        }
+    }
+    return {};
+}
+
 const std::array Cases{
     Case{"lanes", LanesCode, 64, 0, 32, checkLanes},
     Case{"reduce", ReduceCode, 1024, 0, 16, checkReduce},
@@ -462,6 +491,7 @@ const std::array Cases{
     Case{"permlane", PermlaneCode, 64, 0, 16, checkPermlane},
     Case{"sdwa", SdwaCode, 64, 0, 16, checkSdwa},
     Case{"mask-scalar", MaskScalarCode, 64, 0, 16, checkMaskScalar},
+    Case{"wave-branch", WaveBranchCode, 256, 1024, 4, checkWaveBranch},
 };
 
 }

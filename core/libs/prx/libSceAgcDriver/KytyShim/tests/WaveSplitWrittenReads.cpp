@@ -211,11 +211,10 @@ struct Replay {
     std::vector<std::uint32_t> output;
 };
 
-Replay replay(const std::filesystem::path& tool, const std::filesystem::path& root, const Case& test, const char* split) {
-    const auto directory = root / (std::string(test.name) + "-split-" + split);
+Replay replay(const std::filesystem::path& tool, const std::filesystem::path& root, const Case& test) {
+    const auto directory = root / test.name;
     std::filesystem::create_directories(directory);
     makeCapture(directory / "capture", test.code());
-    setVariable("KYTY_WAVE_SPLIT", split);
     const auto pieces = Block / DumpPiece;
     std::string dumps;
     for (std::uint64_t piece = 0; piece < pieces; ++piece) {
@@ -319,8 +318,9 @@ Mismatches compare(const std::vector<std::uint32_t>& got, const std::vector<std:
     return result;
 }
 
-bool keptInLanePairs(const std::string& log) {
-    return log.find("wave64 kept in lane pairs") != std::string::npos;
+bool split(const std::string& log) {
+    return log.find("wave64 split across subgroups") != std::string::npos &&
+           log.find("wave64 kept in lane pairs") == std::string::npos;
 }
 
 std::uint64_t emittedWords(const std::string& log) {
@@ -348,41 +348,33 @@ int main(int argc, char** argv) {
         std::string summary;
         for (const auto& test : cases) {
             const auto expected = expectedOutput(test);
-            const auto pairs = replay(tool, root, test, "0");
-            if (!pairs.completed) {
-                std::cerr << test.name << ": replay in lane pairs did not complete"
+            const auto result = replay(tool, root, test);
+            if (!result.completed) {
+                std::cerr << test.name << ": replay did not complete"
                           << (vulkan_required ? "" : "; skipping (no usable Vulkan device?)") << '\n';
-                printTail(pairs.log);
+                printTail(result.log);
                 return vulkan_required ? 1 : 77;
             }
-            const auto split = replay(tool, root, test, "1");
             std::string failure;
-            const auto pairsDiff = compare(pairs.output, expected);
-            const auto splitDiff = split.completed ? compare(split.output, expected) : Mismatches{};
-            if (pairsDiff.count != 0) {
-                failure = "lane pairs: " + std::to_string(pairsDiff.count) + " words differ from RDNA2, first " + pairsDiff.first;
-            } else if (!split.completed) {
-                failure = "the replay with the wave split did not complete";
-            } else if (keptInLanePairs(split.log) || emittedWords(pairs.log) == 0 || emittedWords(split.log) == 0 ||
-                       emittedWords(pairs.log) == emittedWords(split.log)) {
-                failure = "KYTY_WAVE_SPLIT=1 did not split the program (" + std::to_string(emittedWords(pairs.log)) +
-                          " SPIR-V words in lane pairs, " + std::to_string(emittedWords(split.log)) + " split): nothing was tested";
-            } else if (splitDiff.count != 0) {
-                failure = "wave split: " + std::to_string(splitDiff.count) + " words differ from RDNA2 (" +
-                          std::to_string(splitDiff.lowHalf) + " in lanes 0-31, " + std::to_string(splitDiff.highHalf) +
-                          " in lanes 32-63), first " + splitDiff.first;
+            const auto diff = compare(result.output, expected);
+            if (!split(result.log) || emittedWords(result.log) == 0) {
+                failure = "the program was not split across two subgroups: nothing was tested";
+            } else if (diff.count != 0) {
+                failure = "wave split: " + std::to_string(diff.count) + " words differ from RDNA2 (" +
+                          std::to_string(diff.lowHalf) + " in lanes 0-31, " + std::to_string(diff.highHalf) +
+                          " in lanes 32-63), first " + diff.first;
             }
             if (!failure.empty()) {
                 std::cerr << test.name << ": " << failure << '\n';
-                printTail(split.log);
+                printTail(result.log);
                 return 1;
             }
-            summary += std::string(summary.empty() ? "" : ", ") + test.name + " " + std::to_string(emittedWords(pairs.log)) +
-                       " -> " + std::to_string(emittedWords(split.log)) + " SPIR-V words";
+            summary += std::string(summary.empty() ? "" : ", ") + test.name + " " + std::to_string(emittedWords(result.log)) +
+                       " SPIR-V words";
         }
         std::filesystem::remove_all(root);
         std::cout << "kyty_shim_wave_split_written_reads: ok (" << Groups << " waves each; " << summary
-                  << "; split and lane pairs equal to RDNA2)\n";
+                  << "; split, equal to RDNA2)\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

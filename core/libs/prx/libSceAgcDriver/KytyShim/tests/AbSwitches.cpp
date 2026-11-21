@@ -64,10 +64,9 @@ void Refusals() {
 	Check(Contains(Refused("30:KYTY_FLAT_DEFER+"), "an empty setting name"), "an empty name is refused");
 	Check(Contains(Refused("30:KYTY_FLAT_DEFER+KYTY_FLAT_DEFER"), "KYTY_FLAT_DEFER is listed twice"),
 	      "a setting listed twice is refused");
-	const auto wave = Refused("30:KYTY_WAVE_SPLIT");
-	Check(Contains(wave, "KYTY_AB: KYTY_WAVE_SPLIT cannot change while the title runs: it changes how shaders are compiled"),
-	      "KYTY_WAVE_SPLIT is refused with its reason");
-	Check(Contains(wave, listed), "the refusal of KYTY_WAVE_SPLIT lists the settings that can change");
+	const auto relaxed = Refused("30:KYTY_RELAXED_SHADER_FLOAT");
+	Check(Contains(relaxed, "KYTY_AB: KYTY_RELAXED_SHADER_FLOAT cannot change while the title runs; " + listed),
+	      "a setting that changes how shaders are compiled is refused with the list");
 	const auto labels = Refused("30:KYTY_FLAT_DEFER+KYTY_PROTO_TRUE_LABELS");
 	Check(Contains(labels, "KYTY_AB: KYTY_PROTO_TRUE_LABELS cannot change while the title runs; " + listed),
 	      "a setting that is not a runtime switch is refused with the list");
@@ -98,7 +97,7 @@ void Defaults() {
 	Check(IR::SrtFlatDeferMode() == IR::SrtFlatDefer::On, "the walker sees KYTY_FLAT_DEFER on");
 	Check(IR::GenericComputeVariants(), "the compute variants see KYTY_GENERIC_COMPUTE_VARIANT on");
 	Check(Switches::Find("KYTY_FLAT_DEFER") == Switch::FlatDefer, "KYTY_FLAT_DEFER is a runtime switch");
-	Check(!Switches::Find("KYTY_WAVE_SPLIT").has_value(), "KYTY_WAVE_SPLIT is not a runtime switch");
+	Check(!Switches::Find("KYTY_RELAXED_SHADER_FLOAT").has_value(), "KYTY_RELAXED_SHADER_FLOAT is not a runtime switch");
 	Check(!Ab::Configured() && Ab::AtFlip().empty() && !Ab::Listed(Switch::FlatDefer),
 	      "without KYTY_AB a flip prints nothing and changes nothing");
 }

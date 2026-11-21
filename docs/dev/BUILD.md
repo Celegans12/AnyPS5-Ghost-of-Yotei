@@ -321,7 +321,7 @@ On Windows MinGW frees `thread_local` objects before their destructors run, so t
 
 ### Replay one Kyty compute module
 
-Build `kyty_compute_pipeline_replay` in a Kyty build. Pass a `.shaders` store recorded with the same Kyty build and Vulkan device profile and the decimal `module=` ID from the `compute-driver` line emitted by `KYTY_PIPELINE_STALL_LOG_MS`. Use the same shader-affecting Kyty settings as the recording, including `KYTY_NATIVE_RT`, `KYTY_WAVE_SPLIT` and `KYTY_RELAXED_SHADER_FLOAT` if set. The existing `KYTY_SHADER_CACHE_STAMP` setting can select an earlier recording stamp when you know that both builds use compatible shader-store records and SPIR-V.
+Build `kyty_compute_pipeline_replay` in a Kyty build. Pass a `.shaders` store recorded with the same Kyty build and Vulkan device profile and the decimal `module=` ID from the `compute-driver` line emitted by `KYTY_PIPELINE_STALL_LOG_MS`. Use the same shader-affecting Kyty settings as the recording, including `KYTY_NATIVE_RT` and `KYTY_RELAXED_SHADER_FLOAT` if set. The existing `KYTY_SHADER_CACHE_STAMP` setting can select an earlier recording stamp when you know that both builds use compatible shader-store records and SPIR-V.
 
 ```sh
 cmake --build build --target kyty_compute_pipeline_replay

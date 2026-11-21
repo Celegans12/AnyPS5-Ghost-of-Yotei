@@ -254,12 +254,8 @@ bool RelaxedShaderFloatEnabled() {
 	return g_config->relaxed_shader_float;
 }
 
-bool WaveSplitEnabled() {
-	return g_config->wave_split;
-}
-
 uint32_t WaveSplitCheckPeriod() {
-	return g_config->wave_split ? g_config->wave_split_check_period : 0u;
+	return g_config->wave_split_check_period;
 }
 
 bool ImageTableHeapEnabled() {

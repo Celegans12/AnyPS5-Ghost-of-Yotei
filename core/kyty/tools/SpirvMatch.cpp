@@ -58,15 +58,21 @@ bool ReadStoreHeader(std::istream& input) {
 		return Read(input, std::span(&magic, 1)) && magic == ZSTD_MAGICNUMBER;
 	};
 	const size_t current_size = layout.bytes.size();
-	const size_t legacy_size = current_size - sizeof(bool);
+	const size_t legacy_size = current_size + sizeof(bool);
 	if ((!current || !has_frame_at(current_size)) && has_frame_at(legacy_size)) {
-		Reader legacy{std::span(layout.bytes).first(legacy_size)};
-		IoAll(legacy, stamp, profile.maintenance8, profile.native_float_min_max, profile.device_clock_period_ps,
-		      profile.robust_buffer_access, profile.r8_srgb_views, profile.r8g8_srgb_views, profile.relaxed_float,
-		      profile.ray_query, profile.lds_lane_sync, max_shared_memory);
-		if (legacy.ok && legacy.bytes.empty() && stamp != 0 && max_shared_memory != 0) {
-			input.seekg(legacy_size);
-			return bool(input);
+		std::vector<uint8_t> bytes(legacy_size);
+		input.clear();
+		input.seekg(0);
+		bool wave_split = false;
+		if (Read(input, std::span(bytes))) {
+			Reader legacy{bytes};
+			IoAll(legacy, stamp, profile.maintenance8, profile.native_float_min_max, profile.device_clock_period_ps,
+			      profile.robust_buffer_access, profile.r8_srgb_views, profile.r8g8_srgb_views, profile.relaxed_float,
+			      wave_split, profile.ray_query, profile.lds_lane_sync, max_shared_memory);
+			if (legacy.ok && legacy.bytes.empty() && stamp != 0 && max_shared_memory != 0) {
+				input.seekg(legacy_size);
+				return bool(input);
+			}
 		}
 	}
 	input.clear();

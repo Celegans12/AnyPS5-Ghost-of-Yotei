@@ -103,11 +103,7 @@ std::string FlippableList() {
 }
 
 std::string Refusal(std::string_view name) {
-	const char* reason = name == "KYTY_WAVE_SPLIT"
-	                         ? ": it changes how shaders are compiled, the modules already built keep their form, and "
-	                           "the shader store records it once for the whole session"
-	                         : "";
-	return fmt::format("KYTY_AB: {} cannot change while the title runs{}; settings KYTY_AB can change: {}", name, reason,
+	return fmt::format("KYTY_AB: {} cannot change while the title runs; settings KYTY_AB can change: {}", name,
 	                   FlippableList());
 }
 

@@ -668,7 +668,6 @@ ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	        .r8_srgb_views          = graphics.r8_srgb_views,
 	        .r8g8_srgb_views        = graphics.r8g8_srgb_views,
 	        .relaxed_float          = Config::RelaxedShaderFloatEnabled(),
-	        .wave_split             = Config::WaveSplitEnabled(),
 	        .ray_query              = graphics.ray_query_enabled,
 	        .lds_lane_sync          = LdsLaneSyncEnabled()};
 }

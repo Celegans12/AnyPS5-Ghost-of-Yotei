@@ -14,4 +14,6 @@ struct SplitHints {
 
 bool SplitWaveAcrossSubgroups(std::vector<uint32_t>& module, std::string& refusal, const SplitHints* hints = nullptr);
 
+bool WaveSplitThreads(const uint32_t (&threads)[3]);
+
 }

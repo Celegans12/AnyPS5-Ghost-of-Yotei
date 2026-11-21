@@ -18,11 +18,10 @@ namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
 namespace {
 
-constexpr uint32_t None          = UINT32_MAX;
-constexpr uint32_t WaveLanes     = 64;
-constexpr uint32_t SlotWords     = 2 * WaveLanes;
-constexpr uint32_t MaxBatch      = 4;
-constexpr uint32_t ExchangeWords = 2 * MaxBatch * SlotWords;
+constexpr uint32_t None           = UINT32_MAX;
+constexpr uint32_t WaveLanes      = 64;
+constexpr uint32_t MaxBatch       = 4;
+constexpr uint32_t MaxThreads     = 1024;
 constexpr uint32_t MaxSharedBytes = 49152;
 
 struct Inst {
@@ -174,6 +173,11 @@ private:
 	uint32_t m_uvec4          = 0;
 	uint32_t m_local_size     = None;
 	uint32_t m_size[3]        = {1, 1, 1};
+	uint32_t m_threads        = WaveLanes;
+	uint32_t m_waves          = 1;
+	uint32_t m_batch          = MaxBatch;
+	uint32_t m_void           = 0;
+	uint32_t m_sync_fn_type   = 0;
 	std::unordered_set<uint32_t> m_caps;
 	bool                         m_caps_done = false;
 	bool                         m_writes_buffers = false;
@@ -224,6 +228,7 @@ private:
 					if (Word(inst, 0) == 32u) m_bit32_types.insert(inst.result);
 					break;
 				case spv::OpTypeBool: m_bool = inst.result; break;
+				case spv::OpTypeVoid: m_void = inst.result; break;
 				case spv::OpTypeVector:
 					if (Word(inst, 0) == m_u32 && Word(inst, 1) == 4u) m_uvec4 = inst.result;
 					break;
@@ -259,11 +264,15 @@ private:
 					break;
 				case spv::OpExecutionMode:
 					if (m_in[inst.offset + 2] == spv::ExecutionModeLocalSize) {
-						if (m_in[inst.offset + 3] * m_in[inst.offset + 4] * m_in[inst.offset + 5] != WaveLanes) {
-							refusal = "workgroup is not one wave";
+						const uint64_t threads =
+						    uint64_t {m_in[inst.offset + 3]} * m_in[inst.offset + 4] * m_in[inst.offset + 5];
+						if (threads == 0 || threads % WaveLanes != 0 || threads > MaxThreads) {
+							refusal = "workgroup is not whole waves";
 							return false;
 						}
 						m_local_size = index;
+						m_threads    = static_cast<uint32_t>(threads);
+						m_waves      = m_threads / WaveLanes;
 						for (uint32_t k = 0; k < 3; k++) m_size[k] = m_in[inst.offset + 3 + k];
 					}
 					break;
@@ -302,7 +311,7 @@ private:
 			m_insts.push_back(inst);
 			i += inst.count;
 		}
-		if (m_entry_point == None || m_u32 == 0 || m_bool == 0 || m_first_function == None ||
+		if (m_entry_point == None || m_u32 == 0 || m_bool == 0 || m_void == 0 || m_first_function == None ||
 		    m_memory_model == None || m_local_size == None) {
 			refusal = "module lacks an entry point or basic types";
 			return false;
@@ -413,7 +422,12 @@ private:
 			}
 			shared_bytes += uint64_t {m_const[Word(arr, 1)]} * 4u;
 		}
-		if (shared_bytes + ExchangeWords * 4u > MaxSharedBytes) {
+		const uint64_t sync_bytes = m_waves > 1 ? uint64_t {m_waves} * 4u : 0u;
+		m_batch                   = MaxBatch;
+		while (m_batch > 1 && shared_bytes + sync_bytes + uint64_t {m_waves} * ExchangeWords() * 4u > MaxSharedBytes) {
+			m_batch /= 2;
+		}
+		if (shared_bytes + sync_bytes + uint64_t {m_waves} * ExchangeWords() * 4u > MaxSharedBytes) {
 			refusal = "no workgroup memory left for the exchange";
 			return false;
 		}
@@ -504,6 +518,22 @@ private:
 			}
 		}
 		return true;
+	}
+
+	uint32_t ExchangeWords() const { return 2u * m_batch * WaveLanes; }
+
+	bool WaveIndexOfLane(const Inst& inst) const {
+		if (m_lii == 0 || (inst.op != spv::OpUDiv && inst.op != spv::OpShiftRightLogical) || Operands(inst) != 2) {
+			return false;
+		}
+		const auto source = Word(inst, 0);
+		if (source >= m_bound || m_def[source] == None) return false;
+		const auto& load = m_insts[m_def[source]];
+		if (load.op != spv::OpLoad || Word(load, 0) != m_lii) return false;
+		const auto divisor = m_const.find(Word(inst, 1));
+		if (divisor == m_const.end()) return false;
+		return inst.op == spv::OpUDiv ? divisor->second != 0 && divisor->second % WaveLanes == 0
+		                              : divisor->second >= 6u && divisor->second < 32u;
 	}
 
 	bool ValueTypeIsUvec4(uint32_t type) const {
@@ -701,6 +731,10 @@ private:
 						}
 						break;
 					case spv::OpGroupNonUniformElect: d = true; break;
+					case spv::OpUDiv:
+					case spv::OpShiftRightLogical:
+						d = d || (!WaveIndexOfLane(inst) && AnyOperandDivergent(inst));
+						break;
 					case spv::OpGroupNonUniformShuffle: d = d || Div(Word(inst, 1)); break;
 					case spv::OpGroupNonUniformBallotBitCount:
 						d = d || Word(inst, 1) != spv::GroupOperationReduce || Div(Word(inst, 2));
@@ -925,9 +959,102 @@ private:
 		return true;
 	}
 
+	static bool Pure(uint32_t op) {
+		switch (op) {
+			case spv::OpAccessChain:
+			case spv::OpInBoundsAccessChain:
+			case spv::OpIAdd:
+			case spv::OpISub:
+			case spv::OpIMul:
+			case spv::OpUDiv:
+			case spv::OpUMod:
+			case spv::OpShiftLeftLogical:
+			case spv::OpShiftRightLogical:
+			case spv::OpShiftRightArithmetic:
+			case spv::OpBitwiseAnd:
+			case spv::OpBitwiseOr:
+			case spv::OpBitwiseXor:
+			case spv::OpNot:
+			case spv::OpBitcast:
+			case spv::OpUConvert:
+			case spv::OpSConvert:
+			case spv::OpCompositeExtract:
+			case spv::OpCompositeConstruct:
+			case spv::OpCopyObject:
+			case spv::OpSelect:
+			case spv::OpIEqual:
+			case spv::OpINotEqual:
+			case spv::OpULessThan:
+			case spv::OpULessThanEqual:
+			case spv::OpUGreaterThan:
+			case spv::OpUGreaterThanEqual:
+			case spv::OpLogicalAnd:
+			case spv::OpLogicalOr:
+			case spv::OpLogicalNot:
+			case spv::OpLine:
+			case spv::OpNoLine: return true;
+			default: return false;
+		}
+	}
+
+	bool m_dirty = true;
+
 	void EmitSharedBarrier() {
+		m_dirty = false;
+		if (m_waves > 1) {
+			EmitHalvesSync(spv::ScopeWorkgroup, spv::MemorySemanticsWorkgroupMemoryMask);
+			return;
+		}
 		Emit(spv::OpControlBarrier, {Const(spv::ScopeWorkgroup), Const(spv::ScopeWorkgroup),
 		                             Const(spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsWorkgroupMemoryMask)});
+	}
+
+	void EmitHalvesSync(uint32_t memory_scope, uint32_t storage) {
+		const uint32_t ordering = static_cast<uint32_t>(spv::MemorySemanticsAcquireMask) |
+		                          static_cast<uint32_t>(spv::MemorySemanticsReleaseMask) |
+		                          static_cast<uint32_t>(spv::MemorySemanticsAcquireReleaseMask) |
+		                          static_cast<uint32_t>(spv::MemorySemanticsSequentiallyConsistentMask);
+		const auto semantics = Const((storage & ~ordering) | static_cast<uint32_t>(spv::MemorySemanticsWorkgroupMemoryMask) |
+		                             static_cast<uint32_t>(spv::MemorySemanticsAcquireReleaseMask));
+		Emit(spv::OpControlBarrier, {Const(spv::ScopeSubgroup), Const(memory_scope), semantics});
+		const auto target = U32(spv::OpIAdd, {U32(spv::OpLoad, {m_epoch}), Const(2)});
+		Emit(spv::OpStore, {m_epoch, target});
+		Value(spv::OpFunctionCall, m_void, {m_sync_fn, m_wave, target});
+		Emit(spv::OpMemoryBarrier, {Const(memory_scope), semantics});
+	}
+
+	void EmitSyncFunction() {
+		const auto wave   = NewId();
+		const auto target = NewId();
+		const auto start = NewId(), arrive = NewId(), arrived = NewId(), header = NewId(), body = NewId(), next = NewId(),
+		           done = NewId();
+		Put(*m_out, spv::OpFunction, {m_void, m_sync_fn, spv::FunctionControlMaskNone, m_sync_fn_type});
+		Put(*m_out, spv::OpFunctionParameter, {m_u32, wave});
+		Put(*m_out, spv::OpFunctionParameter, {m_u32, target});
+		Put(*m_out, spv::OpLabel, {start});
+		const auto counter = Value(spv::OpAccessChain, m_ptr_wg_u32, {m_sync, wave});
+		const auto first   = Bool(spv::OpIEqual, {U32(spv::OpLoad, {m_real_lane}), Const(0)});
+		Put(*m_out, spv::OpSelectionMerge, {arrived, spv::SelectionControlMaskNone});
+		Put(*m_out, spv::OpBranchConditional, {first, arrive, arrived});
+		Put(*m_out, spv::OpLabel, {arrive});
+		U32(spv::OpAtomicIAdd, {counter, Const(spv::ScopeWorkgroup),
+		                        Const(spv::MemorySemanticsReleaseMask | spv::MemorySemanticsWorkgroupMemoryMask), Const(1)});
+		Put(*m_out, spv::OpBranch, {arrived});
+		Put(*m_out, spv::OpLabel, {arrived});
+		Put(*m_out, spv::OpBranch, {header});
+		Put(*m_out, spv::OpLabel, {header});
+		Put(*m_out, spv::OpLoopMerge, {done, next, spv::LoopControlMaskNone});
+		Put(*m_out, spv::OpBranch, {body});
+		Put(*m_out, spv::OpLabel, {body});
+		const auto seen = U32(spv::OpAtomicLoad, {counter, Const(spv::ScopeWorkgroup),
+		                                         Const(spv::MemorySemanticsAcquireMask | spv::MemorySemanticsWorkgroupMemoryMask)});
+		const auto reached = Bool(spv::OpSGreaterThanEqual, {U32(spv::OpISub, {seen, target}), Const(0)});
+		Put(*m_out, spv::OpBranchConditional, {reached, done, next});
+		Put(*m_out, spv::OpLabel, {next});
+		Put(*m_out, spv::OpBranch, {header});
+		Put(*m_out, spv::OpLabel, {done});
+		Put(*m_out, spv::OpReturn, {});
+		Put(*m_out, spv::OpFunctionEnd, {});
 	}
 
 	std::vector<uint32_t>*                 m_out = nullptr;
@@ -962,7 +1089,8 @@ private:
 	}
 
 	uint32_t m_xchg = 0, m_slot = 0, m_ptr_wg_u32 = 0, m_ptr_priv_u32 = 0;
-	uint32_t m_lane = 0, m_lane2 = 0, m_bit = 0, m_in_lo = 0, m_other2 = 0, m_scope = 0;
+	uint32_t m_lane = 0, m_wave_lane = 0, m_wave = 0, m_wave_base = 0, m_bit = 0, m_in_lo = 0, m_other = 0, m_scope = 0;
+	uint32_t m_sync = 0, m_epoch = 0, m_sync_fn = 0;
 
 	uint32_t U32(uint32_t op, std::initializer_list<uint32_t> operands) { return Value(op, m_u32, operands); }
 	uint32_t Bool(uint32_t op, std::initializer_list<uint32_t> operands) { return Value(op, m_bool, operands); }
@@ -980,12 +1108,20 @@ private:
 		const auto sid  = U32(spv::OpLoad, {m_sid});
 		const auto slii = U32(spv::OpLoad, {m_real_lane});
 		m_lane          = U32(spv::OpIAdd, {U32(spv::OpShiftLeftLogical, {sid, Const(5)}), slii});
-		m_lane2         = U32(spv::OpShiftLeftLogical, {m_lane, Const(1)});
+		m_wave_lane     = U32(spv::OpBitwiseAnd, {m_lane, Const(WaveLanes - 1u)});
+		m_wave          = U32(spv::OpShiftRightLogical, {sid, Const(1)});
+		m_wave_base     = U32(spv::OpIMul, {m_wave, Const(ExchangeWords())});
 		m_bit           = U32(spv::OpShiftLeftLogical, {Const(1), slii});
-		m_in_lo         = Bool(spv::OpIEqual, {sid, Const(0)});
-		m_other2        = U32(spv::OpShiftLeftLogical, {U32(spv::OpBitwiseXor, {m_lane, Const(32)}), Const(1)});
+		m_in_lo         = Bool(spv::OpIEqual, {U32(spv::OpBitwiseAnd, {sid, Const(1)}), Const(0)});
+		m_other         = U32(spv::OpBitwiseXor, {m_wave_lane, Const(32)});
+		if (m_waves > 1) {
+			Emit(spv::OpAtomicStore, {Value(spv::OpAccessChain, m_ptr_wg_u32, {m_sync, m_wave}), Const(spv::ScopeWorkgroup),
+			                          Const(spv::MemorySemanticsMaskNone), Const(0)});
+			Emit(spv::OpControlBarrier, {Const(spv::ScopeWorkgroup), Const(spv::ScopeWorkgroup),
+			                             Const(spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsWorkgroupMemoryMask)});
+		}
 		if (m_lii != 0) Emit(spv::OpStore, {m_lii, m_lane});
-		if (m_subgroup_lane != 0) Emit(spv::OpStore, {m_subgroup_lane, m_lane});
+		if (m_subgroup_lane != 0) Emit(spv::OpStore, {m_subgroup_lane, m_wave_lane});
 		if (m_lid == 0 && m_gid == 0) return;
 		const uint32_t local[3] = {
 		    U32(spv::OpUMod, {m_lane, Const(m_size[0])}),
@@ -1050,7 +1186,7 @@ private:
 		std::unordered_set<uint32_t> predicates;
 		if (IsBallotOp(m_insts[first].op)) predicates.insert(Word(m_insts[first], 1));
 		const auto block = m_block_of[first];
-		for (uint32_t j = first + 1; j <= m_blocks[block].end && group.size() < MaxBatch; j++) {
+		for (uint32_t j = first + 1; j <= m_blocks[block].end && group.size() < m_batch; j++) {
 			const auto& inst = m_insts[j];
 			if (!IsSubgroupOp(inst.op) || !NeedsExchange(inst) || !AvailableAt(inst, first)) continue;
 			if (IsBallotOp(inst.op) && !predicates.insert(Word(inst, 1)).second) continue;
@@ -1071,37 +1207,35 @@ private:
 			}
 		}
 		const auto slot = U32(spv::OpLoad, {m_slot});
-		const auto base = U32(spv::OpIMul, {slot, Const(SlotWords * MaxBatch)});
-		const auto at   = U32(spv::OpIAdd, {base, m_lane2});
-		const auto store = [&](uint32_t member, uint32_t word, uint32_t value) {
-			const auto index = U32(spv::OpIAdd, {at, Const(member * SlotWords + word)});
+		const auto base = U32(spv::OpIAdd, {m_wave_base, U32(spv::OpIMul, {slot, Const(WaveLanes * m_batch)})});
+		const auto at   = U32(spv::OpIAdd, {base, m_wave_lane});
+		const auto store = [&](uint32_t member, uint32_t value) {
+			const auto index = U32(spv::OpIAdd, {at, Const(member * WaveLanes)});
 			Emit(spv::OpStore, {Value(spv::OpAccessChain, m_ptr_wg_u32, {m_xchg, index}), value});
 		};
 		for (uint32_t member = 0; member < group.size(); member++) {
 			const auto& inst = m_insts[group[member]];
 			auto&       job  = m_jobs[group[member]];
-			store(member, 0, IsReduction(inst.op) ? job.mine2 : job.mine);
+			store(member, IsReduction(inst.op) ? job.mine2 : job.mine);
 		}
 		std::vector<uint32_t> sources;
 		for (const auto j: group) {
 			const auto& inst = m_insts[j];
-			sources.push_back(IsShuffleOp(inst.op)   ? U32(spv::OpShiftLeftLogical, {ShuffleLane(inst), Const(1)})
-			                  : IsReduction(inst.op) ? m_other2
-			                                         : 0);
+			sources.push_back(IsShuffleOp(inst.op) ? ShuffleLane(inst) : IsReduction(inst.op) ? m_other : 0);
 		}
 		EmitSharedBarrier();
-		const auto load = [&](uint32_t member, uint32_t source, uint32_t word) {
-			const auto index = U32(spv::OpIAdd, {U32(spv::OpIAdd, {base, source}), Const(member * SlotWords + word)});
+		const auto load = [&](uint32_t member, uint32_t source) {
+			const auto index = U32(spv::OpIAdd, {U32(spv::OpIAdd, {base, source}), Const(member * WaveLanes)});
 			return U32(spv::OpLoad, {Value(spv::OpAccessChain, m_ptr_wg_u32, {m_xchg, index})});
 		};
 		for (uint32_t member = 0; member < group.size(); member++) {
 			const auto& inst = m_insts[group[member]];
 			auto&       job  = m_jobs[group[member]];
 			if (IsBallotOp(inst.op)) {
-				m_ballots[Word(inst, 1)] = {load(member, Const(0), 0), load(member, Const(2 * 32), 0)};
+				m_ballots[Word(inst, 1)] = {load(member, Const(0)), load(member, Const(32))};
 				continue;
 			}
-			job.loaded.push_back(load(member, sources[member], 0));
+			job.loaded.push_back(load(member, sources[member]));
 		}
 		Emit(spv::OpStore, {m_slot, U32(spv::OpBitwiseXor, {slot, Const(1)})});
 	}
@@ -1176,7 +1310,7 @@ private:
 		};
 		const auto job = m_jobs.find(index);
 		switch (inst.op) {
-			case spv::OpGroupNonUniformElect: Emit(spv::OpIEqual, {inst.type, inst.result, m_lane, Const(0)}); break;
+			case spv::OpGroupNonUniformElect: Emit(spv::OpIEqual, {inst.type, inst.result, m_wave_lane, Const(0)}); break;
 			case spv::OpGroupNonUniformBallot: {
 				const auto [lo, hi] = BallotWords(Word(inst, 1));
 				Emit(spv::OpCompositeConstruct, {inst.type, inst.result, lo, hi, Const(0), Const(0)});
@@ -1246,6 +1380,17 @@ private:
 		}
 	}
 
+	uint32_t FindSyncFunctionType() const {
+		for (uint32_t i = 0; i < m_first_function; i++) {
+			const auto& inst = m_insts[i];
+			if (inst.op == spv::OpTypeFunction && Operands(inst) == 3u && Word(inst, 0) == m_void &&
+			    Word(inst, 1) == m_u32 && Word(inst, 2) == m_u32) {
+				return inst.result;
+			}
+		}
+		return 0;
+	}
+
 	uint32_t Scope(uint32_t id) { return m_const.contains(id) && m_const[id] == spv::ScopeSubgroup ? Const(spv::ScopeWorkgroup) : id; }
 
 	void Rewrite(std::vector<uint32_t>& out) {
@@ -1253,7 +1398,7 @@ private:
 		out.assign(m_in.begin(), m_in.begin() + 5);
 		m_scope        = Const(spv::ScopeSubgroup);
 		const auto arr = NewId();
-		Put(m_decls, spv::OpTypeArray, {arr, m_u32, Const(ExchangeWords)});
+		Put(m_decls, spv::OpTypeArray, {arr, m_u32, Const(m_waves * ExchangeWords())});
 		const auto ptr_arr = NewId();
 		Put(m_decls, spv::OpTypePointer, {ptr_arr, spv::StorageClassWorkgroup, arr});
 		m_ptr_wg_u32 = NewId();
@@ -1264,6 +1409,22 @@ private:
 		Put(m_decls, spv::OpTypePointer, {m_ptr_priv_u32, spv::StorageClassPrivate, m_u32});
 		m_slot = NewId();
 		Put(m_decls, spv::OpVariable, {m_ptr_priv_u32, m_slot, spv::StorageClassPrivate, Const(0)});
+		if (m_waves > 1) {
+			const auto sync_arr = NewId();
+			Put(m_decls, spv::OpTypeArray, {sync_arr, m_u32, Const(m_waves)});
+			const auto ptr_sync = NewId();
+			Put(m_decls, spv::OpTypePointer, {ptr_sync, spv::StorageClassWorkgroup, sync_arr});
+			m_sync = NewId();
+			Put(m_decls, spv::OpVariable, {ptr_sync, m_sync, spv::StorageClassWorkgroup});
+			m_epoch = NewId();
+			Put(m_decls, spv::OpVariable, {m_ptr_priv_u32, m_epoch, spv::StorageClassPrivate, Const(0)});
+			m_sync_fn_type = FindSyncFunctionType();
+			if (m_sync_fn_type == 0) {
+				m_sync_fn_type = NewId();
+				Put(m_decls, spv::OpTypeFunction, {m_sync_fn_type, m_void, m_u32, m_u32});
+			}
+			m_sync_fn = NewId();
+		}
 		std::vector<uint32_t> decorations;
 		std::vector<uint32_t> interface_ids;
 		uint32_t              first_global = m_memory_model + 1u;
@@ -1329,6 +1490,7 @@ private:
 		std::sort(globals.begin(), globals.end());
 		interface_ids = globals;
 		interface_ids.insert(interface_ids.end(), {m_xchg, m_slot, m_sid, m_real_lane});
+		if (m_waves > 1) interface_ids.insert(interface_ids.end(), {m_sync, m_epoch});
 		if (m_gid != 0 && m_wgid == 0) interface_ids.push_back(m_wgid_in);
 		bool need_glsl = m_glsl == 0;
 		if (need_glsl) m_glsl = NewId();
@@ -1368,7 +1530,7 @@ private:
 				continue;
 			}
 			if (i == m_local_size) {
-				Put(out, spv::OpExecutionMode, {m_entry, spv::ExecutionModeLocalSize, WaveLanes, 1, 1});
+				Put(out, spv::OpExecutionMode, {m_entry, spv::ExecutionModeLocalSize, m_threads, 1, 1});
 				continue;
 			}
 			if (inst.op == spv::OpDecorate && moved.contains(Word(inst, 0)) && Word(inst, 1) == spv::DecorationBuiltIn) {
@@ -1387,12 +1549,18 @@ private:
 				setup_due = false;
 			}
 			if (in_entry && inst.op == spv::OpLabel) m_ballots.clear();
-			if (m_barrier_before.contains(i)) EmitSharedBarrier();
+			if (m_barrier_before.contains(i) && m_dirty) EmitSharedBarrier();
 			if (const auto found = chain_type.find(i); found != chain_type.end()) {
 				out.insert(out.end(), src.begin(), src.end());
 				out[out.size() - inst.count + 1] = found->second;
 			} else if (in_entry && IsSubgroupOp(inst.op)) {
 				RewriteSubgroupOp(i);
+			} else if (inst.op == spv::OpControlBarrier && m_waves > 1 && ScopeOf(inst) == spv::ScopeSubgroup) {
+				const auto semantics = m_const.find(m_in[inst.first + 2]);
+				EmitHalvesSync(m_const.contains(m_in[inst.first + 1]) && m_const[m_in[inst.first + 1]] == spv::ScopeDevice
+				                   ? spv::ScopeDevice
+				                   : spv::ScopeWorkgroup,
+				               semantics == m_const.end() ? 0u : semantics->second);
 			} else if (inst.op == spv::OpControlBarrier) {
 				Put(out, spv::OpControlBarrier, {Scope(m_in[inst.first]), Scope(m_in[inst.first + 1]), m_in[inst.first + 2]});
 			} else if (inst.op == spv::OpMemoryBarrier) {
@@ -1400,9 +1568,11 @@ private:
 			} else {
 				out.insert(out.end(), src.begin(), src.end());
 			}
+			if (!Pure(inst.op)) m_dirty = true;
 			if (m_barrier_after.contains(i)) EmitSharedBarrier();
 			if (i == entry_block) setup_due = true;
 		}
+		if (m_waves > 1) EmitSyncFunction();
 		out.insert(out.begin() + static_cast<std::ptrdiff_t>(decl_at), m_decls.begin(), m_decls.end());
 		if (!decorations.empty()) {
 			const auto at = deco_at;
@@ -1413,6 +1583,11 @@ private:
 	}
 };
 
+}
+
+bool WaveSplitThreads(const uint32_t (&threads)[3]) {
+	const uint64_t total = uint64_t {std::max(threads[0], 1u)} * std::max(threads[1], 1u) * std::max(threads[2], 1u);
+	return total % WaveLanes == 0 && total <= MaxThreads;
 }
 
 bool SplitWaveAcrossSubgroups(std::vector<uint32_t>& module, std::string& refusal, const SplitHints* hints) {

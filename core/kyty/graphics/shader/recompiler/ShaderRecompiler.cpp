@@ -837,11 +837,9 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	     ir.shader_hash);
 	std::vector<uint32_t> spirv;
 	if (const auto* group = options.stage == ShaderType::Compute ? options.input_info.compute : nullptr;
-	    group != nullptr && options.profile->wave_split && !options.wave_lane_pairs && ir.wave_size == 64u &&
-	    group->host_subgroup_size == 32u && !ir.lane_local &&
-	    std::max(group->threads_num[0], 1u) * std::max(group->threads_num[1], 1u) *
-	            std::max(group->threads_num[2], 1u) ==
-	        64u) {
+	    group != nullptr && !options.wave_lane_pairs && ir.wave_size == 64u && group->host_subgroup_size == 32u &&
+	    !ir.lane_local && !(ir.info.uses_lds && (group->lds_storage || ir.info.function_lds)) &&
+	    Spirv::WaveSplitThreads(group->threads_num)) {
 		auto wide               = *group;
 		wide.host_subgroup_size = 64u;
 		auto wide_input         = options.input_info;
@@ -854,6 +852,11 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 			LOGF("ShaderRecompiler %s wave64 kept in lane pairs: hash=0x%016" PRIx64 " reason=%s\n", stage,
 			     ir.shader_hash, refusal.c_str());
 			spirv.clear();
+		} else {
+			LOGF("ShaderRecompiler %s wave64 split across subgroups: hash=0x%016" PRIx64 " threads=%u\n", stage,
+			     ir.shader_hash,
+			     std::max(group->threads_num[0], 1u) * std::max(group->threads_num[1], 1u) *
+			         std::max(group->threads_num[2], 1u));
 		}
 	}
 	if (spirv.empty()) {
