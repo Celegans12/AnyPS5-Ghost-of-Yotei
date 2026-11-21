@@ -60,14 +60,14 @@ constexpr size_t   MaxParkedImages  = 8;
 constexpr uint64_t ParkedImageTicks = 2048;
 constexpr uint64_t LazyReadbackBytes = 256 * 1024;
 constexpr uint64_t PartialDirtyMinSize = uint64_t {8} << 20;
+constexpr uint64_t PartialDirtyGranule = uint64_t {256} << 10;
+constexpr uint64_t PartialUploadMaxShare = 2;
+constexpr uint64_t PartialUploadChunk = uint64_t {64} << 20;
 
 void AddWrittenPages(RangeSet& written, uint64_t address, uint64_t size) {
 	const auto first = Common::AlignDown(address, TRACKER_PAGE_SIZE);
 	written.Add(first, Common::AlignUp(address + size, TRACKER_PAGE_SIZE) - first);
 }
-constexpr uint64_t PartialDirtyGranule = uint64_t {256} << 10;
-constexpr uint64_t PartialUploadMaxShare = 2;
-constexpr uint64_t PartialUploadChunk = uint64_t {64} << 20;
 
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
