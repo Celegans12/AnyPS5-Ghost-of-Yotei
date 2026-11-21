@@ -608,3 +608,15 @@ add_dependencies(kyty_shim_wave_split_written_reads_tests agc_frame_replay)
 add_test(NAME kyty_shim_wave_split_written_reads COMMAND kyty_shim_wave_split_written_reads_tests $<TARGET_FILE:agc_frame_replay>)
 set_tests_properties(kyty_shim_wave_split_written_reads PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
         PASS_REGULAR_EXPRESSION "kyty_shim_wave_split_written_reads: ok")
+
+add_test_executable(kyty_shim_wave_split_codegen_tests ${CMAKE_CURRENT_SOURCE_DIR}/WaveSplitCodegen.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+target_include_directories(kyty_shim_wave_split_codegen_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_include_directories(kyty_shim_wave_split_codegen_tests SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/3rdparty/SPIRV-Tools/include)
+configure_host_test_executable(kyty_shim_wave_split_codegen_tests)
+if(MINGW)
+    target_link_libraries(kyty_shim_wave_split_codegen_tests PRIVATE stdc++ gcc_eh)
+endif()
+target_link_libraries(kyty_shim_wave_split_codegen_tests PRIVATE Kyty::gpu libkernel libc)
+add_test(NAME kyty_shim_wave_split_codegen COMMAND kyty_shim_wave_split_codegen_tests)
+set_tests_properties(kyty_shim_wave_split_codegen PROPERTIES TIMEOUT 60
+        PASS_REGULAR_EXPRESSION "kyty_shim_wave_split_codegen: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
