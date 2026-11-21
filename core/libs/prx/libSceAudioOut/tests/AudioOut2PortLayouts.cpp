@@ -76,7 +76,7 @@ void TestUserAttributes() {
     Require(sceAudioOut2UserGetSupportedAttributes(first, invalidAttribute, &port.value) == static_cast<int>(0x80268001));
     Require(port.value == 0xFFFFFFFFu && errno == 73);
     Require(sceAudioOut2UserGetSupportedAttributes(first, &context.value, invalidAttribute) == static_cast<int>(0x80268001));
-    Require(context.value == 0 && errno == 73);
+    Require(context.value == 0xFFFFFFFFu && errno == 73);
     const auto rejects = [&](AudioOut2UserHandle handle, bool nullContext, bool nullPort) {
         context.value = port.value = 0xFFFFFFFFu;
         bool threw = false;
