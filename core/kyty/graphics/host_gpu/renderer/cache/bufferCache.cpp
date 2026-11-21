@@ -2602,8 +2602,22 @@ uint64_t BufferCache::InPlaceGpuWriteTick(uint64_t vaddr, uint64_t size) const {
 	return m_in_place->PendingGpuWrite(vaddr, size, m_scheduler.GetMasterSemaphore().KnownGpuTick());
 }
 
+uint64_t BufferCache::InPlaceGpuWriteBytesTick(uint64_t vaddr, uint64_t size) const {
+	if (!m_in_place) {
+		return 0;
+	}
+	return m_in_place->PendingGpuWriteBytes(vaddr, size, m_scheduler.GetMasterSemaphore().KnownGpuTick());
+}
+
+bool BufferCache::IsRegionTrackedGpuModified(uint64_t vaddr, uint64_t size) {
+	return m_memory_tracker.IsRegionGpuModified(vaddr, size);
+}
+
 void BufferCache::NoteInPlaceGpuWrite(uint64_t vaddr, uint64_t size) {
-	m_in_place->NoteGpuWrite(vaddr, size, m_scheduler.CurrentTick());
+	if (m_scheduler.HasPendingGuestOperations(vaddr, size)) {
+		InPlaceMemory::NoteGpuWriteOverPending();
+	}
+	m_in_place->NoteGpuWrite(vaddr, size, m_scheduler.CurrentTick(), m_scheduler.GetMasterSemaphore().KnownGpuTick());
 }
 
 void BufferCache::ServeInPlaceConversions() {
@@ -2723,9 +2737,10 @@ bool BufferCache::WriteAroundGpuWrites(uint64_t vaddr, const void* data, uint64_
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
-	if (InPlaceGpuWriteTick(vaddr, size) != 0) {
-		return true;
-	}
+	return InPlaceGpuWriteTick(vaddr, size) != 0 || HasTrackedGpuDirtyBytes(vaddr, size);
+}
+
+bool BufferCache::HasTrackedGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 	constexpr uint64_t PageSize = 4096;
 	const auto         page     = vaddr / PageSize;
 	if (!m_inflight_readbacks.empty() && size != 0 &&

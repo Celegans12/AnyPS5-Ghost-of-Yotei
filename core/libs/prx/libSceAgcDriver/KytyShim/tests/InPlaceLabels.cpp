@@ -1,0 +1,102 @@
+#include "graphics/guest_gpu/labelOrder.h"
+#include "graphics/host_gpu/renderer/cache/inPlaceMemory.h"
+
+#include <cstdint>
+#include <cstdio>
+
+namespace {
+
+using namespace Libs::Graphics;
+using LabelOrder::Facts;
+using LabelOrder::Reason;
+using LabelOrder::Route;
+
+int g_failures = 0;
+
+void Check(bool condition, const char* what) {
+	if (!condition) {
+		std::fprintf(stderr, "FAILED: %s\n", what);
+		++g_failures;
+	}
+}
+
+Facts FromBits(unsigned bits) {
+	return {.deferable      = (bits & 1u) != 0,
+	        .tracked_page   = (bits & 2u) != 0,
+	        .tracked_bytes  = (bits & 4u) != 0,
+	        .in_place_block = (bits & 8u) != 0,
+	        .in_place_bytes = (bits & 16u) != 0,
+	        .around_enabled = (bits & 32u) != 0,
+	        .backing        = (bits & 64u) != 0,
+	        .label_pending  = (bits & 128u) != 0};
+}
+
+bool Reference(const Facts& facts, bool* around) {
+	const bool gpu_page = facts.deferable && (facts.tracked_page || facts.in_place_block);
+	*around = gpu_page && facts.around_enabled && facts.label_pending && !(facts.in_place_block || facts.tracked_bytes) &&
+	          facts.backing;
+	return facts.deferable && (!gpu_page || *around);
+}
+
+void EveryDrainHasAReason() {
+	for (unsigned bits = 0; bits < 256; bits++) {
+		const auto facts = FromBits(bits);
+		if (facts.in_place_bytes && !facts.in_place_block) {
+			continue;
+		}
+		bool       around   = false;
+		const bool deferred = Reference(facts, &around);
+		const auto route    = LabelOrder::Current(facts);
+		Check((route != Route::Drain) == deferred, "current rule: the route differs from the rule of ExecuteReleaseMem");
+		Check((route == Route::DeferAround) == (deferred && around), "current rule: wrong kind of deferral");
+		Check((LabelOrder::DrainReason(facts) == Reason::Other) == deferred, "a drain without a reason, or a reason without a drain");
+	}
+	Check(LabelOrder::DrainReason({.deferable = true, .in_place_block = true}) == Reason::InPlaceBlock,
+	      "a label that only shares the block of an in-place write is not named so");
+	Check(LabelOrder::DrainReason({.deferable = true, .in_place_block = true, .in_place_bytes = true}) == Reason::InPlaceBytes,
+	      "a label under an in-place write is not named so");
+	Check(LabelOrder::DrainReason({.deferable = true, .tracked_page = true, .around_enabled = true, .backing = true}) ==
+	          Reason::NoLabelPending,
+	      "a label on a GPU-written page with no label pending is not named so");
+	Check(LabelOrder::DrainReason({.deferable = true, .tracked_page = true, .tracked_bytes = true, .in_place_block = true}) ==
+	          Reason::CacheBytes,
+	      "GPU-written bytes of the cache do not come before the block of an in-place write");
+}
+
+void WrittenBytesAreExact() {
+	constexpr uint64_t Base = 0x10000100;
+	InPlaceMemory      memory;
+	memory.NoteGpuWrite(Base, 0x40, 5, 0);
+	Check(memory.PendingGpuWrite(Base + 0x200, 8, 0) == 5, "the block of a pending write is not pending");
+	Check(memory.PendingGpuWriteBytes(Base + 0x200, 8, 0) == 0, "bytes next to a pending write count as written");
+	Check(memory.PendingGpuWriteBytes(Base + 0x3c, 8, 0) == 5, "bytes across the end of a pending write are missed");
+	Check(memory.PendingGpuWriteBytes(Base + 0x40, 8, 0) == 0, "the byte after a pending write counts as written");
+	Check(memory.PendingGpuWriteBytes(Base - 8, 8, 0) == 0, "the bytes before a pending write count as written");
+	Check(memory.PendingGpuWriteBytes(Base - 7, 8, 0) == 5, "bytes across the start of a pending write are missed");
+	Check(memory.PendingGpuWriteBytes(Base, 8, 4) == 5, "a write the GPU has not reached is forgotten");
+	memory.NoteGpuWrite(Base, 0x40, 7, 0);
+	memory.NoteGpuWrite(Base + 0x1000, 0x10, 6, 0);
+	Check(memory.PendingGpuWriteBytes(Base, 8, 5) == 7, "a newer write to the same bytes is missed");
+	Check(memory.PendingGpuWriteBytes(Base + 0x1000, 4, 5) == 6, "a second range is missed");
+	Check(memory.PendingGpuWriteBytes(Base + 0x1000, 4, 6) == 0, "a write the GPU finished still counts");
+	Check(memory.PendingGpuWriteBytes(Base, 8, 6) == 7, "a pending write is dropped with a finished one");
+	Check(memory.PendingGpuWriteBytes(Base, 8, 7) == 0 && memory.PendingGpuWrite(Base, 8, 7) == 0,
+	      "writes the GPU finished still count");
+	for (uint64_t i = 0; i < 1000; i++) {
+		memory.NoteGpuWrite(Base + i * 0x100, 0x10, 8 + i, 7 + i);
+	}
+	Check(memory.PendingGpuWriteBytes(Base + 999 * 0x100, 4, 1000) == 1007, "the newest of many writes is missed");
+	Check(memory.PendingGpuWriteBytes(Base + 998 * 0x100, 4, 1006) == 0, "an older finished write of many still counts");
+}
+
+}
+
+int main() {
+	EveryDrainHasAReason();
+	WrittenBytesAreExact();
+	if (g_failures != 0) {
+		return 1;
+	}
+	std::puts("kyty_shim_in_place_labels: ok");
+	return 0;
+}

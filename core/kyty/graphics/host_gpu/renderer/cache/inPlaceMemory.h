@@ -10,6 +10,7 @@
 #include <mutex>
 #include <optional>
 #include <unordered_map>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -42,8 +43,13 @@ public:
 	void                                  Register(uint64_t bytes, uint64_t pages) noexcept;
 	void                                  Unregister(uint64_t bytes, uint64_t pages) noexcept;
 
-	void                   NoteGpuWrite(uint64_t vaddr, uint64_t size, uint64_t tick);
+	void                   NoteGpuWrite(uint64_t vaddr, uint64_t size, uint64_t tick, uint64_t known = 0);
 	[[nodiscard]] uint64_t PendingGpuWrite(uint64_t vaddr, uint64_t size, uint64_t known) const;
+	[[nodiscard]] uint64_t PendingGpuWriteBytes(uint64_t vaddr, uint64_t size, uint64_t known) const;
+	static void            NoteGpuWriteOverPending() noexcept { s_writes_over_pending.fetch_add(1, std::memory_order_relaxed); }
+	[[nodiscard]] static uint64_t TakeGpuWritesOverPending() noexcept {
+		return s_writes_over_pending.exchange(0, std::memory_order_relaxed);
+	}
 	static void            NoteReadWait() noexcept { s_read_waits.fetch_add(1, std::memory_order_relaxed); }
 
 	void                   RequestConversion(uint64_t page) noexcept;
@@ -68,6 +74,12 @@ private:
 
 	enum class Refusal : uint8_t { None, Unbacked, GuestFile, Straddle, Chunk };
 
+	struct WrittenRange {
+		uint64_t begin = 0;
+		uint64_t end   = 0;
+		uint64_t tick  = 0;
+	};
+
 	bool    Initialize(GraphicContext& graphics);
 	Refusal Locate(GraphicContext& graphics, uint64_t vaddr, uint64_t size, uint64_t* offset, Chunk** chunk,
 	               uint64_t* chunk_begin, uint64_t* chunk_end);
@@ -89,6 +101,7 @@ private:
 	mutable std::mutex                       m_writes_mutex;
 	std::atomic<uint64_t>                    m_writes_max {0};
 	mutable std::unordered_map<uint64_t, uint64_t> m_writes;
+	mutable std::vector<WrittenRange>              m_written_ranges;
 
 	std::array<std::atomic<uint64_t>, Requests> m_requests {};
 	std::atomic<uint32_t>                       m_request_head {0};
@@ -110,6 +123,7 @@ private:
 	inline static std::atomic<uint64_t> s_pages_out {0};
 	inline static std::atomic<uint64_t> s_gpu_writes {0};
 	inline static std::atomic<uint64_t> s_read_waits {0};
+	inline static std::atomic<uint64_t> s_writes_over_pending {0};
 	inline static std::atomic<uint64_t> s_labels {0};
 	inline static std::atomic<uint64_t> s_bounded_flips {0};
 	inline static std::atomic<uint64_t> s_bounded_ns {0};

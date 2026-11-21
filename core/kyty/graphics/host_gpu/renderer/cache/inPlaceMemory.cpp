@@ -243,11 +243,20 @@ void InPlaceMemory::Unregister(uint64_t bytes, uint64_t pages) noexcept {
 	s_pages_out.fetch_add(pages, std::memory_order_relaxed);
 }
 
-void InPlaceMemory::NoteGpuWrite(uint64_t vaddr, uint64_t size, uint64_t tick) {
+void InPlaceMemory::NoteGpuWrite(uint64_t vaddr, uint64_t size, uint64_t tick, uint64_t known) {
 	if (size == 0) {
 		return;
 	}
 	std::lock_guard lock(m_writes_mutex);
+	const auto end = size > UINT64_MAX - vaddr ? UINT64_MAX : vaddr + size;
+	if (m_written_ranges.size() >= 256) {
+		std::erase_if(m_written_ranges, [known](const WrittenRange& range) { return range.tick <= known; });
+	}
+	if (!m_written_ranges.empty() && m_written_ranges.back().begin == vaddr && m_written_ranges.back().end == end) {
+		m_written_ranges.back().tick = std::max(m_written_ranges.back().tick, tick);
+	} else {
+		m_written_ranges.push_back({vaddr, end, tick});
+	}
 	for (auto block = vaddr >> BlockBits; block <= (vaddr + size - 1) >> BlockBits; ++block) {
 		auto& latest = m_writes[block];
 		latest       = std::max(latest, tick);
@@ -270,6 +279,22 @@ uint64_t InPlaceMemory::PendingGpuWrite(uint64_t vaddr, uint64_t size, uint64_t 
 	for (auto block = vaddr >> BlockBits; block <= (vaddr + size - 1) >> BlockBits; ++block) {
 		if (const auto it = m_writes.find(block); it != m_writes.end() && it->second > known) {
 			latest = std::max(latest, it->second);
+		}
+	}
+	return latest;
+}
+
+uint64_t InPlaceMemory::PendingGpuWriteBytes(uint64_t vaddr, uint64_t size, uint64_t known) const {
+	if (size == 0 || m_writes_max.load(std::memory_order_acquire) <= known) {
+		return 0;
+	}
+	const auto      end = size > UINT64_MAX - vaddr ? UINT64_MAX : vaddr + size;
+	std::lock_guard lock(m_writes_mutex);
+	std::erase_if(m_written_ranges, [known](const WrittenRange& range) { return range.tick <= known; });
+	uint64_t latest = 0;
+	for (const auto& range: m_written_ranges) {
+		if (range.begin < end && vaddr < range.end) {
+			latest = std::max(latest, range.tick);
 		}
 	}
 	return latest;

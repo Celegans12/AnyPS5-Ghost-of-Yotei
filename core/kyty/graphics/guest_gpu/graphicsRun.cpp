@@ -15,6 +15,7 @@
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/guest_gpu/labelOrder.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/guest_gpu/scout.h"
 #include "graphics/guest_gpu/psrShaders.h"
@@ -31,6 +32,7 @@
 #include "kernel/memory.h"
 #include "libs/errno.h"
 
+#include <fmt/ranges.h>
 #include <xxhash.h>
 
 #include <algorithm>
@@ -47,6 +49,7 @@
 #include <thread>
 #include <utility>
 #include <type_traits>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -2780,13 +2783,45 @@ bool CommandProcessor::LabelsAfterDumps() {
 }
 
 namespace {
+constexpr size_t LabelWaitBuckets = 8;
+constexpr std::array<uint64_t, LabelWaitBuckets - 1> LabelWaitLimitsNs {100'000,   250'000,   500'000,  1'000'000,
+                                                                       2'000'000, 4'000'000, 8'000'000};
+
 struct LabelOrderStats {
 	std::atomic<uint64_t> around {0};
 	std::atomic<uint64_t> drains {0};
 	std::atomic<uint64_t> drain_ns {0};
 	std::atomic<int64_t>  last_line {0};
+	std::atomic<uint64_t> deferred {0};
+	std::atomic<uint64_t> immediate {0};
+	std::atomic<uint64_t> covered {0};
+	std::atomic<uint64_t> block_only {0};
+	std::array<std::atomic<uint64_t>, LabelOrder::ReasonCount> reasons {};
+	std::array<std::atomic<uint64_t>, LabelWaitBuckets>        waits {};
+	std::array<std::atomic<uint64_t>, LabelWaitBuckets>        wait_ns {};
+	std::mutex                                                 addresses_mutex;
+	std::unordered_set<uint64_t>                               addresses;
 };
 LabelOrderStats g_label_stats;
+
+void NoteLabelAddress(uint64_t address) {
+	std::lock_guard lock(g_label_stats.addresses_mutex);
+	g_label_stats.addresses.insert(address);
+}
+
+void NoteLabelDrain(const LabelOrder::Facts& facts, uint64_t waited_ns) {
+	auto& stats = g_label_stats;
+	stats.reasons[static_cast<size_t>(LabelOrder::DrainReason(facts))].fetch_add(1, std::memory_order_relaxed);
+	if (facts.in_place_bytes) {
+		stats.covered.fetch_add(1, std::memory_order_relaxed);
+	} else if (facts.in_place_block) {
+		stats.block_only.fetch_add(1, std::memory_order_relaxed);
+	}
+	const auto bucket = static_cast<size_t>(
+	    std::upper_bound(LabelWaitLimitsNs.begin(), LabelWaitLimitsNs.end(), waited_ns) - LabelWaitLimitsNs.begin());
+	stats.waits[bucket].fetch_add(1, std::memory_order_relaxed);
+	stats.wait_ns[bucket].fetch_add(waited_ns, std::memory_order_relaxed);
+}
 
 int64_t LabelClockNs() {
 	return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -2806,9 +2841,31 @@ void CommandProcessor::LogLabelSummary() {
 	if (now - last < 10'000'000'000 || !stats.last_line.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
 		return;
 	}
-	const auto around   = stats.around.exchange(0, std::memory_order_relaxed);
-	const auto drains   = stats.drains.exchange(0, std::memory_order_relaxed);
-	const auto drain_ns = stats.drain_ns.exchange(0, std::memory_order_relaxed);
+	const auto take      = [](std::atomic<uint64_t>& value) { return value.exchange(0, std::memory_order_relaxed); };
+	const auto around    = take(stats.around);
+	const auto drains    = take(stats.drains);
+	const auto drain_ns  = take(stats.drain_ns);
+	const auto deferred  = take(stats.deferred);
+	const auto immediate = take(stats.immediate);
+	const auto covered   = take(stats.covered);
+	const auto block     = take(stats.block_only);
+	const auto over      = InPlaceMemory::TakeGpuWritesOverPending();
+	std::array<uint64_t, LabelOrder::ReasonCount> reasons {};
+	std::array<uint64_t, LabelWaitBuckets>        waits {};
+	std::array<double, LabelWaitBuckets>          wait_ms {};
+	for (size_t i = 0; i < reasons.size(); i++) {
+		reasons[i] = take(stats.reasons[i]);
+	}
+	for (size_t i = 0; i < waits.size(); i++) {
+		waits[i]   = take(stats.waits[i]);
+		wait_ms[i] = static_cast<double>(take(stats.wait_ns[i])) / 1e6;
+	}
+	size_t addresses = 0;
+	{
+		std::lock_guard lock(stats.addresses_mutex);
+		addresses = stats.addresses.size();
+		stats.addresses.clear();
+	}
 	if (around + drains == 0) {
 		return;
 	}
@@ -2816,6 +2873,21 @@ void CommandProcessor::LogLabelSummary() {
 	    "[kyty-labels] summary of the last {:.0f} s: {} RELEASE_MEM labels on a page the GPU wrote elsewhere deferred "
 	    "behind the pending labels; the execute thread drained the GPU {} times to keep a label in order ({:.3f} s)\n",
 	    static_cast<double>(now - last) / 1e9, around, drains, static_cast<double>(drain_ns) / 1e9));
+	const auto reason = [&reasons](LabelOrder::Reason id) { return reasons[static_cast<size_t>(id)]; };
+	::Log::WriteToConsoleAndLog(fmt::format(
+	    "[kyty-label-drains] summary of the last {:.0f} s: {} RELEASE_MEM labels at {} addresses: {} deferred to the end "
+	    "of a tick, {} written at once, {} written after a drain; drained because: {} not deferable, {} own bytes under an "
+	    "in-place GPU write in flight, {} own bytes GPU-written in the cache, {} around writes off, {} no backing view, {} "
+	    "only the 64 KiB block under an in-place GPU write in flight, {} on a GPU-written page with no label pending, {} "
+	    "other; of the drained labels {} lie under an in-place GPU write in flight and {} only share its block; drain "
+	    "waits under 0.1/0.25/0.5/1/2/4/8 ms and above: {} ({:.1f} ms, in the same order {:.1f}); {} in-place GPU writes "
+	    "noted over a pending completion write\n",
+	    static_cast<double>(now - last) / 1e9, deferred + immediate + drains, addresses, deferred, immediate, drains,
+	    reason(LabelOrder::Reason::NotDeferable), reason(LabelOrder::Reason::InPlaceBytes),
+	    reason(LabelOrder::Reason::CacheBytes), reason(LabelOrder::Reason::AroundOff),
+	    reason(LabelOrder::Reason::NoBacking), reason(LabelOrder::Reason::InPlaceBlock),
+	    reason(LabelOrder::Reason::NoLabelPending), reason(LabelOrder::Reason::Other), covered, block,
+	    fmt::join(waits, "/"), static_cast<double>(drain_ns) / 1e6, fmt::join(wait_ms, "/"), over));
 }
 
 bool CommandProcessor::LabelsAroundGpuWrites() {
@@ -2855,6 +2927,9 @@ void CommandProcessor::ExecuteReleaseMem(uint32_t data_sel, bool interrupt, void
 	const auto labels_pending = [this] { return m_deferred_labels.load(std::memory_order_acquire); };
 #endif
 	const bool at_completion = InPlaceMemory::Live();
+#if defined(ANYPS5_KYTY)
+	bool drained = false;
+#endif
 	if (data_sel != 0 &&
 	    (at_completion || m_renderer.GetOcclusionQueries().HasPendingDumps() || labels_pending() != 0)) {
 		const auto     vaddr = reinterpret_cast<uint64_t>(address);
@@ -2881,6 +2956,10 @@ void CommandProcessor::ExecuteReleaseMem(uint32_t data_sel, bool interrupt, void
 			if (at_completion) {
 				InPlaceMemory::NoteLabelAtCompletion();
 			}
+#if defined(ANYPS5_KYTY)
+			g_label_stats.deferred.fetch_add(1, std::memory_order_relaxed);
+			NoteLabelAddress(vaddr);
+#endif
 			m_deferred_labels.fetch_add(1, std::memory_order_relaxed);
 #if defined(ANYPS5_KYTY)
 			s_deferred_labels.fetch_add(1, std::memory_order_relaxed);
@@ -2918,16 +2997,36 @@ void CommandProcessor::ExecuteReleaseMem(uint32_t data_sel, bool interrupt, void
 			auto&      scheduler = GetScheduler();
 			const auto tick      = scheduler.CurrentTick();
 #if defined(ANYPS5_KYTY)
+			LabelOrder::Facts facts {.deferable = deferable};
+			if (deferable) {
+				facts.tracked_page   = buffers.IsRegionTrackedGpuModified(vaddr, size);
+				facts.tracked_bytes  = buffers.HasTrackedGpuDirtyBytes(vaddr, size);
+				facts.in_place_block = buffers.InPlaceGpuWriteTick(vaddr, size) != 0;
+				facts.in_place_bytes = facts.in_place_block && buffers.InPlaceGpuWriteBytesTick(vaddr, size) != 0;
+				facts.around_enabled = m_labels_around_gpu_writes;
+				facts.backing        = LibKernel::Memory::FindBackingPointer(vaddr, size) != nullptr;
+				facts.label_pending  = labels_pending() != 0;
+			}
 			const auto started = LabelClockNs();
 #endif
 			scheduler.Wait(tick);
 			scheduler.WaitPriorityOperations(tick);
 #if defined(ANYPS5_KYTY)
+			const auto waited = static_cast<uint64_t>(LabelClockNs() - started);
 			g_label_stats.drains.fetch_add(1, std::memory_order_relaxed);
-			g_label_stats.drain_ns.fetch_add(static_cast<uint64_t>(LabelClockNs() - started), std::memory_order_relaxed);
+			g_label_stats.drain_ns.fetch_add(waited, std::memory_order_relaxed);
+			NoteLabelDrain(facts, waited);
+			NoteLabelAddress(vaddr);
+			drained = true;
 #endif
 		}
 	}
+#if defined(ANYPS5_KYTY)
+	if (data_sel != 0 && data_sel != 5 && !drained) {
+		g_label_stats.immediate.fetch_add(1, std::memory_order_relaxed);
+		NoteLabelAddress(reinterpret_cast<uint64_t>(address));
+	}
+#endif
 	switch (data_sel) {
 		case 0: break;
 		case 1: {

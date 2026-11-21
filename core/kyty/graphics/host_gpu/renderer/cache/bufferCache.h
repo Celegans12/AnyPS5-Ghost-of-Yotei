@@ -100,6 +100,7 @@ public:
 	[[nodiscard]] static bool CommandMemoryInPlaceRequested() noexcept { return InPlaceMemory::Requested(); }
 	[[nodiscard]] bool        ServesInPlace(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] uint64_t    InPlaceGpuWriteTick(uint64_t vaddr, uint64_t size) const;
+	[[nodiscard]] uint64_t    InPlaceGpuWriteBytesTick(uint64_t vaddr, uint64_t size) const;
 	void                      NoteInPlaceGpuWrite(uint64_t vaddr, uint64_t size);
 	void                      ServeInPlaceConversions();
 	void NoteCommandBuffer(uint64_t vaddr, uint64_t size) {
@@ -168,6 +169,8 @@ public:
 	void ScheduleCopyFeedback(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool HasTrackedGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool IsRegionTrackedGpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool NeverGpuWritten(uint64_t vaddr, uint64_t size) const noexcept;
 	[[nodiscard]] bool NoGpuBytesNow(uint64_t vaddr, uint64_t size) const noexcept;
 	static void NoteReplayedRead();
