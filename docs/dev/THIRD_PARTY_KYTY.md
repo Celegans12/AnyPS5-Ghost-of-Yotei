@@ -65,6 +65,7 @@ be second declarations of AnyPS5 exports for `core/libs/tests/test_public_header
   | `222d8301` | #1405 | a lone last dword of a command buffer is consumed |
   | `7ee598b4`, `f26b1d7e` | #1403 | a compute dispatch's scalar reads may overlap the start of its own sentinel write range (`FindBuffers`); `a9d34f70`'s `CommitBindings` check is not in the imported revision |
   | `d6ad3c2b` | #1802 | a buffer allocation refused by VMA's budget is retried once without the budget limit |
+  | `046bf882` | — | `swapchain.cpp` only: a flip copies layer 0 of the cached image that holds the surface |
 
   `Presenter::PrepareFrame` takes the VideoOut pixel format since `50c0c066`: the shim passes the display buffer's
   `pixelFormat`.
