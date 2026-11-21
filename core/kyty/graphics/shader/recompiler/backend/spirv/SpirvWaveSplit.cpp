@@ -154,6 +154,7 @@ private:
 	std::vector<uint32_t>                  m_shared_writes;
 	std::unordered_set<uint32_t>           m_barrier_before;
 	std::unordered_set<uint32_t>           m_barrier_after;
+	std::unordered_set<uint32_t>           m_last_lane_stores;
 
 	uint32_t m_bound          = 0;
 	uint32_t m_u32            = 0;
@@ -522,14 +523,25 @@ private:
 
 	uint32_t ExchangeWords() const { return 2u * m_batch * WaveLanes; }
 
+	bool LaneIndexLoad(uint32_t id) const {
+		if (id >= m_bound || m_def[id] == None) return false;
+		const auto& load = m_insts[m_def[id]];
+		if (load.op != spv::OpLoad) return false;
+		const auto pointer = Word(load, 0);
+		if (m_lii != 0 && pointer == m_lii) return true;
+		if (pointer >= m_bound || m_def[pointer] == None || m_size[0] % WaveLanes != 0) return false;
+		const auto& chain = m_insts[m_def[pointer]];
+		if ((chain.op != spv::OpAccessChain && chain.op != spv::OpInBoundsAccessChain) || Operands(chain) != 2) return false;
+		const auto variable = Word(chain, 0);
+		const auto axis     = m_const.find(Word(chain, 1));
+		return (variable == m_lid || variable == m_gid) && variable != 0 && axis != m_const.end() && axis->second == 0;
+	}
+
 	bool WaveIndexOfLane(const Inst& inst) const {
-		if (m_lii == 0 || (inst.op != spv::OpUDiv && inst.op != spv::OpShiftRightLogical) || Operands(inst) != 2) {
+		if ((inst.op != spv::OpUDiv && inst.op != spv::OpShiftRightLogical) || Operands(inst) != 2) {
 			return false;
 		}
-		const auto source = Word(inst, 0);
-		if (source >= m_bound || m_def[source] == None) return false;
-		const auto& load = m_insts[m_def[source]];
-		if (load.op != spv::OpLoad || Word(load, 0) != m_lii) return false;
+		if (!LaneIndexLoad(Word(inst, 0))) return false;
 		const auto divisor = m_const.find(Word(inst, 1));
 		if (divisor == m_const.end()) return false;
 		return inst.op == spv::OpUDiv ? divisor->second != 0 && divisor->second % WaveLanes == 0
@@ -889,6 +901,11 @@ private:
 			if (m_block_div[b] == 0) {
 				m_barrier_before.insert(i);
 				m_barrier_after.insert(i);
+				const auto& store = m_insts[i];
+				if (store.op == spv::OpStore && !Div(Word(store, 0)) && Div(Word(store, 1)) &&
+				    m_bit32_types.contains(ValueType(Word(store, 1)))) {
+					m_last_lane_stores.insert(i);
+				}
 				continue;
 			}
 			if (owner[b] == None) {
@@ -1248,6 +1265,21 @@ private:
 		return {all, all};
 	}
 
+	void EmitLastLaneStore(const Inst& store) {
+		const auto type  = ValueType(Word(store, 1));
+		const auto slot  = U32(spv::OpLoad, {m_slot});
+		const auto base  = U32(spv::OpIAdd, {m_wave_base, U32(spv::OpIMul, {slot, Const(WaveLanes * m_batch)})});
+		const auto entry = [&](uint32_t lane) { return Value(spv::OpAccessChain, m_ptr_wg_u32, {m_xchg, U32(spv::OpIAdd, {base, lane})}); };
+		Emit(spv::OpStore, {entry(m_wave_lane), ToWord(type, Word(store, 1))});
+		EmitSharedBarrier();
+		const auto last = FromWord(type, U32(spv::OpLoad, {entry(Const(WaveLanes - 1u))}));
+		Emit(spv::OpStore, {m_slot, U32(spv::OpBitwiseXor, {slot, Const(1)})});
+		m_out->push_back(static_cast<uint32_t>(store.count << spv::WordCountShift) | spv::OpStore);
+		m_out->push_back(Word(store, 0));
+		m_out->push_back(last);
+		for (uint32_t k = 2; k < Operands(store); k++) m_out->push_back(Word(store, k));
+	}
+
 	uint32_t ToWord(uint32_t type, uint32_t value) {
 		if (type == m_u32) return value;
 		if (type == m_bool) return U32(spv::OpSelect, {value, Const(1), Const(0)});
@@ -1549,10 +1581,12 @@ private:
 				setup_due = false;
 			}
 			if (in_entry && inst.op == spv::OpLabel) m_ballots.clear();
-			if (m_barrier_before.contains(i) && m_dirty) EmitSharedBarrier();
+			if (m_barrier_before.contains(i) && m_dirty && !m_last_lane_stores.contains(i)) EmitSharedBarrier();
 			if (const auto found = chain_type.find(i); found != chain_type.end()) {
 				out.insert(out.end(), src.begin(), src.end());
 				out[out.size() - inst.count + 1] = found->second;
+			} else if (m_last_lane_stores.contains(i)) {
+				EmitLastLaneStore(inst);
 			} else if (in_entry && IsSubgroupOp(inst.op)) {
 				RewriteSubgroupOp(i);
 			} else if (inst.op == spv::OpControlBarrier && m_waves > 1 && ScopeOf(inst) == spv::ScopeSubgroup) {

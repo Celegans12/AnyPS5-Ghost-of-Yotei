@@ -116,6 +116,11 @@ constexpr std::array<std::uint32_t, 40> WaveBranchCode{
     0x34020084u, 0xe0701000u, 0x80010401u, 0xe0701004u, 0x80010501u, 0xe0701008u, 0x80010801u, 0xbf810000u,
 };
 
+constexpr std::array<std::uint32_t, 14> SameAddressCode{
+    0xd5430003u, 0x021d0700u, 0x2c020086u, 0x34020282u, 0xd8340000u, 0x00000301u, 0xbf8cc07fu, 0xd8d80000u,
+    0x04000001u, 0xbf8cc07fu, 0x34040084u, 0xe0701000u, 0x80010402u, 0xbf810000u,
+};
+
 using Words = std::span<const std::uint32_t>;
 using Check = std::function<std::string(Words)>;
 
@@ -495,6 +500,26 @@ std::string checkWaveBranch(Words output) {
     return {};
 }
 
+std::string checkSameAddress(Words output, std::uint32_t threads) {
+    for (std::uint32_t thread = 0; thread < threads; ++thread) {
+        const auto last = (thread / 64u) * 64u + 63u;
+        if (auto failure = compare(output, thread, 4, 0, 3u * last + 7u,
+                                   "DS_READ_B32 of the word every lane of the wave wrote with DS_WRITE_B32: lane 63 wins");
+            !failure.empty()) {
+            return failure;
+        }
+    }
+    return {};
+}
+
+std::string checkSameAddress64(Words output) {
+    return checkSameAddress(output, 64);
+}
+
+std::string checkSameAddress256(Words output) {
+    return checkSameAddress(output, 256);
+}
+
 const std::array Cases{
     Case{"lanes", LanesCode, 64, 0, 32, checkLanes},
     Case{"reduce", ReduceCode, 1024, 0, 16, checkReduce},
@@ -503,6 +528,8 @@ const std::array Cases{
     Case{"sdwa", SdwaCode, 64, 0, 16, checkSdwa},
     Case{"mask-scalar", MaskScalarCode, 64, 0, 16, checkMaskScalar},
     Case{"wave-branch", WaveBranchCode, 256, 1024, 4, checkWaveBranch},
+    Case{"same-address", SameAddressCode, 64, 512, 4, checkSameAddress64},
+    Case{"same-address-waves", SameAddressCode, 256, 512, 4, checkSameAddress256},
 };
 
 }
