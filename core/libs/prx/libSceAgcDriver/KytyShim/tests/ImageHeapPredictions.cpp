@@ -7,10 +7,20 @@
 #include <thread>
 #include <vector>
 
+namespace Libs::Graphics {
+
+struct ImageHeapPredictionsTestAccess {
+	static bool Hold(ImageHeapPredictions& predictions) KYTY_NO_THREAD_SAFETY_ANALYSIS { return predictions.m_lock.try_lock(); }
+	static void Release(ImageHeapPredictions& predictions) KYTY_NO_THREAD_SAFETY_ANALYSIS { predictions.m_lock.unlock(); }
+};
+
+}
+
 namespace {
 
 namespace IR = Libs::Graphics::ShaderRecompiler::IR;
 using Libs::Graphics::ImageHeapPredictions;
+using Libs::Graphics::ImageHeapPredictionsTestAccess;
 
 int g_failures = 0;
 
@@ -88,6 +98,36 @@ void Tables() {
 	      "a table Execute could not take is predicted as not taken");
 }
 
+void NeverWaits() {
+	ImageHeapPredictions predictions;
+	const auto           root   = Root(1u);
+	const auto           values = Kinds(9u, 2u);
+	const int            owner  = 0;
+	const IR::ImageHeapList list {.owner = &owner, .resource = 0u, .root = &root, .values = values};
+	IR::ImageHeapRequest request {.base = 0x400000u, .size = 0x200u, .step = 32u, .count = 16u, .root = &root, .table = true};
+	const auto           first  = Kinds(1u, 2u);
+	const auto           second = Kinds(2u, 3u);
+	predictions.PublishTable(request, true, {.slots = 0x1000u, .slot_count = 17u, .kinds = first});
+	predictions.PublishList(list, true, {.slots = 0x1000u, .slot_count = 3u, .kinds = first});
+	Check(ImageHeapPredictionsTestAccess::Hold(predictions), "the test holds the predictions as the other thread would");
+	predictions.PublishTable(request, true, {.slots = 0x2000u, .slot_count = 17u, .kinds = second});
+	predictions.PublishList(list, true, {.slots = 0x2000u, .slot_count = 3u, .kinds = second});
+	IR::ImageHeapPrediction prediction;
+	Check(!predictions.PredictTable(request, prediction), "a table prediction made while the other thread holds them is refused");
+	Check(!predictions.PredictList(list, prediction), "a list prediction made while the other thread holds them is refused");
+	ImageHeapPredictionsTestAccess::Release(predictions);
+	Check(predictions.PredictTable(request, prediction) && prediction.slots == 0x1000u && prediction.kinds == first,
+	      "a table publication made while the other thread held the predictions is dropped, not waited for");
+	Check(predictions.PredictList(list, prediction) && prediction.slots == 0x1000u && prediction.kinds == first,
+	      "a list publication made while the other thread held the predictions is dropped, not waited for");
+	predictions.PublishTable(request, true, {.slots = 0x2000u, .slot_count = 17u, .kinds = second});
+	predictions.PublishList(list, true, {.slots = 0x2000u, .slot_count = 3u, .kinds = second});
+	Check(predictions.PredictTable(request, prediction) && prediction.slots == 0x2000u && prediction.kinds == second,
+	      "the next table publication lands");
+	Check(predictions.PredictList(list, prediction) && prediction.slots == 0x2000u && prediction.kinds == second,
+	      "the next list publication lands");
+}
+
 void Concurrent() {
 	ImageHeapPredictions predictions;
 	const auto           root   = Root(1u);
@@ -134,6 +174,7 @@ void Concurrent() {
 int main() {
 	Lists();
 	Tables();
+	NeverWaits();
 	Concurrent();
 	if (g_failures != 0) {
 		std::fprintf(stderr, "kyty_shim_image_heap_predictions: %d failures\n", g_failures);

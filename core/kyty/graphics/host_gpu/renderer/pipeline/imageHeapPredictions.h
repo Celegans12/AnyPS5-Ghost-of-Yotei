@@ -13,6 +13,8 @@
 
 namespace Libs::Graphics {
 
+struct ImageHeapPredictionsTestAccess;
+
 class ImageHeapPredictions final {
 public:
 	using Request    = ShaderRecompiler::IR::ImageHeapRequest;
@@ -22,44 +24,49 @@ public:
 
 	void PublishTable(const Request& request, bool acquired, const View& view) {
 		if (request.root == nullptr) return;
-		Common::ScopedLock lock {m_lock};
-		auto&              published = m_tables[KeyOf(request)];
+		if (!m_lock.try_lock()) return;
+		auto& published = m_tables[KeyOf(request)];
 		if (!(published.root == *request.root)) published.root = *request.root;
 		Publish(published.prediction, acquired, view);
+		m_lock.unlock();
 	}
 
 	void PublishList(const List& list, bool acquired, const View& view) {
-		Common::ScopedLock lock {m_lock};
+		if (!m_lock.try_lock()) return;
 		Publish(m_lists[{list.owner, list.resource}], acquired, view);
+		m_lock.unlock();
 	}
 
 	[[nodiscard]] bool PredictTable(const Request& request, Prediction& prediction) {
 		if (request.root == nullptr) return false;
-		Common::ScopedLock lock {m_lock};
-		const auto         found = m_tables.find(KeyOf(request));
-		if (found == m_tables.end() || !(found->second.root == *request.root)) return false;
-		prediction = found->second.prediction;
-		return true;
+		if (!m_lock.try_lock()) return false;
+		const auto found = m_tables.find(KeyOf(request));
+		const bool known = found != m_tables.end() && found->second.root == *request.root;
+		if (known) prediction = found->second.prediction;
+		m_lock.unlock();
+		return known;
 	}
 
 	[[nodiscard]] bool PredictList(const List& list, Prediction& prediction) {
 		if (list.root == nullptr) return false;
-		Common::ScopedLock lock {m_lock};
-		const auto         found = m_lists.find({list.owner, list.resource});
-		if (found == m_lists.end() || !found->second.acquired) return false;
-		prediction            = found->second;
-		prediction.slot_count = static_cast<uint32_t>(list.values.size() + 1u);
-		return true;
+		if (!m_lock.try_lock()) return false;
+		const auto found = m_lists.find({list.owner, list.resource});
+		const bool known = found != m_lists.end() && found->second.acquired;
+		if (known) {
+			prediction            = found->second;
+			prediction.slot_count = static_cast<uint32_t>(list.values.size() + 1u);
+		}
+		m_lock.unlock();
+		return known;
 	}
 
 private:
-	class KYTY_CAPABILITY("spin lock") SpinLock {
+	friend struct ImageHeapPredictionsTestAccess;
+
+	class KYTY_CAPABILITY("try lock") TryLock {
 	public:
-		void lock() noexcept KYTY_ACQUIRE() KYTY_NO_THREAD_SAFETY_ANALYSIS {
-			while (m_flag.test_and_set(std::memory_order_acquire)) {
-				while (m_flag.test(std::memory_order_relaxed)) {
-				}
-			}
+		[[nodiscard]] bool try_lock() noexcept KYTY_TRY_ACQUIRE(true) KYTY_NO_THREAD_SAFETY_ANALYSIS {
+			return !m_flag.test(std::memory_order_relaxed) && !m_flag.test_and_set(std::memory_order_acquire);
 		}
 		void unlock() noexcept KYTY_RELEASE() KYTY_NO_THREAD_SAFETY_ANALYSIS { m_flag.clear(std::memory_order_release); }
 
@@ -118,7 +125,7 @@ private:
 		}
 	}
 
-	SpinLock                                                   m_lock;
+	TryLock                                                    m_lock;
 	std::unordered_map<TableKey, PublishedTable, TableKeyHash> m_tables KYTY_GUARDED_BY(m_lock);
 	std::unordered_map<ListKey, Prediction, ListKeyHash>       m_lists KYTY_GUARDED_BY(m_lock);
 };
