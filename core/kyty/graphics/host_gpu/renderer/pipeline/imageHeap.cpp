@@ -136,51 +136,24 @@ ImageHeap::~ImageHeap() {
 	graphics.device.destroyDescriptorSetLayout(m_layout, nullptr);
 }
 
-void ImageHeap::Publish(IR::ImageHeapPrediction& published, bool acquired, const IR::ImageHeapView& result) {
-	published.acquired   = acquired;
-	published.slots      = acquired ? result.slots : 0;
-	published.slot_count = acquired ? result.slot_count : 0;
-	if (!acquired) {
-		published.kinds.clear();
-	} else if (!std::ranges::equal(published.kinds, result.kinds)) {
-		published.kinds.assign(result.kinds.begin(), result.kinds.end());
-	}
-}
-
 bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& result) {
 	const bool acquired = AcquireNow(request, result);
-	if (request.root == nullptr) return acquired;
-	std::scoped_lock lock {m_published_lock};
-	auto&            published = m_published_tables[KeyOf(request)];
-	if (!(published.root == *request.root)) published.root = *request.root;
-	Publish(published.prediction, acquired, result);
+	m_predictions.PublishTable(request, acquired, result);
 	return acquired;
 }
 
 bool ImageHeap::AcquireList(const IR::ImageHeapList& list, IR::ImageHeapView& result) {
-	const bool       acquired = AcquireListNow(list, result);
-	std::scoped_lock lock {m_published_lock};
-	Publish(m_published_lists[{list.owner, list.resource}], acquired, result);
+	const bool acquired = AcquireListNow(list, result);
+	m_predictions.PublishList(list, acquired, result);
 	return acquired;
 }
 
 bool ImageHeap::Predict(const IR::ImageHeapRequest& request, IR::ImageHeapPrediction& prediction) {
-	if (request.root == nullptr) return false;
-	std::scoped_lock lock {m_published_lock};
-	const auto       found = m_published_tables.find(KeyOf(request));
-	if (found == m_published_tables.end() || !(found->second.root == *request.root)) return false;
-	prediction = found->second.prediction;
-	return true;
+	return m_predictions.PredictTable(request, prediction);
 }
 
 bool ImageHeap::PredictList(const IR::ImageHeapList& list, IR::ImageHeapPrediction& prediction) {
-	if (list.root == nullptr) return false;
-	std::scoped_lock lock {m_published_lock};
-	const auto       found = m_published_lists.find({list.owner, list.resource});
-	if (found == m_published_lists.end() || !found->second.acquired) return false;
-	prediction            = found->second;
-	prediction.slot_count = static_cast<uint32_t>(list.values.size() + 1u);
-	return true;
+	return m_predictions.PredictList(list, prediction);
 }
 
 bool ImageHeap::AcquireNow(const IR::ImageHeapRequest& request, IR::ImageHeapView& result) {

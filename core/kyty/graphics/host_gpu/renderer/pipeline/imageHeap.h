@@ -3,9 +3,9 @@
 
 #include "common/common.h"
 #include "graphics/host_gpu/renderer/image/image.h"
+#include "graphics/host_gpu/renderer/pipeline/imageHeapPredictions.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
-#include <atomic>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -70,41 +70,10 @@ private:
 		}
 	};
 
-	struct TableKey {
-		uint64_t base  = 0;
-		uint64_t size  = 0;
-		uint64_t step  = 0;
-		uint64_t first = 0;
-		uint64_t count = 0;
-		bool     table = false;
-		bool     operator==(const TableKey&) const = default;
-	};
-	struct TableKeyHash {
-		size_t operator()(const TableKey& key) const noexcept {
-			return std::hash<uint64_t> {}(key.base ^ (key.first * 0x9e3779b97f4a7c15ull) ^ (key.step << 17u) ^
-			                              (key.size << 29u) ^ key.count) ^
-			       size_t {key.table};
-		}
-	};
-	struct PublishedTable {
-		ShaderRecompiler::IR::ImageResource       root;
-		ShaderRecompiler::IR::ImageHeapPrediction prediction;
-	};
-	[[nodiscard]] static TableKey KeyOf(const ShaderRecompiler::IR::ImageHeapRequest& request) {
-		return {.base  = request.base,
-		        .size  = request.size,
-		        .step  = request.step,
-		        .first = request.first,
-		        .count = request.count,
-		        .table = request.table};
-	}
-
 	bool AcquireNow(const ShaderRecompiler::IR::ImageHeapRequest& request,
 	                ShaderRecompiler::IR::ImageHeapView&          result);
 	bool AcquireListNow(const ShaderRecompiler::IR::ImageHeapList& list,
 	                    ShaderRecompiler::IR::ImageHeapView&       result);
-	static void Publish(ShaderRecompiler::IR::ImageHeapPrediction& published, bool acquired,
-	                    const ShaderRecompiler::IR::ImageHeapView& result);
 
 	enum class State : uint8_t { Live, Stale, Buried };
 
@@ -186,19 +155,7 @@ private:
 	RenderContext&                       m_context;
 	PageManager&                         m_page_manager;
 	std::mutex                           m_mutex;
-	struct PublishedLock {
-		std::atomic_flag flag;
-		void             lock() noexcept {
-			while (flag.test_and_set(std::memory_order_acquire)) {
-				while (flag.test(std::memory_order_relaxed)) {
-				}
-			}
-		}
-		void unlock() noexcept { flag.clear(std::memory_order_release); }
-	};
-	PublishedLock m_published_lock;
-	std::unordered_map<TableKey, PublishedTable, TableKeyHash>                            m_published_tables;
-	std::unordered_map<ListKey, ShaderRecompiler::IR::ImageHeapPrediction, ListKeyHash>   m_published_lists;
+	ImageHeapPredictions                 m_predictions;
 	std::vector<std::unique_ptr<Memory>> m_memories;
 	std::vector<std::unique_ptr<Memory>>           m_list_memories;
 	std::unordered_map<ListKey, List, ListKeyHash> m_lists;
