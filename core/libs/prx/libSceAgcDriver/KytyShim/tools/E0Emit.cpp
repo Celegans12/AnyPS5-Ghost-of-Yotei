@@ -615,7 +615,7 @@ int EmitCompute(const Settings& settings) {
 		}
 	}
 	std::vector<Form> forms;
-	forms.reserve(12);
+	forms.reserve(16);
 	const auto compile = [&](const char* name, bool gpu_reads, bool plain_roots, bool keep_buffers = false,
 	                         std::span<const uint8_t> slots = {}, uint32_t page_table = 0) {
 		auto form_options                   = options;
@@ -672,6 +672,10 @@ int EmitCompute(const Settings& settings) {
 		compile("bq", true, false, false, {}, 2);
 		compile("bt", true, false, false, {}, 3);
 		compile("bts", true, false, false, arena, 3);
+		std::vector<uint8_t> shallow(none.size(), 0), deep(none.size(), 0);
+		for (uint32_t slot = 0; slot < tp.slots.size(); ++slot) (values.depth[slot] > 1 ? deep : shallow)[slot] = 1;
+		compile("bwr", true, false, true, shallow);
+		compile("bwd", true, false, true, deep);
 		WriteClasses(info, translated.program, tp, arena, snapshot.flattened_srt.size());
 	}
 	std::fprintf(info, "arena_slots %u\n", arena_slots);

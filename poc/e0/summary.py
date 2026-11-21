@@ -3,7 +3,7 @@ import argparse
 import re
 from collections import defaultdict
 
-FORMS = ["b", "bs", "bw", "bv", "b0", "bt", "bts", "bq", "bp"]
+FORMS = ["b", "bs", "bw", "bwr", "bwd", "bv", "b0", "bt", "bts", "bq", "bp"]
 
 
 def load(paths):
