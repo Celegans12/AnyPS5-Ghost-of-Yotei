@@ -92,6 +92,7 @@ struct GpuOperation {
 	bool guest_sync = true;
 	bool clean = false;
 	bool stream_in_place = false;
+	uint32_t gpu_time_marker = 0;
 	const void*     table_ticket   = nullptr;
 	uint64_t        scout_sequence = 0;
 	union {

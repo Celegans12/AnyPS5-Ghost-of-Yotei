@@ -22,6 +22,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/gpuTime.h"
 #include "graphics/host_gpu/renderer/rayTracing.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -703,6 +704,9 @@ GpuOperation CommandProcessor::MakeOperation(GpuOperationKind kind) {
 	operation.clean         = m_draw_observer != nullptr &&
 	                          (kind == GpuOperationKind::DrawIndex || kind == GpuOperationKind::DrawIndirect) &&
 	                          m_draw_observer->LastClean();
+	if (!m_gpu_time_markers.empty()) {
+		operation.gpu_time_marker = m_gpu_time_markers.back();
+	}
 	if (m_scout_sequence != 0 && (kind == GpuOperationKind::DrawIndex || kind == GpuOperationKind::DrawAuto ||
 	                              kind == GpuOperationKind::DrawIndirect)) {
 		operation.scout_sequence = m_scout_sequence;
@@ -792,8 +796,24 @@ uint64_t CommandProcessor::EmitCallback(GpuCallback&& callback, const GpuGuestWr
 	return Emit(std::move(operation));
 }
 
+void CommandProcessor::PushGpuTimeMarker(const char* text, size_t max_bytes) {
+	constexpr size_t Depth = 64;
+	if (m_gpu_time_markers.size() < Depth) {
+		m_gpu_time_markers.push_back(GpuTime::InternMarker(text, max_bytes));
+	}
+}
+
+void CommandProcessor::PopGpuTimeMarker() {
+	if (!m_gpu_time_markers.empty()) {
+		m_gpu_time_markers.pop_back();
+	}
+}
+
 void CommandProcessor::Execute(GpuOperation& operation) {
 	EXIT_IF(operation.processor != this);
+	if (GpuTime::Enabled()) {
+		GpuTime::SetMarker(operation.gpu_time_marker);
+	}
 	if (operation.scout_sequence != 0 && Scout::Running()) Scout::EnterSubmission(operation.scout_sequence);
 	BindState(operation.state);
 	m_renderer.GetRenderExecutor().SetTableTicket(operation.table_ticket);

@@ -13,6 +13,7 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "gpu_tiler_shaders/indirect_thread_dispatch_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/gpuTime.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/occlusionQueries.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
@@ -665,6 +666,12 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		}
 
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+#if defined(ANYPS5_KYTY)
+		const bool gpu_time = GpuTime::Enabled();
+		if (gpu_time) {
+			GpuTime::BeforeWork(buffer);
+		}
+#endif
 		constexpr uint32_t DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE = 1u << 3u;
 		const uint64_t     group_threads = uint64_t {std::max(input_info.threads_num[0], 1u)} *
 		                                   std::max(input_info.threads_num[1], 1u) *
@@ -684,6 +691,11 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		} else {
 			vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 		}
+#if defined(ANYPS5_KYTY)
+		if (gpu_time) {
+			GpuTime::AfterDispatch(buffer, program.shader_hash);
+		}
+#endif
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 		if (rt_pass == 1) {
 			RtCheck().AfterOracle(bindings, counted);
@@ -942,7 +954,18 @@ void RenderExecutor::DispatchIndirectThreads(CommandBuffer& buffer, uint64_t arg
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+#if defined(ANYPS5_KYTY)
+	const bool gpu_time = GpuTime::Enabled();
+	if (gpu_time) {
+		GpuTime::BeforeWork(buffer);
+	}
+#endif
 	vk_buffer.dispatchIndirect(stream.Handle(), scratch_offset);
+#if defined(ANYPS5_KYTY)
+	if (gpu_time) {
+		GpuTime::AfterDispatch(buffer, program.shader_hash);
+	}
+#endif
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
 }
@@ -1037,7 +1060,18 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 			                          1, &barrier, 0, nullptr, 0, nullptr);
 		}
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+#if defined(ANYPS5_KYTY)
+		const bool gpu_time = GpuTime::Enabled();
+		if (gpu_time) {
+			GpuTime::BeforeWork(buffer);
+		}
+#endif
 		vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+#if defined(ANYPS5_KYTY)
+		if (gpu_time) {
+			GpuTime::AfterDispatch(buffer, program.shader_hash);
+		}
+#endif
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 		if (rt_pass == 1) {
 			RtCheck().AfterOracle(bindings, counted);
