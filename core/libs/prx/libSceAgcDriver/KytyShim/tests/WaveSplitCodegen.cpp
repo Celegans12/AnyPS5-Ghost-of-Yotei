@@ -204,6 +204,89 @@ std::vector<uint32_t> ComputeModule(bool derivatives) {
 	return words;
 }
 
+std::vector<uint32_t> LoopModule(uint32_t threads, uint32_t values) {
+	std::vector<uint32_t> words {spv::MagicNumber, 0x00010600u, 0u, 0u, 0u};
+	uint32_t              next = 1;
+	const auto put = [&](spv::Op op, std::initializer_list<uint32_t> operands, const char* text = nullptr) {
+		std::vector<uint32_t> packed;
+		if (text != nullptr) {
+			packed.assign(std::strlen(text) / 4u + 1u, 0u);
+			std::memcpy(packed.data(), text, std::strlen(text));
+		}
+		words.push_back(static_cast<uint32_t>((operands.size() + packed.size() + 1u) << spv::WordCountShift) | op);
+		words.insert(words.end(), operands);
+		words.insert(words.end(), packed.begin(), packed.end());
+	};
+	const auto type_void = next++, type_bool = next++, type_u32 = next++, type_function = next++, zero = next++,
+	           one = next++, rounds = next++, main = next++, entry = next++, header = next++, body = next++,
+	           latch = next++, merge = next++, counter = next++, counted = next++, again = next++;
+	std::vector<uint32_t> carried(values), updated(values);
+	for (uint32_t k = 0; k < values; k++) {
+		carried[k] = next++;
+		updated[k] = next++;
+	}
+	put(spv::OpCapability, {spv::CapabilityShader});
+	put(spv::OpMemoryModel, {spv::AddressingModelLogical, spv::MemoryModelGLSL450});
+	put(spv::OpEntryPoint, {spv::ExecutionModelGLCompute, main}, "main");
+	put(spv::OpExecutionMode, {main, spv::ExecutionModeLocalSize, threads, 1u, 1u});
+	put(spv::OpTypeVoid, {type_void});
+	put(spv::OpTypeBool, {type_bool});
+	put(spv::OpTypeInt, {type_u32, 32u, 0u});
+	put(spv::OpTypeFunction, {type_function, type_void});
+	put(spv::OpConstant, {type_u32, zero, 0u});
+	put(spv::OpConstant, {type_u32, one, 1u});
+	put(spv::OpConstant, {type_u32, rounds, 8u});
+	put(spv::OpFunction, {type_void, main, spv::FunctionControlMaskNone, type_function});
+	put(spv::OpLabel, {entry});
+	put(spv::OpBranch, {header});
+	put(spv::OpLabel, {header});
+	put(spv::OpPhi, {type_u32, counter, zero, entry, counted, latch});
+	for (uint32_t k = 0; k < values; k++) put(spv::OpPhi, {type_u32, carried[k], zero, entry, updated[k], latch});
+	put(spv::OpLoopMerge, {merge, latch, spv::LoopControlMaskNone});
+	put(spv::OpBranch, {body});
+	put(spv::OpLabel, {body});
+	for (uint32_t k = 0; k < values; k++) put(spv::OpIAdd, {type_u32, updated[k], carried[k], one});
+	put(spv::OpIAdd, {type_u32, counted, counter, one});
+	put(spv::OpBranch, {latch});
+	put(spv::OpLabel, {latch});
+	put(spv::OpULessThan, {type_bool, again, counted, rounds});
+	put(spv::OpBranchConditional, {again, header, merge});
+	put(spv::OpLabel, {merge});
+	put(spv::OpReturn, {});
+	put(spv::OpFunctionEnd, {});
+	words[3] = next;
+	return words;
+}
+
+void RegisterRelief() {
+	struct Shape {
+		uint32_t threads;
+		uint32_t values;
+		bool     split;
+	};
+	for (const auto& shape: {Shape {256u, 47u, true}, Shape {512u, 47u, true}, Shape {256u, 7u, false},
+	                         Shape {1024u, 47u, false}, Shape {64u, 7u, true}}) {
+		auto        module = LoopModule(shape.threads, shape.values);
+		const auto  label  = std::to_string(shape.threads) + " threads, a loop carrying " + std::to_string(shape.values + 1u) +
+		                     " values";
+		std::string messages;
+		Check(Valid(module, messages), label + ": invalid input module: " + messages);
+		std::string refusal;
+		const bool  split = Recompiler::Spirv::SplitWaveAcrossSubgroups(module, refusal);
+		std::printf("%s: %s: %s\n", Name, label.c_str(), split ? "split" : ("kept in lane pairs: " + refusal).c_str());
+		if (!shape.split) {
+			Check(!split && refusal.find("without registers to gain") != std::string::npos,
+			      label + ": a group of several waves stays in lane pairs unless the split gives its lanes registers they need");
+			continue;
+		}
+		messages.clear();
+		const auto inspected = Inspect(module);
+		Check(split && inspected.local_size == std::array<uint32_t, 3> {shape.threads, 1u, 1u} && inspected.subgroup_id &&
+		          inspected.sync_functions == (shape.threads > WaveLanes ? 1u : 0u) && Valid(module, messages),
+		      label + ": the split runs one invocation per lane: " + refusal + messages);
+	}
+}
+
 void ComputeDerivatives() {
 	for (const bool derivatives: {false, true}) {
 		auto        module = ComputeModule(derivatives);
@@ -234,18 +317,23 @@ int main() {
 		const bool waves  = program.threads > WaveLanes;
 		std::printf("%s: %s: local size %u, halves sync functions %u, calls %u, workgroup stores %u\n", Name, program.name,
 		            module.local_size[0], module.sync_functions, module.sync_calls, module.workgroup_stores);
+		if (waves) {
+			Check(module.local_size == std::array<uint32_t, 3> {program.threads / 2u, 1u, 1u} && module.sync_functions == 0u,
+			      std::string(program.name) +
+			          ": a group of several waves whose loops carry few values stays in lane pairs, with no halves to wait on");
+			continue;
+		}
 		Check(module.local_size == std::array<uint32_t, 3> {program.threads, 1u, 1u} && module.subgroup_id,
 		      std::string(program.name) + ": the workgroup runs one invocation per guest lane on 32-wide subgroups");
-		Check(waves ? module.sync_functions == 1u && module.sync_calls != 0u : module.sync_functions == 0u,
-		      std::string(program.name) +
-		          (waves ? ": the halves of each wave meet through the wave's own counter"
-		                 : ": a one-wave workgroup synchronizes its halves with workgroup barriers"));
+		Check(module.sync_functions == 0u,
+		      std::string(program.name) + ": a one-wave workgroup synchronizes its halves with workgroup barriers");
 		if (program.same_address_store) {
 			Check(module.workgroup_stores >= 2u,
 			      std::string(program.name) + ": the wave's store to one LDS word goes through the exchange first");
 		}
 	}
 	ComputeDerivatives();
+	RegisterRelief();
 	if (g_failures != 0) return 1;
 	std::printf("%s: ok\n", Name);
 	return 0;

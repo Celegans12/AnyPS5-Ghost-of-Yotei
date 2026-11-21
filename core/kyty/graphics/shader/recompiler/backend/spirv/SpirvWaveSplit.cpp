@@ -18,11 +18,13 @@ namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
 namespace {
 
-constexpr uint32_t None           = UINT32_MAX;
-constexpr uint32_t WaveLanes      = 64;
-constexpr uint32_t MaxBatch       = 4;
-constexpr uint32_t MaxThreads     = 1024;
-constexpr uint32_t MaxSharedBytes = 49152;
+constexpr uint32_t None                    = UINT32_MAX;
+constexpr uint32_t WaveLanes               = 64;
+constexpr uint32_t MaxBatch                = 4;
+constexpr uint32_t MaxThreads              = 1024;
+constexpr uint32_t MaxSharedBytes          = 49152;
+constexpr uint32_t MaxRelievedThreads      = 512;
+constexpr uint32_t RegisterBoundLoopValues = 48;
 
 struct Inst {
 	uint32_t offset = 0;
@@ -125,7 +127,7 @@ public:
 			return false;
 		}
 		Analyze();
-		if (!CheckUniform(refusal) || !PlaceSharedBarriers(refusal)) {
+		if (!CheckUniform(refusal) || !PlaceSharedBarriers(refusal) || !RelievesRegisters(refusal)) {
 			return false;
 		}
 		Rewrite(out);
@@ -979,6 +981,26 @@ private:
 			m_barrier_before.insert(at);
 		}
 		return true;
+	}
+
+	uint32_t LoopCarriedValues() const {
+		uint32_t most = 0;
+		for (const auto& block: m_blocks) {
+			if (block.merge == 0 || m_insts[block.end - 1].op != spv::OpLoopMerge) continue;
+			uint32_t values = 0;
+			for (uint32_t i = block.begin + 1; i < block.end && m_insts[i].op == spv::OpPhi; i++) values++;
+			most = std::max(most, values);
+		}
+		return most;
+	}
+
+	bool RelievesRegisters(std::string& refusal) const {
+		if (m_waves == 1) return true;
+		const auto values = LoopCarriedValues();
+		if (m_threads <= MaxRelievedThreads && values >= RegisterBoundLoopValues) return true;
+		refusal = "several waves whose halves would wait on each other without registers to gain: threads=" +
+		          std::to_string(m_threads) + " loop_values=" + std::to_string(values);
+		return false;
 	}
 
 	static bool Pure(uint32_t op) {
