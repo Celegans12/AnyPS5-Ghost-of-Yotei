@@ -10,11 +10,6 @@
 #include <span>
 #include <string>
 #include <vector>
-#if defined(_WIN32)
-#include <windows.h>
-#else
-#include <sys/mman.h>
-#endif
 
 namespace {
 
@@ -44,15 +39,19 @@ constexpr std::array<uint32_t, 31> SamplerLoopWords {
     0x3a14050au, 0x3a16070bu, 0x80038103u, 0xbf82fff1u, 0xe0781000u, 0x80010806u, 0xbf810000u,
 };
 
-constexpr uint64_t GuestRegion   = 0x200900000ull;
-constexpr size_t   GuestBytes    = 0x40000u;
-constexpr uint64_t SrtAddress    = 0x200910000ull;
-constexpr uint64_t TextureA      = 0x200920000ull;
-constexpr uint64_t TextureB      = 0x200920100ull;
-constexpr uint64_t OutputAddress = 0x200930000ull;
-constexpr uint32_t Format8888    = 56;
-constexpr uint32_t Format32UInt  = 20;
-constexpr uint32_t SwizzleXyzw   = 0xfacu;
+constexpr size_t GuestBytes = 0x40000u;
+
+alignas(4096) std::array<uint32_t, GuestBytes / 4u> g_guest {};
+
+const uint64_t GuestRegion   = reinterpret_cast<uint64_t>(g_guest.data());
+const uint64_t SrtAddress    = GuestRegion + 0x10000u;
+const uint64_t TextureA      = GuestRegion + 0x20000u;
+const uint64_t TextureB      = GuestRegion + 0x20100u;
+const uint64_t OutputAddress = GuestRegion + 0x30000u;
+
+constexpr uint32_t Format8888   = 56;
+constexpr uint32_t Format32UInt = 20;
+constexpr uint32_t SwizzleXyzw  = 0xfacu;
 
 constexpr uint32_t SpirvOpDecorate          = 71u;
 constexpr uint32_t SpirvOpVariable          = 59u;
@@ -60,25 +59,12 @@ constexpr uint32_t SpirvDecorationBinding   = 33u;
 constexpr uint32_t SpirvStorageUniform      = 2u;
 constexpr uint32_t SpirvStorageStorageBuffer = 12u;
 
-int       g_failures = 0;
-uint32_t* g_guest    = nullptr;
+int g_failures = 0;
 
 void Check(bool condition, const std::string& what) {
 	if (condition) return;
 	std::fprintf(stderr, "FAILED: %s\n", what.c_str());
 	g_failures++;
-}
-
-bool MapGuest() {
-#if defined(_WIN32)
-	g_guest = static_cast<uint32_t*>(VirtualAlloc(reinterpret_cast<void*>(GuestRegion), GuestBytes,
-	                                              MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-#else
-	void* mapped = mmap(reinterpret_cast<void*>(GuestRegion), GuestBytes, PROT_READ | PROT_WRITE,
-	                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-	g_guest      = mapped == MAP_FAILED ? nullptr : static_cast<uint32_t*>(mapped);
-#endif
-	return g_guest == reinterpret_cast<uint32_t*>(GuestRegion);
 }
 
 void Poke(uint64_t address, uint32_t value) {
@@ -176,7 +162,7 @@ const uint32_t SrtBinding =
     IR::NativeBinding(ShaderType::Compute, IR::DescriptorBindingKind::FlattenedSrt);
 
 void ConstantRead() {
-	std::fill_n(g_guest, GuestBytes / 4u, 0u);
+	std::fill(g_guest.begin(), g_guest.end(), 0u);
 	Poke(SrtAddress, 0x3f800000u);
 	std::array<uint32_t, 16> user_data {};
 	user_data[0]       = static_cast<uint32_t>(SrtAddress);
@@ -196,7 +182,7 @@ void ConstantRead() {
 }
 
 void TableRead() {
-	std::fill_n(g_guest, GuestBytes / 4u, 0u);
+	std::fill(g_guest.begin(), g_guest.end(), 0u);
 	const std::array<Texture, 2> table {MakeTexture(TextureA, Format8888), MakeTexture(TextureB, Format8888)};
 	for (uint32_t entry = 0; entry < table.size(); ++entry) {
 		for (uint32_t word = 0; word < 8u; ++word) Poke(SrtAddress + entry * 32u + word * 4u, table[entry][word]);
@@ -223,7 +209,7 @@ void TableRead() {
 }
 
 void SamplerTableRead() {
-	std::fill_n(g_guest, GuestBytes / 4u, 0u);
+	std::fill(g_guest.begin(), g_guest.end(), 0u);
 	const auto texture = MakeTexture(TextureA, Format8888);
 	for (uint32_t word = 0; word < 8u; ++word) Poke(SrtAddress + word * 4u, texture[word]);
 	const std::array<std::array<uint32_t, 4>, 2> samplers {{{0x12u, 0u, 0u, 0u}, {0x0u, 0u, 0u, 0u}}};
@@ -256,10 +242,6 @@ void SamplerTableRead() {
 int main() {
 	Common::SoftExitScope soft;
 	IR::SetComputeIndirectFloors(256, 8);
-	if (!MapGuest()) {
-		std::fprintf(stderr, "FAILED: the guest region could not be mapped\n");
-		return 1;
-	}
 	ConstantRead();
 	TableRead();
 	SamplerTableRead();
