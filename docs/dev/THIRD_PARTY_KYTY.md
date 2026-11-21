@@ -73,6 +73,7 @@ be second declarations of AnyPS5 exports for `core/libs/tests/test_public_header
   | `046bf882` | — | the presenter copies only layer 0 of a flipped surface's cached image |
   | `8d0ebb8f` | — | the SRT walker evaluates `SMin32` |
   | `46213dfd` | — | shorter compiled SRT walkers (biased scratch register, bases formed once per walk, folded constant offsets, inline tests of values already evaluated, plain marks of later blocks); ported by hand onto the walker's page cache, flat words and ahead loads, kept after an in-run A/B (+4.0 % on Ghost of Yotei) |
+  | `f6e3373d` | #2407 | `AssociateStencil` tells the image heap before it rewrites an image as a stencil plane |
 
   `Presenter::PrepareFrame` takes the VideoOut pixel format since `50c0c066`: the shim passes the display buffer's
   `pixelFormat`.
