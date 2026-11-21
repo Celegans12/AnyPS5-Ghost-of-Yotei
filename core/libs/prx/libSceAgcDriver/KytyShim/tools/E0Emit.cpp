@@ -951,6 +951,7 @@ bool SynthesizeModule(const Settings& settings, const std::string& dir, std::FIL
 		uint64_t address = 0, size = 0;
 		uint32_t stride  = 0;
 		bool     made    = false;
+		std::array<WordSource, 4> words {};
 	};
 	std::vector<SynthBuffer> buffers(roles.info.buffers.size());
 	for (size_t i = 0; i < roles.info.buffers.size() && i < a.info.buffers.size(); ++i) {
@@ -979,7 +980,7 @@ bool SynthesizeModule(const Settings& settings, const std::string& dir, std::FIL
 		set_word(words[3], (specialized.descriptor_swizzle & 0xfffu) | (format << 12u) |
 		                       (((specialized.packed_stride >> 16u) & 3u) << 21u) |
 		                       (((specialized.packed_stride >> 20u) & 1u) << 23u) | (1u << 24u));
-		buffers[i] = {address, size, stride, true};
+		buffers[i] = {address, size, stride, true, words};
 	}
 	for (const auto& read: tp.slots) {
 		if (read.low.kind != Kind::Slot || read.high.kind != Kind::Slot) continue;
@@ -1006,35 +1007,89 @@ bool SynthesizeModule(const Settings& settings, const std::string& dir, std::FIL
 		return 0u;
 	};
 	std::vector<uint64_t> slot_address(tp.slots.size(), 0);
-	for (uint32_t pass = 0; pass < 64; ++pass) {
-		bool progress = false;
-		for (uint32_t slot = 0; slot < tp.slots.size(); ++slot) {
-			if (slot_done[slot] != 0) continue;
-			const auto&    read  = tp.slots[slot];
-			bool           ready = true;
-			const uint64_t low   = operand(read.low, ready);
-			const uint64_t high  = operand(read.high, ready);
-			const auto     off   = operand(read.offset, ready);
-			if (!ready) continue;
-			const auto address = ((low | high << 32u) & 0x0000fffffffffffcull) + (off & ~3u) +
-			                     static_cast<uint64_t>(int64_t {read.immediate});
-			slot_address[slot] = address;
-			if (address >= 0x10000) {
-				if (slot_fixed[slot] != 0) {
-					synth.Write(address, slot_value[slot]);
-				} else if (synth.Has(address) && synth.Read(address) != 0) {
+	const auto resolve = [&]() {
+		for (uint32_t pass = 0; pass < 64; ++pass) {
+			bool progress = false;
+			for (uint32_t slot = 0; slot < tp.slots.size(); ++slot) {
+				if (slot_done[slot] != 0) continue;
+				const auto&    read  = tp.slots[slot];
+				bool           ready = true;
+				const uint64_t low   = operand(read.low, ready);
+				const uint64_t high  = operand(read.high, ready);
+				const auto     off   = operand(read.offset, ready);
+				if (!ready) continue;
+				const auto address = ((low | high << 32u) & 0x0000fffffffffffcull) + (off & ~3u) +
+				                     static_cast<uint64_t>(int64_t {read.immediate});
+				slot_address[slot] = address;
+				if (address >= 0x10000) {
+					if (slot_fixed[slot] != 0) {
+						synth.Write(address, slot_value[slot]);
+					} else if (synth.Has(address) && synth.Read(address) != 0) {
+						slot_value[slot] = synth.Read(address);
+					} else {
+						slot_value[slot] = synth.Data();
+						synth.Write(address, slot_value[slot]);
+					}
 					slot_value[slot] = synth.Read(address);
-				} else {
-					slot_value[slot] = synth.Data();
-					synth.Write(address, slot_value[slot]);
 				}
-				slot_value[slot] = synth.Read(address);
+				slot_done[slot] = 1;
+				progress        = true;
 			}
-			slot_done[slot] = 1;
-			progress        = true;
+			if (!progress) break;
 		}
-		if (!progress) break;
+	};
+	const auto disagreeing = [&]() {
+		std::vector<uint32_t> list;
+		for (uint32_t slot = 0; slot < tp.slots.size(); ++slot) {
+			if (slot_done[slot] != 0 && slot_address[slot] >= 0x10000 && synth.Read(slot_address[slot]) != slot_value[slot]) {
+				list.push_back(slot);
+			}
+		}
+		return list;
+	};
+	resolve();
+	const auto first_bad = disagreeing().size();
+	const auto word_at   = [&](const WordSource& word, uint32_t fallback) -> uint32_t {
+		if (word.kind == WordSource::Kind::Slot && word.value < slot_done.size() && slot_done[word.value] != 0 &&
+		    slot_address[word.value] >= 0x10000) {
+			return synth.Read(slot_address[word.value]);
+		}
+		return fallback;
+	};
+	uint32_t aliased = 0, orphaned = 0;
+	for (auto& buffer: buffers) {
+		if (!buffer.made || buffer.words[0].kind != WordSource::Kind::Slot) continue;
+		const uint64_t held = uint64_t {word_at(buffer.words[0], static_cast<uint32_t>(buffer.address))} |
+		                      uint64_t {word_at(buffer.words[1], static_cast<uint32_t>(buffer.address >> 32u)) & 0xffffu} << 32u;
+		if (held == buffer.address) continue;
+		const auto owner = std::find_if(buffers.begin(), buffers.end(), [&](const SynthBuffer& other) { return other.made && other.address == held; });
+		if (owner == buffers.end()) {
+			orphaned++;
+			continue;
+		}
+		buffer.address = owner->address;
+		buffer.size    = owner->size;
+		buffer.stride  = owner->stride;
+		aliased++;
 	}
+	for (uint32_t slot = 0; slot < tp.slots.size(); ++slot) {
+		if (slot_done[slot] != 0 && slot_address[slot] >= 0x10000) slot_value[slot] = synth.Read(slot_address[slot]);
+	}
+	{
+		std::ofstream slots(fmt::format("{}/slots.txt", std::filesystem::absolute(dir).string()));
+		const auto    name = [](const IR::TablePlan::Operand& op) {
+			static const char* const kinds[] = {"imm", "user", "slot", "baselo", "basehi"};
+			return fmt::format("{}:{:x}", kinds[static_cast<uint32_t>(op.kind)], op.value);
+		};
+		for (uint32_t slot = 0; slot < tp.slots.size(); ++slot) {
+			const auto& read = tp.slots[slot];
+			slots << fmt::format("{} low {} high {} off {} imm {:x} address {:x} fixed {} flat {:08x} memory {:08x}\n", slot, name(read.low),
+			                     name(read.high), name(read.offset), read.immediate, slot_address[slot], slot_fixed[slot],
+			                     slot_value[slot], synth.Read(slot_address[slot]));
+		}
+	}
+	std::fprintf(info, "synth plan agreement: %zu slots disagreed with memory, %u buffers aliased to the buffer their V# slot holds, %u not found\n",
+	             first_bad, aliased, orphaned);
 	std::vector<Region> regions;
 	for (const auto& [page, bytes]: synth.pages) {
 		if (!regions.empty() && regions.back().start + regions.back().size == page << 12u && regions.back().size < (4u << 20u)) {
@@ -1065,7 +1120,8 @@ bool SynthesizeModule(const Settings& settings, const std::string& dir, std::FIL
 		for (size_t i = 0; i < program.info.buffers.size(); ++i) {
 			const auto& metadata = program.info.buffers[i];
 			if (&form == &forms[0] && (metadata.written || metadata.atomic) && metadata.live && i < buffers.size() && buffers[i].made) {
-				written.emplace_back(buffers[i].address, buffers[i].size);
+				const std::pair<uint64_t, uint64_t> region {buffers[i].address, buffers[i].size};
+				if (std::find(written.begin(), written.end(), region) == written.end()) written.push_back(region);
 			}
 			if (metadata.descriptor_index == UINT32_MAX) continue;
 			const auto made = i < buffers.size() && buffers[i].made;
