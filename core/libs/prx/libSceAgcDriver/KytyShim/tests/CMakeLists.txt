@@ -268,13 +268,10 @@ target_link_libraries(kyty_shim_gpu_control_loads_tests PRIVATE Kyty::gpu libker
 add_test(NAME kyty_shim_gpu_control_loads COMMAND kyty_shim_gpu_control_loads_tests)
 set_tests_properties(kyty_shim_gpu_control_loads PROPERTIES TIMEOUT 20
         PASS_REGULAR_EXPRESSION "kyty_shim_gpu_control_loads: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
-add_test_executable(kyty_shim_speculative_compile_tests ${CMAKE_CURRENT_SOURCE_DIR}/SpeculativeCompile.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
-target_include_directories(kyty_shim_speculative_compile_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/SpeculativeCompile.cpp)
+add_test_executable(kyty_shim_speculative_compile_tests ${CMAKE_CURRENT_SOURCE_DIR}/SpeculativeCompileMain.cpp)
 configure_host_test_executable(kyty_shim_speculative_compile_tests)
-if(MINGW)
-    target_link_libraries(kyty_shim_speculative_compile_tests PRIVATE stdc++ gcc_eh)
-endif()
-target_link_libraries(kyty_shim_speculative_compile_tests PRIVATE Kyty::gpu libkernel libc)
+target_link_libraries(kyty_shim_speculative_compile_tests PRIVATE libSceAgcDriver libkernel libc)
 if(NOT WIN32)
     add_test(NAME kyty_shim_speculative_compile COMMAND kyty_shim_speculative_compile_tests)
     set_tests_properties(kyty_shim_speculative_compile PROPERTIES TIMEOUT 60 ENVIRONMENT "KYTY_FALLBACKS=0"
@@ -514,13 +511,10 @@ set_tests_properties(kyty_shim_ab_switches_refused PROPERTIES TIMEOUT 20 ENVIRON
         PASS_REGULAR_EXPRESSION "KYTY_AB: KYTY_RELAXED_SHADER_FLOAT cannot change while the title runs; settings KYTY_AB can change"
         FAIL_REGULAR_EXPRESSION "kyty_shim_ab_switches_flip: ok")
 
-add_test_executable(kyty_shim_ahead_revalidation_tests ${CMAKE_CURRENT_SOURCE_DIR}/AheadRevalidation.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
-target_include_directories(kyty_shim_ahead_revalidation_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/AheadRevalidation.cpp)
+add_test_executable(kyty_shim_ahead_revalidation_tests ${CMAKE_CURRENT_SOURCE_DIR}/AheadRevalidationMain.cpp)
 configure_host_test_executable(kyty_shim_ahead_revalidation_tests)
-if(MINGW)
-    target_link_libraries(kyty_shim_ahead_revalidation_tests PRIVATE stdc++ gcc_eh)
-endif()
-target_link_libraries(kyty_shim_ahead_revalidation_tests PRIVATE Kyty::gpu libkernel libc)
+target_link_libraries(kyty_shim_ahead_revalidation_tests PRIVATE libSceAgcDriver libkernel libc)
 add_test(NAME kyty_shim_ahead_revalidation COMMAND kyty_shim_ahead_revalidation_tests)
 set_tests_properties(kyty_shim_ahead_revalidation PROPERTIES TIMEOUT 20
         PASS_REGULAR_EXPRESSION "kyty_shim_ahead_revalidation: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")

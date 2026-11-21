@@ -152,7 +152,7 @@ int Finish(const char* name) {
 
 }
 
-int main(int argc, char** argv) {
+extern "C" int RunKytySpeculativeCompileTest(int argc, char** argv) {
 	const auto valid    = Specialize(SwizzleXyzw);
 	const auto reserved = Specialize(ReservedX);
 	Check(!valid.buffers.empty(), "the program has buffers");

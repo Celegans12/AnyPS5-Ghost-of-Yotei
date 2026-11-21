@@ -139,7 +139,7 @@ void HeapRefusal() {
 
 }
 
-int main() {
+extern "C" int RunKytyAheadRevalidationTest() {
 	EmptyLog();
 	UnbackedRead();
 	EmptyRead();
