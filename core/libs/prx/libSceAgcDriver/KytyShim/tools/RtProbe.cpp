@@ -41,6 +41,7 @@ struct Settings {
 	uint32_t oracle    = 0;
 	bool     replay    = false;
 	bool     oracleSet = false;
+	bool     robust    = false;
 	std::string spirv;
 };
 
@@ -150,6 +151,8 @@ int Probe(const char* label, const std::vector<uint32_t>& code, uint64_t hash, c
 	compute.lds_size_dwords     = settings.lds;
 	compute.scratch_size_dwords = settings.scratch;
 	static Libs::Graphics::ShaderRecompiler::Spirv::Profile profile {.maintenance8 = true, .ray_query = true};
+	profile.robust_buffer_access   = settings.robust;
+	profile.device_clock_period_ps = settings.robust ? 1000u : 0u;
 	std::vector<uint32_t> user_data(settings.user, 0u);
 	Recompiler::CompileOptions options;
 	options.stage                 = ShaderType::Compute;
@@ -236,6 +239,8 @@ bool CompileVariant(const std::vector<uint32_t>& code, uint64_t hash, const Sett
 	compute.lds_size_dwords     = settings.lds;
 	compute.scratch_size_dwords = settings.scratch;
 	static Libs::Graphics::ShaderRecompiler::Spirv::Profile profile {.maintenance8 = true, .ray_query = true};
+	profile.robust_buffer_access   = settings.robust;
+	profile.device_clock_period_ps = settings.robust ? 1000u : 0u;
 	std::vector<uint32_t> user_data(settings.user, 0u);
 	Recompiler::CompileOptions options;
 	options.stage              = ShaderType::Compute;
@@ -312,7 +317,7 @@ int Replay(const char* label, const std::vector<uint32_t>& code, uint64_t hash, 
 }
 
 int Usage() {
-	std::fprintf(stderr, "usage: kyty_rt_probe [--wave 32|64] [--subgroup N] [--user N] [--group X Y Z] [--scratch dwords] [--lds dwords] [--dump] [--emit] [--spirv out.spv] [--off] [--oracle 0-63] [--stats] [--replay-check] [--stage compute|pixel] [--inputs N] (<shader.bin>... | --cache <file.code> --hash <hex> | --cache <file.code> --all [--kpm <file.kpm>] [--subgroup 32|64] [--lds-limit bytes] [--no-validate])\n       kyty_rt_probe --version\n");
+	std::fprintf(stderr, "usage: kyty_rt_probe [--wave 32|64] [--subgroup N] [--user N] [--group X Y Z] [--scratch dwords] [--lds dwords] [--dump] [--emit] [--spirv out.spv] [--off] [--oracle 0-63] [--stats] [--robust] [--replay-check] [--stage compute|pixel] [--inputs N] (<shader.bin>... | --cache <file.code> --hash <hex> | --cache <file.code> --all [--kpm <file.kpm>] [--subgroup 32|64] [--lds-limit bytes] [--no-validate])\n       kyty_rt_probe --version\n");
 	return 64;
 }
 
@@ -361,6 +366,8 @@ int main(int argc, char** argv) {
 			settings.pixel = stage == "pixel";
 		} else if (arg == "--inputs" && i + 1 < argc) {
 			settings.inputs = static_cast<uint32_t>(std::atoi(argv[++i]));
+		} else if (arg == "--robust") {
+			settings.robust = true;
 		} else if (arg == "--stats") {
 			settings.stats = true;
 		} else if (arg == "--off") {

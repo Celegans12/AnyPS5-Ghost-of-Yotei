@@ -481,7 +481,9 @@ the instances they left out. `kyty_rt_probe` (a target of every `kyty` build, wr
 prints, per file, its BVH intersections, how many of them trace with ray queries, and the TLAS source and instance
 record layout derived for them, and exits with 0 only when every intersection does. `--dump` adds the IR, `--off`
 compiles as with `KYTY_NATIVE_RT=0`, `--oracle 0-15` as with `KYTY_RT_ORACLE`, `--stats` as with `KYTY_RT_STATS=1`, and
-`--subgroup 32` translates a wave of 64 for a GPU with subgroups of 32, as the driver does there, `--stage pixel` translates a
+`--subgroup 32` translates a wave of 64 for a GPU with subgroups of 32, as the driver does there, `--robust` emits as for a device
+with `robustBufferAccess2` and a storage access alignment of 1 (no explicit bounds checks on storage buffers, as the driver emits
+on such a device), `--stage pixel` translates a
 pixel shader (`--inputs N` interpolated inputs, 8 by default) instead of a compute one; the line then ends with
 `oracle=N lane=M empty=E`, the intersections that answer from a host ray query, those of them that do it lane by lane,
 and those that run empty.
