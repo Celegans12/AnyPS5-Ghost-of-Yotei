@@ -11,8 +11,8 @@ struct ReadLaneStats {
 	uint32_t rewritten_reductions = 0;
 };
 
-[[nodiscard]] std::vector<Inst*> MarkUndefinedLaneSpills(Program& program);
-void ReleaseUndefinedLaneSpills(const std::vector<Inst*>& undefined);
+void MarkUndefinedLaneSpills(Program& program);
+void ReleaseUndefinedLaneSpills(Program& program);
 
 [[nodiscard]] ReadLaneStats EliminateReadLane(Program& program, uint32_t wave_size);
 

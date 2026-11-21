@@ -17,6 +17,8 @@ struct ChainResult {
 	Inst* write = nullptr;
 };
 
+constexpr uint64_t UndefinedLaneSpillFlag = 0x4c616e655370696cull;
+
 bool IsUndefinedSpill(Value value) {
 	const auto* inst = value.Resolve().TryInstruction();
 	return inst != nullptr && inst->GetOpcode() == ValueOpcode::UndefU32;
@@ -206,10 +208,9 @@ std::optional<ValueOpcode> WaveReduction(ValueOpcode operation) {
 
 }
 
-std::vector<Inst*> MarkUndefinedLaneSpills(Program& program) {
-	std::vector<Inst*> undefined;
+void MarkUndefinedLaneSpills(Program& program) {
 	if (program.blocks.empty() || !program.blocks.front()->ImmPredecessors().empty()) {
-		return undefined;
+		return;
 	}
 	std::map<uint32_t, bool> lane_only;
 	for (auto* block: program.blocks) {
@@ -236,16 +237,19 @@ std::vector<Inst*> MarkUndefinedLaneSpills(Program& program) {
 			continue;
 		}
 		auto& value = *entry_block->PrependNewInst(start, ValueOpcode::UndefU32);
+		value.SetFlags(UndefinedLaneSpillFlag);
 		entry_block->PrependNewInst(start, ValueOpcode::SetVectorRegister,
 		                            {Value(static_cast<VectorReg>(reg)), Value(&value)});
-		undefined.push_back(&value);
 	}
-	return undefined;
 }
 
-void ReleaseUndefinedLaneSpills(const std::vector<Inst*>& undefined) {
-	for (auto* value: undefined) {
-		value->ReplaceUsesWith(Value(0u));
+void ReleaseUndefinedLaneSpills(Program& program) {
+	for (auto* block: program.blocks) {
+		for (auto& inst: *block) {
+			if (inst.GetOpcode() == ValueOpcode::UndefU32 && inst.Flags<uint64_t>() == UndefinedLaneSpillFlag) {
+				inst.ReplaceUsesWith(Value(0u));
+			}
+		}
 	}
 }
 
