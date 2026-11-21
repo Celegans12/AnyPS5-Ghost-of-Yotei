@@ -838,8 +838,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	std::vector<uint32_t> spirv;
 	if (const auto* group = options.stage == ShaderType::Compute ? options.input_info.compute : nullptr;
 	    group != nullptr && !options.wave_lane_pairs && ir.wave_size == 64u && group->host_subgroup_size == 32u &&
-	    !ir.lane_local && !(ir.info.uses_lds && (group->lds_storage || ir.info.function_lds)) &&
-	    Spirv::WaveSplitThreads(group->threads_num)) {
+	    !ir.lane_local && !(ir.info.uses_lds && group->lds_storage) && Spirv::WaveSplitThreads(group->threads_num)) {
 		auto wide               = *group;
 		wide.host_subgroup_size = 64u;
 		auto wide_input         = options.input_info;
