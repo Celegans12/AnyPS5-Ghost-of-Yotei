@@ -27,6 +27,9 @@ struct Slots {
 
 using Fallback = void* (*)(EmutlsObject*);
 
+constexpr std::uintptr_t Owned = std::uintptr_t{1} << 62u;
+constexpr std::size_t TebTlsSlots = 0x1480;
+
 DWORD tlsSlot = TLS_OUT_OF_INDEXES;
 std::uintptr_t imageBegin = 0;
 std::uintptr_t imageEnd = 0;
@@ -37,7 +40,7 @@ std::uintptr_t indices = 0;
 SRWLOCK lock = SRWLOCK_INIT;
 
 void* ReadSlot() {
-    if (tlsSlot < 64) return reinterpret_cast<void* const*>(reinterpret_cast<const char*>(NtCurrentTeb()) + 0x1480)[tlsSlot];
+    if (tlsSlot < 64) return reinterpret_cast<void* const*>(reinterpret_cast<const char*>(NtCurrentTeb()) + TebTlsSlots)[tlsSlot];
     const DWORD error = GetLastError();
     void* value = TlsGetValue(tlsSlot);
     SetLastError(error);
@@ -62,15 +65,15 @@ void Prepare() {
 
 std::uintptr_t IndexOf(EmutlsObject* object) {
     std::uintptr_t index = __atomic_load_n(&object->index, __ATOMIC_ACQUIRE);
-    if (index != 0) return index;
+    if (index != 0) return index & ~Owned;
     AcquireSRWLockExclusive(&lock);
     index = object->index;
     if (index == 0) {
-        index = ++indices;
+        index = ++indices | Owned;
         __atomic_store_n(&object->index, index, __ATOMIC_RELEASE);
     }
     ReleaseSRWLockExclusive(&lock);
-    return index;
+    return index & ~Owned;
 }
 
 void* Allocate(const EmutlsObject* object) {
@@ -82,7 +85,7 @@ void* Allocate(const EmutlsObject* object) {
     return value;
 }
 
-void* Slow(EmutlsObject* object) {
+__attribute__((noinline)) void* Slow(EmutlsObject* object) {
     const DWORD error = GetLastError();
     if (!ready.load(std::memory_order_acquire)) Prepare();
     const auto address = reinterpret_cast<std::uintptr_t>(object);
@@ -128,14 +131,12 @@ void NTAPI ReleaseThread(PVOID, DWORD reason, PVOID) {
 }
 
 extern "C" void* __emutls_get_address(EmutlsObject* object) {
-    if (ready.load(std::memory_order_acquire) && fast) {
-        const std::uintptr_t index = __atomic_load_n(&object->index, __ATOMIC_ACQUIRE);
-        const auto address = reinterpret_cast<std::uintptr_t>(object);
-        if (index != 0 && address >= imageBegin && address < imageEnd) {
-            const auto* slots = static_cast<const Slots*>(ReadSlot());
-            if (slots != nullptr && index <= slots->count) {
-                if (void* value = slots->values[index - 1]) return value;
-            }
+    const std::uintptr_t tagged = __atomic_load_n(&object->index, __ATOMIC_ACQUIRE);
+    if ((tagged & Owned) != 0 && tlsSlot < 64) {
+        const auto* slots = static_cast<const Slots*>(reinterpret_cast<void* const*>(reinterpret_cast<const char*>(NtCurrentTeb()) + TebTlsSlots)[tlsSlot]);
+        const std::uintptr_t index = tagged & ~Owned;
+        if (slots != nullptr && index <= slots->count) {
+            if (void* value = slots->values[index - 1]) return value;
         }
     }
     return Slow(object);
