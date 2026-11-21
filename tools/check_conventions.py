@@ -132,8 +132,9 @@ def git(*args, text=True):
 
 
 class Check:
-    def __init__(self, base, head):
+    def __init__(self, base, head, exclude=()):
         self.head = head
+        self.exclude = list(exclude)
         self.target = base
         self.base = git("merge-base", base, head).strip()
         self.findings = []
@@ -521,7 +522,7 @@ class Check:
                     self.report("ci-gate", path, number, name)
 
     def commits(self):
-        for line in filter(None, git("log", "--no-merges", "--format=%h %s", f"{self.base}..{self.head}").split("\n")):
+        for line in filter(None, git("log", "--no-merges", "--format=%h %s", f"{self.base}..{self.head}", *(["--not", *self.exclude] if self.exclude else [])).split("\n")):
             sha, subject = line.split(" ", 1)
             if not CONVENTIONAL.match(subject):
                 self.report("commit-subject", "", 0, f"{sha} {subject}")
@@ -1193,6 +1194,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="check a branch against the contributing rules; errors fail the check")
     parser.add_argument("--base", help="branch the pull request targets (default: upstream/main, then origin/main, then main)")
     parser.add_argument("--head", default="HEAD")
+    parser.add_argument("--exclude", action="append", default=[], help="skip the commit subjects of commits reachable from this ref (an upstream branch merged in)")
     parser.add_argument("--title", help="pull request title to check")
     parser.add_argument("--body", help="file with the pull request description to check")
     parser.add_argument("--event", default=os.environ.get("GITHUB_EVENT_PATH"), help="GitHub event JSON (set in CI)")
@@ -1215,7 +1217,7 @@ if __name__ == "__main__":
         base = base_ref.resolve(".", args.base)
     except ValueError as error:
         parser.error(str(error))
-    check = Check(base, args.head)
+    check = Check(base, args.head, args.exclude)
     check.code()
     check.build()
     check.shaders()

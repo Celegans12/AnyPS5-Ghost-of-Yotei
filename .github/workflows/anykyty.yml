@@ -62,8 +62,10 @@ jobs:
           else
             base=origin/AnyKyty; head=HEAD
           fi
+          exclude=()
+          if git fetch -q --no-tags https://github.com/boykopovar/AnyPS5.git +main:refs/remotes/upstream/main; then exclude=(--exclude refs/remotes/upstream/main); fi
           echo "Checking $(git rev-parse --short "$base")..$(git rev-parse --short "$head")"
-          python3 -I tools/check_conventions.py --base "$base" --head "$head"
+          python3 -I tools/check_conventions.py --base "$base" --head "$head" "${exclude[@]}"
       - name: Check that every Kyty setting is documented
         run: python3 -I tools/check_kyty_settings.py
 
