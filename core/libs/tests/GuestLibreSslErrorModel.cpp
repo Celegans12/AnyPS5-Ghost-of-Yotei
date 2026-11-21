@@ -92,7 +92,7 @@ static void TestPkcs12FileErrors() {
 }
 
 int main() {
-    const std::array<unsigned char, 16> sessionBytes {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+    const std::array<unsigned char, sizeof(LibreSslSession)> sessionBytes {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
     auto sessionCopy = sessionBytes;
     ERR_clear_error_nid_postfix();
     LibreSslPutError_nid_no_patch(3, 1, 41);
