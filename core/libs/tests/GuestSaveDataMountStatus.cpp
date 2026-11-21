@@ -50,15 +50,6 @@ bool MountedCountThrows(std::int32_t reserved, std::uint32_t* count) {
     return false;
 }
 
-bool Umount2Throws(std::uint32_t mode, const SaveDataMountPoint* point) {
-    try {
-        static_cast<void>(sceSaveDataUmount2(mode, point));
-    } catch (const std::runtime_error&) {
-        return true;
-    }
-    return false;
-}
-
 void CheckUnmountedCalls() {
     SaveDataMountPoint point{};
     std::memcpy(point.data, "test", sizeof("test"));
@@ -883,9 +874,20 @@ void CheckUmount2BackupModes() {
     SaveDataMountInfo info{};
     Check(sceSaveDataGetMountInfo(&mounted.mount_point, &info) == SaveDataErrorNotMounted, "umount2(0x10000) unmounts the save when backup copy fails");
 
-    for (const std::uint32_t unknownMode : {1u, 2u, 0x20000u}) {
-        Check(Umount2Throws(unknownMode, &missing), "umount2 throws on unknown mode " + std::to_string(unknownMode));
+    for (const std::uint32_t otherMode : {1u, 2u, 0x20000u}) {
+        const std::string tag = "umount2(" + std::to_string(otherMode) + ")";
+        Check(sceSaveDataUmount2(otherMode, &missing) == SaveDataErrorNotMounted, tag + " unmounted point is NOT_MOUNTED");
+        Check(MountSave(&name, MountReadWrite, &mounted), tag + " remount");
+        Check(sceSaveDataUmount2(otherMode, &mounted.mount_point) == 0, tag + " succeeds");
+        SaveDataEvent none{};
+        Check(sceSaveDataGetEventResult(nullptr, &none) == SaveDataErrorNotFound, tag + " does not post a backup event");
+        SaveDataMountInfo otherInfo{};
+        Check(sceSaveDataGetMountInfo(&mounted.mount_point, &otherInfo) == SaveDataErrorNotMounted, tag + " unmounts the save");
     }
+    Check(MountSave(&name, MountReadWrite, &mounted), "remount for umount2(0x10002)");
+    Check(sceSaveDataUmount2(0x10002u, &mounted.mount_point) == 0, "umount2(0x10002) succeeds");
+    SaveDataEvent backupEvent{};
+    Check(sceSaveDataGetEventResult(nullptr, &backupEvent) == 0 && backupEvent.type == 1, "umount2(0x10002) still backs up");
 
     SaveDataDelete del{};
     del.dir_name = &name;

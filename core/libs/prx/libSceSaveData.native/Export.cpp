@@ -1880,10 +1880,13 @@ static int unmountMountPoint(const SaveDataMountPoint* mount_point, std::string*
 }
 
 static int umount2(uint32_t mode, const SaveDataMountPoint* mount_point, std::string* tracePoint) {
-    if (mode != 0 &&
-        mode != SAVE_DATA_UMOUNT_MODE_BACKUP &&
-        mode != (SAVE_DATA_UMOUNT_MODE_BACKUP | SAVE_DATA_UMOUNT_MODE_BACKUP_FORCE)) {
-        throw std::runtime_error("sceSaveDataUmount2: unknown mode");
+    const uint32_t unknownBits = mode & ~(SAVE_DATA_UMOUNT_MODE_BACKUP | SAVE_DATA_UMOUNT_MODE_BACKUP_FORCE);
+    if (unknownBits != 0) {
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true, std::memory_order_relaxed)) {
+            std::fprintf(stderr, "[SAVEDATA:native] sceSaveDataUmount2: mode 0x%x has unknown bits 0x%x, ignored\n", mode, unknownBits);
+            std::fflush(stderr);
+        }
     }
     return unmountMountPoint(mount_point, tracePoint, (mode & SAVE_DATA_UMOUNT_MODE_BACKUP) != 0);
 }
