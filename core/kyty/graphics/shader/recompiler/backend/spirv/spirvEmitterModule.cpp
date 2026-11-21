@@ -278,6 +278,45 @@ void DefineImageArray(EmitterState& state, ImageDefinition& definition, const IR
 	return words <= IR::FlattenedSrtUniformWords;
 }
 
+[[nodiscard]] std::vector<bool> BuffersReadByScalarLoads(const IR::Program& program) {
+	std::vector<bool> read(program.info.buffers.size());
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (inst.GetOpcode() != IR::ValueOpcode::ReadConstBuffer) continue;
+			const auto index = inst.Flags<IR::MemoryFlags>().index;
+			if (index >= program.memory_info.size()) continue;
+			const auto& memory = program.memory_info[index];
+			if (memory.kind == IR::ResourceKind::ScalarBuffer && !memory.planning_only &&
+			    memory.resource < read.size()) {
+				read[memory.resource] = true;
+			}
+		}
+	}
+	return read;
+}
+
+[[nodiscard]] bool ReadOnlyScalarBuffer(const IR::BufferResource& buffer) {
+	return !buffer.written && !buffer.atomic && !buffer.formatted &&
+	       buffer.indirect_root == IR::BufferResource::NoIndirectBuffer && buffer.indirect_resources.empty() &&
+	       !buffer.indirect_write_table;
+}
+
+[[nodiscard]] bool ReadsFlattenedSrtConstantSlots(const IR::Program& program) {
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			const auto opcode = inst.GetOpcode();
+			if (opcode == IR::ValueOpcode::ReadConst) {
+				const auto slot = inst.Arg(1).Resolve();
+				if (slot.IsImmediate() && slot.U32() < IR::FlattenedSrtUniformWords) return true;
+			} else if (opcode == IR::ValueOpcode::ReadCallWord && inst.Arg(0).IsImmediate() &&
+			           program.srt_reads.size() + inst.Arg(0).U32() < IR::FlattenedSrtUniformWords) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 void DefineDescriptors(EmitterState& state) {
 	using Kind = IR::DescriptorBindingKind;
 	auto& info = state.program.info;
@@ -289,10 +328,14 @@ void DefineDescriptors(EmitterState& state) {
 		buffer.descriptor_index = buffer.live && !table ? buffer_count++ : UINT32_MAX;
 	}
 	auto& uniform_count = counts[static_cast<size_t>(Kind::UniformBuffers)];
-	for (auto& buffer: info.buffers) {
-		buffer.uniform_index = state.profile.robust_buffer_access &&
-		                               buffer.descriptor_index != UINT32_MAX && buffer.constant_only
-		                           ? uniform_count++ : UINT32_MAX;
+	const auto scalar_reads = state.profile.uniform_scalar_loads ? BuffersReadByScalarLoads(state.program)
+	                                                             : std::vector<bool>(info.buffers.size());
+	for (size_t index = 0; index < info.buffers.size(); ++index) {
+		auto&      buffer   = info.buffers[index];
+		const bool constant = state.profile.robust_buffer_access && buffer.constant_only;
+		const bool scalar   = scalar_reads[index] && buffer.live && ReadOnlyScalarBuffer(buffer);
+		buffer.uniform_index =
+		    buffer.descriptor_index != UINT32_MAX && (constant || scalar) ? uniform_count++ : UINT32_MAX;
 	}
 	std::array<const IR::ImageResource*, IR::ImageBindingCount> image_types {};
 	for (auto& image: info.images) {
@@ -337,6 +380,10 @@ void DefineDescriptors(EmitterState& state) {
 	counts[static_cast<size_t>(Kind::FlattenedSrt)] = info.uses_flattened_srt && !table;
 	bindings.flattened_srt_uniform =
 	    counts[static_cast<size_t>(Kind::FlattenedSrt)] != 0 && FlattenedSrtFitsUniform(state.program);
+	bindings.flattened_srt_uniform_index =
+	    state.profile.uniform_scalar_loads && counts[static_cast<size_t>(Kind::FlattenedSrt)] != 0 &&
+	            !bindings.flattened_srt_uniform && ReadsFlattenedSrtConstantSlots(state.program)
+	        ? uniform_count++ : UINT32_MAX;
 	bindings.memory_offset_dword = static_cast<uint32_t>(info.user_data_registers.size());
 	if (info.uses_dispatch_threads) {
 		bindings.dispatch_thread_dword = bindings.memory_offset_dword;

@@ -2475,6 +2475,11 @@ uint32_t EmitReadConst(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (state.flattened_srt_variable == 0) {
 		ctx.Fail(inst, "requires the flattened SRT descriptor");
 	}
+	const auto slot = inst.Arg(1).Resolve();
+	if (const auto uniform = state.program.bindings.flattened_srt_uniform_index;
+	    uniform != UINT32_MAX && slot.IsImmediate() && slot.U32() < IR::FlattenedSrtUniformWords) {
+		return LoadUniformBufferWord(state, uniform, ConstantU32(state, slot.U32()));
+	}
 	const auto pointer = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, state.flattened_srt_pointer, pointer,
 	                          state.flattened_srt_variable, ConstantU32(state, 0),
@@ -2499,36 +2504,52 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (!offset.IsImmediate() && mem.offset >= 4u) {
 		index = Binary(state, spv::OpIAdd, TypeU32(state), index, ConstantU32(state, mem.offset >> 2u));
 	}
-	if (const auto& resource = state.program.info.buffers.at(mem.resource);
-	    resource.uniform_index != UINT32_MAX) {
-		const auto element = Binary(
-		    state, spv::OpIAdd, TypeU32(state), index,
-		    Binary(state, spv::OpShiftRightLogical, TypeU32(state),
-		           state.memory_byte_offsets[resource.descriptor_index], ConstantU32(state, 2)));
-		const auto pointer = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpAccessChain,
-		                          TypePointer(state, spv::StorageClassUniform, TypeU32(state)),
-		                          pointer, state.uniform_buffer_variable,
-		                          ConstantU32(state, resource.uniform_index), ConstantU32(state, 0),
-		                          element);
-		ctx.Define(inst, EmitNative<spv::OpLoad, IR::Type::U32>(state, pointer));
+	const auto storage_load = [&]() {
+		const auto access  = PrepareMemoryResourceAccess(state, mem);
+		auto       element = Binary(state, spv::OpIAdd, TypeU32(state), index,
+		                            Binary(state, spv::OpShiftRightLogical, TypeU32(state), access.byte_offset,
+		                                   ConstantU32(state, 2)));
+		constexpr uint32_t last_element = UINT32_MAX >> 2u;
+		if (state.profile.robust_buffer_access &&
+		    (!offset.IsImmediate() || (offset.U32() >> 2u) + (mem.offset >> 2u) > last_element - 63u)) {
+			element = EmitGlsl<GLSLstd450UMin, IR::Type::U32>(state, element, ConstantU32(state, last_element));
+		}
+		const auto condition = EmitStorageElementInBounds(state, access, element);
+		return EmitValueOrZeroIfCondition(state, condition, [&]() {
+			return EmitAccessLoad(state, TypeU32(state), EmitMemoryElementPointer(state, access, element), access);
+		});
+	};
+	const auto& resource = state.program.info.buffers.at(mem.resource);
+	if (resource.uniform_index == UINT32_MAX || state.memory_byte_offsets[resource.descriptor_index] == 0) {
+		ctx.Define(inst, storage_load());
 		return;
 	}
-	const auto access    = PrepareMemoryResourceAccess(state, mem);
-	auto element = Binary(
+	const auto element = Binary(
 	    state, spv::OpIAdd, TypeU32(state), index,
-	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), access.byte_offset, ConstantU32(state, 2)));
-	constexpr uint32_t last_element = UINT32_MAX >> 2u;
-	if (state.profile.robust_buffer_access &&
-	    (!offset.IsImmediate() || (offset.U32() >> 2u) + (mem.offset >> 2u) > last_element - 63u)) {
-		element = EmitGlsl<GLSLstd450UMin, IR::Type::U32>(state, element,
-		                                                  ConstantU32(state, last_element));
+	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), state.memory_byte_offsets[resource.descriptor_index],
+	           ConstantU32(state, 2)));
+	const auto uniform_load = [&]() { return LoadUniformBufferWord(state, resource.uniform_index, element); };
+	if (state.profile.robust_buffer_access && resource.constant_only) {
+		ctx.Define(inst, uniform_load());
+		return;
 	}
-	const auto condition = EmitStorageElementInBounds(state, access, element);
-	ctx.Define(inst, EmitValueOrZeroIfCondition(state, condition, [&]() {
-		           return EmitAccessLoad(state, TypeU32(state), EmitMemoryElementPointer(state, access, element),
-		                                 access);
-	           }));
+	const auto bounded_load = [&]() {
+		const auto in_bounds =
+		    Binary(state, spv::OpULessThan, TypeBool(state), element,
+		           Binary(state, spv::OpShiftRightLogical, TypeU32(state),
+		                  state.memory_byte_sizes[resource.descriptor_index], ConstantU32(state, 2)));
+		return state.profile.robust_buffer_access
+		           ? Select(state, TypeU32(state), in_bounds, uniform_load(), ConstantU32(state, 0))
+		           : EmitValueOrZeroIfCondition(state, in_bounds, uniform_load);
+	};
+	constexpr uint32_t uniform_words = IR::UniformBufferBytes / sizeof(uint32_t);
+	constexpr uint32_t base_words    = IR::UniformBufferBaseSlack / sizeof(uint32_t);
+	if (offset.IsImmediate() && (offset.U32() >> 2u) + (mem.offset >> 2u) < uniform_words - base_words) {
+		ctx.Define(inst, bounded_load());
+		return;
+	}
+	const auto fits = Binary(state, spv::OpULessThan, TypeBool(state), element, ConstantU32(state, uniform_words));
+	ctx.Define(inst, EmitValueIfElse(state, fits, TypeU32(state), bounded_load, storage_load));
 }
 
 uint32_t EmitLoadDeviceAddressU32(ValueEmitContext& ctx, const IR::Inst& inst) {

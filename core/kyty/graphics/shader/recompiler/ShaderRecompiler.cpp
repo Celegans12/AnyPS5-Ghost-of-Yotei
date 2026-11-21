@@ -835,6 +835,8 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 
 	LOGF("ShaderRecompiler %s phase begin: hash=0x%016" PRIx64 " SPIR-V EmitProgram\n", stage,
 	     ir.shader_hash);
+	auto profile                 = *options.profile;
+	profile.uniform_scalar_loads = options.uniform_scalar_loads;
 	std::vector<uint32_t> spirv;
 	if (const auto* group = options.stage == ShaderType::Compute ? options.input_info.compute : nullptr;
 	    group != nullptr && !options.wave_lane_pairs && ir.wave_size == 64u && group->host_subgroup_size == 32u &&
@@ -844,7 +846,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 		auto wide_input         = options.input_info;
 		wide_input.compute      = &wide;
 		Spirv::SplitHints hints;
-		spirv = Spirv::EmitProgram(ir, wide_input, push_data_start_dword, *options.profile, options.emit_debug_info,
+		spirv = Spirv::EmitProgram(ir, wide_input, push_data_start_dword, profile, options.emit_debug_info,
 		                           true, options.ray_stats, &hints);
 		std::string refusal;
 		if (!Spirv::SplitWaveAcrossSubgroups(spirv, refusal, &hints)) {
@@ -859,7 +861,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 		}
 	}
 	if (spirv.empty()) {
-		spirv = Spirv::EmitProgram(ir, options.input_info, push_data_start_dword, *options.profile,
+		spirv = Spirv::EmitProgram(ir, options.input_info, push_data_start_dword, profile,
 		                           options.emit_debug_info, true, options.ray_stats);
 	}
 	LOGF("ShaderRecompiler %s phase end: hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
@@ -871,7 +873,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	CompileResult result;
 	if (options.plain_mip_stats_variant && Spirv::UsesMipStats(ir)) {
 		result.spirv_plain =
-		    Spirv::EmitProgram(ir, options.input_info, push_data_start_dword, *options.profile,
+		    Spirv::EmitProgram(ir, options.input_info, push_data_start_dword, profile,
 		                       options.emit_debug_info, false, options.ray_stats);
 	}
 	result.spirv          = std::move(spirv);

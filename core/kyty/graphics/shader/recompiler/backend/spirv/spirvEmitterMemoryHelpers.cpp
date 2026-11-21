@@ -38,6 +38,16 @@ uint32_t EmitBinaryU32(EmitterState& state, spv::Op opcode, uint32_t lhs, uint32
 	return ret;
 }
 
+uint32_t LoadUniformBufferWord(EmitterState& state, uint32_t uniform_index, uint32_t element) {
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, TypePointer(state, spv::StorageClassUniform, TypeU32(state)),
+	                          pointer, state.uniform_buffer_variable, ConstantU32(state, uniform_index),
+	                          ConstantU32(state, 0), element);
+	const auto value = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+	return value;
+}
+
 static uint32_t LoadFlattenedSrt(EmitterState& state, uint32_t index) {
 	const auto pointer = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, state.flattened_srt_pointer, pointer,

@@ -600,6 +600,7 @@ struct Bindings {
 	uint32_t mip_stats_count = 0;
 	uint32_t stride_count = 0;
 	bool     flattened_srt_uniform = false;
+	uint32_t flattened_srt_uniform_index = UINT32_MAX;
 
 	[[nodiscard]] uint32_t MemorySizeDword() const {
 		return memory_offset_dword +

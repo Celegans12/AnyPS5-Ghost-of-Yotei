@@ -36,6 +36,7 @@ struct CompileOptions {
 	ShaderStageInputInfo        input_info;
 	bool                        plain_mip_stats_variant    = false;
 	bool                        wave_lane_pairs            = false;
+	bool                        uniform_scalar_loads       = true;
 };
 
 struct TranslateResult {

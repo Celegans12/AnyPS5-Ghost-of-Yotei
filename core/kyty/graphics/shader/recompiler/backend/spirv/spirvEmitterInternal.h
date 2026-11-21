@@ -770,6 +770,29 @@ uint32_t EmitValueOrZeroIfCondition(EmitterState& state, uint32_t condition, Fn&
 	                                     std::forward<Fn>(fn));
 }
 
+template <typename Then, typename Else>
+uint32_t EmitValueIfElse(EmitterState& state, uint32_t condition, uint32_t type, Then&& then_fn, Else&& else_fn) {
+	const auto then_label  = state.builder.AllocateId();
+	const auto else_label  = state.builder.AllocateId();
+	const auto merge_label = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(spv::OpBranchConditional, condition, then_label, else_label);
+	EmitLabel(state, then_label);
+	const auto then_value = then_fn();
+	const auto then_exit  = state.current_label;
+	state.builder.AddFunction(spv::OpBranch, merge_label);
+	EmitLabel(state, else_label);
+	const auto else_value = else_fn();
+	const auto else_exit  = state.current_label;
+	state.builder.AddFunction(spv::OpBranch, merge_label);
+	EmitLabel(state, merge_label);
+	const auto value = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpPhi, type, value, then_value, then_exit, else_value, else_exit);
+	return value;
+}
+
+uint32_t LoadUniformBufferWord(EmitterState& state, uint32_t uniform_index, uint32_t element);
+
 template <typename Fn>
 uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind kind, Fn&& desired) {
 	const auto scope     = kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;

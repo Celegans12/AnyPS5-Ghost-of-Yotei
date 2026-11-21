@@ -2901,6 +2901,13 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 			CopyGpuFlatLoads(m_context, prepared.flattened_srt, snapshot.gpu_flat_loads);
 			snapshot.gpu_flat_loads.clear();
 		}
+		if (layout.flattened_srt_uniform_index != UINT32_MAX) {
+			auto view  = prepared.flattened_srt;
+			view.range = std::min(
+			    std::min<vk::DeviceSize>(view.range, ShaderRecompiler::IR::UniformBufferBytes),
+			    vk::DeviceSize {m_context.GetGraphics().GetPhysicalDeviceProperties().limits.maxUniformBufferRange});
+			prepared.uniform_buffers[layout.flattened_srt_uniform_index] = view;
+		}
 	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::ShaderData)] != 0) {
 		prepared.shader_data_buffer = NativeUpload(m_context, prepared.shader_data);
