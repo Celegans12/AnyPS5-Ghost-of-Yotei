@@ -90,6 +90,15 @@ class FrameReplayReportTests(unittest.TestCase):
                 self.assertEqual(len(result["issues"]), 1)
                 self.assertIn("skipped_bytes", result["issues"][0])
 
+    def test_native_unavailable_reasons_belong_to_the_host_report(self):
+        reasons = ["cpu: cpuid", "memory: no source", "os: uname failed"]
+        raw = HOST + "[unavailable]\n" + "\n".join(reasons) + "\n"
+        parsed = report.parse_replay_host_report(raw + "warning: loading frames\n", COMMIT)
+        self.assertEqual(parsed["unavailable"], reasons)
+        self.assertEqual(parsed["raw"], raw)
+        with self.assertRaisesRegex(ValueError, "contradictory invocation host reports"):
+            report.parse_replay_host_report(raw + raw.replace("os: uname failed", "os: no source"), COMMIT)
+
     def test_validation_diagnostics_in_stdout_and_stderr(self):
         for stdout_bytes in (False, True):
             for stderr_bytes in (False, True):
