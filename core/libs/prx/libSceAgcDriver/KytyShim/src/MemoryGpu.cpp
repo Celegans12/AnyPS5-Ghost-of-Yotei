@@ -1,7 +1,6 @@
 #include "kernel/memory.h"
 
 #include "MemoryShim.hpp"
-#include "common/runtimeSwitches.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/scout.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -279,9 +278,7 @@ Graphics::ShaderRecompiler::IR::SrtWalkerPage WalkerGuestPage(uint64_t address, 
 	}
 	if (!Graphics::GuestGpu::IsGpuThread()) {
 		if (!ahead) return Graphics::ShaderRecompiler::IR::SrtWalkerPage::Direct;
-		if (Common::RuntimeSwitches::On(Common::RuntimeSwitches::Switch::ResolveGpuReads)) {
-			backing = FindAheadAroundBackingPage(address);
-		}
+		backing = FindAheadAroundBackingPage(address);
 		return Graphics::ShaderRecompiler::IR::SrtWalkerPage::PerLoad;
 	}
 	return ahead ? Graphics::ShaderRecompiler::IR::SrtWalkerPage::Direct : Graphics::ShaderRecompiler::IR::SrtWalkerPage::PerLoad;

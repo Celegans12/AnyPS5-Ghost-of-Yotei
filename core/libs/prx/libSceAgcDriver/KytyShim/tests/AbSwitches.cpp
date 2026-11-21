@@ -55,9 +55,7 @@ std::string Refused(const char* ab, const char* start = "", const char* settle =
 }
 
 void Refusals() {
-	const std::string listed =
-	    "settings KYTY_AB can change: KYTY_FLAT_DEFER, KYTY_GENERIC_COMPUTE_VARIANT, KYTY_RESOLVE_GPU_READS, "
-	    "KYTY_RESOLVE_IMAGE_HEAP";
+	const std::string listed = "settings KYTY_AB can change: KYTY_FLAT_DEFER, KYTY_GENERIC_COMPUTE_VARIANT";
 	Check(Contains(Refused("KYTY_FLAT_DEFER"), "expected <seconds>:<setting>"), "a value without a phase length is refused");
 	Check(Contains(Refused("0.5:KYTY_FLAT_DEFER"), "at least 1 s"), "a phase under 1 s is refused");
 	Check(Contains(Refused("x:KYTY_FLAT_DEFER"), "KYTY_AB phase length: 'x' is not a number of seconds"),

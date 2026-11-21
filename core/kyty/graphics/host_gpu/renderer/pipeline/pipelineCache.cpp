@@ -13,7 +13,6 @@
 #include "common/hackNotice.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
-#include "common/runtimeSwitches.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -2773,11 +2772,9 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 	key.user_data_count = params.user_data_count;
 	BuildStageStaticKey(input_info, key.static_state);
 	AppendNativeRayTracingKey(key.stage, key.static_state);
-	const bool unlocked   = t_ahead_unlocked;
-	const bool heap_ahead = m_image_heap != nullptr &&
-	                        Common::RuntimeSwitches::On(Common::RuntimeSwitches::Switch::ResolveImageHeap);
-	Program*   program    = nullptr;
-	bool       heap_used  = false;
+	const bool unlocked  = t_ahead_unlocked;
+	Program*   program   = nullptr;
+	bool       heap_used = false;
 	{
 		const ProgramLockMaybe lock(m_program_lock, unlocked);
 		const auto             entry = m_program_cache.find(key);
@@ -2794,7 +2791,7 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 		    entry == m_program_cache.end()                ? AheadRefusal::Compiling
 		    : ahead.stages == ProgramResolution::MaxStages || entry->second.skip_dispatch ? AheadRefusal::Shape
 		    : entry->second.call_source                   ? AheadRefusal::Calls
-		    : heap_used && !heap_ahead                    ? AheadRefusal::ImageHeap
+		    : heap_used && m_image_heap == nullptr        ? AheadRefusal::ImageHeap
 		                                                  : AheadRefusal::None;
 		if (refusal != AheadRefusal::None) {
 			ahead.reads.Fail(refusal);
@@ -2835,7 +2832,7 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 	ShaderRecompiler::IR::SrtAroundLoadsOfThread().clear();
 #endif
 	std::optional<AheadImageHeap> heap;
-	if (heap_ahead && heap_used) {
+	if (m_image_heap != nullptr && heap_used) {
 		heap.emplace(*m_image_heap, ahead.heap);
 		runtime.image_heap = &*heap;
 	}
