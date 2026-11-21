@@ -3,6 +3,7 @@
 #include "graphics/shader/recompiler/Tessellation.h"
 
 #include "common/assert.h"
+#include "common/hackNotice.h"
 #include "common/logging/log.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvWaveSplit.h"
@@ -554,6 +555,14 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 			if (inst.opcode == Decoder::Opcode::S_SWAPPC_B64 && inst.branch_target == UINT32_MAX)
 				EXIT("shader call at pc 0x%08x must be linked before translation", inst.pc);
 		}
+	}
+
+	for (const auto& inst: decoded.instructions) {
+		const auto mode_bits = Decoder::FloatModeBitsWritten(inst);
+		if (mode_bits == 0u) continue;
+		Common::HackNotice::Report("S_SETREG_B32 float MODE write ignored", "ShaderRecompiler::TranslateProgram",
+		                           options.shader_hash, inst.pc,
+		                           fmt::format("round=0x{:x} denorm=0x{:x}", mode_bits & 0xfu, (mode_bits >> 4u) & 0xfu));
 	}
 
 	const auto* stage        = StageName(options.stage);

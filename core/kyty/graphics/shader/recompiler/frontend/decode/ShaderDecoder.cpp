@@ -348,6 +348,16 @@ Family GetInstructionFamily(uint32_t word) {
 	}
 }
 
+uint32_t FloatModeBitsWritten(const Instruction& inst) {
+	if (inst.opcode != Opcode::S_SETREG_B32 || (inst.src1.value & 0x3fu) != 1u) {
+		return 0;
+	}
+	const uint32_t offset = (inst.src1.value >> 6u) & 0x1fu;
+	const uint32_t size   = ((inst.src1.value >> 11u) & 0x1fu) + 1u;
+	const uint64_t field  = ((uint64_t {1} << size) - 1u) << offset;
+	return static_cast<uint32_t>(field & 0xffu);
+}
+
 static uint32_t BaseWordCount(Family family) {
 	switch (family) {
 		case Family::VOP3:

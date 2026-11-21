@@ -946,6 +946,7 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program,
 bool IsConditionalBranch(Opcode opcode);
 bool IsDirectBranch(Opcode opcode);
 bool IsDsWriteOpcode(Opcode opcode);
+[[nodiscard]] uint32_t FloatModeBitsWritten(const Instruction& inst);
 
 void DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand);
 void DecodeScalarDestination(uint32_t code, uint32_t pc, Operand& operand);

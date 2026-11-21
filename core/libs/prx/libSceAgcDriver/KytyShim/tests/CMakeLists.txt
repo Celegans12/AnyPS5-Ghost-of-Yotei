@@ -291,6 +291,9 @@ if(NOT WIN32)
     add_test(NAME kyty_shim_recompiler_robustness COMMAND kyty_shim_recompiler_robustness_tests)
     set_tests_properties(kyty_shim_recompiler_robustness PROPERTIES TIMEOUT 60 PASS_REGULAR_EXPRESSION "kyty_shim_recompiler_robustness: ok"
             FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+    add_test(NAME kyty_shim_recompiler_float_mode COMMAND kyty_shim_recompiler_robustness_tests float-mode-bits)
+    set_tests_properties(kyty_shim_recompiler_float_mode PROPERTIES TIMEOUT 60 PASS_REGULAR_EXPRESSION "kyty_shim_recompiler_robustness: ok"
+            FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
     add_test(NAME kyty_shim_recompiler_stale_lane_spill COMMAND kyty_shim_recompiler_robustness_tests stale-lane-spill-after-read-lane-elimination)
     set_tests_properties(kyty_shim_recompiler_stale_lane_spill PROPERTIES TIMEOUT 60 PASS_REGULAR_EXPRESSION "kyty_shim_recompiler_robustness: ok"
             FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
