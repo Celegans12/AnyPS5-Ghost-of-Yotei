@@ -606,6 +606,8 @@ std::vector<vk::Format> VertexInputFormats(const ShaderVertexInputInfo&         
 	return formats;
 }
 
+constexpr uint32_t LanePairsKey = 0x574c5052u;
+
 void SkipCallExpansionFailure(uint64_t hash, const ShaderRecompiler::ShaderSource& source) {
 	Common::HackNotice::Report("dispatch whose call tables do not expand skipped",
 	                           "PipelineCache::GetProgram", hash, 0, source.refresh_failure);
@@ -613,10 +615,7 @@ void SkipCallExpansionFailure(uint64_t hash, const ShaderRecompiler::ShaderSourc
 
 }
 
-void AppendNativeRayTracingKey(ShaderType stage, std::vector<uint32_t>& key, bool native, bool lane_pairs) {
-	if (lane_pairs) {
-		key.push_back(0x574c5052u);
-	}
+void AppendNativeRayTracingKey(ShaderType stage, std::vector<uint32_t>& key, bool native) {
 	if (native && stage == ShaderType::Pixel && RayTracing::NativeTraversals() && Config::RayTracingOracle() != 0) {
 		key.push_back(0x52544f00u | Config::RayTracingOracle());
 		if (Config::RayTracingStatsEnabled()) {
@@ -1761,7 +1760,10 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	m_lookup_key.hash            = params.hash;
 	m_lookup_key.user_data_count = params.user_data_count;
 	BuildStageStaticKey(input_info, m_lookup_key.static_state);
-	AppendNativeRayTracingKey(options.stage, m_lookup_key.static_state, !m_guest_traversal, m_lane_pairs);
+	AppendNativeRayTracingKey(options.stage, m_lookup_key.static_state, !m_guest_traversal);
+	if (m_lane_pairs) {
+		m_lookup_key.static_state.push_back(LanePairsKey);
+	}
 	auto entry = m_program_cache.find(m_lookup_key);
 	const auto bind = [&](const ShaderModule& module) {
 		input_info.stage = {.module = &module, .resources = &entry->second.resources};

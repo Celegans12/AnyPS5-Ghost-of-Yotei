@@ -955,8 +955,7 @@ private:
 	[[nodiscard]] uint32_t    UseRank(uint64_t program_hash) const;
 };
 
-void AppendNativeRayTracingKey(ShaderType stage, std::vector<uint32_t>& key, bool native = true,
-                               bool lane_pairs = false);
+void AppendNativeRayTracingKey(ShaderType stage, std::vector<uint32_t>& key, bool native = true);
 
 std::string PipelineCacheTitleId();
 std::filesystem::path ShaderStorePath();
