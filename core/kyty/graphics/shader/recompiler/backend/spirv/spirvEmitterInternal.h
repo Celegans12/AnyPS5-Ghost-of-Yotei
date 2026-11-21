@@ -246,6 +246,7 @@ struct EmitterState {
 	uint32_t                   pixel_valid_mask_variable             = 0;
 	uint32_t                   subgroup_local_invocation_id_variable = 0;
 	uint32_t                   helper_invocation_variable            = 0;
+	bool                       quad_lanes                            = false;
 	uint32_t                   per_vertex_variable                   = 0;
 	uint32_t                   point_size_variable                   = 0;
 	uint32_t                   clip_distance_variable                = 0;
@@ -374,6 +375,7 @@ struct ValueEmitContext {
 	uint32_t                                                           relative_vgpr_variable = 0;
 	ValueEmitContext*                                                  other_half = nullptr;
 	uint32_t                                                           half       = 0;
+	bool                                                               quad_read  = false;
 };
 
 constexpr uint32_t NoImageComponent = 0xffffffffu;
@@ -417,6 +419,9 @@ uint32_t MrtOutputType(EmitterState& state, uint32_t index);
 uint32_t ConstantU32(EmitterState& state, uint32_t value);
 
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state);
+bool     QuadLanes(const EmitterState& state);
+uint32_t QuadBallot(EmitterState& state, uint32_t predicate);
+uint32_t QuadShuffle(EmitterState& state, uint32_t type, uint32_t value, uint32_t lane);
 
 [[noreturn]] void ExitDescriptorBindingFailure(const EmitterState&       state,
                                                IR::DescriptorBindingKind kind, uint32_t resource,

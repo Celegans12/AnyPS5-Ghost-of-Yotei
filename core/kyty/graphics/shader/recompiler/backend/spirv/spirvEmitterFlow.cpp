@@ -837,7 +837,10 @@ uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 uint32_t EmitBallot(ValueEmitContext& ctx, IR::Value predicate) {
-	return ctx.Ballot(predicate);
+	ctx.quad_read     = true;
+	const auto result = ctx.Ballot(predicate);
+	ctx.quad_read     = false;
+	return result;
 }
 
 uint32_t EmitLiveMask(EmitterState& state) {
@@ -848,13 +851,19 @@ uint32_t EmitLiveMask(EmitterState& state) {
 }
 
 uint32_t EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst) {
+	ctx.quad_read     = true;
 	const auto ballot = ctx.Ballot(inst.Arg(1));
 	const auto lane   = ctx.FirstLane(ballot);
-	return ctx.Shuffle(inst, 0, lane);
+	const auto result = ctx.Shuffle(inst, 0, lane);
+	ctx.quad_read     = false;
+	return result;
 }
 
 uint32_t EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst) {
-	return ctx.Shuffle(inst, 0, ctx.Arg(inst, 1));
+	ctx.quad_read     = true;
+	const auto result = ctx.Shuffle(inst, 0, ctx.Arg(inst, 1));
+	ctx.quad_read     = false;
+	return result;
 }
 
 template <spv::Op Reduce, auto Combine>

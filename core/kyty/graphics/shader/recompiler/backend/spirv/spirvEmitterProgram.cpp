@@ -1405,7 +1405,104 @@ uint32_t ValueEmitContext::HalfArg(const IR::Inst& inst, size_t index, uint32_t 
 	return lane_half == half ? Arg(inst, index) : other_half->Arg(inst, index);
 }
 
+bool QuadLanes(const EmitterState& state) {
+	return state.quad_lanes && state.helper_invocation_variable != 0;
+}
+
+uint32_t QuadBallot(EmitterState& state, uint32_t predicate) {
+	state.builder.RequireCapability(spv::CapabilityGroupNonUniformQuad);
+	const auto vec   = TypeU32Vector(state, 4);
+	const auto u32   = TypeU32(state);
+	const auto scope = ConstantU32(state, spv::ScopeSubgroup);
+	const auto splat = [&](uint32_t value) {
+		const auto c  = ConstantU32(state, value);
+		const auto id = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeConstruct, vec, id, c, c, c, c);
+		return id;
+	};
+	const auto ballot = [&](uint32_t value) {
+		const auto id = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpGroupNonUniformBallot, vec, id, scope, value);
+		return id;
+	};
+	const auto helper = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeBool(state), helper, state.helper_invocation_variable);
+	const auto helper_true = Binary(state, spv::OpLogicalAnd, TypeBool(state), predicate, helper);
+	const auto word   = Select(state, u32, helper_true, ConstantU32(state, 1), ConstantU32(state, 0));
+	auto       result = ballot(predicate);
+	const auto nibble = splat(0x11111111u);
+	for (uint32_t k = 0; k < 4; k++) {
+		const auto mate = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpGroupNonUniformQuadBroadcast, u32, mate, scope, word,
+		                          ConstantU32(state, k));
+		const auto bits =
+		    ballot(Binary(state, spv::OpINotEqual, TypeBool(state), mate, ConstantU32(state, 0)));
+		auto any = bits;
+		for (uint32_t shift = 1; shift < 4; shift++) {
+			any = Binary(state, spv::OpBitwiseOr, vec, any,
+			             Binary(state, spv::OpShiftRightLogical, vec, bits, splat(shift)));
+		}
+		any = Binary(state, spv::OpBitwiseAnd, vec, any, nibble);
+		if (k != 0) {
+			any = Binary(state, spv::OpShiftLeftLogical, vec, any, splat(k));
+		}
+		result = Binary(state, spv::OpBitwiseOr, vec, result, any);
+	}
+	return result;
+}
+
+uint32_t QuadShuffle(EmitterState& state, uint32_t type, uint32_t value, uint32_t lane) {
+	state.builder.RequireCapability(spv::CapabilityGroupNonUniformQuad);
+	const auto u32     = TypeU32(state);
+	const auto boolean = TypeBool(state);
+	const auto scope   = ConstantU32(state, spv::ScopeSubgroup);
+	const auto index   = Binary(state, spv::OpBitwiseAnd, u32, lane, ConstantU32(state, 3));
+	const auto base    = Binary(state, spv::OpBitwiseAnd, u32, lane, ConstantU32(state, ~3u));
+	const auto helper  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, boolean, helper, state.helper_invocation_variable);
+	const auto live = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), live, scope,
+	                          Unary(state, spv::OpLogicalNot, boolean, helper));
+	const auto extract = [&](uint32_t word) {
+		const auto id = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, u32, id, live, word);
+		return id;
+	};
+	auto live_word = extract(0);
+	if (state.program.wave_size == 64u) {
+		live_word = Select(state, u32,
+		                   Binary(state, spv::OpUGreaterThanEqual, boolean, lane, ConstantU32(state, 32)),
+		                   extract(1), live_word);
+	}
+	const auto quad_live = Binary(
+	    state, spv::OpBitwiseAnd, u32,
+	    Binary(state, spv::OpShiftRightLogical, u32, live_word,
+	           Binary(state, spv::OpBitwiseAnd, u32, base, ConstantU32(state, 31))),
+	    ConstantU32(state, 15));
+	const auto source = Select(
+	    state, u32, Binary(state, spv::OpINotEqual, boolean, quad_live, ConstantU32(state, 0)),
+	    Binary(state, spv::OpIAdd, u32, base,
+	           EmitGlsl<GLSLstd450FindILsb, IR::Type::U32>(state, quad_live)),
+	    lane);
+	uint32_t picked = 0;
+	for (uint32_t k = 0; k < 4; k++) {
+		const auto mate = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpGroupNonUniformQuadBroadcast, type, mate, scope, value,
+		                          ConstantU32(state, k));
+		picked = k == 0 ? mate
+		                : Select(state, type,
+		                         Binary(state, spv::OpIEqual, boolean, index, ConstantU32(state, k)),
+		                         mate, picked);
+	}
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, type, result, scope, picked, source);
+	return result;
+}
+
 uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
+	if (other_half == nullptr && quad_read && QuadLanes(state)) {
+		return QuadBallot(state, Def(predicate));
+	}
 	const auto ballot_type = TypeU32Vector(state, 4);
 	const auto scope       = ConstantU32(state, spv::ScopeSubgroup);
 	const auto low         = state.builder.AllocateId();
@@ -1450,6 +1547,9 @@ uint32_t ValueEmitContext::FirstLane(uint32_t ballot) {
 uint32_t ValueEmitContext::Shuffle(const IR::Inst& inst, size_t index, uint32_t lane) {
 	const auto type  = TypeId(state, inst.Arg(index).GetType());
 	const auto scope = ConstantU32(state, spv::ScopeSubgroup);
+	if (other_half == nullptr && quad_read && QuadLanes(state)) {
+		return QuadShuffle(state, type, Arg(inst, index), lane);
+	}
 	const auto low   = state.builder.AllocateId();
 	if (other_half == nullptr) {
 		state.builder.AddFunction(spv::OpGroupNonUniformShuffle, type, low, scope, Arg(inst, index),

@@ -641,7 +641,24 @@ uint32_t BuiltInForInput(IR::StageInputKind kind) {
 	}
 }
 
+bool ReadsLanesAfterWqm(const IR::Program& program) {
+	bool reads = program.dispatcher_fallback;
+	bool wqm   = false;
+	for (const auto* block: program.blocks) {
+		reads |= block->terminator.loop_header;
+		for (const auto& inst: *block) {
+			const auto opcode = inst.GetOpcode();
+			wqm |= opcode == IR::ValueOpcode::WqmU64;
+			reads |= opcode == IR::ValueOpcode::ReadFirstLane ||
+			         (opcode == IR::ValueOpcode::ReadLane && !inst.Arg(1).IsImmediate());
+		}
+	}
+	return reads && wqm;
+}
+
 void DefineInputs(EmitterState& state) {
+	state.quad_lanes = state.program.stage == ShaderType::Pixel && state.lane_count == 1u &&
+	                   ReadsLanesAfterWqm(state.program);
 	state.inputs.reserve(state.program.info.inputs.size());
 	for (const auto& input: state.program.info.inputs) {
 		state.inputs.push_back({input});
@@ -749,7 +766,7 @@ void DefineInputs(EmitterState& state) {
 			                            builtin);
 		}
 	}
-	if (state.program.info.subgroup_local_invocation_id) {
+	if (state.program.info.subgroup_local_invocation_id || state.quad_lanes) {
 		const auto variable = DefineInterfaceVariable(state, TypeU32(state), spv::StorageClassInput,
 		                                              "gl_SubgroupInvocationID");
 		state.subgroup_local_invocation_id_variable = variable;
@@ -759,7 +776,7 @@ void DefineInputs(EmitterState& state) {
 			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationFlat);
 		}
 	}
-	if (state.program.info.helper_invocation) {
+	if (state.program.info.helper_invocation || state.quad_lanes) {
 		const auto variable = DefineInterfaceVariable(state, TypeBool(state), spv::StorageClassInput,
 		                                              "gl_HelperInvocation");
 		state.helper_invocation_variable = variable;
@@ -996,13 +1013,15 @@ void DefineModule(EmitterState& state) {
 	if (state.lane_count == 2 || state.program.info.subgroup_barrier ||
 	    state.program.info.subgroup_ballot ||
 	    state.program.info.subgroup_shuffle ||
-	    state.program.info.subgroup_arithmetic || state.program.info.subgroup_local_invocation_id) {
+	    state.program.info.subgroup_arithmetic || state.program.info.subgroup_local_invocation_id ||
+	    state.quad_lanes) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
 	}
-	if (state.lane_count == 2 || state.program.info.subgroup_ballot || state.ray_stats) {
+	if (state.lane_count == 2 || state.program.info.subgroup_ballot || state.ray_stats ||
+	    state.quad_lanes) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
 	}
-	if (state.program.info.subgroup_shuffle) {
+	if (state.program.info.subgroup_shuffle || state.quad_lanes) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformShuffle);
 	}
 	if (state.program.info.subgroup_arithmetic) {
