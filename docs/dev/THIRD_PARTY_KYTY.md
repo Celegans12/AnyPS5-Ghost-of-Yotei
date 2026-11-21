@@ -71,6 +71,7 @@ be second declarations of AnyPS5 exports for `core/libs/tests/test_public_header
   | `fc705b4b` | — | `DMA_DATA` writes whose destination ends in `0x3022c` are no longer dropped |
   | `f130c02b` | — | `WRITE_DATA` to a GDS destination writes the GDS buffer at its 16-bit dword offset |
   | `f216821b` | — | an indirect buffer is fetched at its target with the two low bits cleared |
+  | `8d0ebb8f` | — | the SRT walker evaluates `SMin32` in runtime descriptor values |
 
   `Presenter::PrepareFrame` takes the VideoOut pixel format since `50c0c066`: the shim passes the display buffer's
   `pixelFormat`.
