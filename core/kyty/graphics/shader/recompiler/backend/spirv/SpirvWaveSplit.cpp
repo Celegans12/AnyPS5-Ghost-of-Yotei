@@ -127,7 +127,7 @@ public:
 			return false;
 		}
 		Analyze();
-		if (!CheckUniform(refusal) || !PlaceSharedBarriers(refusal) || !RelievesRegisters(refusal)) {
+		if (!CheckUniform(refusal) || !PlaceSharedBarriers(refusal) || !WorthSplitting(refusal)) {
 			return false;
 		}
 		Rewrite(out);
@@ -994,8 +994,8 @@ private:
 		return most;
 	}
 
-	bool RelievesRegisters(std::string& refusal) const {
-		if (m_waves == 1) return true;
+	bool WorthSplitting(std::string& refusal) const {
+		if (m_waves == 1 || !m_last_lane_stores.empty()) return true;
 		const auto values = LoopCarriedValues();
 		if (m_threads <= MaxRelievedThreads && values >= RegisterBoundLoopValues) return true;
 		refusal = "several waves whose halves would wait on each other without registers to gain: threads=" +

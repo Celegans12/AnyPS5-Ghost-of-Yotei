@@ -317,7 +317,7 @@ int main() {
 		const bool waves  = program.threads > WaveLanes;
 		std::printf("%s: %s: local size %u, halves sync functions %u, calls %u, workgroup stores %u\n", Name, program.name,
 		            module.local_size[0], module.sync_functions, module.sync_calls, module.workgroup_stores);
-		if (waves) {
+		if (waves && !program.same_address_store) {
 			Check(module.local_size == std::array<uint32_t, 3> {program.threads / 2u, 1u, 1u} && module.sync_functions == 0u,
 			      std::string(program.name) +
 			          ": a group of several waves whose loops carry few values stays in lane pairs, with no halves to wait on");
@@ -325,8 +325,10 @@ int main() {
 		}
 		Check(module.local_size == std::array<uint32_t, 3> {program.threads, 1u, 1u} && module.subgroup_id,
 		      std::string(program.name) + ": the workgroup runs one invocation per guest lane on 32-wide subgroups");
-		Check(module.sync_functions == 0u,
-		      std::string(program.name) + ": a one-wave workgroup synchronizes its halves with workgroup barriers");
+		Check(waves ? module.sync_functions == 1u && module.sync_calls != 0u : module.sync_functions == 0u,
+		      std::string(program.name) +
+		          (waves ? ": a group of several waves whose lanes store to one LDS word stays split, the last lane winning"
+		                 : ": a one-wave workgroup synchronizes its halves with workgroup barriers"));
 		if (program.same_address_store) {
 			Check(module.workgroup_stores >= 2u,
 			      std::string(program.name) + ": the wave's store to one LDS word goes through the exchange first");
