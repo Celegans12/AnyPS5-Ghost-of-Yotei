@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -26,6 +27,25 @@ const std::vector<Case> Cases = {
     {"backward-branch-before-the-program", 0x00, 0x00, {0xbf828000u, 0xbf810000u}},
     {"setreg-float-mode-denorm", 0x00, 0x00, {0xb9801901u, 0xbf810000u}},
     {"empty-program-end", 0x00, 0x00, {0xbf810000u}},
+};
+
+struct Refusal {
+	const char*           name;
+	uint8_t               mode;
+	uint8_t               shape;
+	std::vector<uint32_t> words;
+	const char*           reason;
+};
+
+const std::vector<Refusal> Refusals = {
+    {"position-export-from-a-pixel-shader", 0x04, 0x00, {0xf80008cfu, 0x03020100u, 0xbf810000u},
+     "position export outside a vertex processing stage"},
+    {"position-export-from-a-compute-shader", 0x00, 0x00, {0xf80008cfu, 0x03020100u, 0xbf810000u},
+     "position export outside a vertex processing stage"},
+    {"depth-compare-sample-on-a-3d-image", 0x04, 0x00, {0xf0a00110u, 0x00400400u, 0xf8000801u, 0x00000004u, 0xbf810000u},
+     "depth comparison with a 3D or multisampled image"},
+    {"depth-compare-sample-on-a-multisampled-image", 0x04, 0x00, {0xf0a00130u, 0x00400400u, 0xf8000801u, 0x00000004u, 0xbf810000u},
+     "depth comparison with a 3D or multisampled image"},
 };
 
 struct ModeWrite {
@@ -72,6 +92,17 @@ int main(int argc, char** argv) {
 		if (argc >= 2 && std::string_view(argv[1]) != entry.name) continue;
 		found = true;
 		KytyFuzz::Run(entry.words, entry.mode, entry.shape);
+		std::printf("%s: ok\n", entry.name);
+	}
+	for (const auto& entry: Refusals) {
+		if (argc >= 2 && std::string_view(argv[1]) != entry.name) continue;
+		found = true;
+		std::string refusal;
+		KytyFuzz::Run(entry.words, entry.mode, entry.shape, &refusal);
+		if (refusal.find(entry.reason) == std::string::npos) {
+			std::printf("%s: FAILED, refusal \"%s\" instead of \"%s\"\n", entry.name, refusal.c_str(), entry.reason);
+			return 1;
+		}
 		std::printf("%s: ok\n", entry.name);
 	}
 	if (!found) {

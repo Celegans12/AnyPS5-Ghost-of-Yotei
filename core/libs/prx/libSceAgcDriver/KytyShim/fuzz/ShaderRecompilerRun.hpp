@@ -71,7 +71,7 @@ inline void ReportInvalid(const std::string& message, std::span<const uint32_t> 
 	}
 }
 
-inline void Run(std::span<const uint32_t> original, uint8_t mode, uint8_t shape) {
+inline void Run(std::span<const uint32_t> original, uint8_t mode, uint8_t shape, std::string* refusal = nullptr) {
 	static const auto profile = Profile();
 	std::vector<uint32_t> storage(original.begin(), original.end());
 	if (std::getenv("KYTY_FUZZ_PAD") != nullptr) storage.resize(original.size() + 16u, 0u);
@@ -139,7 +139,8 @@ inline void Run(std::span<const uint32_t> original, uint8_t mode, uint8_t shape)
 			std::string message;
 			if (!Valid(compiled.spirv, message)) ReportInvalid(message, code, mode, shape);
 		}
-	} catch (const std::exception&) {
+	} catch (const std::exception& error) {
+		if (refusal != nullptr) *refusal = error.what();
 	}
 }
 

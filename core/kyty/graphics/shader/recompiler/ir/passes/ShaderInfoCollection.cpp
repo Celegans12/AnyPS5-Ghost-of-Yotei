@@ -205,6 +205,9 @@ void CollectOutput(const Program& program, ShaderStageInputInfo input_info,
 	}
 	switch (export_info.kind) {
 		case ExportTargetKind::Position:
+			if (program.stage == ShaderType::Pixel || program.stage == ShaderType::Compute) {
+				return Fail("position export outside a vertex processing stage");
+			}
 			if (export_info.index == 0) {
 				AddOutput(info, StageOutputKind::Position, 0, 0, "out_position");
 				break;

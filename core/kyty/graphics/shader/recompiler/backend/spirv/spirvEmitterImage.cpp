@@ -1124,6 +1124,16 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			ctx.Fail(inst, "uses depth comparison with a converted image");
 			return;
 		}
+		const auto refuses_dref = [&state](uint32_t resource) {
+			const auto dimension = state.program.info.images[resource].dimension;
+			return dimension == ImageDimension::Dim3D || dimension == ImageDimension::Dim2DMsaa ||
+			       dimension == ImageDimension::Dim2DMsaaArray;
+		};
+		if (dref && (refuses_dref(mem.resource) ||
+		             std::ranges::any_of(state.program.info.images[mem.resource].indirect_resources, refuses_dref))) {
+			ctx.Fail(inst, "uses depth comparison with a 3D or multisampled image");
+			return;
+		}
 		if (op == IR::ValueOpcode::ImageGatherRaw) {
 			uint32_t component_or_dref;
 			if (dref) {
