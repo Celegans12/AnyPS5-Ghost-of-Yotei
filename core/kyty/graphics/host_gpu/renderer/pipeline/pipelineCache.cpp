@@ -1210,7 +1210,8 @@ ShaderModule* PipelineCache::Program::ShareModule(const ShaderRecompiler::IR::Re
 		    layout.push_data_start_dword !=
 		        ShaderRecompiler::IR::PushData::StartFor(push_data_cursor, layout.ShaderDataDwords()) ||
 		    (calls && !std::ranges::equal(candidate.function_code, code)) ||
-		    !ShaderRecompiler::IR::EmptyBuffersServe(resource_plan, snapshot, requested, candidate.specialization)) {
+		    (!ShaderRecompiler::IR::EmptyBuffersServe(resource_plan, snapshot, requested, candidate.specialization) &&
+		     !ShaderRecompiler::IR::SameModuleCode(resource_plan, requested, candidate.specialization))) {
 			continue;
 		}
 		auto& shared          = modules.emplace_back(candidate);

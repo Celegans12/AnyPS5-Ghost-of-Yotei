@@ -437,7 +437,15 @@ const ShaderModule* PipelineCache::FindCompiledModule(
 	}
 	for (const auto& module: entry->second.modules) {
 		const auto& layout = module.info.bindings;
-		if (module.function_code.empty() && module.specialization == specialization &&
+#if defined(ANYPS5_KYTY)
+		const bool same = module.specialization == specialization ||
+		                  (!module.shared_variant && ShaderRecompiler::IR::SharesEmptyBuffers() &&
+		                   ShaderRecompiler::IR::SameModuleCode(entry->second.resource_plan, specialization,
+		                                                        module.specialization));
+#else
+		const bool same = module.specialization == specialization;
+#endif
+		if (module.function_code.empty() && same &&
 		    layout.push_data_start_dword == ShaderRecompiler::IR::PushData::StartFor(
 		                                        push_data_cursor, layout.ShaderDataDwords())) {
 			return &module;

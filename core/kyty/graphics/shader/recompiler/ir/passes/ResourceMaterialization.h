@@ -93,6 +93,8 @@ bool EmptyBufferServes(const ResourcePlan& program, const ResourceSnapshot& snap
                        const ResourceSpecialization::Buffer& candidate);
 bool EmptyBuffersServe(const ResourcePlan& program, const ResourceSnapshot& snapshot,
                        const ResourceSpecialization& requested, const ResourceSpecialization& candidate);
+bool SameModuleCode(const ResourcePlan& program, const ResourceSpecialization& requested,
+                    const ResourceSpecialization& candidate);
 bool GenericComputeVariants();
 bool AlignResources(const ResourcePlan& program, const ResourceSnapshot& snapshot,
                     const ResourceSpecialization& specialization, const ResourceSpecialization& target,

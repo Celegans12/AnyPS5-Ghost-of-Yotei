@@ -2364,6 +2364,26 @@ bool EmptyBufferServes(const ResourcePlan& program, const ResourceSnapshot& snap
 	return true;
 }
 
+bool SameModuleCode(const ResourcePlan& program, const ResourceSpecialization& requested,
+                    const ResourceSpecialization& candidate) {
+	if (requested.buffers.size() != candidate.buffers.size() || requested.images != candidate.images ||
+	    requested.samplers != candidate.samplers) {
+		return false;
+	}
+	for (uint32_t i = 0; i < requested.buffers.size(); i++) {
+		const auto& wanted = requested.buffers[i];
+		const auto& served = candidate.buffers[i];
+		if (wanted == served) continue;
+		if (i >= program.info.buffers.size() || program.info.buffers[i].scalar || wanted.scalar_empty == served.scalar_empty) {
+			return false;
+		}
+		auto unmarked         = wanted;
+		unmarked.scalar_empty = served.scalar_empty;
+		if (!(unmarked == served)) return false;
+	}
+	return true;
+}
+
 bool EmptyBuffersServe(const ResourcePlan& program, const ResourceSnapshot& snapshot,
                        const ResourceSpecialization& requested, const ResourceSpecialization& candidate) {
 	if (requested.buffers.size() != candidate.buffers.size() || requested.images != candidate.images ||

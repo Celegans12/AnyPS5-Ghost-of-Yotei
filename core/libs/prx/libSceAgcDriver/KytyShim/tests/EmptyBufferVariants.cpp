@@ -142,6 +142,19 @@ void RawSlot(bool sharing) {
 	      "raw: a zero-stride V# with records keeps its own key");
 	Check(!loaded.ok || loaded.specialization != zero_baked.specialization || !sharing,
 	      "raw: a zero-stride V# with records never keys like an empty one");
+	Check(!loaded.ok || IR::SameModuleCode(program.plan, loaded.specialization, zero_baked.specialization),
+	      "raw: a zero-stride V# with records takes the module built for an empty one, the code being the same");
+	Check(!loaded.ok || IR::SameModuleCode(program.plan, zero_baked.specialization, loaded.specialization),
+	      "raw: an empty slot takes the module built for a zero-stride V# with records, the code being the same");
+	Check(!IR::SameModuleCode(program.plan, bound.specialization, zero_baked.specialization),
+	      "raw: a bound slot with its stride never takes the module of an empty one");
+	auto scalar = Translate(Shader(LoadRaw));
+	if (slot < scalar.plan.info.buffers.size()) {
+		scalar.plan.info.buffers[slot].scalar = true;
+		Check(!loaded.ok || !sharing ||
+		          !IR::SameModuleCode(scalar.plan, loaded.specialization, zero_baked.specialization),
+		      "raw: the empty mark of a slot read by scalar loads keeps its own module");
+	}
 	auto loaded_mixed          = bound.specialization;
 	loaded_mixed.buffers[slot] = loaded.specialization.buffers[slot];
 	Check(!IR::EmptyBuffersServe(program.plan, loaded.snapshot, loaded_mixed, bound.specialization),
