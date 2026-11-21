@@ -67,6 +67,7 @@ be second declarations of AnyPS5 exports for `core/libs/tests/test_public_header
   | `d6ad3c2b` | #1802 | a buffer allocation refused by VMA's budget is retried once without the budget limit |
   | `f6e3373d` | #2407 | `AssociateStencil` tells the image heap before it rewrites an image as a stencil plane |
   | `4cfdc862` | — | a texture view keeps its mip and layer when a later overlap candidate is not a view; `94119354`, the one-pass lookup it follows, is not needed for it and not taken |
+  | `046bf882` | — | `swapchain.cpp` only: a flip copies layer 0 of the cached image that holds the surface |
 
   `Presenter::PrepareFrame` takes the VideoOut pixel format since `50c0c066`: the shim passes the display buffer's
   `pixelFormat`.
