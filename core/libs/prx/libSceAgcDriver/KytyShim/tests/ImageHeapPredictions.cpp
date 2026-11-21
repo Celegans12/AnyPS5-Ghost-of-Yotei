@@ -128,6 +128,40 @@ void NeverWaits() {
 	      "the next list publication lands");
 }
 
+void Bounded() {
+	ImageHeapPredictions predictions;
+	const auto           root   = Root(1u);
+	const auto           kinds  = Kinds(3u, 1u);
+	const auto           values = Kinds(9u, 1u);
+	const int            owner  = 0;
+	const IR::ImageHeapView view {.slots = 0x1000u, .slot_count = 2u, .kinds = kinds};
+	const auto table = [&](uint64_t index) {
+		return IR::ImageHeapRequest {.base = 0x10000000u + index * 0x1000u, .size = 0x200u, .step = 32u, .count = 16u,
+		                             .root = &root, .table = true};
+	};
+	const auto list = [&](uint64_t index) {
+		return IR::ImageHeapList {.owner = &owner, .resource = static_cast<uint32_t>(index), .root = &root, .values = values};
+	};
+	for (uint64_t index = 0; index < ImageHeapPredictions::MaxPublished; ++index) {
+		predictions.PublishTable(table(index), true, view);
+		predictions.PublishList(list(index), true, view);
+	}
+	IR::ImageHeapPrediction prediction;
+	Check(predictions.PredictTable(table(0), prediction) && predictions.PredictList(list(0), prediction),
+	      "the first requests are still predicted when the predictions are full");
+	predictions.PublishTable(table(1), true, view);
+	predictions.PublishList(list(1), true, view);
+	Check(predictions.PredictTable(table(0), prediction) && predictions.PredictList(list(0), prediction),
+	      "publishing a request already known keeps the other predictions");
+	const auto fresh = ImageHeapPredictions::MaxPublished;
+	predictions.PublishTable(table(fresh), true, view);
+	predictions.PublishList(list(fresh), true, view);
+	Check(!predictions.PredictTable(table(0), prediction) && !predictions.PredictList(list(0), prediction),
+	      "a new request beyond the limit drops the older predictions instead of growing them forever");
+	Check(predictions.PredictTable(table(fresh), prediction) && predictions.PredictList(list(fresh), prediction),
+	      "the new request is predicted");
+}
+
 void Concurrent() {
 	ImageHeapPredictions predictions;
 	const auto           root   = Root(1u);
@@ -175,6 +209,7 @@ int main() {
 	Lists();
 	Tables();
 	NeverWaits();
+	Bounded();
 	Concurrent();
 	if (g_failures != 0) {
 		std::fprintf(stderr, "kyty_shim_image_heap_predictions: %d failures\n", g_failures);

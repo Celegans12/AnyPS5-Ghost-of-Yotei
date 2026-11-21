@@ -22,10 +22,12 @@ public:
 	using View       = ShaderRecompiler::IR::ImageHeapView;
 	using Prediction = ShaderRecompiler::IR::ImageHeapPrediction;
 
+	static constexpr size_t MaxPublished = size_t {1} << 16u;
+
 	void PublishTable(const Request& request, bool acquired, const View& view) {
 		if (request.root == nullptr) return;
 		if (!m_lock.try_lock()) return;
-		auto& published = m_tables[KeyOf(request)];
+		auto& published = Entry(m_tables, KeyOf(request));
 		if (!(published.root == *request.root)) published.root = *request.root;
 		Publish(published.prediction, acquired, view);
 		m_lock.unlock();
@@ -33,7 +35,7 @@ public:
 
 	void PublishList(const List& list, bool acquired, const View& view) {
 		if (!m_lock.try_lock()) return;
-		Publish(m_lists[{list.owner, list.resource}], acquired, view);
+		Publish(Entry(m_lists, ListKey {list.owner, list.resource}), acquired, view);
 		m_lock.unlock();
 	}
 
@@ -112,6 +114,12 @@ private:
 		        .first = request.first,
 		        .count = request.count,
 		        .table = request.table};
+	}
+
+	template <typename Map>
+	static typename Map::mapped_type& Entry(Map& map, const typename Map::key_type& key) {
+		if (map.size() >= MaxPublished && !map.contains(key)) map.clear();
+		return map[key];
 	}
 
 	static void Publish(Prediction& published, bool acquired, const View& view) {
