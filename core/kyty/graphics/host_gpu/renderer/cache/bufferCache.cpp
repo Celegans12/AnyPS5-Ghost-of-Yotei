@@ -2269,10 +2269,10 @@ uint8_t BufferCache::WriteTickRecycleMode() {
 	static const uint8_t mode = [] {
 		const char*            value = std::getenv("KYTY_WRITE_TICK_RECYCLE");
 		const std::string_view text {value == nullptr ? "" : value};
-		if (text.empty() || text == "0") {
+		if (text == "0") {
 			return uint8_t {0};
 		}
-		if (text == "1") {
+		if (text.empty() || text == "1") {
 			return uint8_t {1};
 		}
 		if (text != "verify") {
