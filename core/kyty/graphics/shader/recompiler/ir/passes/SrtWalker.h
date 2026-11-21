@@ -130,8 +130,6 @@ struct SrtWalkerGuestMemory {
 };
 void SetSrtWalkerGuestMemory(const SrtWalkerGuestMemory& memory);
 #if defined(ANYPS5_KYTY)
-enum class SrtFlatDefer : uint8_t { Off, On, Verify };
-[[nodiscard]] SrtFlatDefer           SrtFlatDeferMode();
 [[nodiscard]] std::vector<uint64_t>& SrtDeferredLoadsOfThread();
 [[nodiscard]] std::vector<uint64_t>& SrtAroundLoadsOfThread();
 #endif

@@ -17,54 +17,34 @@ namespace Common::RuntimeSwitches {
 
 namespace {
 
-enum class Reading { Off, On, NotAnArm, Invalid };
-
 struct Entry {
 	const char* name;
-	Reading (*read)(std::string_view value);
 	const char* off;
 	const char* on;
-	const char* not_an_arm;
-	const char* expected;
 };
 
-constexpr Reading ReadFlatDefer(std::string_view value) {
-	return value == "0" ? Reading::Off : value == "verify" ? Reading::NotAnArm : Reading::On;
-}
-
-constexpr Reading ReadUnlessZero(std::string_view value) {
-	return value == "0" ? Reading::Off : Reading::On;
-}
-
 constexpr Entry Entries[] = {
-    {"KYTY_FLAT_DEFER", ReadFlatDefer, "0", "1",
-     "KYTY_AB: KYTY_FLAT_DEFER=verify is a check, not an arm of an A/B: set KYTY_FLAT_DEFER to 0 or 1", nullptr},
-    {"KYTY_GENERIC_COMPUTE_VARIANT", ReadUnlessZero, "0", "1", nullptr, nullptr},
+    {"KYTY_GENERIC_COMPUTE_VARIANT", "0", "1"},
 };
 
 static_assert(std::size(Entries) == SwitchCount);
 
-constexpr bool Default(Switch id) {
-	return Entries[static_cast<size_t>(id)].read({}) != Reading::Off;
-}
-
-Reading Initial(size_t index) {
+bool Initial(size_t index) {
 	const char* value = std::getenv(Entries[index].name);
-	return Entries[index].read(value == nullptr ? std::string_view {} : std::string_view {value});
+	return value == nullptr || std::string_view {value} != Entries[index].off;
 }
 
 }
 
 namespace Detail {
-constinit std::atomic<bool> g_on[SwitchCount] {Default(Switch::FlatDefer), Default(Switch::GenericComputeVariant)};
+constinit std::atomic<bool> g_on[SwitchCount] {true};
 }
 
 namespace {
 
 void Apply() {
 	for (size_t index = 0; index < SwitchCount; ++index) {
-		const auto reading = Initial(index);
-		if (reading != Reading::Invalid) Detail::g_on[index].store(reading != Reading::Off, std::memory_order_relaxed);
+		Detail::g_on[index].store(Initial(index), std::memory_order_relaxed);
 	}
 }
 
@@ -107,17 +87,7 @@ std::string Refusal(std::string_view name) {
 	                   FlippableList());
 }
 
-std::string ArmRefusal(Switch id) {
-	const auto index = static_cast<size_t>(id);
-	return Initial(index) == Reading::NotAnArm ? std::string(Entries[index].not_an_arm) : std::string {};
-}
-
-void Validate() {
-	for (size_t index = 0; index < SwitchCount; ++index) {
-		if (Initial(index) == Reading::Invalid) {
-			EXIT("invalid %s: %s (%s)\n", Entries[index].name, std::getenv(Entries[index].name), Entries[index].expected);
-		}
-	}
+void Reload() {
 	Apply();
 }
 
@@ -171,7 +141,6 @@ std::string Parse(std::string_view ab, std::string_view start, std::string_view 
 		if (std::ranges::find(config.switches, *found) != config.switches.end()) {
 			return fmt::format("KYTY_AB: {} is listed twice", name);
 		}
-		if (auto refusal = RuntimeSwitches::ArmRefusal(*found); !refusal.empty()) return refusal;
 		config.switches.push_back(*found);
 		if (plus == std::string_view::npos) break;
 		list = list.substr(plus + 1);
@@ -330,7 +299,7 @@ bool Listed(RuntimeSwitches::Switch id) {
 }
 
 void Start() {
-	RuntimeSwitches::Validate();
+	RuntimeSwitches::Reload();
 	if (Configured()) static_cast<void>(Parsed());
 }
 

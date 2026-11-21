@@ -2,7 +2,6 @@
 
 #include "common/abi.h"
 #include "common/assert.h"
-#include "common/runtimeSwitches.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <xbyak/xbyak.h>
@@ -15,7 +14,6 @@
 #include <cstring>
 #include <deque>
 #include <map>
-#include <string_view>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -252,18 +250,8 @@ uint64_t KYTY_SYSV_ABI ProbeGuestLoad(uint64_t address, WalkerCachedPage* cache)
 thread_local bool                  t_walker_defer = false;
 thread_local std::vector<uint64_t> t_deferred_loads;
 
-SrtFlatDefer FlatDeferMode() {
-	static const bool verify = [] {
-		const char* value = std::getenv("KYTY_FLAT_DEFER");
-		return value != nullptr && std::string_view(value) == "verify";
-	}();
-	if (!Common::RuntimeSwitches::On(Common::RuntimeSwitches::Switch::FlatDefer)) return SrtFlatDefer::Off;
-	return verify ? SrtFlatDefer::Verify : SrtFlatDefer::On;
-}
-
 bool DefersFlatLoad(uint32_t slot) {
-	return slot != NoFlatSlot && slot != ZeroTestSlot && !IsDescriptorSlot(slot) &&
-	       (FlatDeferMode() != SrtFlatDefer::Off || Common::Ab::Listed(Common::RuntimeSwitches::Switch::FlatDefer));
+	return slot != NoFlatSlot && slot != ZeroTestSlot && !IsDescriptorSlot(slot);
 }
 
 uint64_t KYTY_SYSV_ABI ProbeFlatGuestLoad(uint64_t address, WalkerCachedPage* cache) {
@@ -1909,10 +1897,6 @@ uint32_t SrtWalkerAheadLoadLength(uint64_t rip, uint64_t address) {
 }
 
 #if defined(ANYPS5_KYTY)
-SrtFlatDefer SrtFlatDeferMode() {
-	return FlatDeferMode();
-}
-
 std::vector<uint64_t>& SrtDeferredLoadsOfThread() {
 	return t_deferred_loads;
 }

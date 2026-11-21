@@ -529,22 +529,11 @@ struct RenderExecutor::ResolvedDrawRing {
 };
 
 #if defined(ANYPS5_KYTY)
-static void ResetDrawRenderState(DrawRenderState& state, bool tessellation_stages);
-
 namespace {
 std::atomic<uint64_t> g_flat_defer_resolutions {0};
 std::atomic<uint64_t> g_flat_defer_words {0};
 std::atomic<uint64_t> g_flat_defer_gpu_words {0};
-std::atomic<uint64_t> g_flat_defer_compared {0};
-std::atomic<uint64_t> g_flat_defer_mismatches {0};
 std::atomic<uint64_t> g_flat_defer_line {0};
-std::atomic<uint32_t> g_flat_defer_reports {0};
-
-bool FlatDeferVerifies() {
-	static const bool verifies =
-	    ShaderRecompiler::IR::SrtFlatDeferMode() == ShaderRecompiler::IR::SrtFlatDefer::Verify;
-	return verifies;
-}
 
 void NoteFlatDefer(uint32_t words, uint32_t gpu_words) {
 	const auto now = static_cast<uint64_t>(
@@ -556,138 +545,16 @@ void NoteFlatDefer(uint32_t words, uint32_t gpu_words) {
 	} else if (now - last >= 10'000'000'000ull &&
 	           g_flat_defer_line.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
 		Log::WriteToConsoleAndLog(fmt::format(
-		    "[kyty-flat-defer] summary of the last {:.1f} s: {} deferred resolutions, {} deferred words, {} mismatches "
-		    "(mode {}); {} of the words left to a GPU copy, {} resolutions compared with a full resolution\n",
+		    "[kyty-flat-defer] summary of the last {:.1f} s: {} deferred resolutions, {} deferred words; {} of the words "
+		    "left to a GPU copy\n",
 		    static_cast<double>(now - last) / 1e9, g_flat_defer_resolutions.exchange(0, std::memory_order_relaxed),
 		    g_flat_defer_words.exchange(0, std::memory_order_relaxed),
-		    g_flat_defer_mismatches.exchange(0, std::memory_order_relaxed), FlatDeferVerifies() ? "verify" : "on",
-		    g_flat_defer_gpu_words.exchange(0, std::memory_order_relaxed),
-		    g_flat_defer_compared.exchange(0, std::memory_order_relaxed)));
+		    g_flat_defer_gpu_words.exchange(0, std::memory_order_relaxed)));
 	}
 	g_flat_defer_resolutions.fetch_add(1, std::memory_order_relaxed);
 	g_flat_defer_words.fetch_add(words, std::memory_order_relaxed);
 	g_flat_defer_gpu_words.fetch_add(gpu_words, std::memory_order_relaxed);
 }
-
-struct FlatDeferDifference {
-	const char* what     = nullptr;
-	uint32_t    slot     = 0;
-	uint64_t    address  = 0;
-	uint32_t    deferred = 0;
-	uint32_t    full     = 0;
-};
-
-bool SameImageTables(const std::vector<ShaderRecompiler::IR::ImageTableSnapshot>& a,
-                     const std::vector<ShaderRecompiler::IR::ImageTableSnapshot>& b) {
-	return std::ranges::equal(a, b, [](const auto& x, const auto& y) {
-		return x.base == y.base && x.size == y.size && x.offset == y.offset && x.entry_mask == y.entry_mask &&
-		       x.raw == y.raw && x.slots == y.slots && x.mapping == y.mapping;
-	});
-}
-
-bool SameResolvedStage(const ShaderStageRuntime& ahead, const ShaderStageRuntime& full, FlatDeferDifference& difference) {
-	const auto differs = [&](const char* what) {
-		difference.what = what;
-		return false;
-	};
-	if (ahead.module != full.module) return differs("module");
-	if ((ahead.resources == nullptr) != (full.resources == nullptr)) return differs("resources");
-	if (ahead.resources == nullptr) return true;
-	const auto& a = *ahead.resources;
-	const auto& b = *full.resources;
-	if (a.buffers != b.buffers) return differs("buffer descriptors");
-	if (a.images != b.images) return differs("image descriptors");
-	if (a.samplers != b.samplers) return differs("sampler descriptors");
-	if (a.user_data != b.user_data) return differs("user data");
-	if (!SameImageTables(a.image_tables, b.image_tables)) return differs("image tables");
-	if (a.specialization_reads != b.specialization_reads) return differs("specialization reads");
-	if (!(a.uniform_fill == b.uniform_fill)) return differs("uniform fill");
-	if (a.flattened_srt.size() != b.flattened_srt.size()) return differs("flattened SRT size");
-	thread_local std::vector<uint8_t> copied;
-	copied.assign(a.flattened_srt.size(), 0);
-	for (const auto& load: a.gpu_flat_loads) {
-		for (uint32_t word = 0; word < load.count && uint64_t {load.slot} + word < copied.size(); word++) {
-			const auto address = load.address + uint64_t {word} * sizeof(uint32_t);
-			uint32_t   source  = 0;
-			GuestReadLog::ReadGuestNow(address, &source, sizeof(source));
-			copied[load.slot + word] = 1;
-			if (source != b.flattened_srt[load.slot + word]) {
-				difference = {.what     = "flattened SRT word left to a GPU copy",
-				              .slot     = load.slot + word,
-				              .address  = address,
-				              .deferred = source,
-				              .full     = b.flattened_srt[load.slot + word]};
-				return false;
-			}
-		}
-	}
-	for (uint32_t slot = 0; slot < a.flattened_srt.size(); slot++) {
-		if (copied[slot] == 0 && a.flattened_srt[slot] != b.flattened_srt[slot]) {
-			difference = {.what = "flattened SRT word", .slot = slot, .deferred = a.flattened_srt[slot], .full = b.flattened_srt[slot]};
-			return false;
-		}
-	}
-	return true;
-}
-
-void ReportFlatDeferMismatch(const char* kind, uint64_t shader, uint32_t stage, const FlatDeferDifference& difference) {
-	g_flat_defer_mismatches.fetch_add(1, std::memory_order_relaxed);
-	const auto report = g_flat_defer_reports.fetch_add(1, std::memory_order_relaxed);
-	if (report >= 16) return;
-	Log::WriteToConsoleAndLog(fmt::format(
-	    "[kyty-flat-defer] mismatch {}: {} shader {:#018x} stage {}: {} differs, slot {} address {:#x} deferred {:#010x} "
-	    "full {:#010x}\n",
-	    report + 1, kind, shader, stage, difference.what != nullptr ? difference.what : "stage count", difference.slot,
-	    difference.address, difference.deferred, difference.full));
-}
-}
-
-void RenderExecutor::CheckDeferredDraw(CommandBuffer& buffer, const DrawRenderState& state) {
-	m_flat_defer_check = nullptr;
-	if (m_draw_state == nullptr) {
-		m_draw_state = {new DrawRenderStorage {}, [](DrawRenderStorage* storage) { delete storage; }};
-	} else {
-		ResetDrawRenderState(m_draw_state->state, m_draw_state->tessellation_stages_written);
-	}
-	m_draw_state->tessellation_stages_written =
-	    buffer.GetUserConfig().GetPrimType() == Prospero::PrimitiveType::kPatch;
-	auto& full            = m_draw_state->state;
-	full.indirect_offsets = state.indirect_offsets;
-	full.indirect_draw    = state.indirect_draw;
-	m_context.GetPipelineCache().GetGraphicsPrograms(buffer, full);
-	g_flat_defer_compared.fetch_add(1, std::memory_order_relaxed);
-	FlatDeferDifference difference;
-	const auto          ahead_stages = state.VertexStages();
-	const auto          full_stages  = full.VertexStages();
-	uint64_t            shader       = state.vertex_info[0].stage.module != nullptr
-	                                       ? state.vertex_info[0].stage.module->info.shader_hash
-	                                       : 0;
-	uint32_t            stage        = 0;
-	bool                same         = state.ps_active == full.ps_active && ahead_stages.size() == full_stages.size();
-	for (uint32_t i = 0; same && i < ahead_stages.size(); i++) {
-		stage = i;
-		if (ahead_stages[i].stage.module != nullptr) shader = ahead_stages[i].stage.module->info.shader_hash;
-		same = SameResolvedStage(ahead_stages[i].stage, full_stages[i].stage, difference);
-	}
-	if (same && state.ps_active) {
-		stage = static_cast<uint32_t>(ahead_stages.size());
-		if (state.ps_input_info.stage.module != nullptr) shader = state.ps_input_info.stage.module->info.shader_hash;
-		same = SameResolvedStage(state.ps_input_info.stage, full.ps_input_info.stage, difference);
-	}
-	if (!same) ReportFlatDeferMismatch("draw", shader, stage, difference);
-}
-
-void RenderExecutor::CheckDeferredDispatch(const HW::ComputeShaderInfo& regs, const ShaderComputeInputInfo& pristine,
-                                           const ShaderComputeInputInfo& input_info, const ShaderModule* module) {
-	m_flat_defer_check = nullptr;
-	ShaderComputeInputInfo full = pristine;
-	const auto* full_module     = m_context.GetPipelineCache().GetComputeProgram(regs, full);
-	g_flat_defer_compared.fetch_add(1, std::memory_order_relaxed);
-	FlatDeferDifference difference;
-	if (full_module != module) difference.what = "module";
-	if (full_module != module || !SameResolvedStage(input_info.stage, full.stage, difference)) {
-		ReportFlatDeferMismatch("dispatch", module != nullptr ? module->info.shader_hash : 0, 0, difference);
-	}
 }
 #endif
 
@@ -1151,12 +1018,8 @@ DrawRenderState& RenderExecutor::AcquireDrawRenderState(bool tessellation, bool&
 	}
 	m_ahead_taken = m_ahead_taken || m_ahead_present;
 #if defined(ANYPS5_KYTY)
-	m_flat_defer_check = nullptr;
 	if (shaders_resolved) {
-		if (const auto words = resolved->programs.reads.DeferredWords(); words != 0) {
-			NoteFlatDefer(words, 0);
-			if (FlatDeferVerifies()) m_flat_defer_check = resolved;
-		}
+		if (const auto words = resolved->programs.reads.DeferredWords(); words != 0) NoteFlatDefer(words, 0);
 	}
 #endif
 	m_draw_resource_key =
@@ -1915,9 +1778,6 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveIndirectDispatchAhead(
 bool RenderExecutor::TakeResolvedDispatch(ShaderComputeInputInfo& input_info,
                                           const ShaderModule*&    module) {
 	auto* resolved = std::exchange(m_resolved_draw, nullptr);
-#if defined(ANYPS5_KYTY)
-	m_flat_defer_check = nullptr;
-#endif
 	if (resolved == nullptr) {
 		m_execute_cause = MissingAheadCause();
 		return false;
@@ -1935,7 +1795,6 @@ bool RenderExecutor::TakeResolvedDispatch(ShaderComputeInputInfo& input_info,
 #if defined(ANYPS5_KYTY)
 	if (const auto words = resolved->programs.reads.DeferredWords(); words != 0) {
 		NoteFlatDefer(words, resolved->programs.reads.DeferredGpuWords());
-		if (FlatDeferVerifies()) m_flat_defer_check = resolved;
 	}
 #endif
 	input_info = resolved->compute;
@@ -1946,11 +1805,6 @@ bool RenderExecutor::TakeResolvedDispatch(ShaderComputeInputInfo& input_info,
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, bool shaders_resolved,
                                             const DrawCallInfo& draw,
                                             DrawRenderState&    state) {
-#if defined(ANYPS5_KYTY)
-	if (shaders_resolved && m_flat_defer_check != nullptr) {
-		CheckDeferredDraw(buffer, state);
-	}
-#endif
 	if (!shaders_resolved) {
 		m_context.GetImageHeap().BeginDraw();
 		const auto begin = Common::SteadyNs();

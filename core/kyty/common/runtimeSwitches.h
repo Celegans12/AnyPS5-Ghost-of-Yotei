@@ -12,7 +12,6 @@
 namespace Common::RuntimeSwitches {
 
 enum class Switch : uint32_t {
-	FlatDefer,
 	GenericComputeVariant,
 	Count
 };
@@ -33,8 +32,7 @@ void                                Assign(Switch id, bool on) noexcept;
 [[nodiscard]] std::string           Value(Switch id, bool on);
 [[nodiscard]] std::string           FlippableList();
 [[nodiscard]] std::string           Refusal(std::string_view name);
-[[nodiscard]] std::string           ArmRefusal(Switch id);
-void                                Validate();
+void                                Reload();
 
 }
 

@@ -507,7 +507,7 @@ add_test(NAME kyty_shim_ab_switches COMMAND kyty_shim_ab_switches_tests)
 set_tests_properties(kyty_shim_ab_switches PROPERTIES TIMEOUT 20
         PASS_REGULAR_EXPRESSION "kyty_shim_ab_switches: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
 add_test(NAME kyty_shim_ab_switches_flip COMMAND kyty_shim_ab_switches_tests)
-set_tests_properties(kyty_shim_ab_switches_flip PROPERTIES TIMEOUT 20 ENVIRONMENT "KYTY_AB=1:KYTY_FLAT_DEFER;KYTY_AB_SETTLE=0.5"
+set_tests_properties(kyty_shim_ab_switches_flip PROPERTIES TIMEOUT 20 ENVIRONMENT "KYTY_AB=1:KYTY_GENERIC_COMPUTE_VARIANT;KYTY_AB_SETTLE=0.5"
         PASS_REGULAR_EXPRESSION "kyty_shim_ab_switches_flip: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
 add_test(NAME kyty_shim_ab_switches_refused COMMAND kyty_shim_ab_switches_tests)
 set_tests_properties(kyty_shim_ab_switches_refused PROPERTIES TIMEOUT 20 ENVIRONMENT "KYTY_AB=30:KYTY_RELAXED_SHADER_FLOAT"

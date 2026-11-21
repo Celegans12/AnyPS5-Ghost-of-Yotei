@@ -255,7 +255,6 @@ This build does not read KytyPS5's `KYTY_PIPELINE_PRECOMPILE`: stopping the game
 | `KYTY_FUZZ_PAD` | any value | unset | Read by the shader recompiler harness (`KytyShim/fuzz/ShaderRecompilerRun.hpp`), which only the libFuzzer targets and `kyty_shim_recompiler_robustness` link, never the emulator: pads its copy of the shader with 16 zero words, so that a decoder read past the last word stays inside the buffer and the fuzzer goes on to the defects behind it | debug | Linux | AnyKyty |
 | `KYTY_FUZZ_SPIRV` | `abort`, `off`, any other text | unset, which does not validate | Same harness: runs `spirv-val` (Vulkan 1.3) on the SPIR-V the recompiler produced; `abort` stops on a module it refuses, any other text except `off` logs one `SPIRV-INVALID` line per distinct message | debug | Linux | AnyKyty |
 | `KYTY_FUZZ_SPIRV_DIR` | directory | unset | Same harness, with `KYTY_FUZZ_SPIRV` set to log: writes the input of each distinct refused module there as `invalid-<n>.bin` | debug | Linux | AnyKyty |
-| `KYTY_FLAT_DEFER` | `0` off, `verify` on with a check, any other value or unset on | on | An SRT walk done ahead of execution on the resolve thread no longer stops at a load from a page holding GPU-written bytes when the walker uses the loaded dword only as a flattened SRT word. The walk records the address and the slot, and the execution thread fills the word when it takes the resolution, as it already does for every flattened SRT word read ahead: a draw reads it on the CPU, a dispatch copies GPU-written bytes on the GPU in command order unless the renderer also reads that slot on the CPU (address bases, device-address read spans, any ray query program), which it then reads on the CPU. Native XPR relocation does not take a resolution with such words. `verify` also resolves those draws and dispatches fully on the execution thread and compares module, descriptors, user data, image tables, specialization reads, uniform fill and every flattened SRT word (for a word left to a GPU copy: the guest dword at the recorded address after the full walk read it); it logs `[kyty-flat-defer]` with the first 16 mismatches. On or with `verify` the line is logged every 10 s; with `0` the walker emits the same code as before, unless `KYTY_AB` lists it. `KYTY_AB` can change `0` and `1` at a flip, not `verify`. On by default since an in-run A/B on a title at 12 img/s: +2.0 % (+0.17 img/s with drift cancelled, standard error 0.20, same scene); `verify` then compared 714,094 deferred resolutions of that title with full ones without a mismatch, and Stray deferred none | perf | all | AnyKyty; the idea of GPU-read SRT words is Erlou's (Kyty `740ce47c`) |
 
 ### Ray tracing
 
@@ -289,7 +288,7 @@ This build does not read KytyPS5's `KYTY_PIPELINE_PRECOMPILE`: stopping the game
 | `KYTY_SPIRV_DEBUG_PRINTF` | `0` or `1`, else stops | `0` | Enables `debugPrintfEXT` in the generated shaders | debug | all | Kyty option |
 | `KYTY_CX_OBSERVER` | any value | unset | Counts what dirtied the registers between draws, by first cause | debug | all | Kyty import |
 | `KYTY_PERF_OVERLAY` | `0` or `1`, else stops | `0` | Switches Kyty's debug counters on; the overlay that draws them is not built, and `PerformanceOverlayEnabled()` is `false` in the shim | debug | all | Kyty option |
-| `KYTY_AB` | `<seconds>:<setting>[+<setting>...]`, else stops | unset | In-run A/B: alternates phase A (the listed settings as the environment sets them) and phase B (the listed settings turned over) at flips, each phase at least `<seconds>` long (1 or more). The execution thread changes them right after a flip's submission, between two submissions. It prints `[kyty-ab]` lines: both arms at the start, each phase's begin and its settled point, and at the end of a phase its settled part: presents, img/s, longest frame, frames of 50 ms or more, with the wall clock. A setting that cannot change while the title runs, a name listed twice and `KYTY_FLAT_DEFER=verify` stop at start with a message that lists the settings it can change: `KYTY_FLAT_DEFER` and `KYTY_GENERIC_COMPUTE_VARIANT` (see [Details](#details)). `python3 tools/kyty_ab_report.py <session>` gives each arm | debug | all | AnyKyty |
+| `KYTY_AB` | `<seconds>:<setting>[+<setting>...]`, else stops | unset | In-run A/B: alternates phase A (the listed settings as the environment sets them) and phase B (the listed settings turned over) at flips, each phase at least `<seconds>` long (1 or more). The execution thread changes them right after a flip's submission, between two submissions. It prints `[kyty-ab]` lines: both arms at the start, each phase's begin and its settled point, and at the end of a phase its settled part: presents, img/s, longest frame, frames of 50 ms or more, with the wall clock. A setting that cannot change while the title runs and a name listed twice stop at start with a message that lists the settings it can change: `KYTY_GENERIC_COMPUTE_VARIANT` (see [Details](#details)). `python3 tools/kyty_ab_report.py <session>` gives each arm | debug | all | AnyKyty |
 | `KYTY_AB_SETTLE` | seconds, shorter than the phase, else stops | `2` | Seconds into a phase after which `KYTY_AB` counts it: its settled line, then its presents and img/s until the next phase | debug | all | AnyKyty |
 | `KYTY_AB_START` | flip count from 1, or `<n>s`, else stops | `0` | Flip at which `KYTY_AB` starts, or `<n>s` for `<n>` seconds after the first flip | debug | all | AnyKyty |
 
@@ -396,6 +395,17 @@ setting switched every 10 s inside one session (14 periods in game, neighbouring
 whose execution thread is the wall, both within ±1 % (the idle submit takes it from 114 to 181 submissions a frame). Same
 images. The provider has no switch since this measurement; `KYTY_IDLE_SUBMIT` at `0` restores the previous behaviour, another
 value stops the emulator with a message naming the variable.
+
+Flattened SRT words left to the execution thread: an SRT walk done ahead of execution on the resolve thread does not stop at
+a load from a page holding GPU-written bytes when the walker uses the loaded dword only as a flattened SRT word. The walk
+records the address and the slot, and the execution thread fills the word when it takes the resolution, as it already does
+for every flattened SRT word read ahead: a draw reads it on the CPU, a dispatch copies GPU-written bytes on the GPU in
+command order unless the renderer also reads that slot on the CPU (address bases, device-address read spans, any ray query
+program), which it then reads on the CPU. Native XPR relocation does not take a resolution with such words. A
+`[kyty-flat-defer]` line counts these resolutions every 10 s. Measured by an in-run A/B on a title at 12 img/s: +2.0 %
+(+0.17 img/s with drift cancelled, standard error 0.20, same scene); a check mode then compared 714,094 deferred
+resolutions of that title with full ones without a mismatch, and Stray deferred none. The setting and its check mode were
+removed after these measurements. The idea of GPU-read SRT words is Erlou's (Kyty `740ce47c`).
 
 Suspend points: KytyPS5 makes `sceAgcSuspendPoint` (`GuestGpu::SuspendPoint`) acquire a binary semaphore that its
 priority thread releases once the GPU has finished the work queued before the previous suspend point, so a title can
@@ -574,10 +584,6 @@ static value it replaces) and when its two values may follow each other between 
 keep running: each use reads it once, and work done under one value stays right under the other. The settings it can
 change:
 
-- `KYTY_FLAT_DEFER` (`0` and `1`): the resolve thread reads it once per resolution done ahead of execution, and the
-  execution thread fills the deferred words of a resolution whatever the value is when it takes it. Listed, it makes the
-  walkers call the deferring load helper even while it is off, which then behaves as the plain one. `verify` is a check,
-  not an arm, and is refused.
 - `KYTY_GENERIC_COMPUTE_VARIANT`: read where a dispatch picks its module and where a build widens a shape; a dispatch that
   sees it change between two of its reads takes the path of the off value. Its effect belongs to the first time a shape
   is seen: a shape served on a wider module while it is on gets its own module compiled in the background, and a shape

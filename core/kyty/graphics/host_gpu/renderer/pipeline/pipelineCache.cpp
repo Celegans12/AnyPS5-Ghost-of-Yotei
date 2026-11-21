@@ -2891,10 +2891,9 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 	}
 	t_ahead_unread_load = false;
 #if defined(ANYPS5_KYTY)
-	const bool defers = ShaderRecompiler::IR::SrtFlatDeferMode() != ShaderRecompiler::IR::SrtFlatDefer::Off;
-	runtime.defer_flat_loads  = defers;
+	runtime.defer_flat_loads  = true;
 	runtime.note_around_loads = true;
-	if (defers) ShaderRecompiler::IR::SrtDeferredLoadsOfThread().clear();
+	ShaderRecompiler::IR::SrtDeferredLoadsOfThread().clear();
 	ShaderRecompiler::IR::SrtAroundLoadsOfThread().clear();
 #endif
 	std::optional<AheadImageHeap> heap;
@@ -2913,7 +2912,7 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 		return nullptr;
 	}
 #if defined(ANYPS5_KYTY)
-	if (defers && !ShaderRecompiler::IR::SrtDeferredLoadsOfThread().empty()) {
+	if (!ShaderRecompiler::IR::SrtDeferredLoadsOfThread().empty()) {
 		ahead.reads.NoteDeferredLoads(ShaderRecompiler::IR::SrtDeferredLoadsOfThread());
 	}
 	ahead.reads.NoteAroundLoads(ShaderRecompiler::IR::SrtAroundLoadsOfThread());
