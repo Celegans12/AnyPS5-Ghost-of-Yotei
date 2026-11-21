@@ -41,7 +41,7 @@ void SurveyLogScope::Observe(std::string_view text) noexcept {
     if (current_ != nullptr) current_->observer_(current_->context_, text);
 }
 
-} // namespace AgcDriver
+}
 #endif
 
 namespace Log {

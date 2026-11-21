@@ -38,6 +38,6 @@ struct SurveySettings {
 
 int RunSurvey(const SurveySettings& settings);
 
-} // namespace AgcDriver
+}
 
 #endif

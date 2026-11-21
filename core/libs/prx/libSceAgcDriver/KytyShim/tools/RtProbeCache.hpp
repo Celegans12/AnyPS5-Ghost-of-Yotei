@@ -30,6 +30,6 @@ CachedShaderCode ReadCachedShaderCode(std::istream& cache, std::uint64_t hash);
 CachedShaderIndex IndexCachedShaderCode(std::istream& cache);
 CachedShaderCode ReadIndexedShaderCode(std::istream& cache, const CachedShaderEntry& entry);
 
-} // namespace AgcDriver
+}
 
 #endif

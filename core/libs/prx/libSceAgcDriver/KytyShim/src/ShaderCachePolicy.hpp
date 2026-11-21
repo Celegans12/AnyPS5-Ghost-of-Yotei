@@ -9,6 +9,6 @@ inline constexpr bool ResolveShaderCacheEnabled(bool enabled, const char* disabl
     return enabled && (disabled == nullptr || *disabled == '\0' || std::string_view(disabled) == "0");
 }
 
-} // namespace KytyShim
+}
 
 #endif

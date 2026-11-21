@@ -50,7 +50,7 @@ CachedShaderCode DecodeCachedShader(std::istream& cache, const CodeRecord& recor
     return {.code = std::move(code)};
 }
 
-} // namespace
+}
 
 CachedShaderIndex IndexCachedShaderCode(std::istream& cache) {
     cache.clear();
@@ -127,4 +127,4 @@ CachedShaderCode ReadCachedShaderCode(std::istream& cache, std::uint64_t hash) {
     return {.error = "shader hash not found in the manifest cache"};
 }
 
-} // namespace AgcDriver
+}

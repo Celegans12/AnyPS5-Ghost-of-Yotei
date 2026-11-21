@@ -23,7 +23,7 @@ void Require(bool condition, const char* message) {
     std::abort();
 }
 
-} // namespace
+}
 
 int main() {
     Require(FrameReplaySamplesCoverInterval(Timing(1, 3), Timing(11, 13), Tick(0), Tick(10), Tick(20)),

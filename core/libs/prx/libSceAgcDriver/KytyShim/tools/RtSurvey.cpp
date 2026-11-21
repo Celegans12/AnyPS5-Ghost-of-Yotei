@@ -394,7 +394,7 @@ Gfx::ManifestModule DefaultComputeModule(std::uint32_t wave) {
     return module;
 }
 
-} // namespace
+}
 
 int RunSurvey(const SurveySettings& settings) {
     const auto begin = std::chrono::steady_clock::now();
@@ -567,4 +567,4 @@ int RunSurvey(const SurveySettings& settings) {
     return 0;
 }
 
-} // namespace AgcDriver
+}

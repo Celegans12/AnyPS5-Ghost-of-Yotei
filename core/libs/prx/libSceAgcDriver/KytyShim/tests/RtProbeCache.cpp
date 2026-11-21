@@ -145,7 +145,7 @@ void CheckIndex() {
     Require(AgcDriver::ReadIndexedShaderCode(damagedInput, damagedIndex.entries[1]).error != nullptr, "a damaged payload was decoded");
 }
 
-} // namespace
+}
 
 int main(int argc, char** argv) {
     if (argc == 3 && std::string_view(argv[1]) == "write-export-fixture") {
