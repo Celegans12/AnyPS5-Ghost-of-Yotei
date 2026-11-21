@@ -571,6 +571,16 @@ add_dependencies(kyty_shim_bda_submission_sync_tests agc_frame_replay)
 add_test(NAME kyty_shim_bda_submission_sync COMMAND kyty_shim_bda_submission_sync_tests $<TARGET_FILE:agc_frame_replay>)
 set_tests_properties(kyty_shim_bda_submission_sync PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
         PASS_REGULAR_EXPRESSION "kyty_shim_bda_submission_sync: ok")
+add_test_executable(kyty_shim_bda_load_forms_tests ${CMAKE_CURRENT_SOURCE_DIR}/BdaLoadForms.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../Execution/src/FrameCapture.cpp)
+target_include_directories(kyty_shim_bda_load_forms_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/3rdparty/zstd/lib)
+target_link_libraries(kyty_shim_bda_load_forms_tests PRIVATE libzstd_static)
+set_target_properties(kyty_shim_bda_load_forms_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_host_test_executable(kyty_shim_bda_load_forms_tests)
+add_dependencies(kyty_shim_bda_load_forms_tests agc_frame_replay)
+add_test(NAME kyty_shim_bda_load_forms COMMAND kyty_shim_bda_load_forms_tests $<TARGET_FILE:agc_frame_replay>)
+set_tests_properties(kyty_shim_bda_load_forms PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "kyty_shim_bda_load_forms: ok")
 add_test_executable(kyty_shim_cross_queue_order_tests ${CMAKE_CURRENT_SOURCE_DIR}/CrossQueueOrder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../../Execution/src/FrameCapture.cpp)
 target_include_directories(kyty_shim_cross_queue_order_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/3rdparty/zstd/lib)

@@ -280,15 +280,6 @@ uint32_t EmitBdaPointerLoad(EmitterState& state, uint32_t bda, bool coherent) {
 	return value;
 }
 
-uint32_t LoadBdaPointerDword(ValueEmitContext& ctx, uint32_t bda, bool coherent, uint32_t missing) {
-	auto&      state   = ctx.state;
-	const auto present =
-	    Binary(state, spv::OpINotEqual, TypeBool(state), bda, ConstantU64(state, 0));
-	return EmitValueOrDefaultIfCondition(state, present, TypeU32(state), missing, [&]() {
-		return EmitBdaPointerLoad(state, bda, coherent);
-	});
-}
-
 uint32_t LoadBdaDwordIf(ValueEmitContext& ctx, uint32_t condition, uint32_t address, bool coherent = false) {
 	auto& state = ctx.state;
 	if (condition == ConstantBool(state, true)) condition = 0;
@@ -309,8 +300,15 @@ uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address, bool coherent = f
 	return LoadBdaDwordIf(ctx, 0, address, coherent);
 }
 
-std::pair<uint32_t, uint32_t> LoadBdaCrossingDwords(ValueEmitContext& ctx, uint32_t aligned,
-                                                    uint32_t low, uint32_t crosses, bool coherent) {
+uint32_t LoadBdaPointerDword(ValueEmitContext& ctx, uint32_t bda, bool coherent, uint32_t missing) {
+	auto&      state   = ctx.state;
+	const auto present = Binary(state, spv::OpINotEqual, TypeBool(state), bda, ConstantU64(state, 0));
+	return EmitValueOrDefaultIfCondition(state, present, TypeU32(state), missing,
+	                                     [&]() { return EmitBdaPointerLoad(state, bda, coherent); });
+}
+
+std::pair<uint32_t, uint32_t> LoadBdaCrossingDwords(ValueEmitContext& ctx, uint32_t aligned, uint32_t low,
+                                                    uint32_t crosses, bool coherent) {
 	auto&      state = ctx.state;
 	const auto u32 = TypeU32(state), u64 = TypeU64(state), boolean = TypeBool(state);
 	static_assert(BufferCache::CACHING_PAGESIZE <= (uint64_t {1} << 32u));
@@ -318,10 +316,8 @@ std::pair<uint32_t, uint32_t> LoadBdaCrossingDwords(ValueEmitContext& ctx, uint3
 	    ConstantU32(state, static_cast<uint32_t>(BufferCache::CACHING_PAGESIZE - 1u) & ~3u);
 	const auto next_page = Binary(
 	    state, spv::OpLogicalAnd, boolean, crosses,
-	    Binary(state, spv::OpIEqual, boolean, Binary(state, spv::OpBitwiseAnd, u32, low, last_dword),
-	           last_dword));
-	const auto same_page = Binary(state, spv::OpLogicalAnd, boolean, crosses,
-	                              Unary(state, spv::OpLogicalNot, boolean, next_page));
+	    Binary(state, spv::OpIEqual, boolean, Binary(state, spv::OpBitwiseAnd, u32, low, last_dword), last_dword));
+	const auto zero      = ConstantU64(state, 0);
 	const auto preheader = state.current_label;
 	const auto header    = state.builder.AllocateId();
 	const auto body      = state.builder.AllocateId();
@@ -329,37 +325,35 @@ std::pair<uint32_t, uint32_t> LoadBdaCrossingDwords(ValueEmitContext& ctx, uint3
 	const auto merge     = state.builder.AllocateId();
 	const auto pass      = state.builder.AllocateId();
 	const auto kept      = state.builder.AllocateId();
-	const auto first     = state.builder.AllocateId();
+	const auto pointer   = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpBranch, header);
 	EmitLabel(state, header);
 	state.builder.AddFunction(spv::OpPhi, boolean, pass, ConstantBool(state, false), preheader,
 	                          ConstantBool(state, true), latch);
-	state.builder.AddFunction(spv::OpPhi, u32, kept, ConstantU32(state, 0), preheader, first, latch);
+	state.builder.AddFunction(spv::OpPhi, u64, kept, zero, preheader, pointer, latch);
 	state.builder.AddFunction(spv::OpLoopMerge, merge, latch, spv::LoopControlMaskNone);
 	state.builder.AddFunction(spv::OpBranch, body);
 	EmitLabel(state, body);
-	const auto zero    = ConstantU64(state, 0);
-	const auto step    = Select(state, u64, pass, ConstantU64(state, sizeof(uint32_t)), zero);
-	const auto bda     = GetBdaPointer(state, Binary(state, spv::OpIAdd, u64, aligned, step));
-	const auto at      = LoadBdaPointerDword(ctx, bda, coherent, MissingBdaDword(state));
-	const auto next_at = Select(
-	    state, u64,
-	    Binary(state, spv::OpLogicalAnd, boolean, same_page,
-	           Binary(state, spv::OpINotEqual, boolean, bda, zero)),
-	    Binary(state, spv::OpIAdd, u64, bda, ConstantU64(state, sizeof(uint32_t))), zero);
-	const auto missing_next =
-	    state.program.info.bvh
-	        ? Select(state, u32, same_page, MissingBdaDword(state), ConstantU32(state, 0))
-	        : ConstantU32(state, 0);
-	const auto following = LoadBdaPointerDword(ctx, next_at, coherent, missing_next);
-	state.builder.AddFunction(spv::OpCopyObject, u32, first, Select(state, u32, pass, kept, at));
-	const auto second = Select(state, u32, pass, at, following);
+	const auto step = Select(state, u64, pass, ConstantU64(state, sizeof(uint32_t)), zero);
+	state.builder.AddFunction(spv::OpCopyObject, u64, pointer,
+	                          GetBdaPointer(state, Binary(state, spv::OpIAdd, u64, aligned, step)));
 	state.builder.AddFunction(spv::OpBranch, latch);
 	EmitLabel(state, latch);
-	const auto again = Binary(state, spv::OpLogicalAnd, boolean, next_page,
-	                          Unary(state, spv::OpLogicalNot, boolean, pass));
+	const auto again =
+	    Binary(state, spv::OpLogicalAnd, boolean, next_page, Unary(state, spv::OpLogicalNot, boolean, pass));
 	state.builder.AddFunction(spv::OpBranchConditional, again, header, merge);
 	EmitLabel(state, merge);
+	const auto first_pointer = Select(state, u64, pass, kept, pointer);
+	const auto same_page_next =
+	    Select(state, u64,
+	           Binary(state, spv::OpLogicalAnd, boolean, crosses,
+	                  Binary(state, spv::OpINotEqual, boolean, first_pointer, zero)),
+	           Binary(state, spv::OpIAdd, u64, first_pointer, ConstantU64(state, sizeof(uint32_t))), zero);
+	const auto second_pointer = Select(state, u64, pass, pointer, same_page_next);
+	const auto first  = LoadBdaPointerDword(ctx, first_pointer, coherent, MissingBdaDword(state));
+	const auto second = EmitValueOrZeroIfCondition(state, crosses, [&]() {
+		return LoadBdaPointerDword(ctx, second_pointer, coherent, MissingBdaDword(state));
+	});
 	return {first, second};
 }
 
@@ -1993,7 +1987,6 @@ void DefineBdaLoads(EmitterState& state) {
 				                          page);
 				const auto base = state.builder.AllocateId();
 				state.builder.AddFunction(spv::OpLoad, u64, base, entry_pointer);
-				RecordBdaPageBit(state, page, BufferCache::USE_BITMAP_OFFSET);
 				const auto missing = Binary(state, spv::OpIEqual, boolean, base, ConstantU64(state, 0));
 				const auto fault_label = state.builder.AllocateId();
 				const auto load_label  = state.builder.AllocateId();
@@ -2014,6 +2007,7 @@ void DefineBdaLoads(EmitterState& state) {
 				const auto result = state.builder.AllocateId();
 				state.builder.AddFunction(spv::OpPhi, u32, result, MissingBdaDword(state), fault_label, value,
 				                          load_exit);
+				RecordBdaPageBit(state, page, BufferCache::USE_BITMAP_OFFSET);
 				return result;
 			};
 			const auto result = guarded != 0u
