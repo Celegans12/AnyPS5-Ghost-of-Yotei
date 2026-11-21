@@ -3446,6 +3446,46 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	});
 }
 
+void TextureCache::ApplyPartialBufferCopy(uint64_t address, uint64_t size, const Buffer& buffer,
+                                         uint64_t buffer_offset) {
+	if (((address | size | buffer_offset) & 3u) != 0 || !MayHoldImages(address, size)) {
+		return;
+	}
+	Common::ScopedLock lock {m_lock};
+	ImageId target {};
+	ForEachImageInRegion(address, size, [&](ImageId id, Image&) {
+		if (target) {
+			target = {};
+			return true;
+		}
+		target = id;
+		return false;
+	});
+	if (!target) return;
+
+	auto&       image = m_slot_images[target];
+	const auto& info  = image.info;
+	if (address <= info.data.address || address + size > info.data.End() ||
+	    (info.data.address & 3u) != 0 || !image.SafeToDownload() || image.depth_id ||
+	    info.IsDepth() || info.HasStencil() || info.HasMetadata() || info.IsBlock() ||
+	    info.type != Prospero::ImageType::kColor2D || info.resources.levels != 1 ||
+	    info.resources.layers != 1 || !CanDownload(image)) {
+		return;
+	}
+
+	auto& scratch = m_buffer_cache.GetUtilityBuffer(MemoryUsage::DeviceLocal);
+	const auto limit = m_graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
+	if (info.data.size > scratch.Size() ||
+	    (info.IsTiled() && (!info.HasTiledLayout() || std::max(info.data.size, info.LinearSize()) > limit))) {
+		return;
+	}
+	DownloadImage(image, scratch, 0, info.data.size, info.resources.levels);
+	scratch.CopyFrom(m_scheduler.Current(), buffer, buffer_offset, address - info.data.address,
+	                 size);
+	UploadImage(image, scratch, 0);
+	CommitGpuWrite(image);
+}
+
 bool TextureCache::CopyToImage(uint64_t address, uint64_t source, uint64_t size) {
 	Common::ScopedLock lock {m_lock};
 	Common::SmallVector<ImageId, 8> targets;

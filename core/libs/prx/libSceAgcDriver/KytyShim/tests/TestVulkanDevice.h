@@ -15,7 +15,7 @@ struct TestVulkanDevice {
 	vk::detail::DynamicLoader loader;
 	Libs::Graphics::GraphicContext graphics;
 
-	const char* Initialize() {
+	const char* Initialize(bool require_tiling = false) {
 		if (!loader.success()) {
 			return "Vulkan loader unavailable";
 		}
@@ -36,7 +36,7 @@ struct TestVulkanDevice {
 			return "Vulkan device enumeration failed";
 		}
 		for (const auto device : devices.value) {
-			if (InitializeDevice(device)) {
+			if (InitializeDevice(device, require_tiling)) {
 				return nullptr;
 			}
 		}
@@ -56,7 +56,7 @@ struct TestVulkanDevice {
 	}
 
 private:
-	bool InitializeDevice(vk::PhysicalDevice physical) {
+	bool InitializeDevice(vk::PhysicalDevice physical, bool require_tiling) {
 		vk::PhysicalDeviceVulkan12Properties limits {};
 		vk::PhysicalDeviceProperties2 properties {.pNext = &limits};
 		physical.getProperties2(&properties);
@@ -87,11 +87,14 @@ private:
 		}
 		vk::PhysicalDeviceRobustness2FeaturesEXT supported_robustness {};
 		vk::PhysicalDeviceVulkan12Features supported12 {.pNext = &supported_robustness};
-		vk::PhysicalDeviceVulkan13Features supported13 {.pNext = &supported12};
+		vk::PhysicalDeviceVulkan11Features supported11 {.pNext = &supported12};
+		vk::PhysicalDeviceVulkan13Features supported13 {.pNext = &supported11};
 		vk::PhysicalDeviceFeatures2 supported {.pNext = &supported13};
 		physical.getFeatures2(&supported);
 		if (!supported.features.shaderInt64 || !supported.features.sampleRateShading ||
 		    !supported_robustness.nullDescriptor ||
+		    (require_tiling && (!supported11.storageBuffer16BitAccess ||
+		                        !supported12.storageBuffer8BitAccess)) ||
 		    !supported12.descriptorBindingSampledImageUpdateAfterBind ||
 		    !supported12.descriptorBindingUpdateUnusedWhilePending ||
 		    !supported12.descriptorBindingPartiallyBound || !supported12.hostQueryReset ||
@@ -102,14 +105,17 @@ private:
 		vk::PhysicalDeviceRobustness2FeaturesEXT robustness {.nullDescriptor = VK_TRUE};
 		vk::PhysicalDeviceVulkan12Features features12 {
 		    .pNext = &robustness,
+		    .storageBuffer8BitAccess = require_tiling,
 		    .descriptorBindingSampledImageUpdateAfterBind = VK_TRUE,
 		    .descriptorBindingUpdateUnusedWhilePending = VK_TRUE,
 		    .descriptorBindingPartiallyBound = VK_TRUE,
 		    .hostQueryReset = VK_TRUE,
 		    .timelineSemaphore = VK_TRUE,
 		    .bufferDeviceAddress = VK_TRUE};
+		vk::PhysicalDeviceVulkan11Features features11 {
+		    .pNext = &features12, .storageBuffer16BitAccess = require_tiling};
 		const vk::PhysicalDeviceVulkan13Features features13 {
-		    .pNext = &features12, .synchronization2 = VK_TRUE, .dynamicRendering = VK_TRUE};
+		    .pNext = &features11, .synchronization2 = VK_TRUE, .dynamicRendering = VK_TRUE};
 		const vk::PhysicalDeviceFeatures core_features {
 		    .sampleRateShading = VK_TRUE, .shaderInt64 = VK_TRUE};
 		const float priority = 1.0f;

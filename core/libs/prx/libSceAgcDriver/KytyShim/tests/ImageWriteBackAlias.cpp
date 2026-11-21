@@ -181,6 +181,96 @@ const char* CheckWriteBackRefreshesBufferCopy(GraphicContext& graphics, uint64_t
 	return nullptr;
 }
 
+const char* CheckPartialBufferCopy(GraphicContext& graphics, uint64_t address,
+                                   Prospero::TileMode mode) {
+	RenderContext renderer(graphics);
+	CommandProcessor producer(renderer, 0);
+	producer.Reset();
+	auto& scheduler = renderer.GetCommandScheduler();
+	auto& textures = renderer.GetTextureCache();
+	auto& buffers = renderer.GetBufferCache();
+	scheduler.Begin(producer.GetCtx(), producer.GetUcfg(), producer.GetShCtx());
+
+	constexpr uint32_t Width = 64;
+	constexpr uint32_t Height = 32;
+	constexpr uint64_t TexelBytes = sizeof(uint32_t);
+	constexpr uint64_t CopyBytes = WriteWords * TexelBytes;
+	ImageInfo info;
+	info.data.address = address;
+	info.pixel_format = vk::Format::eR32Uint;
+	info.guest_format = Prospero::BufferFormat::k32UInt;
+	info.extent = vk::Extent3D {Width, Height, 1};
+	info.tile_mode = mode;
+	info.UpdateSize();
+	const auto id = TextureCacheTestAccess::Create(textures, info);
+	auto& image = textures.GetImage(id);
+
+	std::array<uint32_t, Width * Height> pixels {};
+	for (uint32_t i = 0; i < pixels.size(); ++i) {
+		pixels[i] = ImageValue + i;
+	}
+	Buffer initial(graphics, scheduler, MemoryUsage::Upload, 0,
+	               vk::BufferUsageFlagBits::eTransferSrc, sizeof(pixels));
+	std::memcpy(initial.Mapped().data(), pixels.data(), sizeof(pixels));
+	initial.Flush(0, sizeof(pixels));
+	const std::array copies {vk::BufferImageCopy {
+	    0, 0, 0, {vk::ImageAspectFlagBits::eColor, 0, 0, 1}, {}, info.extent}};
+	image.Upload(copies, initial.Handle(), 0, sizeof(pixels));
+	textures.MarkGpuWritten(id);
+
+	const auto& block = info.tiling.block;
+	const uint64_t offset = info.IsTiled() ? block.block_size - 2 * TexelBytes
+	                                      : (Width + 5) * TexelBytes;
+	const auto source = address + GuestBytes / 4;
+	const auto [source_buffer, source_offset] = buffers.ObtainBuffer(source, CopyBytes, true, false);
+	source_buffer->Fill(source_offset, CopyBytes, CopyValue);
+	buffers.CopyBuffer(address + offset, source, CopyBytes, false, false);
+
+	TextureCache::ImageDesc desc {.info = info};
+	desc.view_info.format = info.pixel_format;
+	const auto view = textures.FindTexture(id, desc);
+	Buffer readback(graphics, scheduler, MemoryUsage::Download, 0,
+	                vk::BufferUsageFlagBits::eTransferDst, sizeof(pixels));
+	image.Download(copies, readback.Handle(), 0, sizeof(pixels));
+	const auto tick = scheduler.CurrentTick();
+	scheduler.Wait(tick);
+	scheduler.WaitPriorityOperations(tick);
+	readback.Invalidate(0, sizeof(pixels));
+	std::array<uint32_t, Width * Height> actual {};
+	std::memcpy(actual.data(), readback.Mapped().data(), sizeof(actual));
+	BufferCacheTestAccess::DiscardGpuWrites(buffers, address, GuestBytes / 2);
+	(void)buffers.DropFreedRange(address, GuestBytes / 2, nullptr, nullptr);
+	if (!view) return "could not rebind the resident image after the partial copy";
+
+	uint32_t covered = 0;
+	bool stale = false;
+	const auto& mip = info.mip_layout[0];
+	for (uint32_t y = 0; y < Height; ++y) {
+		for (uint32_t x = 0; x < Width; ++x) {
+			uint64_t guest_offset = (uint64_t {y} * mip.linear_pitch + x) * TexelBytes;
+			if (info.IsTiled()) {
+				uint32_t in_block = 0;
+				if (!TileGetBlockOffset(block, x % block.block_width, y % block.block_height, 0,
+				                        in_block)) {
+					return "could not map a tiled texel in the reference";
+				}
+				const auto block_index = y / block.block_height * (mip.pitch / block.block_width) +
+				                         x / block.block_width;
+				guest_offset = mip.offset + uint64_t {block_index} * block.block_size + in_block;
+			}
+			const auto index = y * Width + x;
+			if (guest_offset >= offset && guest_offset < offset + CopyBytes) {
+				covered++;
+				stale |= actual[index] != CopyValue;
+			} else if (actual[index] != pixels[index]) {
+				return "the partial copy changed texels outside its guest range";
+			}
+		}
+	}
+	if (covered != WriteWords) return "the reference did not cover the copied words";
+	return stale ? "the resident image still held stale texels after the partial copy" : nullptr;
+}
+
 }
 
 extern "C" int RunKytyImageWriteBackAliasTest() {
@@ -189,7 +279,7 @@ extern "C" int RunKytyImageWriteBackAliasTest() {
 	Config::Load(Config::ConfigOptions {});
 	KytyShimTests::TestVulkanDevice gpu;
 	auto& graphics = gpu.graphics;
-	if (const auto* unavailable = gpu.Initialize()) {
+	if (const auto* unavailable = gpu.Initialize(true)) {
 		const bool required = std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr;
 		std::fprintf(stderr, "kyty_shim_image_write_back_alias: %s, no usable Vulkan device (%s)\n",
 		             required ? "FAILED" : "skipped", unavailable);
@@ -208,6 +298,13 @@ extern "C" int RunKytyImageWriteBackAliasTest() {
 	auto failure = CheckWriteBackOrder(graphics, address);
 	if (failure == nullptr) {
 		failure = CheckWriteBackRefreshesBufferCopy(graphics, address + GuestBytes / 4);
+	}
+	if (failure == nullptr) {
+		const auto* linear = CheckPartialBufferCopy(graphics, address + GuestBytes / 2,
+		                                           Prospero::TileMode::kLinear);
+		const auto* tiled = CheckPartialBufferCopy(graphics, address + GuestBytes / 2,
+		                                          Prospero::TileMode::kStandard4KB);
+		failure = linear != nullptr ? linear : tiled;
 	}
 	if (sceKernelMunmap(address, GuestBytes) != 0) {
 		std::fputs("kyty_shim_image_write_back_alias: FAILED: could not unmap guest backing\n", stderr);
