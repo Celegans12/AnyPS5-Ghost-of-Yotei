@@ -1917,6 +1917,22 @@ static constexpr auto MakeContextIndirectTable() {
 			cp.GetCtx().SetTargetOutputMode(i, (value >> (i * 4)) & 0xFu);
 		}
 	};
+	table[Pm4::SX_PS_DOWNCONVERT_CONTROL] = [](KYTY_HW_REG_ARGS) {
+		if ((value & ~0xffu) != 0u) {
+			EXIT("unsupported SX_PS_DOWNCONVERT_CONTROL bits: 0x%08x\n", value);
+		}
+		cp.GetCtx().SetSxDownconvertControl(value);
+	};
+	table[Pm4::SX_PS_DOWNCONVERT] = [](KYTY_HW_REG_ARGS) {
+		for (uint32_t slot = 0; slot < 8u; slot++) {
+			const auto format = (value >> (slot * 4u)) & 0xfu;
+			if (format > 11u) {
+				EXIT("reserved SX_PS_DOWNCONVERT format: mrt=%u format=%u value=0x%08x\n",
+				     slot, format, value);
+			}
+		}
+		cp.GetCtx().SetSxDownconvertFormats(value);
+	};
 
 	table[Pm4::SPI_PS_INPUT_ENA]  = [](KYTY_HW_REG_ARGS) { cp.GetCtx().SetPsInputEna(value); };
 	table[Pm4::SPI_PS_INPUT_ADDR] = [](KYTY_HW_REG_ARGS) { cp.GetCtx().SetPsInputAddr(value); };

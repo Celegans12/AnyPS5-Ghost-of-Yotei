@@ -2303,6 +2303,7 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 	const bool  object_primitive_id = context.HasObjectPrimitiveIdOutput();
 	const auto  write_mask          = context.GetRenderTargetMask() & sh.m_cbShaderMask;
 	uint32_t    color_output_mask   = object_primitive_id ? 1u << 7u : 0;
+	uint32_t    sx_active_targets   = 0;
 	for (uint32_t index = 0; index < RENDER_COLOR_ATTACHMENTS_MAX; index++) {
 		const auto slot = ShaderPixelExportTarget(sh.m_cbShaderMask, index);
 		if (slot >= RENDER_COLOR_ATTACHMENTS_MAX) {
@@ -2310,6 +2311,9 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 		}
 		if (sh.target_output_mode[index] != 0 && render_target_mask_slot(write_mask, slot) != 0) {
 			color_output_mask |= 1u << slot;
+			if (context.GetRenderTarget(slot).base.addr != 0) {
+				sx_active_targets |= 1u << slot;
+			}
 		}
 	}
 	const auto& db = sh.db_shader_control;
@@ -2318,6 +2322,20 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 	    (color_output_mask != 0 || db.shader_kill_enable || db.shader_z_export_enable ||
 	     db.shader_mask_export_enable || db.shader_dual_export_enable ||
 	     db.shader_execute_on_noop || sh.AlphaToMask());
+	if (pixel_active) {
+		const auto& sx = context.GetSxDownconvert();
+		const auto unsupported = sx.UnsupportedManualTargets(sx_active_targets);
+		if (unsupported != 0u) {
+			if (ahead != nullptr) {
+				ahead->reads.Fail(AheadRefusal::Stage);
+				return false;
+			}
+			if (context.GetColorControl().mode == 1u) {
+				EXIT("unsupported SX_PS_DOWNCONVERT conversion: mrt_mask=0x%02x control=0x%02x "
+				     "formats=0x%08x\n", unsupported, sx.control, sx.formats);
+			}
+		}
+	}
 	state.ps_active = pixel_active;
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 #if defined(ANYPS5_KYTY)

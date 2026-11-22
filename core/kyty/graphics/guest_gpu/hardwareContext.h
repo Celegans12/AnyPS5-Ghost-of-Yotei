@@ -317,6 +317,22 @@ struct ColorControl {
 	uint8_t op   = 0xCC;
 };
 
+struct SxDownconvert {
+	uint32_t control = 0;
+	uint32_t formats = 0;
+
+	[[nodiscard]] constexpr uint32_t UnsupportedManualTargets(uint32_t active_targets) const {
+		uint32_t unsupported = 0;
+		for (uint32_t slot = 0; slot < 8u; slot++) {
+			if ((active_targets & control & (1u << slot)) != 0u &&
+			    ((formats >> (slot * 4u)) & 0xfu) != 0u) {
+				unsupported |= 1u << slot;
+			}
+		}
+		return unsupported;
+	}
+};
+
 struct ScanModeControl {
 	bool msaa_enable          = false;
 	bool vport_scissor_enable = true;
@@ -771,6 +787,9 @@ public:
 	void SetStencilMask(const StencilMask& mask) { m_stencil_mask = mask; }
 	[[nodiscard]] const ColorControl& GetColorControl() const { return m_color_control; }
 	void SetColorControl(const ColorControl& control) { m_color_control = control; }
+	[[nodiscard]] const SxDownconvert& GetSxDownconvert() const { return m_sx_downconvert; }
+	void SetSxDownconvertControl(uint32_t control) { m_sx_downconvert.control = control; }
+	void SetSxDownconvertFormats(uint32_t formats) { m_sx_downconvert.formats = formats; }
 	[[nodiscard]] const ScanModeControl& GetScanModeControl() const { return m_scan_mode_control; }
 	void SetScanModeControl(const ScanModeControl& control) { m_scan_mode_control = control; }
 	[[nodiscard]] const AaSampleControl& GetAaSampleControl() const { return m_aa_sample_control; }
@@ -832,6 +851,7 @@ private:
 	ScreenViewport  m_screen_viewport;
 	ClipControl     m_clip_control;
 	ColorControl    m_color_control;
+	SxDownconvert   m_sx_downconvert;
 	ScanModeControl m_scan_mode_control;
 
 	std::array<uint32_t, 24> m_user_clip_planes {};
