@@ -258,10 +258,6 @@ uint32_t WaveSplitCheckPeriod() {
 	return g_config->wave_split_check_period;
 }
 
-bool ImageTableHeapEnabled() {
-	return g_config->image_table_heap;
-}
-
 bool NativeRtEnabled() {
 	return g_config->native_rt;
 }

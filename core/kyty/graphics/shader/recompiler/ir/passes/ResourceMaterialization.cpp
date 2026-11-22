@@ -1388,7 +1388,7 @@ bool MaterializeImageTableHeap(const ResourcePlan& program,
                                ResourceSpecialization& specialization) {
 	const auto&          root = program.info.images[image_index];
 	ShaderBufferResource table;
-	if (!runtime.image_table_heap || root.resource_class != ImageResourceClass::Sampled ||
+	if (root.resource_class != ImageResourceClass::Sampled ||
 	    root.mip_mode == ImageMipMode::Dynamic ||
 	    table_value.dword_count != 4u ||
 	    !DecodeBufferDescriptor(table_value, table) || (indirect.table_offset & 31u) != 0u) {

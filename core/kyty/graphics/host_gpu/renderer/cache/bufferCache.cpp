@@ -26,7 +26,6 @@
 #include <bit>
 #include <chrono>
 #include <cinttypes>
-#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <utility>
@@ -355,14 +354,6 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	return true;
 }
 
-static bool WriteFaultBlocks() {
-	static const bool on = [] {
-		const char* value = std::getenv("KYTY_WRITE_FAULT_BLOCKS");
-		return value == nullptr || value[0] != '0';
-	}();
-	return on;
-}
-
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                          PageManager& page_manager, TextureCache& texture_cache, RenderContext* resources)
     : m_graphics(graphics), m_scheduler(scheduler), m_resources(resources),
@@ -376,7 +367,6 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache) {
-	(void)WriteFaultBlocks();
 	if (InPlaceMemory::Requested()) {
 		m_in_place = std::make_unique<InPlaceMemory>();
 	}
@@ -506,7 +496,7 @@ BufferCache::WriteFaultOwner BufferCache::InvalidateGuestWriteFault(uint64_t vad
 	const auto block      = Common::AlignDown(page, FaultBlockSize);
 	const bool command    = m_memory_tracker.IsCommandBlock(page);
 	const bool segment    = !command && m_memory_tracker.IsSegmentBlock(page);
-	const bool open_block = (command || segment) && WriteFaultBlocks();
+	const bool open_block = command || segment;
 	const auto owner_of   = [&](bool gpu, bool tracked) {
 		return command   ? WriteFaultOwner::CommandBuffer
 		       : segment ? WriteFaultOwner::CommandSegment

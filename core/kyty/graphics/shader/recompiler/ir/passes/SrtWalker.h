@@ -78,7 +78,6 @@ struct SrtRuntime {
 	bool (*pending_write)(uint64_t address, uint32_t& value) = nullptr;
 	std::span<const uint32_t> call_words;
 	bool runtime_stride = false;
-	bool image_table_heap = false;
 #if defined(ANYPS5_KYTY)
 	bool defer_flat_loads = false;
 	bool note_around_loads = false;

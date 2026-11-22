@@ -50,7 +50,6 @@ constexpr Flag Flags[] = {
     {"KYTY_TESSELLATION", &Options::tessellation_enabled},
     {"KYTY_OCCLUSION_QUERIES", &Options::occlusion_queries_enabled},
     {"KYTY_RELAXED_SHADER_FLOAT", &Options::relaxed_shader_float},
-    {"KYTY_IMAGE_TABLE_HEAP", &Options::image_table_heap},
     {"KYTY_RT_STATS", &Options::rt_stats_enabled},
     {"KYTY_COMMAND_BUFFER_DUMP", &Options::command_buffer_dump_enabled},
     {"KYTY_GRAPHICS_DEBUG_DUMP", &Options::graphics_debug_dump_enabled},

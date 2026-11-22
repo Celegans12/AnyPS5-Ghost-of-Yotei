@@ -111,7 +111,6 @@ struct ConfigOptions {
 	bool                   occlusion_queries_enabled   = true;
 	bool                   relaxed_shader_float        = false;
 	uint32_t               wave_split_check_period     = 0;
-	bool                   image_table_heap            = true;
 	bool                   native_rt                   = false;
 	bool                   async_pipelines_enabled     = true;
 	bool                   async_pipelines_skip_more   = false;
@@ -197,7 +196,6 @@ bool TessellationEnabled();
 bool OcclusionQueriesEnabled();
 bool RelaxedShaderFloatEnabled();
 uint32_t WaveSplitCheckPeriod();
-bool ImageTableHeapEnabled();
 bool NativeRtEnabled();
 bool AsyncPipelinesEnabled();
 bool AsyncPipelinesSkipMore();
