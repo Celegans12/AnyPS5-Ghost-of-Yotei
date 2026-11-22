@@ -578,6 +578,10 @@ def main():
                     convert(metadata + "-" + transfer, make_image(transfer, metadata))
                 convert(metadata + "-truncated", make_image("register", metadata, 0x46), "Code analysis:")
                 convert(metadata + "-outside", make_image("register", metadata, 0x1000), "Code analysis: function exceeds executable segment")
+                no_terminator = make_image("register", metadata, 0x46)
+                no_terminator[0x1200:0x1240] = b"\x90" * 0x40
+                convert(metadata + "-tls-crossing-without-terminator", no_terminator,
+                        "Code analysis: instruction crosses function boundary")
             for first, second in ((0x47, 0x51), (0x51, 0x47), (0, 0x51), (0x51, 0)):
                 convert(f"symbol-alias-{first:x}-{second:x}",
                         add_alias(make_image("register", "symbol", first), second))

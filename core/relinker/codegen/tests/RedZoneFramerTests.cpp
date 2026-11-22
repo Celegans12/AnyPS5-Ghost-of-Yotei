@@ -868,8 +868,8 @@ void stopsAtAShortFdeWithoutLosingTheNextFunction() {
     Codegen::RedZoneFrameReport report;
     std::vector<Codegen::RedZoneDisplacement> displacements;
     const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
-    require(report.Functions == 2 && report.Framed == 1 && sites.size() == 2, "an FDE that ends inside its tail jmp was decoded past its bytes or lost the next function");
-    require(report.Skipped.size() == 1 && report.Skipped.begin()->first == "branch leaves the function", "the FDE whose tail jmp leaves its range was not skipped as a branch out");
+    require(report.Functions == 2 && report.Framed == 2 && sites.size() == 5, "an FDE that ends inside its tail jmp was decoded past its bytes or lost the next function");
+    require(report.Skipped.empty(), "the FDE whose tail jmp leaves its range was skipped");
 }
 
 void skipsAnInstructionThatOverrunsTheNextFunction() {
