@@ -9,15 +9,11 @@ on:
       - 'core/libs/prx/libSceAgcDriver/**'
       - 'tools/lavapipe_*'
       - '.github/workflows/offline-checks.yml'
+  # No path filter on pull requests: a workflow that path filters leave out reports nothing, so a check required on it
+  # waits forever. The `eligibility` job applies the same paths, and a job it skips is reported as skipped.
   pull_request:
     branches: [AnyKyty]
     types: [opened, synchronize, reopened]
-    paths:
-      - 'core/kyty/**'
-      - 'core/relinker/**'
-      - 'core/libs/prx/libSceAgcDriver/**'
-      - 'tools/lavapipe_*'
-      - '.github/workflows/offline-checks.yml'
   workflow_dispatch:
 
 permissions:
@@ -28,8 +24,59 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Pushes only start the workflow for the paths listed above, and manual runs want everything. A pull request runs
+  # the jobs when it changes one of those paths with more than the documentation.
+  eligibility:
+    name: Detect the changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.detect.outputs.run }}
+      summary: ${{ steps.detect.outputs.summary }}
+    steps:
+      - if: github.event_name == 'pull_request'
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - id: detect
+        name: Look for changes to the code these checks cover
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" != pull_request ]; then
+            printf '%s\n' run=true summary=true >> "$GITHUB_OUTPUT"
+            echo "$EVENT: everything runs"
+            exit 0
+          fi
+          run=false
+          total=0
+          # The checkout is the merge commit of the pull request: its first parent is the base, so the diff is what the pull request changes.
+          if git rev-parse -q --verify 'HEAD^2' > /dev/null; then
+            git diff --name-only --no-renames -z HEAD^1 HEAD > "$RUNNER_TEMP/changed-files"
+            while IFS= read -r -d '' path; do
+              total=$((total + 1))
+              case "$path" in
+                *.md | docs/* | .github/ISSUE_TEMPLATE/* | .github/DISCUSSION_TEMPLATE/* | LICENSE) ;;
+                core/kyty/* | core/relinker/* | core/libs/prx/libSceAgcDriver/* | tools/lavapipe_* | .github/workflows/offline-checks.yml)
+                  run=true; echo "covered: $path" ;;
+              esac
+            done < "$RUNNER_TEMP/changed-files"
+          else
+            echo "::warning::The checkout is not a merge commit; running everything"
+            run=true
+          fi
+          if [ "$total" -eq 0 ]; then
+            echo "::warning::No changed file found; running everything"
+            run=true
+          fi
+          printf '%s\n' "run=$run" summary=true >> "$GITHUB_OUTPUT"
+          echo "$total changed file(s): run=$run"
+
   lavapipe:
     name: Shim GPU tests on lavapipe
+    needs: eligibility
+    if: needs.eligibility.outputs.run == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -113,6 +160,8 @@ jobs:
 
   relinker-fuzzers:
     name: Relinker fuzzers
+    needs: eligibility
+    if: needs.eligibility.outputs.run == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -149,3 +198,28 @@ jobs:
           name: relinker-fuzzer-crashes
           path: build-fuzz/*-crash-*
           if-no-files-found: ignore
+
+  # The one check to require: it passes when the jobs that had to run passed, or were skipped because the pull request
+  # changes nothing these checks cover.
+  result:
+    name: Offline checks result
+    if: ${{ always() && needs.eligibility.outputs.summary != 'false' }}
+    needs: [eligibility, lavapipe, relinker-fuzzers]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check the outcome of the jobs
+        env:
+          RUN: ${{ needs.eligibility.outputs.run }}
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          status=0
+          result=$(echo "$NEEDS" | jq -r '.eligibility.result')
+          if [ "$result" != success ]; then echo "::error::eligibility: $result"; status=1; fi
+          for job in lavapipe relinker-fuzzers; do
+            result=$(echo "$NEEDS" | jq -r --arg job "$job" '.[$job].result')
+            if [ "$RUN" = true ] && [ "$result" != success ]; then echo "::error::$job: $result"; status=1; fi
+            if [ "$RUN" != true ] && [ "$result" != skipped ]; then echo "::error::$job: $result (expected skipped)"; status=1; fi
+          done
+          exit $status

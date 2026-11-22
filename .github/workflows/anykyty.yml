@@ -9,9 +9,6 @@ on:
   pull_request:
     branches: [AnyKyty]
     types: [opened, synchronize, reopened]
-    paths-ignore:
-      - '**.md'
-      - LICENSE
   schedule:
     - cron: '17 4 * * *'
   workflow_dispatch:
@@ -34,8 +31,77 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Tells the build jobs whether the pull request changes more than the documentation. A job skipped by its `if` is
+  # reported as skipped and counts as passed; the `result` job at the end is the one check to require.
+  eligibility:
+    name: Detect the changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      conventions: ${{ steps.detect.outputs.conventions }}
+      build: ${{ steps.detect.outputs.build }}
+      sanitize: ${{ steps.detect.outputs.sanitize }}
+      summary: ${{ steps.detect.outputs.summary }}
+    steps:
+      - if: github.event_name == 'pull_request'
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - id: detect
+        name: Look for changes beyond the documentation
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          # The nightly run only has the sanitizers to run.
+          nightly=false
+          if [ "$EVENT" = schedule ]; then nightly=true; fi
+          # Pushes, the nightly run and manual runs always build everything. Only a pull request can be documentation only.
+          if [ "$EVENT" != pull_request ]; then
+            {
+              echo "conventions=$([ $nightly = true ] && echo false || echo true)"
+              echo "build=$([ $nightly = true ] && echo false || echo true)"
+              echo "sanitize=true"
+              echo "summary=$([ $nightly = true ] && echo false || echo true)"
+            } >> "$GITHUB_OUTPUT"
+            echo "$EVENT: everything runs"
+            exit 0
+          fi
+          code=false
+          total=0
+          docs=0
+          # The checkout is the merge commit of the pull request: its first parent is the base, so the diff is what the pull request changes.
+          if git rev-parse -q --verify 'HEAD^2' > /dev/null; then
+            git diff --name-only --no-renames -z HEAD^1 HEAD > "$RUNNER_TEMP/changed-files"
+            while IFS= read -r -d '' path; do
+              total=$((total + 1))
+              case "$path" in
+                *.md | docs/* | .github/ISSUE_TEMPLATE/* | .github/DISCUSSION_TEMPLATE/* | LICENSE) docs=$((docs + 1)) ;;
+                *) code=true; echo "code: $path" ;;
+              esac
+            done < "$RUNNER_TEMP/changed-files"
+          else
+            echo "::warning::The checkout is not a merge commit; building everything"
+            code=true
+          fi
+          if [ "$total" -eq 0 ]; then
+            echo "::warning::No changed file found; building everything"
+            code=true
+          fi
+          {
+            echo "conventions=true"
+            echo "build=$code"
+            echo "sanitize=$code"
+            echo "summary=true"
+          } >> "$GITHUB_OUTPUT"
+          echo "$total changed file(s), $docs of them documentation: code=$code"
+          if [ "$code" = false ]; then
+            echo "Documentation only: the builds and the GPU tests are skipped, the conventions still run." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   conventions:
-    if: github.event_name != 'schedule'
+    needs: eligibility
+    if: ${{ !cancelled() && needs.eligibility.outputs.conventions != 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -71,7 +137,8 @@ jobs:
 
   linux:
     name: Linux kyty
-    if: github.event_name != 'schedule'
+    needs: eligibility
+    if: needs.eligibility.outputs.build == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -195,6 +262,8 @@ jobs:
 
   sanitize:
     name: Linux ${{ matrix.name }}
+    needs: eligibility
+    if: needs.eligibility.outputs.sanitize == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
@@ -334,7 +403,8 @@ jobs:
 
   windows:
     name: Windows kyty
-    if: github.event_name != 'schedule'
+    needs: eligibility
+    if: needs.eligibility.outputs.build == 'true'
     runs-on: windows-latest
     timeout-minutes: 150
     env:
@@ -403,8 +473,8 @@ jobs:
           rm -rf "$RUNNER_TEMP/llvm" "$RUNNER_TEMP/llvm.exe" "$RUNNER_TEMP/winlibs.zip"
       - name: Put WinLibs GCC and LLVM first on the path
         run: |
-          echo 'C:\winlibs\mingw64\bin' >> "$GITHUB_PATH"
-          echo 'C:\llvm\bin' >> "$GITHUB_PATH"
+          printf '%s\n' 'C:\winlibs\mingw64\bin' >> "$GITHUB_PATH"
+          printf '%s\n' 'C:\llvm\bin' >> "$GITHUB_PATH"
       - name: Show the toolchain
         run: |
           command -v g++ clang clang++ cmake ninja
@@ -451,3 +521,31 @@ jobs:
       - name: Show the ccache statistics
         if: ${{ !cancelled() && steps.ccache.outcome == 'success' }}
         run: ccache -s
+
+  # The one check to require: it passes when every job that had to run passed, or was skipped because the pull
+  # request only changes the documentation. (A matrix job skipped by its `if` is reported under its unexpanded
+  # name, "Linux ${{ matrix.name }}", so the Linux tsan and asan checks cannot be required one by one.)
+  result:
+    name: AnyKyty result
+    if: ${{ always() && needs.eligibility.outputs.summary != 'false' }}
+    needs: [eligibility, conventions, linux, sanitize, windows]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check the outcome of the jobs
+        env:
+          BUILD: ${{ needs.eligibility.outputs.build }}
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          status=0
+          for job in eligibility conventions; do
+            result=$(echo "$NEEDS" | jq -r --arg job "$job" '.[$job].result')
+            if [ "$result" != success ]; then echo "::error::$job: $result"; status=1; fi
+          done
+          for job in linux sanitize windows; do
+            result=$(echo "$NEEDS" | jq -r --arg job "$job" '.[$job].result')
+            if [ "$BUILD" = true ] && [ "$result" != success ]; then echo "::error::$job: $result"; status=1; fi
+            if [ "$BUILD" != true ] && [ "$result" != skipped ]; then echo "::error::$job: $result (expected skipped for a documentation-only change)"; status=1; fi
+          done
+          exit $status
