@@ -1693,12 +1693,10 @@ static constexpr auto MakeContextIndirectTable() {
 			attrib3.tile_mode = static_cast<Prospero::TileMode>(
 			    KYTY_PM4_GET(value, CB_COLOR0_ATTRIB3, COLOR_SW_MODE));
 			attrib3.dimension = KYTY_PM4_GET(value, CB_COLOR0_ATTRIB3, RESOURCE_TYPE);
-			const bool cmask_pipe_aligned =
+			attrib3.cmask_pipe_aligned =
 			    KYTY_PM4_GET(value, CB_COLOR0_ATTRIB3, CMASK_PIPE_ALIGNED) != 0;
-			const bool dcc_pipe_aligned =
+			attrib3.dcc_pipe_aligned =
 			    KYTY_PM4_GET(value, CB_COLOR0_ATTRIB3, DCC_PIPE_ALIGNED) != 0;
-			EXIT_NOT_IMPLEMENTED(cmask_pipe_aligned != dcc_pipe_aligned);
-			attrib3.metadata_pipe_aligned = cmask_pipe_aligned;
 			attrib3.write_vrs_rate_hint_to_cmask =
 			    KYTY_PM4_GET(value, CB_COLOR0_ATTRIB3, WRITE_VRS_RATE_HINT_TO_CMASK) != 0;
 			cp.GetCtx().SetColorAttrib3(slot, attrib3);

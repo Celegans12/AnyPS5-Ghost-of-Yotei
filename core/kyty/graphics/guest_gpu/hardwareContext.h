@@ -49,7 +49,8 @@ struct ColorAttrib3 {
 	uint32_t           depth                        = 0;
 	Prospero::TileMode tile_mode                    = Prospero::TileMode::kRenderTarget;
 	uint32_t           dimension                    = 0;
-	bool               metadata_pipe_aligned        = false;
+	bool               cmask_pipe_aligned           = false;
+	bool               dcc_pipe_aligned             = false;
 	bool               write_vrs_rate_hint_to_cmask = false;
 };
 

@@ -102,8 +102,10 @@ static std::string rt_print(const char* func, const HW::RenderTarget& rt) {
 	dst += fmt::format("\t attrib3.tile_mode               = 0x{:08x}\n",
 	                  static_cast<uint32_t>(rt.attrib3.tile_mode));
 	dst += fmt::format("\t attrib3.dimension               = 0x{:08x}\n", rt.attrib3.dimension);
-	dst += fmt::format("\t attrib3.metadata_pipe_aligned   = {}\n",
-	                  rt.attrib3.metadata_pipe_aligned ? "true" : "false");
+	dst += fmt::format("\t attrib3.cmask_pipe_aligned      = {}\n",
+	                  rt.attrib3.cmask_pipe_aligned ? "true" : "false");
+	dst += fmt::format("\t attrib3.dcc_pipe_aligned        = {}\n",
+	                  rt.attrib3.dcc_pipe_aligned ? "true" : "false");
 	dst += fmt::format("\t attrib3.write_vrs_rate_hint_to_cmask = {}\n",
 	                  rt.attrib3.write_vrs_rate_hint_to_cmask ? "true" : "false");
 	dst += fmt::format("\t dcc.max_uncompressed_block_size = 0x{:08x}\n",
@@ -164,10 +166,10 @@ static void RtCheck(const HW::RenderTarget& rt) {
 		if (!RenderIsColorDimension(rt.attrib3.dimension)) {
 			EXIT("unknown PS5 render-target dimension: 0x%08" PRIx32 "\n", rt.attrib3.dimension);
 		}
-		if (!rt.attrib3.metadata_pipe_aligned) {
+		if (!rt.attrib3.cmask_pipe_aligned || !rt.attrib3.dcc_pipe_aligned) {
 			static bool logged = false;
 			if (!logged) {
-				LOGF("RenderTarget: temporary: accepting unaligned PS5 metadata pipe flag\n");
+				LOGF("RenderTarget: temporary: accepting unaligned PS5 metadata pipe flags\n");
 				logged = true;
 			}
 		}

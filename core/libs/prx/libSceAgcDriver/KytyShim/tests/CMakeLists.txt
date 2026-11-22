@@ -105,6 +105,31 @@ add_test(NAME kyty_shim_events COMMAND kyty_shim_events_tests)
 set_tests_properties(kyty_shim_events PROPERTIES TIMEOUT 20)
 endif()
 
+if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
+    if(WIN32)
+        add_test_executable(kyty_shim_pm4_context_registers_tests
+                ${CMAKE_CURRENT_SOURCE_DIR}/Pm4ContextRegisters.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/Pm4ContextRegistersMain.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+        target_include_directories(kyty_shim_pm4_context_registers_tests PRIVATE ${LIBS_INCLUDE_DIR})
+        configure_host_test_executable(kyty_shim_pm4_context_registers_tests)
+        if(MINGW)
+            target_link_libraries(kyty_shim_pm4_context_registers_tests PRIVATE stdc++ gcc_eh)
+        endif()
+        target_link_libraries(kyty_shim_pm4_context_registers_tests PRIVATE
+                "$<TARGET_GENEX_EVAL:kyty_shim_pm4_context_registers_tests,$<TARGET_PROPERTY:Kyty::gpu,INTERFACE_LINK_LIBRARIES>>"
+                Kyty::gpu libSceAgcDriver libkernel libc)
+    else()
+        target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/Pm4ContextRegisters.cpp)
+        add_test_executable(kyty_shim_pm4_context_registers_tests ${CMAKE_CURRENT_SOURCE_DIR}/Pm4ContextRegistersMain.cpp)
+        target_link_libraries(kyty_shim_pm4_context_registers_tests PRIVATE libSceAgcDriver libkernel libc)
+    endif()
+    add_test(NAME kyty_shim_pm4_context_registers COMMAND kyty_shim_pm4_context_registers_tests)
+    set_tests_properties(kyty_shim_pm4_context_registers PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77
+            ENVIRONMENT "KYTY_GPU_PIPELINE=0;KYTY_FALLBACKS=0"
+            PASS_REGULAR_EXPRESSION "kyty_shim_pm4_context_registers: ok" FAIL_REGULAR_EXPRESSION "FAILED")
+endif()
+
 add_test_executable(kyty_shim_completion_invalidation_tests ${CMAKE_CURRENT_SOURCE_DIR}/CompletionInvalidation.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
 target_include_directories(kyty_shim_completion_invalidation_tests PRIVATE ${LIBS_INCLUDE_DIR})
