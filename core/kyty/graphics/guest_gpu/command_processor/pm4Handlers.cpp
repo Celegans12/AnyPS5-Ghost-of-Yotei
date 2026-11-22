@@ -424,6 +424,7 @@ KYTY_HW_SH_PARSER(HwShIgnoreUserAccumulator) {
 	const auto reg_num = (cmd_id >> 16u) & 0x3fffu;
 	const bool valid_range =
 	    HwShIsUserAccumulatorRange(cmd_offset, reg_num, Pm4::SPI_SHADER_USER_ACCUM_PS_0) ||
+	    HwShIsUserAccumulatorRange(cmd_offset, reg_num, Pm4::SPI_SHADER_USER_ACCUM_VS_0) ||
 	    HwShIsUserAccumulatorRange(cmd_offset, reg_num, Pm4::SPI_SHADER_USER_ACCUM_ESGS_0) ||
 	    HwShIsUserAccumulatorRange(cmd_offset, reg_num, Pm4::SPI_SHADER_USER_ACCUM_LSHS_0) ||
 	    HwShIsUserAccumulatorRange(cmd_offset, reg_num, Pm4::COMPUTE_USER_ACCUM_0);
@@ -2258,7 +2259,8 @@ static constexpr auto MakeShaderIndirectTable() {
 	                             Pm4::SPI_GRAPHICS_SHADER_CONTROL_HS, Pm4::SPI_SHADER_PGM_RSRC4_GS,
 	                             Pm4::SPI_SHADER_PACE_ID_GS, Pm4::SPI_GRAPHICS_SHADER_CONTROL_GS,
 	                             Pm4::SPI_SHADER_PACE_ID_PS, Pm4::SPI_GRAPHICS_SHADER_CONTROL_PS,
-	                             Pm4::SPI_SHADER_REQ_CTRL_PS}) {
+	                             Pm4::SPI_SHADER_REQ_CTRL_PS, Pm4::SPI_SHADER_REQ_CTRL_VS,
+	                             Pm4::SPI_SHADER_PGM_RSRC4_PS, Pm4::SPI_SHADER_PGM_RSRC4_VS}) {
 		table[cmd_offset] = IgnoreRegister;
 	}
 	table[0x0ca] = IgnoreRegister;
@@ -2280,7 +2282,8 @@ static constexpr auto MakeShaderIndirectTable() {
 			cp.GetShCtx().SetHsUserSgpr(cmd_offset - Pm4::SPI_SHADER_USER_DATA_HS_0, value);
 		};
 	}
-	for (const auto base: {Pm4::SPI_SHADER_USER_ACCUM_PS_0, Pm4::SPI_SHADER_USER_ACCUM_ESGS_0,
+	for (const auto base: {Pm4::SPI_SHADER_USER_ACCUM_PS_0, Pm4::SPI_SHADER_USER_ACCUM_VS_0,
+	                       Pm4::SPI_SHADER_USER_ACCUM_ESGS_0,
 	                       Pm4::SPI_SHADER_USER_ACCUM_LSHS_0, Pm4::COMPUTE_USER_ACCUM_0}) {
 		for (uint32_t slot = 0; slot < 4; slot++) {
 			table[base + slot] = HwShIgnoreUserAccumulatorRegister;

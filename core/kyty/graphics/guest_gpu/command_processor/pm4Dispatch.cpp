@@ -15,7 +15,8 @@ constexpr auto MakeShaderDispatchTable() {
 	for (uint32_t slot = 0; slot < 16; slot++) {
 		table[Pm4::COMPUTE_USER_DATA_0 + slot] = HwShSetCsUserSgpr;
 	}
-	for (const auto base: {Pm4::SPI_SHADER_USER_ACCUM_PS_0, Pm4::SPI_SHADER_USER_ACCUM_ESGS_0,
+	for (const auto base: {Pm4::SPI_SHADER_USER_ACCUM_PS_0, Pm4::SPI_SHADER_USER_ACCUM_VS_0,
+	                       Pm4::SPI_SHADER_USER_ACCUM_ESGS_0,
 	                       Pm4::SPI_SHADER_USER_ACCUM_LSHS_0, Pm4::COMPUTE_USER_ACCUM_0}) {
 		for (uint32_t slot = 0; slot < 4; slot++) {
 			table[base + slot] = HwShIgnoreUserAccumulator;

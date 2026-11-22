@@ -627,6 +627,7 @@ constexpr uint32_t CX_NOP = 0xDB;
 
 constexpr uint32_t CX_NUM = 0x3FF + 1;
 
+constexpr uint32_t SPI_SHADER_PGM_RSRC4_PS = 0x1;
 constexpr uint32_t SPI_SHADER_USER_DATA_ADDR_LO_PS = 0x2;
 constexpr uint32_t SPI_SHADER_USER_DATA_ADDR_HI_PS = 0x3;
 constexpr uint32_t SPI_SHADER_PACE_ID_PS            = 0x6;
@@ -673,6 +674,10 @@ constexpr uint32_t SPI_SHADER_PGM_RSRC2_PS_SHARED_VGPR_CNT_MASK         = 0xF;
 constexpr uint32_t SPI_SHADER_USER_DATA_PS_0  = 0xC;
 constexpr uint32_t SPI_SHADER_REQ_CTRL_PS = 0x30;
 constexpr uint32_t SPI_SHADER_USER_ACCUM_PS_0 = 0x32;
+
+constexpr uint32_t SPI_SHADER_PGM_RSRC4_VS = 0x41;
+constexpr uint32_t SPI_SHADER_REQ_CTRL_VS = 0x70;
+constexpr uint32_t SPI_SHADER_USER_ACCUM_VS_0 = 0x72;
 
 constexpr uint32_t SPI_SHADER_PACE_ID_GS = 0x80;
 constexpr uint32_t SPI_SHADER_PGM_CHKSUM_GS        = SPI_SHADER_PACE_ID_GS;
