@@ -931,6 +931,8 @@ struct ResourcePlan {
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;
 	uint32_t                              srt_user_data = 0;
 	uint32_t                              srt_captures  = 0;
+	std::unique_ptr<Xbyak::CodeGenerator> srt_long_code;
+	uint32_t                              srt_long_captures = 0;
 	mutable std::vector<uint64_t>           srt_scratch;
 	mutable std::vector<uint32_t>           material_keys;
 	mutable std::vector<SelectorKeys>       selector_keys;
