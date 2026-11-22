@@ -15,6 +15,17 @@ body:
       description: From `sce_sys/param.json` of the dump, for example PPSA12345 02.002.000.
     validations:
       required: true
+  - type: dropdown
+    id: engine
+    attributes:
+      label: Engine
+      description: The engine family, so reports can be grouped. Pick "Don't know" if the game does not say.
+      options:
+        - Unity
+        - Unreal Engine 4
+        - Unreal Engine 5
+        - Another engine (name it in the problems field)
+        - Don't know
   - type: input
     id: commit
     attributes:
@@ -46,7 +57,7 @@ body:
     id: fps
     attributes:
       label: Frame rate
-      description: From the window title (`FPS:`). In the menu, standing still in game, and moving through a busy area. Name the place and the game's graphics mode.
+      description: From the window title (`FPS:`). In the menu, standing still in game, and moving through a busy area. Name the place and the game's graphics mode. Say whether this was the first run after converting (cold shader store) or a later one.
       placeholder: |
         menu: 60
         in game, standing, <place>: 24
