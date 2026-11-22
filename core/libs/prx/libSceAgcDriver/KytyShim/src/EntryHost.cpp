@@ -14,7 +14,7 @@
 namespace {
 
 void Note(const char* what) {
-    std::fprintf(stderr, "[kyty] %s is not available in the kyty GPU backend (ANYPS5_GPU_BACKEND=kyty)\n", what);
+    std::fprintf(stderr, "[kyty] %s is not available in the Kyty GPU driver\n", what);
     std::fflush(stderr);
 }
 
@@ -50,7 +50,7 @@ extern "C" void AgcDriverRaiseWorkerThreadPriority_nid_postfix(const char* role)
 }
 
 extern "C" void AgcDriverUseGcnShaders_nid_postfix() {
-    throw std::runtime_error("PS4 (GNM) titles are not supported by the kyty GPU backend (ANYPS5_GPU_BACKEND=kyty): build without the option to run them");
+    throw std::runtime_error("PS4 (GNM) titles are not supported by the Kyty GPU driver");
 }
 
 extern "C" void AgcDriverTogglePerformanceOverlay_nid_postfix() {

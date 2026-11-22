@@ -126,12 +126,6 @@ int CreateInterpolantMapping(const char* fn, ShaderRegister* regs, const Shader*
 
 extern "C" {
 
-#ifndef ANYPS5_KYTY
-int APS5_VABI sceAgcCreateInterpolantMapping_0100(ShaderRegister* regs, const Shader* gs, const Shader* ps) {
-    return CreateInterpolantMapping(__func__, regs, gs, ps, CreateInterpolantValue, true);
-}
-#endif
-
 int APS5_VABI sceAgcUpdateInterpolantMapping_0100(ShaderRegister* regs, const Shader* vs, const Shader* ps) {
     if (regs == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": regs is null");
@@ -162,12 +156,6 @@ int APS5_VABI sceAgcUpdateInterpolantMapping_0100(ShaderRegister* regs, const Sh
     }
     return 0;
 }
-
-#ifndef ANYPS5_KYTY
-int APS5_VABI sceAgcCreateInterpolantMapping_10000(ShaderRegister* regs, const Shader* gs, const Shader* ps) {
-    return CreateInterpolantMapping(__func__, regs, gs, ps, CreateInterpolantValueSplitF16, true);
-}
-#endif
 
 int APS5_VABI sceAgcUpdateInterpolantMapping_10000(ShaderRegister* regs, const Shader* gs, const Shader* ps) {
     return CreateInterpolantMapping(__func__, regs, gs, ps, CreateInterpolantValueSplitF16, false);

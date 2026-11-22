@@ -661,7 +661,7 @@ void HideManifestProgress() {}
 void ShowPrecompileNotice(const PrecompileNotice& notice) {
     static std::atomic<bool> told{false};
     if (notice.visible && !told.exchange(true)) {
-        std::fprintf(stderr, "[kyty-videoout] the pipeline precompile notice is not drawn with ANYPS5_GPU_BACKEND=kyty: the game waits for its pipelines without it\n");
+        std::fprintf(stderr, "[kyty-videoout] the pipeline precompile notice is not drawn by the Kyty GPU driver: the game waits for its pipelines without it\n");
         std::fflush(stderr);
     }
 }
@@ -693,7 +693,7 @@ void OpenXrStartSession(Graphics::GraphicContext&) {}
 void OpenXrShutdown() {}
 
 void OpenXrQueueEyeSource(Graphics::CommandBuffer&, const Graphics::VulkanImage&) {
-    EXIT("OpenXR headsets are not built with ANYPS5_GPU_BACKEND=kyty\n");
+    EXIT("OpenXR headsets are not built into the Kyty GPU driver\n");
 }
 
 }

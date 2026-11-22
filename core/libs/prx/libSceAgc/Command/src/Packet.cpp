@@ -15,7 +15,7 @@
 #include <thread>
 #include <vector>
 
-#if defined(ANYPS5_KYTY) && defined(_WIN32)
+#if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -68,7 +68,6 @@ std::uint32_t available(const CommandBuffer& buffer, const char* function) {
     return static_cast<std::uint32_t>(count - buffer.reserved_dw);
 }
 
-#if defined(ANYPS5_KYTY)
 #if defined(_WIN32)
 struct NotedSlots {
     DWORD bottom = TlsAlloc();
@@ -96,7 +95,6 @@ void NoteSegment(const CommandBuffer& buffer) {
                                                  static_cast<std::size_t>(buffer.top - buffer.bottom) * sizeof(std::uint32_t));
     }
 }
-#endif
 
 struct Growing {
     const CommandBuffer* buffer;
@@ -180,9 +178,7 @@ std::uint32_t* Allocate(CommandBuffer* buffer, std::uint32_t count, const char* 
         Require(available(*buffer, function) >= count, function, "command buffer allocation callback returned insufficient space");
     }
     auto* result = buffer->cursor_up;
-#if defined(ANYPS5_KYTY)
     NoteSegment(*buffer);
-#endif
     AgcDriverPrepareCommandWrite_nid_no_patch(reinterpret_cast<std::uint64_t>(result), static_cast<std::size_t>(count) * sizeof(std::uint32_t));
     buffer->cursor_up += count;
     return result;

@@ -23,9 +23,6 @@
 #include <ucontext.h>
 #endif
 
-#if !defined(ANYPS5_KYTY)
-#error "KytyShim is built only with ANYPS5_GPU_BACKEND=kyty"
-#endif
 
 namespace KytyShim {
 namespace {

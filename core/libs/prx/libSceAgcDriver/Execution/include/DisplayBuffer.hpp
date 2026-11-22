@@ -23,11 +23,9 @@ struct DisplayBuffer {
     std::uint64_t dccAddress = 0;
     std::uint64_t dccClearColor = 0;
     std::uint32_t alignment = 65536;
-#if defined(ANYPS5_KYTY)
     std::uint32_t dccControl = 0;
 
     bool operator==(const DisplayBuffer&) const = default;
-#endif
 };
 
 inline constexpr std::uint32_t DisplayTilingGcn = 2;

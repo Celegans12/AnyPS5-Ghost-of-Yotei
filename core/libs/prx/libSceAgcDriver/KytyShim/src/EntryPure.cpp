@@ -144,7 +144,7 @@ std::size_t DisplayBufferBytes(const AgcDriver::DisplayBuffer& buffer) {
     require(buffer.alignment == 65536u || (buffer.alignment == 4096u && (buffer.tilingMode == 1 || buffer.tilingMode == AgcDriver::DisplayTilingGcn)), "VideoOut: 4 KiB display buffer alignment is only supported for linear and PS4 buffers");
     require(buffer.address != 0 && (buffer.address & (buffer.alignment - 1u)) == 0, buffer.alignment == 65536u ? "VideoOut: display buffer requires 64 KiB alignment" : "VideoOut: display buffer requires 4 KiB alignment");
     require(buffer.tilingMode <= 1 || buffer.tilingMode == AgcDriver::DisplayTilingGcn, "VideoOut: unsupported display tiling mode");
-    require(buffer.tilingMode != AgcDriver::DisplayTilingGcn, "VideoOut: PS4 tiled display buffers are not supported by the kyty GPU backend (ANYPS5_GPU_BACKEND=kyty)");
+    require(buffer.tilingMode != AgcDriver::DisplayTilingGcn, "VideoOut: PS4 tiled display buffers are not supported by the Kyty GPU driver");
     require(buffer.tilingMode != 0 || buffer.pitchInPixel == 0, "VideoOut: tiled display pitch is unsupported");
     require(buffer.dccAddress == 0 || buffer.tilingMode == 0, "VideoOut: a linear display buffer cannot carry DCC metadata");
     require(buffer.dccAddress != 0 || buffer.dccClearColor == 0, "VideoOut: a DCC clear color needs DCC metadata");

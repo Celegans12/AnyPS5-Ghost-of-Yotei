@@ -53,10 +53,8 @@ extern "C" void AgcDriverRequestScreenshot_nid_postfix();
 extern "C" void AgcDriverTracePresent_nid_postfix(std::uint32_t width, std::uint32_t height);
 extern "C" void AgcDriverSuspendPoint_nid_postfix();
 extern "C" void AgcDriverSerialProgress_nid_postfix(std::uint64_t* accepted, std::uint64_t* completed);
-#if defined(ANYPS5_KYTY)
 extern "C" void AgcDriverTrackSerials_nid_postfix();
 extern "C" std::size_t AgcDriverReplayCounters_nid_postfix(std::uint64_t* values, std::size_t capacity);
-#endif
 extern "C" bool AgcDriverHoldSettled_nid_postfix(std::int64_t milliseconds);
 extern "C" void AgcDriverReleaseSettled_nid_postfix();
 extern "C" bool AgcDriverSettledHeld_nid_postfix();

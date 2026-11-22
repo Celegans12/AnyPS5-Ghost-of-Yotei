@@ -36,8 +36,6 @@ extern "C" void AgcDriverTogglePerformanceOverlay_nid_postfix();
 extern "C" void AgcDriverSetSystemOverlay_nid_postfix(const ImeKeyboardView* view);
 extern "C" void AgcDriverSetSystemDialog_nid_postfix(const ModalDialogView* view);
 extern "C" void AgcDriverReportFailure_nid_postfix(std::exception_ptr error);
-#if defined(ANYPS5_KYTY)
 extern "C" void AgcDriverPrestartGpu_nid_postfix();
-#endif
 
 #endif

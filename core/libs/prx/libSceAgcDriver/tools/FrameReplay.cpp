@@ -11,10 +11,8 @@
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "SceTypes.hpp"
-#if defined(ANYPS5_KYTY)
 #include "FrameReplaySampling.hpp"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
-#endif
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -38,9 +36,7 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
-#if defined(ANYPS5_KYTY)
 #include <stop_token>
-#endif
 #include <string>
 #include <string_view>
 #include <thread>
@@ -54,10 +50,8 @@
 #include "prx/libc/include/specifics/linux/HostMapping.hpp"
 #include <sys/mman.h>
 #include <unistd.h>
-#if defined(ANYPS5_KYTY)
 #include <pthread.h>
 #include <time.h>
-#endif
 #endif
 
 namespace {
@@ -100,7 +94,6 @@ struct Options {
     bool traceSerials = false;
     bool coldPipelines = false;
 };
-#if defined(ANYPS5_KYTY)
 
 struct ThreadSample {
     std::string name;
@@ -174,7 +167,6 @@ Sample sampleNow() {
     const auto ended = endedThreadNs.load();
     return {sampleThreads(), countersNow(), ended, {start, Clock::now()}};
 }
-#endif
 
 class Frames {
 public:
@@ -185,25 +177,18 @@ public:
 
     void MarkReady() {
         AgcDriverTracePresent_nid_postfix(width, height);
-#if defined(ANYPS5_KYTY)
         {
             std::lock_guard lock(mutex);
             ready.push_back(Clock::now());
         }
         wake.notify_one();
-#else
-        std::lock_guard lock(mutex);
-        ready.push_back(Clock::now());
-#endif
     }
-#if defined(ANYPS5_KYTY)
 
     std::vector<Sample> Samples() const {
         std::unique_lock lock(mutex);
         sampled.wait_for(lock, std::chrono::seconds(5), [this] { return samples.size() >= ready.size(); });
         return samples;
     }
-#endif
 
     void Failed(std::exception_ptr error) {
         std::lock_guard lock(mutex);
@@ -221,7 +206,6 @@ public:
     }
 
 private:
-#if defined(ANYPS5_KYTY)
     void sampleLoop(const std::stop_token& stop) {
 #ifdef __linux__
         pthread_setname_np(pthread_self(), "replaySampler");
@@ -236,22 +220,15 @@ private:
         }
     }
 
-#endif
     mutable std::mutex mutex;
-#if defined(ANYPS5_KYTY)
     std::condition_variable_any wake;
     mutable std::condition_variable sampled;
-#endif
     std::vector<Clock::time_point> ready;
-#if defined(ANYPS5_KYTY)
     std::vector<Sample> samples;
-#endif
     std::exception_ptr failure;
     std::uint32_t width = 0;
     std::uint32_t height = 0;
-#if defined(ANYPS5_KYTY)
     std::jthread sampler{[this](const std::stop_token& stop) { sampleLoop(stop); }};
-#endif
 };
 
 class ReplayFlip final : public AgcDriver::IFlipRequest {
@@ -259,9 +236,7 @@ public:
     explicit ReplayFlip(Frames& frames) : frames(frames) {}
     void GpuReady(const std::shared_ptr<AgcDriver::FrameTiming>&) override { frames.MarkReady(); }
     void Fail(std::exception_ptr error) noexcept override { frames.Failed(error); }
-#if defined(ANYPS5_KYTY)
     std::optional<AgcDriver::DisplayBuffer> Source() override { return std::nullopt; }
-#endif
 
 private:
     Frames& frames;
@@ -330,7 +305,7 @@ void commit(const FrameMemoryChunk& chunk) {
         return;
     }
 #endif
-#if defined(ANYPS5_KYTY) && defined(_WIN32)
+#if defined(_WIN32)
     if (DirectMemoryCommitGuestFile_nid_no_patch(pointer, bytes, 0x04)) return;
 #endif
     GuestArena::GuestArenaCommit_nid_postfix(pointer, bytes, 0x04, bytes);
@@ -421,18 +396,6 @@ void restoreSnapshot(const FrameCaptureReader& reader, const Skipped& skipped) {
     }
 }
 
-#if defined(__linux__) && !defined(ANYPS5_KYTY)
-void requireWatch(const FrameMemoryChunk& chunk) {
-    const auto page = static_cast<std::uint64_t>(sysconf(_SC_PAGESIZE));
-    const auto first = chunk.address & ~(page - 1);
-    const auto last = (chunk.address + chunk.bytes + page - 1) & ~(page - 1);
-    GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(first)), static_cast<std::size_t>(last - first));
-    if (GuestWriteWatch::GuestWriteWatchCovers_nid_postfix(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(last - first))) return;
-    const char* reason = GuestWriteWatch::GuestWriteWatchUnavailableReason_nid_postfix();
-    throw std::runtime_error("frame replay: the guest write watch does not cover the captured range at " + std::to_string(chunk.address) + " of " + std::to_string(chunk.bytes) + " bytes: " + (*reason != '\0' ? reason : "registration did not take effect"));
-}
-#endif
-
 Skipped restoreMemory(const FrameCaptureReader& reader) {
     if (reader.Version() < 2) throw std::runtime_error("frame replay: calls format 1 does not record whether GPU writes had landed before each memory delta was read; record the capture again");
     std::uintptr_t base = 0;
@@ -455,9 +418,6 @@ Skipped restoreMemory(const FrameCaptureReader& reader) {
                     skipped.Add(chunk);
                 } else {
                     std::memset(reinterpret_cast<void*>(static_cast<std::uintptr_t>(chunk.address)), 0, static_cast<std::size_t>(chunk.bytes));
-#if defined(__linux__) && !defined(ANYPS5_KYTY)
-                    if (chunk.rangeKind == FrameRangeKind::Watched) requireWatch(chunk);
-#endif
                 }
                 continue;
             }
@@ -471,171 +431,12 @@ Skipped restoreMemory(const FrameCaptureReader& reader) {
                 continue;
             }
             commit(chunk);
-#if defined(__linux__) && !defined(ANYPS5_KYTY)
-            if (chunk.rangeKind == FrameRangeKind::Watched) requireWatch(chunk);
-#endif
             mutation.Add(pointer, bytes, (chunk.access & FrameRangeAccess::Readable) != 0, (chunk.access & FrameRangeAccess::Writable) != 0, gpu);
         }
     }
     restoreSnapshot(reader, skipped);
     return skipped;
 }
-
-#if !defined(ANYPS5_KYTY)
-using Runs = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
-
-constexpr std::uint64_t ResetPage = 4096;
-constexpr std::uint64_t ResetWindow = 1024 * ResetPage;
-
-struct Staged {
-    const FrameMemoryChunk* piece = nullptr;
-    std::vector<std::byte> bytes;
-};
-
-void desiredBytes(const FrameCaptureReader& reader, std::span<const FrameMemoryChunk* const> snapshot, std::uint64_t begin, std::uint64_t end, std::vector<std::byte>& desired, Staged& staged) {
-    desired.assign(static_cast<std::size_t>(end - begin), std::byte{0});
-    auto chunk = std::partition_point(snapshot.begin(), snapshot.end(), [&](const auto* piece) { return piece->address + piece->bytes <= begin; });
-    for (; chunk != snapshot.end() && (*chunk)->address < end; ++chunk) {
-        const auto& piece = **chunk;
-        if (piece.address >= begin && piece.address + piece.bytes <= end) {
-            reader.Read(piece, std::span(desired.data() + (piece.address - begin), static_cast<std::size_t>(piece.bytes)));
-            continue;
-        }
-        const auto first = std::max(piece.address, begin);
-        const auto last = std::min(piece.address + piece.bytes, end);
-        if (staged.piece != &piece) {
-            staged.piece = nullptr;
-            staged.bytes.resize(static_cast<std::size_t>(piece.bytes));
-            reader.Read(piece, staged.bytes);
-            staged.piece = &piece;
-        }
-        std::memcpy(desired.data() + (first - begin), staged.bytes.data() + (first - piece.address), static_cast<std::size_t>(last - first));
-    }
-}
-
-void rethrowDriverFailure(const std::exception_ptr& failure) {
-    if (failure) std::rethrow_exception(failure);
-}
-
-Runs candidateRuns(const FrameMemoryChunk& range, const Runs& changed, const Runs& owned) {
-    const auto rangeEnd = range.address + range.bytes;
-    Runs spans;
-    const auto add = [&](std::uint64_t begin, std::uint64_t end) {
-        begin = std::max(begin & ~(ResetPage - 1), range.address);
-        end = std::min((end + ResetPage - 1) & ~(ResetPage - 1), rangeEnd);
-        if (begin < end) spans.emplace_back(begin, end);
-    };
-    for (const auto& [begin, end] : changed) add(begin, end);
-    for (const auto& [address, bytes] : owned) add(address, address + bytes);
-    std::sort(spans.begin(), spans.end());
-    Runs merged;
-    for (const auto& span : spans) {
-        if (!merged.empty() && span.first <= merged.back().second) merged.back().second = std::max(merged.back().second, span.second);
-        else merged.push_back(span);
-    }
-    return merged;
-}
-
-Runs subtractRuns(const Runs& from, const Runs& taken) {
-    Runs left;
-    auto next = taken.begin();
-    for (auto [begin, end] : from) {
-        while (next != taken.end() && next->second <= begin) ++next;
-        for (auto cut = next; cut != taken.end() && cut->first < end; ++cut) {
-            if (cut->first > begin) left.emplace_back(begin, cut->first);
-            begin = std::max(begin, cut->second);
-        }
-        if (begin < end) left.emplace_back(begin, end);
-    }
-    return left;
-}
-
-std::uint64_t runBytes(const Runs& runs) {
-    std::uint64_t bytes = 0;
-    for (const auto& [begin, end] : runs) bytes += end - begin;
-    return bytes;
-}
-
-struct Differing {
-    Runs runs;
-    std::uint64_t ownedBytes = 0;
-};
-
-Differing restoreDiffering(const FrameCaptureReader& reader, std::span<const FrameMemoryChunk* const> snapshot, const Runs& candidates, const Runs& owned, std::vector<std::byte>& desired, Staged& staged) {
-    Differing differing;
-    auto& runs = differing.runs;
-    for (const auto& [first, last] : candidates) {
-        for (auto window = first; window < last; window += ResetWindow) {
-            const auto windowEnd = std::min(window + ResetWindow, last);
-            desiredBytes(reader, snapshot, window, windowEnd, desired, staged);
-            for (auto address = window; address < windowEnd;) {
-                const auto end = std::min((address & ~(ResetPage - 1)) + ResetPage, windowEnd);
-                auto* const actual = reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(address));
-                const auto* const wanted = desired.data() + (address - window);
-                if (std::memcmp(actual, wanted, static_cast<std::size_t>(end - address)) != 0) {
-                    std::memcpy(actual, wanted, static_cast<std::size_t>(end - address));
-                    if (!runs.empty() && runs.back().second == address) runs.back().second = end;
-                    else runs.emplace_back(address, end);
-                    if (std::any_of(owned.begin(), owned.end(), [&](const auto& held) { return held.first < end && address < held.first + held.second; })) differing.ownedBytes += end - address;
-                }
-                address = end;
-            }
-        }
-    }
-    return differing;
-}
-
-template <class Work>
-std::size_t parallelPieces(std::size_t count, Work work) {
-    const auto width = std::clamp<std::size_t>(std::thread::hardware_concurrency(), 1, std::max<std::size_t>(1, count));
-    std::atomic<std::size_t> claimed{width};
-    std::atomic<std::size_t> busy{0};
-    std::vector<std::future<void>> workers;
-    for (std::size_t worker = 0; worker < width; ++worker) {
-        workers.push_back(std::async(std::launch::async, [&, worker] {
-            std::vector<std::byte> desired;
-            Staged staged;
-            std::size_t done = 0;
-            for (auto index = worker; index < count; index = claimed++, ++done) work(index, desired, staged);
-            if (done != 0) busy.fetch_add(1, std::memory_order_relaxed);
-        }));
-    }
-    for (auto& worker : workers) worker.get();
-    return busy.load(std::memory_order_relaxed);
-}
-
-constexpr std::uint64_t ResetPiece = 16 * ResetWindow;
-
-struct Piece {
-    std::size_t range = 0;
-    Runs runs;
-};
-
-std::vector<Piece> splitRuns(std::span<const Runs> ranges) {
-    std::vector<Piece> pieces;
-    for (std::size_t index = 0; index < ranges.size(); ++index) {
-        pieces.push_back({index, {}});
-        std::uint64_t filled = 0;
-        for (auto [begin, end] : ranges[index]) {
-            while (begin < end) {
-                if (filled >= ResetPiece) {
-                    pieces.push_back({index, {}});
-                    filled = 0;
-                }
-                auto stop = (begin + (ResetPiece - filled)) & ~(ResetPage - 1);
-                if (stop <= begin) stop = (begin & ~(ResetPage - 1)) + ResetPage;
-                stop = std::min(stop, end);
-                pieces.back().runs.emplace_back(begin, stop);
-                filled += stop - begin;
-                begin = stop;
-            }
-        }
-    }
-    std::erase_if(pieces, [](const Piece& piece) { return piece.runs.empty(); });
-    return pieces;
-}
-
-#endif
 
 struct ResetResult {
     std::uint64_t rewritten = 0;
@@ -648,172 +449,6 @@ struct ResetResult {
     AgcDriver::RetiredOwners retired;
 };
 
-#if !defined(ANYPS5_KYTY)
-struct ResetPlan {
-    std::vector<const FrameMemoryChunk*> ranges;
-    std::vector<const FrameMemoryChunk*> snapshot;
-    std::uint64_t rangeBytes = 0;
-};
-
-ResetPlan planReset(const FrameCaptureReader& reader, const Skipped& skipped) {
-    ResetPlan plan;
-    for (const auto& chunk : reader.Chunks()) {
-        if (skipped.Overlaps(chunk)) continue;
-        if (chunk.kind == FrameMemoryKind::Range) {
-            plan.ranges.push_back(&chunk);
-            plan.rangeBytes += chunk.bytes;
-        } else if (chunk.kind == FrameMemoryKind::Snapshot) {
-            plan.snapshot.push_back(&chunk);
-        }
-    }
-    std::sort(plan.snapshot.begin(), plan.snapshot.end(), [](const auto* left, const auto* right) { return left->address < right->address; });
-    return plan;
-}
-
-template <class Body>
-void exclusive(Body&& body) {
-    struct Inside {
-        std::remove_reference_t<Body>* body;
-        std::exception_ptr failure;
-    } inside{&body, nullptr};
-    std::exception_ptr failure;
-    AgcDriverGuestMemoryTransaction_nid_no_patch([](void* context) {
-        auto& state = *static_cast<Inside*>(context);
-        try {
-            (*state.body)();
-        } catch (...) {
-            state.failure = std::current_exception();
-        }
-    }, &inside, &failure);
-    rethrowDriverFailure(inside.failure);
-    rethrowDriverFailure(failure);
-}
-
-std::uint64_t changedSince(std::uint64_t address, std::uint64_t bytes, std::uint64_t since, Runs& changed) {
-    std::uint64_t generation = 0;
-    std::exception_ptr failure;
-    AgcDriverGuestMemoryChangedSince_nid_no_patch(address, static_cast<std::size_t>(bytes), since, changed, &generation, &failure);
-    rethrowDriverFailure(failure);
-    return generation;
-}
-
-std::uint64_t watchBaseline(const FrameCaptureReader& reader, const Skipped& skipped) {
-    std::uint64_t generation = 0;
-    Runs changed;
-    for (const auto* range : planReset(reader, skipped).ranges) generation = changedSince(range->address, range->bytes, std::numeric_limits<std::uint64_t>::max(), changed);
-    return generation;
-}
-
-void verifyReset(const FrameCaptureReader& reader, const ResetPlan& plan, std::span<const Runs> retired) {
-    std::exception_ptr failure;
-    const auto survivors = [&](std::uint64_t begin, std::uint64_t bytes, bool gpuOnly) {
-        std::size_t owners = 0;
-        AgcDriverResidentOwnersOver_nid_no_patch(begin, static_cast<std::size_t>(bytes), gpuOnly, &owners, &failure);
-        rethrowDriverFailure(failure);
-        return owners;
-    };
-    for (std::size_t index = 0; index < plan.ranges.size(); ++index) {
-        const auto& range = *plan.ranges[index];
-        if (const auto owners = survivors(range.address, range.bytes, true); owners != 0) throw std::runtime_error("frame replay: " + std::to_string(owners) + " GPU owners with results only on the GPU over the captured range at " + std::to_string(range.address) + " of " + std::to_string(range.bytes) + " bytes survived the reset");
-        for (const auto& [begin, end] : retired[index]) {
-            if (const auto owners = survivors(begin, end - begin, false); owners != 0) throw std::runtime_error("frame replay: " + std::to_string(owners) + " GPU owners over the restored memory at " + std::to_string(begin) + " of " + std::to_string(end - begin) + " bytes survived the reset");
-        }
-    }
-    std::atomic<std::uint64_t> wrong{0};
-    std::vector<Runs> whole(plan.ranges.size());
-    for (std::size_t index = 0; index < plan.ranges.size(); ++index) whole[index] = {{plan.ranges[index]->address, plan.ranges[index]->address + plan.ranges[index]->bytes}};
-    const auto pieces = splitRuns(whole);
-    parallelPieces(pieces.size(), [&](std::size_t index, std::vector<std::byte>& desired, Staged& staged) {
-        for (const auto& [first, last] : pieces[index].runs) {
-            for (auto window = first; window < last; window += ResetWindow) {
-                const auto end = std::min(window + ResetWindow, last);
-                desiredBytes(reader, plan.snapshot, window, end, desired, staged);
-                const auto* actual = reinterpret_cast<const std::byte*>(static_cast<std::uintptr_t>(window));
-                std::uint64_t offset = 0;
-                while (offset < end - window && actual[offset] == desired[offset]) ++offset;
-                if (offset == end - window) continue;
-                std::uint64_t expected = 0;
-                wrong.compare_exchange_strong(expected, window + offset);
-                return;
-            }
-        }
-    });
-    if (wrong.load() != 0) throw std::runtime_error("frame replay: guest memory at " + std::to_string(wrong.load()) + " differs from the captured contents after the reset");
-}
-
-ResetResult resetMemory(const FrameCaptureReader& reader, const Skipped& skipped, std::uint64_t& since, ResetFault fault, bool verify) {
-    const auto plan = planReset(reader, skipped);
-    ResetResult result;
-    result.rangeBytes = plan.rangeBytes;
-    exclusive([&] {
-        const auto mapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
-        struct Omission {
-            explicit Omission(bool omit) : omit(omit) { if (omit) AgcDriverOmitGpuOwnersForTest_nid_no_patch(true); }
-            ~Omission() { if (omit) AgcDriverOmitGpuOwnersForTest_nid_no_patch(false); }
-            bool omit;
-        } omission(fault == ResetFault::OmitOwners);
-        std::exception_ptr failure;
-        const auto previous = since;
-        std::vector<Runs> owned(plan.ranges.size());
-        std::vector<Runs> candidates(plan.ranges.size());
-        Runs changed;
-        const auto retire = [&](const Runs& runs) {
-            if (fault == ResetFault::KeepOwners) return;
-            for (const auto& [begin, end] : runs) {
-                AgcDriverRetireGpuOwners_nid_no_patch(begin, static_cast<std::size_t>(end - begin), &result.retired, &failure);
-                rethrowDriverFailure(failure);
-            }
-        };
-        for (std::size_t index = 0; index < plan.ranges.size(); ++index) {
-            const auto& range = *plan.ranges[index];
-            AgcDriverGpuOwnedRanges_nid_no_patch(range.address, static_cast<std::size_t>(range.bytes), owned[index], &failure);
-            rethrowDriverFailure(failure);
-            static_cast<void>(changedSince(range.address, range.bytes, previous, changed));
-            candidates[index] = candidateRuns(range, changed, owned[index]);
-            retire(candidates[index]);
-        }
-        for (const auto* range : plan.ranges) {
-            AgcDriverFlushGuestMemory_nid_no_patch(range->address, static_cast<std::size_t>(range->bytes), &failure);
-            rethrowDriverFailure(failure);
-        }
-        for (std::size_t index = 0; index < plan.ranges.size(); ++index) {
-            const auto& range = *plan.ranges[index];
-            since = std::max(since, changedSince(range.address, range.bytes, previous, changed));
-            auto widened = candidateRuns(range, changed, owned[index]);
-            const auto flushed = subtractRuns(widened, candidates[index]);
-            retire(flushed);
-            result.flushed += runBytes(flushed);
-            candidates[index] = std::move(widened);
-            result.compared += runBytes(candidates[index]);
-        }
-        const auto pieces = splitRuns(candidates);
-        std::vector<Differing> runs(pieces.size());
-        result.workers = parallelPieces(pieces.size(), [&](std::size_t index, std::vector<std::byte>& desired, Staged& staged) { runs[index] = restoreDiffering(reader, plan.snapshot, pieces[index].runs, owned[pieces[index].range], desired, staged); });
-        Runs replaced;
-        for (const auto& part : runs) {
-            for (const auto& run : part.runs) {
-                if (!replaced.empty() && replaced.back().second == run.first) replaced.back().second = run.second;
-                else replaced.push_back(run);
-            }
-            result.rewritten += runBytes(part.runs);
-            result.rewrittenOwned += part.ownedBytes;
-        }
-        std::sort(replaced.begin(), replaced.end());
-        if (fault == ResetFault::WrongByte && !plan.ranges.empty()) {
-            auto* const first = reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(plan.ranges.front()->address));
-            *first = ~*first;
-        }
-        if (fault == ResetFault::Remap) std::thread([] { GuestAllocations::Mutation mutation; }).join();
-        for (const auto& [begin, end] : replaced) since = std::max(since, changedSince(begin, end - begin, std::numeric_limits<std::uint64_t>::max(), changed));
-        if (GuestAllocations::GuestAllocationsGeneration_nid_postfix() != mapping) throw std::runtime_error("frame replay: guest memory was mapped or unmapped during the reset, which the reset excludes");
-        if (!verify) return;
-        const auto verifyStart = Clock::now();
-        verifyReset(reader, plan, candidates);
-        result.verifySeconds = std::chrono::duration<double>(Clock::now() - verifyStart).count();
-    });
-    return result;
-}
-#else
 std::uint64_t watchBaseline(const FrameCaptureReader&, const Skipped&) {
     return 0;
 }
@@ -830,7 +465,6 @@ ResetResult resetMemory(const FrameCaptureReader& reader, const Skipped& skipped
     restoreSnapshot(reader, skipped);
     return result;
 }
-#endif
 
 std::pair<std::uint64_t, std::uint64_t> progress() {
     std::uint64_t accepted = 0;
@@ -1055,22 +689,6 @@ struct Replay {
         paceWaitedNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - began).count();
     }
 
-#if !defined(ANYPS5_KYTY)
-    void awaitTailsRead() {
-        const auto began = Clock::now();
-        while (AgcDriverRewindTailsUnread_nid_postfix()) {
-            if (Clock::now() - began >= options.busyTimeout) {
-                std::fprintf(stderr, "[frame-replay] a released REWIND tail was not read before the next memory delta, blocked on%s\n", describeBlocked().c_str());
-                ++paceTimeouts;
-                if (options.strict) throw std::runtime_error("frame replay: a released REWIND tail was not read before the next memory delta");
-                break;
-            }
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
-        }
-        paceWaitedNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - began).count();
-    }
-#endif
-
     struct StagedWord {
         std::uint64_t address;
         std::vector<std::byte> value;
@@ -1128,9 +746,6 @@ struct Replay {
         std::vector<StagedWord> staged;
         const auto found = groups.find(group);
         if (found == groups.end()) return staged;
-#if !defined(ANYPS5_KYTY)
-        awaitTailsRead();
-#endif
         std::array<AgcDriver::AwaitedWait, 64> awaited{};
         const auto count = AgcDriverAwaitedWaits_nid_postfix(awaited.data(), awaited.size());
         std::vector<std::uint64_t> parked;
@@ -1302,9 +917,7 @@ struct Replay {
         sequenced.store(0);
         stalled.store(false);
         std::thread breaker([&] {
-#if defined(ANYPS5_KYTY)
             const EndedThreadCpu ended;
-#endif
             if (!options.release) return;
             auto lastSeen = progress();
             auto lastProgress = Clock::now();
@@ -1325,9 +938,7 @@ struct Replay {
         std::vector<std::thread> workers;
         for (const auto& entry : byThread) {
             workers.emplace_back([&, &indices = entry.second] {
-#if defined(ANYPS5_KYTY)
                 const EndedThreadCpu ended;
-#endif
                 for (const auto index : indices) {
                     std::unique_lock lock(mutex);
                     turn.wait(lock, [&] { return started == index || failure != nullptr; });
@@ -1371,9 +982,6 @@ struct Replay {
         auto lastProgress = Clock::now();
         auto lastReport = lastProgress;
         while (true) {
-#if !defined(ANYPS5_KYTY)
-            AgcDriverCheckFailure_nid_postfix();
-#endif
             const auto [accepted, completed] = progress();
             unfinished = accepted - completed;
             if (unfinished == 0) return;
@@ -1435,14 +1043,7 @@ int usage() {
                          "  --release-after-ms  milliseconds without a completion before awaited dwords are released (3)\n"
                          "  --no-synthesize     releases a wait only with a value the capture recorded, never with its reference value\n"
                          "  --strict            fails on a pacing timeout or a failed registration inside the captured frames\n"
-#if defined(ANYPS5_KYTY)
                          "                      and disables Kyty renderer fallbacks for the replay\n"
-#endif
-#if !defined(ANYPS5_KYTY)
-                         "  --verify-reset      with --repeat, fails when, at the end of a reset, guest memory over any captured range\n"
-                         "                      differs from the captured contents or a resident GPU owner survived over the memory\n"
-                         "                      it compared or holds results only on the GPU\n"
-#endif
                          "  --repeat <n>        replays the frames n times in this process, restoring the snapshot before each pass;\n"
                          "                      with n > 1 the frame times come from passes 2 to n, after the first warmed the caches\n"
                          "  --cold-pipelines    starts with an empty Vulkan pipeline cache instead of the title's pipeline cache file\n"
@@ -1486,9 +1087,7 @@ void writeDump(const Dump& dump) {
 
 struct FrameCheck {
     std::size_t compared = 0;
-#if defined(ANYPS5_KYTY)
     std::size_t written = 0;
-#endif
     double identical = 1.0;
     int maxDifference = 0;
 };
@@ -1515,21 +1114,15 @@ FrameCheck compareFrames(const FrameCaptureReader& reader, const Options& option
         buffer.dccClearColor = call.values[7];
         buffer.alignment = static_cast<std::uint32_t>(call.values[8]);
         const auto chunk = std::find_if(reader.Chunks().begin(), reader.Chunks().end(), [&](const FrameMemoryChunk& candidate) { return candidate.kind == FrameMemoryKind::Reference && candidate.group == call.values[0]; });
-#if defined(ANYPS5_KYTY)
         if (chunk == reader.Chunks().end()) {
             if (options.frames.empty()) continue;
             writeFrame(options.frames / ("replay-" + std::to_string(call.values[0]) + ".bmp"), buffer, AgcDriver::ReadDisplayBuffer(buffer));
             ++check.written;
             continue;
         }
-#else
-        if (chunk == reader.Chunks().end()) continue;
-#endif
         const auto reference = reader.Read(*chunk);
         const auto replayed = AgcDriver::ReadDisplayBuffer(buffer);
-#if defined(ANYPS5_KYTY)
         ++check.written;
-#endif
         ++check.compared;
         std::size_t same = 0;
         const auto pixels = std::min(reference.size(), replayed.size()) / 4;
@@ -1831,13 +1424,10 @@ struct Pass {
     double verifySeconds = 0.0;
     std::size_t resetWorkers = 0;
     AgcDriver::RetiredOwners retired;
-#if defined(ANYPS5_KYTY)
     Sample begin;
     Sample end;
     Clock::time_point sampleDeadline;
-#endif
 };
-#if defined(ANYPS5_KYTY)
 
 struct Window {
     std::map<std::string, std::uint64_t> threadNs;
@@ -1882,7 +1472,6 @@ struct Window {
         return list;
     }
 };
-#endif
 
 double percentile(std::vector<double> values, double fraction) {
     if (values.empty()) return 0.0;
@@ -1892,17 +1481,12 @@ double percentile(std::vector<double> values, double fraction) {
 
 int run(const Options& options) {
     const auto loadStart = Clock::now();
-#if defined(ANYPS5_KYTY)
     AgcDriverTrackSerials_nid_postfix();
-#endif
     const FrameCaptureReader reader(options.directory);
 #ifdef _WIN32
     relaunchIfHostRegionBlocks(reader);
 #endif
     if (reader.Truncated()) std::fprintf(stderr, "[frame-replay] the capture is truncated; replaying the complete records\n");
-#if !defined(ANYPS5_KYTY)
-    AgcDriverTrackRewindTails_nid_postfix();
-#endif
     auto skipped = restoreMemory(reader);
     auto resetSince = options.repeat > 1 ? watchBaseline(reader, skipped) : 0;
     const auto loaded = Clock::now();
@@ -1919,9 +1503,7 @@ int run(const Options& options) {
     const auto journalStart = Clock::now();
     AgcDriverWaitForPipelineJournal_nid_postfix();
     const auto journalSeconds = std::chrono::duration<double>(Clock::now() - journalStart).count();
-#if defined(ANYPS5_KYTY)
     static_cast<void>(countersNow());
-#endif
     std::set<std::uint32_t> initialOutputs;
     for (const auto& [handle, output] : replay.outputs) initialOutputs.insert(handle);
     std::vector<Pass> passes;
@@ -1953,20 +1535,16 @@ int run(const Options& options) {
             }
         }
         Pass measured{replay.frames.Times().size(), 0, 0.0, replay.paceTimeouts.load(), replay.syntheticReleases.load(), reset.rewritten, reset.rewrittenOwned, reset.compared, reset.flushed, reset.rangeBytes, resetSeconds, reset.verifySeconds, reset.workers, reset.retired};
-#if defined(ANYPS5_KYTY)
         measured.begin = sampleNow();
-#endif
         replay.recording = true;
         replay.startedAt = Clock::now();
         if (frameStart != calls.end()) replay.runWindow(std::span(calls).subspan(static_cast<std::size_t>(frameStart - calls.begin()) + 1));
         else AgcDriverWaitIdle_nid_postfix();
         replay.endedAt = Clock::now();
-#if defined(ANYPS5_KYTY)
         if (replay.unfinished == 0) AgcDriverWaitIdle_nid_postfix();
         measured.sampleDeadline = Clock::now();
         static_cast<void>(replay.frames.Samples());
         measured.end = sampleNow();
-#endif
         if (const auto failure = replay.frames.Failure()) std::rethrow_exception(failure);
         measured.frames = replay.frames.Times().size() - measured.firstFrame;
         measured.seconds = std::chrono::duration<double>(replay.endedAt - replay.startedAt).count();
@@ -1988,14 +1566,12 @@ int run(const Options& options) {
     std::string passList;
     double seconds = 0.0;
     std::size_t frames = 0;
-#if defined(ANYPS5_KYTY)
     const auto samples = replay.frames.Samples();
     Window whole;
     Window steady;
     std::size_t expectedIntervals = 0;
     std::size_t missingIntervals = 0;
     std::size_t lateIntervals = 0;
-#endif
     for (std::size_t index = 0; index < passes.size(); ++index) {
         const auto& measured = passes[index];
         std::vector<double> passMs;
@@ -2010,7 +1586,6 @@ int run(const Options& options) {
         frameMs.insert(frameMs.end(), passMs.begin(), passMs.end());
         seconds += measured.seconds;
         frames += measured.frames;
-#if defined(ANYPS5_KYTY)
         whole.Add(measured.begin, measured.end, measured.frames, true);
         const auto passEnd = measured.firstFrame + measured.frames;
         for (auto frame = measured.firstFrame + 1; frame < passEnd; ++frame) {
@@ -2027,19 +1602,14 @@ int run(const Options& options) {
                 ++lateIntervals;
             }
         }
-#endif
     }
     const auto slowest = frameMs.empty() ? 0.0 : *std::max_element(frameMs.begin(), frameMs.end());
-#if defined(ANYPS5_KYTY)
     char steadyDraws[64] = "null";
     if (steady.frames) {
         std::snprintf(steadyDraws, sizeof(steadyDraws), "%.1f", static_cast<double>(steady.Draws()) / static_cast<double>(steady.frames));
     }
     const auto steadyCounters = steady.frames ? "{" + steady.PerFrame() + "}" : "null";
     std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"passes\":[%s],\"kept_reservations\":%llu,\"submits\":%llu,\"delta_mib\":%.1f,\"kept_words\":%llu,\"park_restores\":%llu,\"pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"skipped_bytes\":%llu,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f,\"journal_s\":%.3f,\"draws\":%llu,\"draws_per_frame\":%.1f,\"frames_written\":%zu,\"stages\":[%s],\"counters_per_frame\":{%s},\"steady\":{\"frames\":%zu,\"draws_per_frame\":%s,\"counters_per_frame\":%s,\"stages\":[%s],\"sample_coverage\":{\"expected_intervals\":%zu,\"missing_intervals\":%zu,\"late_intervals\":%zu}}}\n",
-#else
-    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"passes\":[%s],\"kept_reservations\":%llu,\"submits\":%llu,\"delta_mib\":%.1f,\"kept_words\":%llu,\"park_restores\":%llu,\"pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"skipped_bytes\":%llu,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f,\"journal_s\":%.3f}\n",
-#endif
                 frames, seconds, seconds > 0 ? static_cast<double>(frames) / seconds : 0.0, percentile(frameMs, 0.5), percentile(frameMs, 0.9), slowest, frameList.c_str(), passList.c_str(),
                 static_cast<unsigned long long>(replay.keptReservations.load()),
                 static_cast<unsigned long long>(replay.submits.load()), static_cast<double>(replay.deltaBytes.load()) / (1024.0 * 1024.0), static_cast<unsigned long long>(replay.keptWords.load()), static_cast<unsigned long long>(replay.parkRestores.load()), static_cast<unsigned long long>(replay.paceTimeouts.load()),
@@ -2047,19 +1617,14 @@ int run(const Options& options) {
                 static_cast<double>(replay.skipped.bytes) / (1024.0 * 1024.0), static_cast<unsigned long long>(replay.skipped.bytes),
                 replay.threads, static_cast<unsigned long long>(replay.earlyReleases.load()), static_cast<unsigned long long>(replay.lateReleases.load()),
                 static_cast<unsigned long long>(replay.syntheticReleases.load()),
-#if defined(ANYPS5_KYTY)
                 static_cast<unsigned long long>(replay.unfinished), check.compared, check.identical, check.maxDifference, std::chrono::duration<double>(loaded - loadStart).count(), journalSeconds,
                 static_cast<unsigned long long>(whole.Draws()), frames > 0 ? static_cast<double>(whole.Draws()) / static_cast<double>(frames) : 0.0, check.written, whole.Stages().c_str(), whole.PerFrame().c_str(),
                 steady.frames, steadyDraws, steadyCounters.c_str(), steady.Stages().c_str(), expectedIntervals, missingIntervals, lateIntervals);
-#else
-                static_cast<unsigned long long>(replay.unfinished), check.compared, check.identical, check.maxDifference, std::chrono::duration<double>(loaded - loadStart).count(), journalSeconds);
-#endif
     std::fflush(stdout);
     return replay.unfinished == 0 ? 0 : 3;
 }
 
 void configureEnvironment(const Options& options) {
-#if defined(ANYPS5_KYTY)
     if (options.strict && !options.shaders && options.submits == 0) {
 #ifdef _WIN32
         const auto fallbacks = _putenv_s("KYTY_FALLBACKS", "0");
@@ -2071,7 +1636,6 @@ void configureEnvironment(const Options& options) {
         if (fallbacks != 0) throw std::runtime_error("frame replay: cannot disable Kyty renderer fallbacks");
         if (pipelines != 0) throw std::runtime_error("frame replay: cannot require Kyty pipeline waits");
     }
-#endif
 #ifdef _WIN32
     _putenv_s("APS5_FRAME_CAPTURE", "");
     _putenv_s("APS5_HEADLESS_PIPELINE_CACHE", options.coldPipelines ? "" : "1");
@@ -2086,9 +1650,6 @@ void configureEnvironment(const Options& options) {
 
 int main(int argc, char** argv) {
     Options options;
-#if !defined(ANYPS5_KYTY)
-    if (const char* fault = std::getenv("APS5_REPLAY_RESET_FAULT_FOR_TEST"); fault != nullptr) options.resetFault = std::string_view(fault) == "owners" ? ResetFault::KeepOwners : std::string_view(fault) == "bytes" ? ResetFault::WrongByte : std::string_view(fault) == "omit" ? ResetFault::OmitOwners : std::string_view(fault) == "remap" ? ResetFault::Remap : ResetFault::None;
-#endif
     for (int index = 1; index < argc; ++index) {
         const std::string_view argument = argv[index];
         if (argument == "--no-pace") options.pace = false;
@@ -2097,9 +1658,6 @@ int main(int argc, char** argv) {
         else if (argument == "--pace-timeout-ms" && index + 1 < argc) options.paceTimeout = std::chrono::milliseconds(std::strtoll(argv[++index], nullptr, 10));
         else if (argument == "--release-after-ms" && index + 1 < argc) options.releaseAfter = std::chrono::milliseconds(std::strtoll(argv[++index], nullptr, 10));
         else if (argument == "--strict") options.strict = true;
-#if !defined(ANYPS5_KYTY)
-        else if (argument == "--verify-reset") options.verifyReset = true;
-#endif
         else if (argument == "--repeat" && index + 1 < argc) options.repeat = std::max<std::size_t>(1, std::strtoull(argv[++index], nullptr, 10));
         else if (argument == "--shaders") options.shaders = true;
         else if (argument == "--shader-code" && index + 1 < argc) {

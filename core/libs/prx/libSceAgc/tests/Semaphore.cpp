@@ -4,9 +4,6 @@
 #include "prx/libSceAgc/Cb/include/Sync.hpp"
 #include "prx/libSceAgc/Acb/include/Sync.hpp"
 #include "prx/libSceAgc/Command/include/Packet.hpp"
-#ifndef ANYPS5_KYTY
-#include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
-#endif
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 
@@ -189,37 +186,6 @@ void testMemSemaphore() {
     expectFailure([&] { sceAgcCbMemSemaphore(nullptr, label, 0, 0, 0); });
 }
 
-#ifndef ANYPS5_KYTY
-void testMemSemaphoreExecution() {
-    void* label = nullptr;
-    check(sceAgcGetSemaphoreLabel(0, &label) == 0 && label != nullptr, "no label for semaphore execution");
-    auto* lanes = static_cast<std::uint64_t*>(label);
-    const std::array original{lanes[0], lanes[1]};
-    lanes[0] = 0x123456789abcdef0ull;
-    lanes[1] = 5u;
-    auto state = std::make_unique<AgcDriver::QueueState>();
-    const auto execute = [&](std::uint32_t signalType, std::uint32_t operation) {
-        std::array<std::uint32_t, 8> words{};
-        words.fill(0xdeadbeefu);
-        CommandBuffer buffer{words.data(), words.data() + words.size(), words.data(), words.data() + words.size(), nullptr, nullptr, 0};
-        const auto* packet = sceAgcCbMemSemaphore(&buffer, lanes + 1, 0, signalType, operation);
-        check(packet == words.data() && buffer.cursor_up == words.data() + 4 && words[4] == 0xdeadbeefu, "semaphore execution packet bounds differ");
-        const std::span command(packet, 4);
-        AgcDriver::Pm4::Validate(command, 0);
-        AgcDriver::Pm4::Validate(command, 0x20u);
-        AgcDriver::Pm4::Execute(command, *state);
-        check(lanes[0] == 0x123456789abcdef0ull, "semaphore command touched the preceding eight-byte word");
-    };
-    execute(0, 6);
-    check(lanes[1] == 6u, "semaphore increment did not reach the selected word");
-    execute(1, 6);
-    check(lanes[1] == 1u, "semaphore set did not reach the selected word");
-    execute(0, 7);
-    check(lanes[1] == 0u, "semaphore wait did not consume the signal");
-    std::copy(original.begin(), original.end(), lanes);
-}
-#endif
-
 using QueueMemSemaphore = std::uint32_t* APS5_VABI (*)(CommandBuffer*, const volatile void*, std::uint8_t, std::uint8_t, std::uint8_t);
 
 void testQueueMemSemaphore(QueueMemSemaphore write) {
@@ -265,9 +231,6 @@ int main() {
         testRegistration();
         testLabels();
         testMemSemaphore();
-#ifndef ANYPS5_KYTY
-        testMemSemaphoreExecution();
-#endif
         testQueueMemSemaphore(sceAgcAcbMemSemaphore);
         testQueueMemSemaphore(sceAgcDcbMemSemaphore);
         testLabelRejections();
