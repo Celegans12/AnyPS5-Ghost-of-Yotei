@@ -26,7 +26,7 @@ Projede, çalıştırılabilir dosyayı hedef sistemin kendi formatına dönüş
 
 Desteklenmeyen ya da beklenmeyen bir durumda C++ istisnası (genellikle `std::runtime_error`) fırlatılır. Hiçbir yerde yakalanmayan bir istisna `what()` mesajını stderr'e yazdırır ve programı sonlandırır.
 
-[Shader recompiler](../../core/shader/recompiler/Recompiler.cpp) başarıyla SPIR-V üretir (`ANYPS5_ENABLE_SPIRV_TOOLS` ile derlendiğinde [Spirv-Tools](../../3rdparty/SPIRV-Tools) ile doğrulanır).
+Shader recompiler başarıyla SPIR-V üretir (`ANYPS5_ENABLE_SPIRV_TOOLS` ile derlendiğinde [Spirv-Tools](../../3rdparty/SPIRV-Tools) ile doğrulanır).
 
 ## Uyumluluk
 

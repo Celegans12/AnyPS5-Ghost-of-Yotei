@@ -26,7 +26,7 @@ Inclou un [relinker](../../core/relinker) que converteix l'executable al format 
 
 Les situacions no suportades o inesperades llancen una excepció de C++, normalment `std::runtime_error`. Una excepció que no es captura imprimeix el seu `what()` a stderr i acaba el procés.
 
-El [recompilador de shaders](../../core/shader/recompiler/Recompiler.cpp) genera SPIR-V correctament (validat amb [Spirv-Tools](../../3rdparty/SPIRV-Tools) quan es compila amb `ANYPS5_ENABLE_SPIRV_TOOLS`).
+El recompilador de shaders genera SPIR-V correctament (validat amb [Spirv-Tools](../../3rdparty/SPIRV-Tools) quan es compila amb `ANYPS5_ENABLE_SPIRV_TOOLS`).
 
 ## Compatibilitat
 

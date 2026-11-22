@@ -26,7 +26,7 @@ Inclui um [relinker](../../core/relinker) que converte o executável para o form
 
 Estados não suportados ou inesperados lançam uma exceção C++, normalmente `std::runtime_error`. Uma exceção que nada captura imprime seu `what()` no stderr e encerra o processo.
 
-O [recompilador de shaders](../../core/shader/recompiler/Recompiler.cpp) produz SPIR-V com sucesso (validado via [Spirv-Tools](../../3rdparty/SPIRV-Tools) quando compilado com `ANYPS5_ENABLE_SPIRV_TOOLS`).
+O recompilador de shaders produz SPIR-V com sucesso (validado via [Spirv-Tools](../../3rdparty/SPIRV-Tools) quando compilado com `ANYPS5_ENABLE_SPIRV_TOOLS`).
 
 ## Compatibilidade
 

@@ -26,7 +26,7 @@
 
 الحالات غير المدعومة أو غير المتوقعة تُطلق استثناءً في C++، عادةً `std::runtime_error`. والاستثناء الذي لا يلتقطه أحد يطبع `what()` الخاص به إلى stderr وينهي العملية.
 
-[مُعيد تجميع الشيدر](../../core/shader/recompiler/Recompiler.cpp) ينتج SPIR-V بنجاح (يُتحقق منه عبر [Spirv-Tools](../../3rdparty/SPIRV-Tools) عند البناء مع `ANYPS5_ENABLE_SPIRV_TOOLS`).
+مُعيد تجميع الشيدر ينتج SPIR-V بنجاح (يُتحقق منه عبر [Spirv-Tools](../../3rdparty/SPIRV-Tools) عند البناء مع `ANYPS5_ENABLE_SPIRV_TOOLS`).
 
 ## التوافق
 

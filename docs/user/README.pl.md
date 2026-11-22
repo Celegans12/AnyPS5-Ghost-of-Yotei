@@ -26,7 +26,7 @@ Zawiera [relinker](../../core/relinker), który konwertuje plik wykonywalny do n
 
 W nieobsługiwanych lub nieoczekiwanych stanach rzucany jest wyjątek C++, zwykle `std::runtime_error`. Nieprzechwycony wyjątek wypisuje komunikat z `what()` na stderr i kończy proces.
 
-[Rekompilator shaderów](../../core/shader/recompiler/Recompiler.cpp) z powodzeniem generuje kod SPIR-V (weryfikowany za pomocą [Spirv-Tools](../../3rdparty/SPIRV-Tools) przy kompilacji z `ANYPS5_ENABLE_SPIRV_TOOLS`).
+Rekompilator shaderów z powodzeniem generuje kod SPIR-V (weryfikowany za pomocą [Spirv-Tools](../../3rdparty/SPIRV-Tools) przy kompilacji z `ANYPS5_ENABLE_SPIRV_TOOLS`).
 
 ## Kompatybilność
 

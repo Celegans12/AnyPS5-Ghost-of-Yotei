@@ -26,7 +26,7 @@ Berisi [relinker](../../core/relinker) yang mengubah executable ke format asli s
 
 Keadaan yang tidak didukung atau tidak terduga melempar exception C++, biasanya `std::runtime_error`. Exception yang tidak ditangkap mencetak `what()`-nya ke stderr dan mengakhiri proses.
 
-[Shader recompiler](../../core/shader/recompiler/Recompiler.cpp) berhasil menghasilkan SPIR-V (divalidasi dengan [Spirv-Tools](../../3rdparty/SPIRV-Tools) bila di-build dengan `ANYPS5_ENABLE_SPIRV_TOOLS`).
+Shader recompiler berhasil menghasilkan SPIR-V (divalidasi dengan [Spirv-Tools](../../3rdparty/SPIRV-Tools) bila di-build dengan `ANYPS5_ENABLE_SPIRV_TOOLS`).
 
 ## Kompatibilitas
 

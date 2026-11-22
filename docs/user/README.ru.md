@@ -26,7 +26,7 @@
 
 Неподдерживаемые или неожиданные состояния выбрасывают исключение C++, обычно `std::runtime_error`. Исключение, которое никто не перехватил, выводит свой `what()` в stderr и завершает процесс.
 
-[Рекомпилятор шейдеров](../../core/shader/recompiler/Recompiler.cpp) успешно генерирует SPIR-V (проверяется через [Spirv-Tools](../../3rdparty/SPIRV-Tools) при сборке с `ANYPS5_ENABLE_SPIRV_TOOLS`).
+Рекомпилятор шейдеров успешно генерирует SPIR-V (проверяется через [Spirv-Tools](../../3rdparty/SPIRV-Tools) при сборке с `ANYPS5_ENABLE_SPIRV_TOOLS`).
 
 ## Совместимость
 

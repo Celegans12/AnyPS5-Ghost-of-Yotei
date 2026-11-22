@@ -26,7 +26,7 @@
 
 不支持或意外的状态会抛出 C++ 异常，通常是 `std::runtime_error`。没有被捕获的异常会把其 `what()` 输出到 stderr，然后进程终止。
 
-[着色器重编译器](../../core/shader/recompiler/Recompiler.cpp)可成功生成 SPIR-V（使用 `ANYPS5_ENABLE_SPIRV_TOOLS` 构建时通过 [Spirv-Tools](../../3rdparty/SPIRV-Tools) 验证）。
+着色器重编译器可成功生成 SPIR-V（使用 `ANYPS5_ENABLE_SPIRV_TOOLS` 构建时通过 [Spirv-Tools](../../3rdparty/SPIRV-Tools) 验证）。
 
 ## 兼容性
 

@@ -26,7 +26,7 @@
 
 Οι μη υποστηριζόμενες ή απροσδόκητες καταστάσεις προκαλούν μια εξαίρεση (exception) της C++, συνήθως std::runtime_error. Μια εξαίρεση που δεν συλλαμβάνεται εκτυπώνει το what() της στο stderr και τερματίζει τη διεργασία.
 
-Ο [αναμεταγλωττιστής shaders (shader recompiler)](../../core/shader/recompiler/Recompiler.cpp) παράγει επιτυχώς SPIR-V (επικυρωμένο μέσω [Spirv-Tools](../../3rdparty/SPIRV-Tools)) όταν χτίζεται με το ANYPS5_ENABLE_SPIRV_TOOLS.
+Ο αναμεταγλωττιστής shaders (shader recompiler) παράγει επιτυχώς SPIR-V (επικυρωμένο μέσω [Spirv-Tools](../../3rdparty/SPIRV-Tools)) όταν χτίζεται με το ANYPS5_ENABLE_SPIRV_TOOLS.
 
 ## Συμβατότητα
 

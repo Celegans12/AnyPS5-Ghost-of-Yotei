@@ -26,7 +26,7 @@ relinker のみのビルドは、Apple シリコンを含む macOS で動作し�
 
 サポートされていない状態や予期しない状態では、C++ の例外（通常は `std::runtime_error`）が投げられます。どこにも捕捉されない例外は、その `what()` を stderr に出力して、プロセスを終了します。
 
-[シェーダーの再コンパイラー](../../core/shader/recompiler/Recompiler.cpp)は、SPIR-V を正しく生成します（`ANYPS5_ENABLE_SPIRV_TOOLS` を指定してビルドした場合は、[Spirv-Tools](../../3rdparty/SPIRV-Tools) で検証されます）。
+シェーダーの再コンパイラーは、SPIR-V を正しく生成します（`ANYPS5_ENABLE_SPIRV_TOOLS` を指定してビルドした場合は、[Spirv-Tools](../../3rdparty/SPIRV-Tools) で検証されます）。
 
 ## 互換性
 
