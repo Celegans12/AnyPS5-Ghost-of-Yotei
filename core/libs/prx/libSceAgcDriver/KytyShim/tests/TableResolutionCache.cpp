@@ -313,7 +313,7 @@ int BadSetting() {
 
 }
 
-int main(int argc, char** argv) {
+extern "C" int RunKytyTableResolutionCacheTest(int argc, char** argv) {
 	if (argc > 1 && std::strcmp(argv[1], "capacity") == 0) return SettingsTest(64);
 	if (argc > 1 && std::strcmp(argv[1], "default") == 0) return SettingsTest(DefaultTableResolutions);
 	if (argc > 1 && std::strcmp(argv[1], "bad") == 0) return BadSetting();

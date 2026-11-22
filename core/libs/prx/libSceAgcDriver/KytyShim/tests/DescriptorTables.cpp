@@ -1015,7 +1015,7 @@ int DrawTables() {
 
 }
 
-int main(int argc, char** argv) {
+extern "C" int RunKytyDescriptorTablesTest(int argc, char** argv) {
 	if (argc > 1 && std::strcmp(argv[1], "draw") == 0) return DrawTables();
 	if (argc > 1 && std::strcmp(argv[1], "copies") == 0) return CopiesSwitch();
 	if (argc > 1 && std::strcmp(argv[1], "bad") == 0) return BadSwitch();
