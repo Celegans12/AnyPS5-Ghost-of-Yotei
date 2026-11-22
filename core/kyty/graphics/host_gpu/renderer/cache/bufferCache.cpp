@@ -7,6 +7,7 @@
 #include "common/hackNotice.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/runtimeSwitches.h"
 #include "common/spscQueue.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/scout.h"
@@ -26,8 +27,10 @@
 #include <bit>
 #include <chrono>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -117,6 +120,18 @@ int64_t SteadyNs() {
 	    .count();
 }
 
+bool MirrorCheck() {
+	static const bool enabled = [] {
+		const char*            value = std::getenv("KYTY_MIRROR_CHECK");
+		const std::string_view text {value == nullptr ? "" : value};
+		if (!text.empty() && text != "0" && text != "1") {
+			EXIT("invalid KYTY_MIRROR_CHECK: %s (0 or 1)\n", value);
+		}
+		return text == "1";
+	}();
+	return enabled;
+}
+
 
 }
 
@@ -202,13 +217,13 @@ void BufferCache::ChangeRegister(BufferId id) {
 			m_in_place->Register(buffer.Size(), m_memory_tracker.SetInPlace(buffer.CpuAddress(), buffer.Size()));
 		} else {
 			m_total_used_memory += buffer.Size();
-			if (m_guest_mirror) m_guest_mirror->NoteRange(buffer.CpuAddress(), buffer.Size());
+			if (buffer.IsWindow()) m_guest_mirror->NoteRange(buffer.CpuAddress(), buffer.Size());
 		}
 		buffer.lru_id = m_lru_cache.Insert(id, m_gc_tick);
 		std::vector<vk::DeviceAddress> addresses;
 		addresses.reserve(size_pages);
 		for (uint64_t i = 0; i < size_pages; ++i) {
-			addresses.push_back(buffer.BufferDeviceAddress() + (i << CACHING_PAGEBITS));
+			addresses.push_back(buffer.BufferDeviceAddress() + buffer.HandleOffset() + (i << CACHING_PAGEBITS));
 		}
 		WriteDataBuffer(m_bda_pagetable_buffer, table_offset,
 		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
@@ -250,7 +265,7 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	Unregister(id);
 	if (m_scheduler.Active()) {
 		m_scheduler.DeferHostOperation([this, id] {
-			WaitReadbackQueueCopies(m_slot_buffers[id].Handle());
+			if (!m_slot_buffers[id].IsWindow()) WaitReadbackQueueCopies(m_slot_buffers[id].Handle());
 			m_slot_buffers.erase(id);
 		});
 	} else {
@@ -261,13 +276,12 @@ void BufferCache::DeleteBuffer(BufferId id) {
 void BufferCache::CollectDownloadCopies(const Buffer& buffer, uint64_t vaddr, uint64_t size,
                                         std::vector<vk::BufferCopy>& copies,
                                         uint64_t&                    total_size) {
-	const auto buffer_address = buffer.CpuAddress();
 	m_memory_tracker.ForEachDownloadRange<false>(
 	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
 		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
 		                                           "buffer download");
 		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
-			    copies.emplace_back(start - buffer_address, total_size, end - start);
+			    copies.emplace_back(buffer.Offset(start), total_size, end - start);
 			    total_size += Common::AlignUp(end - start, 64);
 		    });
 		    if (m_gpu_modified_ranges.Subtract(address, bytes)) {
@@ -284,11 +298,12 @@ template <bool async>
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
-	const auto                  buffer_address = buffer.CpuAddress();
+	const auto                  buffer_address = buffer.HandleOrigin();
 	CollectDownloadCopies(buffer, vaddr, size, copies, total_size);
 	if (copies.empty()) {
 		return false;
 	}
+	CheckMirrorCopies(buffer, copies);
 
 	if constexpr (!async) {
 		if (DownloadOnReadbackQueue(buffer, copies, total_size)) {
@@ -309,7 +324,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	before.buffer              = buffer.Handle();
-	before.offset              = 0;
+	before.offset              = buffer.HandleOffset();
 	before.size                = buffer.Size();
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
@@ -384,8 +399,8 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	SetVulkanObjectNameF(m_graphics.device, GetBuffer(null_id).Handle(), "Kyty.NullBuffer");
 	GetBuffer(null_id).Fill(0, 16, 0);
 	if (!GuestMirror::Unsupported(m_graphics).empty()) {
-		::Log::WriteToConsoleAndLog(
-		    fmt::format("[kyty-mirror] no mirror: {}; the buffer cache works without it\n", GuestMirror::Unsupported(m_graphics)));
+		::Log::WriteToConsoleAndLog(fmt::format("[kyty-mirror] no mirror: {}; the buffer cache keeps buffers of its own\n",
+		                                        GuestMirror::Unsupported(m_graphics)));
 	} else {
 		m_guest_mirror = std::make_unique<GuestMirror>(m_graphics);
 		::Log::WriteToConsoleAndLog(fmt::format("[kyty-mirror] {}\n", m_guest_mirror->Description()));
@@ -394,13 +409,14 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 		} else {
 			SetVulkanObjectNameF(m_graphics.device, m_guest_mirror->Handle(), "Kyty.GuestMirror[size=0x{:x}]",
 			                     m_guest_mirror->Size());
+			m_windows = Common::RuntimeSwitches::On(Common::RuntimeSwitches::Switch::E75T1);
 		}
 	}
 	m_scheduler.SetSubmitHook(
-	    [](void* self, CommandBuffer& command) {
+	    [](void* self, CommandBuffer& command, SubmitInfo& submit) {
 		    auto* cache = static_cast<BufferCache*>(self);
 		    cache->RecordMirrorCopies(command);
-		    cache->SubmitGuestMirror();
+		    cache->SubmitGuestMirror(submit);
 	    },
 	    this);
 	if (!m_graphics.CanReportMemoryUsage()) {
@@ -1007,7 +1023,7 @@ bool BufferCache::StartReadbackQueueRead(const Buffer& buffer, uint64_t vaddr, u
 				continue;
 			}
 			follower.page           = page;
-			follower.buffer_address = other.CpuAddress();
+			follower.buffer_address = other.HandleOrigin();
 			follower.source         = other.Handle();
 			needed                  = std::max(needed, latest);
 		}
@@ -1046,11 +1062,20 @@ bool BufferCache::StartReadbackQueueRead(const Buffer& buffer, uint64_t vaddr, u
 	vk::CommandBufferBeginInfo begin_info {};
 	begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
 	(void)command.begin(&begin_info);
-	command.copyBuffer(buffer.Handle(), queue.staging->Handle(),
-	                   static_cast<uint32_t>(read.copies.size()), read.copies.data());
+	CheckMirrorCopies(buffer, read.copies);
+	std::vector<vk::BufferCopy> regions = read.copies;
 	for (const auto& follower: read.followers) {
-		command.copyBuffer(follower.source, queue.staging->Handle(),
-		                   static_cast<uint32_t>(follower.copies.size()), follower.copies.data());
+		if (follower.source == buffer.Handle()) {
+			CheckMirrorCopies(buffer, follower.copies);
+			regions.insert(regions.end(), follower.copies.begin(), follower.copies.end());
+		}
+	}
+	command.copyBuffer(buffer.Handle(), queue.staging->Handle(), static_cast<uint32_t>(regions.size()), regions.data());
+	for (const auto& follower: read.followers) {
+		if (follower.source != buffer.Handle()) {
+			command.copyBuffer(follower.source, queue.staging->Handle(),
+			                   static_cast<uint32_t>(follower.copies.size()), follower.copies.data());
+		}
 	}
 	vk::BufferMemoryBarrier after {};
 	after.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
@@ -1079,7 +1104,7 @@ bool BufferCache::StartReadbackQueueRead(const Buffer& buffer, uint64_t vaddr, u
 		EXIT("BufferCache: readback queue submission failed\n");
 	}
 	read.slot           = slot;
-	read.buffer_address = buffer.CpuAddress();
+	read.buffer_address = buffer.HandleOrigin();
 	read.needed         = needed;
 	read.recorded       = m_scheduler.CurrentTick();
 	read.published      = std::make_shared<std::atomic<bool>>(false);
@@ -1512,12 +1537,24 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 		new_buffer.IncreaseStreamScore(overlap.StreamScore() + 1);
 	}
 	new_buffer.device_address_pinned |= overlap.device_address_pinned;
-	if (!new_buffer.InPlace()) {
-		new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
-		                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
+	if (!new_buffer.InPlace() && new_buffer.Handle() != overlap.Handle()) {
+		new_buffer.CopyFrom(m_scheduler.Current(), overlap, overlap.Offset(overlap.CpuAddress()),
+		                    new_buffer.Offset(overlap.CpuAddress()), overlap.Size());
 		NoteWrite(overlap.CpuAddress(), overlap.Size());
 	}
 	DeleteBuffer(overlap_id);
+}
+
+BufferId BufferCache::InsertBuffer(uint64_t vaddr, uint64_t size) {
+	if (m_windows && m_guest_mirror->Holds(vaddr, size)) {
+		return m_slot_buffers.insert(m_graphics, m_scheduler, vaddr, size,
+		                             MirrorWindow {m_guest_mirror->Handle(), m_guest_mirror->DeviceAddress()});
+	}
+	const auto id = m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, vaddr,
+	                                      AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, size);
+	SetVulkanObjectNameF(m_graphics.device, m_slot_buffers[id].Handle(), "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]",
+	                     vaddr, size);
+	return id;
 }
 
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
@@ -1539,12 +1576,7 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	const auto id = imported.has_value()
 	                    ? m_slot_buffers.insert(m_graphics, m_scheduler, overlap.begin, bytes, imported->buffer,
 	                                            imported->address)
-	                    : m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, overlap.begin, flags,
-	                                            bytes);
-	const auto& buffer = m_slot_buffers[id];
-	SetVulkanObjectNameF(m_graphics.device, buffer.Handle(),
-	                     "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", overlap.begin,
-	                     overlap.end - overlap.begin);
+	                    : InsertBuffer(overlap.begin, bytes);
 	for (auto it = overlap.first; it != overlap.last;) {
 		const auto old_id = (it++)->second;
 		JoinOverlap(id, old_id, !overlap.has_stream_leap);
@@ -1614,7 +1646,7 @@ void BufferCache::RecordBufferUpload(Buffer& buffer, std::span<const vk::BufferC
 		before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 		before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 		before.buffer              = buffer.Handle();
-		before.offset              = 0;
+		before.offset              = buffer.HandleOffset();
 		before.size                = buffer.Size();
 		native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 		                       vk::PipelineStageFlagBits::eTransfer,
@@ -1677,7 +1709,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 		if (auto& deferred = MemoryTracker::DeferredProtects(); !deferred.empty()) {
 			bool queued = in_ring;
 			for (const auto& copy: copies) {
-				queued = queued && LibKernel::Memory::FindBackingPointer(buffer.CpuAddress() + copy.dstOffset, copy.size) != nullptr;
+				queued = queued && LibKernel::Memory::FindBackingPointer(buffer.HandleOrigin() + copy.dstOffset, copy.size) != nullptr;
 			}
 			for (const auto& item: deferred) {
 				if (queued) {
@@ -1694,7 +1726,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 			if (queued) m_protect_jobs = host_copies->Flush();
 		}
 		for (auto& copy: copies) {
-			const auto  address = buffer.CpuAddress() + copy.dstOffset;
+			const auto  address = buffer.HandleOrigin() + copy.dstOffset;
 			const void* backing =
 			    in_ring ? LibKernel::Memory::FindBackingPointer(address, copy.size) : nullptr;
 			if (backing != nullptr) {
@@ -1813,17 +1845,33 @@ uint64_t BufferCache::StreamUpload(const void* data, uint64_t size, uint64_t ali
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
-                                                       BufferId id) {
+                                                       BufferId id, ObtainFrom from) {
 	EXIT_IF(!(GuestRange {vaddr, size}.Valid()));
 	if (is_written) {
 		m_scheduler.Context().CollectHotPageWrites(vaddr, size);
 	}
-	return ObtainSynchronizedBuffer(vaddr, size, is_written, is_texel_buffer, id);
+	return ObtainSynchronizedBuffer(vaddr, size, is_written, is_texel_buffer, id, from);
+}
+
+void BufferCache::CheckMirrorRange(const Buffer& buffer, uint64_t vaddr, uint64_t size) noexcept {
+	if (!buffer.IsWindow() || m_guest_mirror->Requested(vaddr, size)) return;
+	m_guest_mirror->NoteUnboundRead();
+	if (MirrorCheck()) {
+		EXIT("[kyty-mirror] 0x%" PRIx64 " + 0x%" PRIx64 " is used from the mirror while a block of it is not bound\n",
+		     vaddr, size);
+	}
+}
+
+void BufferCache::CheckMirrorCopies(const Buffer& buffer, std::span<const vk::BufferCopy> copies) noexcept {
+	if (!buffer.IsWindow()) return;
+	for (const auto& copy: copies) {
+		CheckMirrorRange(buffer, buffer.HandleOrigin() + copy.srcOffset, copy.size);
+	}
 }
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainSynchronizedBuffer(
-    uint64_t vaddr, uint64_t size, bool is_written, bool is_texel_buffer, BufferId id) {
-	if (m_in_place && !is_texel_buffer) {
+    uint64_t vaddr, uint64_t size, bool is_written, bool is_texel_buffer, BufferId id, ObtainFrom from) {
+	if (m_in_place && !is_texel_buffer && from == ObtainFrom::Any) {
 		const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
 		if (owner != nullptr && *owner && m_slot_buffers[*owner].InPlace() &&
 		    m_slot_buffers[*owner].IsInBounds(vaddr, size)) {
@@ -1837,7 +1885,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainSynchronizedBuffer(
 		}
 	}
 
-	const bool  small_read = !is_written && size <= CACHING_PAGESIZE;
+	const bool  small_read = !is_written && size <= CACHING_PAGESIZE && from == ObtainFrom::Any;
 	StreamMemo* stream     = nullptr;
 	uint64_t    window     = 0;
 	if (small_read && !m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
@@ -1871,6 +1919,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainSynchronizedBuffer(
 			    (!is_texel_buffer || NoImageStartsAt(vaddr))) {
 				auto& buffer = m_slot_buffers[page_memo->id];
 				TouchBuffer(buffer);
+				if (MirrorCheck()) CheckMirrorRange(buffer, vaddr, size);
 				return {&buffer, vaddr - page_memo->buffer_address};
 			}
 		} else {
@@ -1881,6 +1930,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainSynchronizedBuffer(
 			    (!is_texel_buffer || NoImageStartsAt(vaddr))) {
 				auto& buffer = m_slot_buffers[memo->id];
 				TouchBuffer(buffer);
+				if (MirrorCheck()) CheckMirrorRange(buffer, vaddr, size);
 				return {&buffer, memo->offset};
 			}
 		}
@@ -1930,6 +1980,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainSynchronizedBuffer(
 		    (IsBufferInvalid(id) || id == written->id)) {
 			auto& buffer = m_slot_buffers[written->id];
 			TouchBuffer(buffer);
+			if (MirrorCheck()) CheckMirrorRange(buffer, vaddr, size);
 			m_gpu_write_generation++;
 			if (m_gpu_modified_ranges.Add(vaddr, size)) {
 				NoteGpuModifiedChange(vaddr, size, true);
@@ -1962,7 +2013,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainSynchronizedBuffer(
 			*page_memo = {.page           = page,
 			              .buffer_epoch   = m_buffer_set_epoch,
 			              .cpu_epoch      = cpu_epoch,
-			              .buffer_address = buffer.CpuAddress(),
+			              .buffer_address = buffer.HandleOrigin(),
 			              .id             = id,
 			              .clean          = all_clean ? AllPageBits : page_bits};
 		}
@@ -1983,6 +2034,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainSynchronizedBuffer(
 		ForgetColorMetadataChecks(vaddr, size);
 		NoteWrite(vaddr, size);
 	}
+	CheckMirrorRange(buffer, vaddr, size);
 	return {&buffer, buffer.Offset(vaddr)};
 }
 
@@ -2010,6 +2062,7 @@ BufferCache::ObtainBufferWithProvenWrites(uint64_t vaddr, uint64_t size,
 		ForgetColorMetadataChecks(range.address, range.size);
 		NoteWrite(range.address, range.size);
 	}
+	CheckMirrorRange(buffer, vaddr, size);
 	return {&buffer, buffer.Offset(vaddr)};
 }
 
@@ -2027,6 +2080,7 @@ bool BufferCache::PrepareDeviceAddressRead(uint64_t vaddr, uint64_t size) {
 	auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 	TouchBuffer(buffer);
 	(void)SynchronizeBuffer(buffer, vaddr, size, false, false);
+	CheckMirrorRange(buffer, vaddr, size);
 	return true;
 }
 
@@ -2037,6 +2091,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 		if (buffer.IsInBounds(vaddr, size)) {
 			TouchBuffer(buffer);
 			(void)SynchronizeBuffer(buffer, vaddr, size, false, false);
+			CheckMirrorRange(buffer, vaddr, size);
 			return {&buffer, buffer.Offset(vaddr)};
 		}
 	}
@@ -2469,7 +2524,7 @@ void BufferCache::RecordMirrorCopies(CommandBuffer& command) {
 		if (buffer.is_deleted || !buffer.IsInBounds(line, MirrorLineSize)) {
 			continue;
 		}
-		if (&buffer != source) {
+		if (source == nullptr || buffer.Handle() != source->Handle()) {
 			flush();
 			source = &buffer;
 		}
@@ -2491,7 +2546,7 @@ bool BufferCache::DownloadOnReadbackQueue(Buffer& buffer, std::span<const vk::Bu
 	if (!m_graphics.readback_queue || m_device_address_pending) {
 		return false;
 	}
-	const auto buffer_address = buffer.CpuAddress();
+	const auto buffer_address = buffer.HandleOrigin();
 	uint64_t needed = m_device_address_tick;
 	const auto readback_begin = buffer_address + copies.front().srcOffset;
 	const auto readback_end   = buffer_address + copies.back().srcOffset + copies.back().size;
@@ -3231,17 +3286,15 @@ uint64_t BufferCache::SplitUnmappedBuffers(uint64_t vaddr, uint64_t size, FreeBl
 		if (owned_outside || (stop > at && m_gpu_modified_ranges.Intersects(at, stop - at))) continue;
 		std::vector<BufferId> ids;
 		for (const auto& [from, to]: pieces) {
-			ids.push_back(m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, from,
-			                                    AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, to - from));
+			ids.push_back(InsertBuffer(from, to - from));
 		}
 		const auto& source = m_slot_buffers[id];
 		for (size_t i = 0; i < ids.size(); ++i) {
 			auto&      piece      = m_slot_buffers[ids[i]];
 			const auto [from, to] = pieces[i];
 			piece.device_address_pinned |= source.device_address_pinned;
-			SetVulkanObjectNameF(m_graphics.device, piece.Handle(), "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", from,
-			                     to - from);
-			piece.CopyFrom(m_scheduler.Current(), source, from - begin, 0, to - from);
+			if (piece.Handle() == source.Handle()) continue;
+			piece.CopyFrom(m_scheduler.Current(), source, source.Offset(from), piece.Offset(from), to - from);
 			NoteWrite(from, to - from);
 		}
 		cut += stop - begin - kept;
@@ -3262,18 +3315,31 @@ uint64_t BufferCache::DropFreedRange(uint64_t vaddr, uint64_t size, FreeBlocksQu
 	return deleted + SplitUnmappedBuffers(vaddr, size, free_blocks, splits);
 }
 
-void BufferCache::SubmitGuestMirror() {
-	if (m_guest_mirror) m_guest_mirror->Submit();
+void BufferCache::SubmitGuestMirror(SubmitInfo& submit) {
+	if (!m_guest_mirror) return;
+	const auto wait = m_guest_mirror->Submit();
+	if (wait.semaphore) submit.AddWait(wait.semaphore, wait.value);
+	if (!std::exchange(m_trim_mirror, false)) return;
+	std::vector<std::pair<uint64_t, uint64_t>> live;
+	if (!std::exchange(m_trim_everything, false)) {
+		live.reserve(m_buffers.size());
+		for (const auto& [vaddr, id]: m_buffers) {
+			const auto& buffer = m_slot_buffers[id];
+			if (buffer.IsWindow()) live.emplace_back(buffer.CpuAddress(), buffer.Size());
+		}
+	}
+	WaitReadbackQueueCopies(m_guest_mirror->Handle());
+	m_guest_mirror->Trim(live, {m_scheduler.GetMasterSemaphore().Handle(), m_scheduler.CurrentTick()});
 }
 
-void BufferCache::TickGuestMirror() {
+void BufferCache::TickGuestMirror(bool summary_now) {
 	static constexpr uint64_t TrimPeriod     = 64;
 	static constexpr uint64_t PressureMargin = 256 * MiB;
 	auto&                     mirror         = *m_guest_mirror;
-	m_guest_mirror_frames++;
+	if (!summary_now) m_guest_mirror_frames++;
 	const auto now     = static_cast<uint64_t>(SteadyNs());
-	const bool summary = m_guest_mirror_line != 0 && now - m_guest_mirror_line >= 10'000'000'000;
-	const bool check   = m_gc_tick - m_guest_mirror_trim >= TrimPeriod;
+	const bool summary = m_guest_mirror_line != 0 && (summary_now || now - m_guest_mirror_line >= 10'000'000'000);
+	const bool check   = !summary_now && m_windows && m_gc_tick - m_guest_mirror_trim >= TrimPeriod;
 	if (m_guest_mirror_line == 0) m_guest_mirror_line = now;
 	if (!summary && !check) return;
 	uint64_t used = 0, budget = 0;
@@ -3290,13 +3356,7 @@ void BufferCache::TickGuestMirror() {
 		m_guest_mirror_trim = m_gc_tick;
 		if (budget != 0 && used + PressureMargin >= budget) {
 			m_guest_mirror_trims++;
-			std::vector<std::pair<uint64_t, uint64_t>> live;
-			live.reserve(m_buffers.size());
-			for (const auto& [vaddr, id]: m_buffers) {
-				const auto& buffer = m_slot_buffers[id];
-				if (!buffer.InPlace()) live.emplace_back(buffer.CpuAddress(), buffer.Size());
-			}
-			mirror.Trim(live);
+			m_trim_mirror = true;
 		}
 	}
 	if (!summary) return;
@@ -3307,21 +3367,71 @@ void BufferCache::TickGuestMirror() {
 	const auto per      = [frames](uint64_t value) { return frames != 0 ? static_cast<double>(value) / static_cast<double>(frames) : 0.0; };
 	const auto block    = mirror.BlockSize();
 	m_guest_mirror_line = now;
+	uint64_t windows = 0, window_bytes = 0, buffers = 0, buffer_bytes = 0;
+	for (const auto& [vaddr, id]: m_buffers) {
+		const auto& buffer = m_slot_buffers[id];
+		if (buffer.InPlace()) continue;
+		(buffer.IsWindow() ? windows : buffers)++;
+		(buffer.IsWindow() ? window_bytes : buffer_bytes) += buffer.Size();
+	}
 	::Log::WriteToConsoleAndLog(fmt::format(
-	    "[kyty-mirror] summary of the last {:.0f} s: {} frames; {} blocks of {} KiB bound ({:.1f} MiB, {} chunks of {} MiB) in a "
-	    "mirror of {} GiB; {} blocks bound in {} vkQueueBindSparse calls ({:.3f} calls and {:.2f} blocks per frame), {:.2f} ms in "
-	    "the calls, {:.1f} ms until they were done (longest {:.2f} ms); {} blocks unbound in {} trims under memory pressure; {} "
-	    "blocks noted outside the mirror; device-local memory {} MiB used of a {} MiB budget\n",
-	    seconds, frames, stats.bound_blocks, block >> 10u,
+	    "[kyty-mirror] summary of the last {:.1f} s ({}): {} frames; {} blocks of {} KiB bound ({:.1f} MiB, {} chunks of {} MiB) "
+	    "in a mirror of {} GiB; {} blocks bound in {} vkQueueBindSparse calls ({:.3f} calls and {:.2f} blocks per frame), {:.2f} "
+	    "ms in the calls, {:.1f} ms until they were done (longest {:.2f} ms); {} submissions waited for a bind; {} blocks unbound "
+	    "in {} trims under memory pressure; {} blocks noted outside the mirror; {} reads of unbound blocks; {} windows ({:.1f} "
+	    "MiB) and {} buffers of their own ({:.1f} MiB); device-local memory {} MiB used of a {} MiB budget; {} bind requests, "
+	    "{:.3f} ms from the request to the bound block on average (longest {:.2f} ms)\n",
+	    seconds, m_windows ? "windows of the mirror" : "buffers of their own", frames, stats.bound_blocks, block >> 10u,
 	    static_cast<double>(stats.bound_blocks * block) / static_cast<double>(MiB), stats.chunks,
 	    std::max(GuestMirror::ChunkBytes, block) / MiB, mirror.Size() / GuestMirror::GiB, stats.blocks, stats.calls,
 	    per(stats.calls), per(stats.blocks), static_cast<double>(stats.call_ns) / 1e6, static_cast<double>(stats.done_ns) / 1e6,
-	    static_cast<double>(stats.longest_ns) / 1e6, stats.unbound_blocks, trims, mirror.OutsideBlocks(), used / MiB,
-	    budget / MiB));
+	    static_cast<double>(stats.longest_ns) / 1e6, stats.waits, stats.unbound_blocks, trims, mirror.OutsideBlocks(),
+	    stats.unbound_reads, windows, static_cast<double>(window_bytes) / static_cast<double>(MiB), buffers,
+	    static_cast<double>(buffer_bytes) / static_cast<double>(MiB), used / MiB, budget / MiB, stats.requests,
+	    stats.requests != 0 ? static_cast<double>(stats.request_ns) / 1e6 / static_cast<double>(stats.requests) : 0.0,
+	    static_cast<double>(stats.request_longest_ns) / 1e6));
+}
+
+void BufferCache::SwitchStorage(bool windows) {
+	if (m_guest_mirror_line != 0) TickGuestMirror(true);
+	std::vector<BufferId> ids;
+	ids.reserve(m_buffers.size());
+	for (const auto& [vaddr, id]: m_buffers) {
+		if (!m_slot_buffers[id].InPlace()) ids.push_back(id);
+	}
+	for (const auto id: ids) {
+		auto& buffer = m_slot_buffers[id];
+		if (m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size())) {
+			(void)DownloadBufferMemory<true>(buffer, buffer.CpuAddress(), buffer.Size());
+		}
+	}
+	const auto tick = m_scheduler.CurrentTick();
+	m_scheduler.Wait(tick);
+	m_scheduler.WaitPriorityOperations(tick);
+	for (const auto id: ids) {
+		auto& buffer = m_slot_buffers[id];
+		WaitReadbackQueueCopies(buffer.Handle());
+		UnmarkGpuModified(buffer.CpuAddress(), buffer.Size());
+		m_memory_tracker.MarkRegionAsCpuModified(buffer.CpuAddress(), buffer.Size());
+		if (m_record_released) {
+			m_released_ranges.Add(buffer.CpuAddress(), buffer.Size());
+		}
+		Unregister(id);
+		m_slot_buffers.erase(id);
+	}
+	m_gpu_write_generation++;
+	m_windows = windows;
+	if (!windows) {
+		m_trim_mirror     = true;
+		m_trim_everything = true;
+	}
 }
 
 void BufferCache::RunGarbageCollector() {
 	ServeInPlaceConversions();
+	if (m_guest_mirror && m_windows != Common::RuntimeSwitches::On(Common::RuntimeSwitches::Switch::E75T1)) {
+		SwitchStorage(!m_windows);
+	}
 	const auto tick = m_gc_tick++;
 	CollectStaleBuffers(tick);
 	if (m_graphics.CanReportMemoryUsage()) {

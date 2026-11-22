@@ -592,7 +592,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(m_command.IsInvalid());
 	if (m_submit_hook != nullptr) {
-		m_submit_hook(m_submit_hook_data, m_command);
+		m_submit_hook(m_submit_hook_data, m_command, submit);
 	}
 	if (InPlaceMemory::Live()) {
 		m_command.EndRendering();

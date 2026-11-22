@@ -134,8 +134,19 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t c
 	EXIT_IF(imported == nullptr || size == 0 || device_address == 0);
 }
 
+Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address, uint64_t size,
+               MirrorWindow mirror)
+    : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(MemoryUsage::DeviceLocal), m_cpu_address(cpu_address),
+      m_handle_offset(cpu_address), m_device_address(mirror.address), m_buffer(mirror.buffer), m_size(size),
+      m_window(true) {
+	EXIT_IF(mirror.buffer == nullptr || size == 0 || mirror.address == 0);
+#if defined(ANYPS5_KYTY)
+	m_device_local = true;
+#endif
+}
+
 Buffer::~Buffer() {
-	if (m_buffer == nullptr) {
+	if (m_buffer == nullptr || m_window) {
 		return;
 	}
 	if (m_in_place) {
@@ -165,7 +176,7 @@ void Buffer::Invalidate(uint64_t offset, uint64_t size) {
 
 vk::BufferMemoryBarrier Buffer::Barrier(uint64_t offset, uint64_t size, vk::AccessFlags source,
                                         vk::AccessFlags destination) const {
-	if (Handle() == nullptr || size == 0 || offset > Size() || size > Size() - offset) {
+	if (Handle() == nullptr || size == 0 || !HoldsOffsets(offset, size)) {
 		EXIT("Buffer: invalid DMA barrier, handle=%p offset=0x%016" PRIx64 " size=0x%016" PRIx64
 		     " capacity=0x%016" PRIx64 "\n",
 		     static_cast<const void*>(Handle()), offset, size, Size());
@@ -183,8 +194,7 @@ vk::BufferMemoryBarrier Buffer::Barrier(uint64_t offset, uint64_t size, vk::Acce
 
 void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t source_offset,
                       uint64_t destination_offset, uint64_t size) {
-	if (size == 0 || source_offset > source.Size() || size > source.Size() - source_offset ||
-	    destination_offset > Size() || size > Size() - destination_offset) {
+	if (size == 0 || !source.HoldsOffsets(source_offset, size) || !HoldsOffsets(destination_offset, size)) {
 		EXIT("Buffer: invalid copy range\n");
 	}
 	if (source.Handle() == Handle() && source_offset < destination_offset + size &&

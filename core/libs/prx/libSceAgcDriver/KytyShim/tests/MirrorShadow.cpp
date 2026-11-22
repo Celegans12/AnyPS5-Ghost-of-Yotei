@@ -117,7 +117,7 @@ bool Open(Device& gpu, bool sparse, std::string& why) {
 		queues[queue_count++] = vk::DeviceQueueCreateInfo {
 		    .queueFamilyIndex = graphics.sparse_family, .queueCount = 1, .pQueuePriorities = priorities.data()};
 	}
-	vk::PhysicalDeviceVulkan12Features features12 {.bufferDeviceAddress = VK_TRUE};
+	vk::PhysicalDeviceVulkan12Features features12 {.timelineSemaphore = VK_TRUE, .bufferDeviceAddress = VK_TRUE};
 	vk::PhysicalDeviceFeatures         features {};
 	features.sparseBinding         = sparse ? VK_TRUE : VK_FALSE;
 	features.sparseResidencyBuffer = sparse ? VK_TRUE : VK_FALSE;
@@ -151,12 +151,13 @@ void Fallback() {
 	GuestMirror mirror(gpu.graphics);
 	Check(!mirror.Available() && mirror.Size() == 0, "no mirror without sparse binding");
 	Check(Contains(mirror.Description(), "no mirror: the device has no sparseBinding") &&
-	          Contains(mirror.Description(), "works without it"),
+	          Contains(mirror.Description(), "keeps buffers of its own"),
 	      "the fallback says why: " + mirror.Description());
 	mirror.NoteRange(0x10000, 0x10000);
-	mirror.Flush();
+	const auto wait = mirror.Submit();
 	mirror.WaitIdle();
-	Check(mirror.Totals().calls == 0 && !mirror.IsBound(0x10000), "the fallback binds nothing");
+	Check(mirror.Totals().calls == 0 && !mirror.IsBound(0x10000) && !wait.semaphore && !mirror.Holds(0x10000, 1),
+	      "the fallback binds nothing and holds nothing");
 }
 
 struct HostBuffer {
@@ -228,6 +229,33 @@ bool RoundTrip(const GraphicContext& graphics, vk::Buffer mirror, uint64_t offse
 	return same;
 }
 
+bool UpdateOutsideMirror(const GraphicContext& graphics) {
+	HostBuffer target(graphics, 16);
+	std::memset(target.mapped, 0, 16);
+	const auto                      device = graphics.device;
+	const vk::CommandPoolCreateInfo pool_info {.queueFamilyIndex = graphics.queue_family};
+	vk::CommandPool                 pool;
+	Require(device.createCommandPool(&pool_info, nullptr, &pool) == vk::Result::eSuccess, "command pool");
+	const vk::CommandBufferAllocateInfo allocate {.commandPool = pool, .commandBufferCount = 1};
+	vk::CommandBuffer                   command;
+	Require(device.allocateCommandBuffers(&allocate, &command) == vk::Result::eSuccess, "command buffer");
+	const vk::CommandBufferBeginInfo begin {.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit};
+	Require(command.begin(&begin) == vk::Result::eSuccess, "begin");
+	const std::array<uint32_t, 4> words {11, 22, 33, 44};
+	command.updateBuffer(target.buffer, 0, sizeof(words), words.data());
+	const vk::MemoryBarrier host {.srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+	                              .dstAccessMask = vk::AccessFlagBits::eHostRead};
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, 1, &host, 0, nullptr,
+	                        0, nullptr);
+	Require(command.end() == vk::Result::eSuccess, "end");
+	const vk::SubmitInfo submit {.commandBufferCount = 1, .pCommandBuffers = &command};
+	Require(graphics.queue.submit(1, &submit, nullptr) == vk::Result::eSuccess, "submit");
+	Require(graphics.queue.waitIdle() == vk::Result::eSuccess, "wait");
+	const bool same = std::memcmp(target.mapped, words.data(), sizeof(words)) == 0;
+	device.destroyCommandPool(pool);
+	return same;
+}
+
 int Sparse() {
 	Device      gpu;
 	std::string why;
@@ -256,26 +284,42 @@ int Sparse() {
 	const std::array<uint64_t, 1> sizes {size};
 	GuestMirror                   mirror(graphics, sizes);
 	Require(mirror.Available(), "the mirror exists: " + mirror.Description());
+	const auto real_update =
+	    reinterpret_cast<PFN_vkCmdUpdateBuffer>(graphics.device.getProcAddr("vkCmdUpdateBuffer"));
+	Check(VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdUpdateBuffer != real_update,
+	      "vkCmdUpdateBuffer goes through the guard that refuses the mirror");
+	Check(UpdateOutsideMirror(graphics), "vkCmdUpdateBuffer into another buffer still writes it");
 	Check(mirror.Size() == size && Contains(mirror.Description(), "sparse mirror of"), mirror.Description());
 	const uint64_t block = mirror.BlockSize();
 	Check(block >= 0x10000 && (block & (block - 1)) == 0, "blocks are a power of two of 64 KiB or more");
 
 	const uint64_t first = size / 2 + 3 * block + 0x1230;
+	Check(mirror.Holds(first, 0x100) && !mirror.Holds(size - 0x10, 0x20) && !mirror.Holds(first, 0),
+	      "the mirror holds the ranges inside it");
 	mirror.NoteRange(first, 0x100);
-	Check(mirror.Totals().calls == 0, "nothing is bound before the submission");
+	Check(mirror.Totals().calls == 0 && mirror.Requested(first, 0x100) && !mirror.Ready(first, 0x100),
+	      "a requested block is not bound before the submission");
 	mirror.Flush();
 	mirror.WaitIdle();
 	auto totals = mirror.Totals();
 	Check(totals.bound_blocks == 1 && totals.calls == 1 && totals.chunks == 1, "one block bound in one call");
+	Check(mirror.Ready(first, 0x100), "a bound block is ready");
+	Check(!mirror.Submit().semaphore, "a submission with nothing to bind waits for nothing");
 	mirror.NoteRange(first + 2 * block, 0x40);
-	mirror.Submit();
-	mirror.WaitIdle();
-	Check(mirror.Totals().calls == 1 && mirror.IsBound(first + 2 * block),
-	      "a submission within a second of the last binding keeps its block for later");
-	mirror.Flush();
+	const auto wait = mirror.Submit();
+	if (mirror.SharedQueue()) {
+		Check(!wait.semaphore && mirror.Ready(first + 2 * block, 0x40),
+		      "on the work queue, a submission binds its blocks before it goes");
+	} else {
+		Check(wait.semaphore && wait.value == 2, "a submission waits for the bind of its blocks");
+		const vk::SemaphoreWaitInfo info {.semaphoreCount = 1, .pSemaphores = &wait.semaphore, .pValues = &wait.value};
+		Check(graphics.device.waitSemaphores(&info, 5'000'000'000) == vk::Result::eSuccess,
+		      "the bind signals the value the submission waits for");
+	}
 	mirror.WaitIdle();
 	totals = mirror.Totals();
-	Check(totals.calls == 2 && totals.bound_blocks == 2, "a flush binds what the submissions kept");
+	Check(totals.calls == 2 && totals.bound_blocks == 2 && totals.waits == 1 && mirror.IsBound(first + 2 * block),
+	      "a submission binds what it requested at once");
 	Check(mirror.IsBound(first) && !mirror.IsBound(first + block), "the residency map holds the block");
 	Check(RoundTrip(graphics, mirror.Handle(), first & ~(block - 1), block, 1), "the bound block keeps what is written to it");
 
@@ -304,8 +348,18 @@ int Sparse() {
 	Check(RoundTrip(graphics, mirror.Handle(), run_base + 299 * 2 * block, block, 3), "the last scattered block holds data");
 
 	const std::array<std::pair<uint64_t, uint64_t>, 1> live {{{first, 0x100}}};
-	mirror.Trim(live);
+	vk::SemaphoreTypeCreateInfo                        type {.semaphoreType = vk::SemaphoreType::eTimeline};
+	const vk::SemaphoreCreateInfo                      gate_info {.pNext = &type};
+	vk::Semaphore                                      gate;
+	Require(graphics.device.createSemaphore(&gate_info, nullptr, &gate) == vk::Result::eSuccess, "gate semaphore");
+	mirror.Trim(live, {gate, 7});
+	Check(!mirror.Requested(run_base, 1) && !mirror.Ready(run_base, 1) && mirror.Ready(first, 0x100),
+	      "a trim takes the blocks out of both maps at once");
+	Check(mirror.Totals().bound_blocks == 303, "an unbind waits for the work it follows");
+	const vk::SemaphoreSignalInfo open {.semaphore = gate, .value = 7};
+	Require(graphics.device.signalSemaphore(&open) == vk::Result::eSuccess, "gate signal");
 	mirror.WaitIdle();
+	graphics.device.destroySemaphore(gate);
 	totals = mirror.Totals();
 	Check(totals.bound_blocks == 1 && totals.unbound_blocks == 302, "a trim unbinds the blocks no live range covers");
 	Check(mirror.IsBound(first) && !mirror.IsBound(run_base), "the trim keeps the covered block");

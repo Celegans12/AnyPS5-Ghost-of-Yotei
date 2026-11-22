@@ -3092,7 +3092,7 @@ void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t des
 	const bool tiled        = info.IsTiled();
 	auto guest_linear = tiled ? m_tiler.GetScratchBuffer(info.LinearSize(), host_linear.buffer)
 	                          : TileManager::Result {destination.Handle(), destination_offset,
-	                                                 destination.Size() - destination_offset};
+	                                                 destination.Capacity(destination_offset)};
 	m_tiler.ConvertD16(host_linear, guest_linear, TileManager::D16Direction::Demote,
 	                   DepthAspectTransferFormat(info.pixel_format) == vk::Format::eD32Sfloat,
 	                   {.width               = info.extent.width,
@@ -3158,7 +3158,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 		return false;
 	}
 	const auto buf_offset = buffer.Offset(image.info.data.address);
-	const auto available  = buffer.Size() - buf_offset;
+	const auto available  = buffer.Capacity(buf_offset);
 	uint32_t   levels     = 0;
 	uint64_t   copy_size  = 0;
 	if (buffer.IsInBounds(image.info.data.address, image.info.data.size)) {

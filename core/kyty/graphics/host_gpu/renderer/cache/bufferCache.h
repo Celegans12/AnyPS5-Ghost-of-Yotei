@@ -32,12 +32,18 @@ class CommandRecorder;
 class TextureCache;
 class RenderContext;
 class GuestMirror;
+struct SubmitInfo;
 
 using BufferId = Common::SlotId;
 inline constexpr BufferId NULL_BUFFER_ID {0};
 
 enum class HackMark : uint32_t {
 	Count,
+};
+
+enum class ObtainFrom : uint8_t {
+	Any,
+	Mirror,
 };
 
 class BufferCache {
@@ -141,9 +147,10 @@ public:
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	void CacheFaultedMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
-	                                                        bool     is_written,
-	                                                        bool     is_texel_buffer = false,
-	                                                        BufferId id              = {});
+	                                                        bool       is_written,
+	                                                        bool       is_texel_buffer = false,
+	                                                        BufferId   id              = {},
+	                                                        ObtainFrom from            = ObtainFrom::Any);
 	[[nodiscard]] std::pair<Buffer*, uint64_t>
 	ObtainBufferWithProvenWrites(uint64_t vaddr, uint64_t size, std::span<const GuestRange> writes,
 	                           BufferId id);
@@ -272,6 +279,7 @@ public:
 	[[nodiscard]] bool CommitWriteTicks();
 	[[nodiscard]] bool TryReadMirroredGpuWrites(uint64_t vaddr, void* data, uint64_t size);
 	[[nodiscard]] GuestMirror* GetGuestMirror() noexcept { return m_guest_mirror.get(); }
+	[[nodiscard]] bool         UsesMirror() const noexcept { return m_windows; }
 	void RequestFlushForReadbacks() noexcept {
 		if ((m_device_address_hot != 0 &&
 		     m_readback_count - m_device_address_hot < HotReadbackLifetime) ||
@@ -291,10 +299,16 @@ public:
 
 private:
 	friend struct BufferCacheTestAccess;
+	friend struct MirrorWindowsTestAccess;
 	friend class TextureCache;
 
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainSynchronizedBuffer(
-	    uint64_t vaddr, uint64_t size, bool is_written, bool is_texel_buffer, BufferId id = {});
+	    uint64_t vaddr, uint64_t size, bool is_written, bool is_texel_buffer, BufferId id = {},
+	    ObtainFrom from = ObtainFrom::Any);
+	[[nodiscard]] BufferId InsertBuffer(uint64_t vaddr, uint64_t size);
+	void                   CheckMirrorRange(const Buffer& buffer, uint64_t vaddr, uint64_t size) noexcept;
+	void                   CheckMirrorCopies(const Buffer& buffer, std::span<const vk::BufferCopy> copies) noexcept;
+	void                   SwitchStorage(bool windows);
 
 	bool IsBufferInvalid(BufferId id) const { return !id || m_slot_buffers[id].is_deleted; }
 	WriteFaultOwner InvalidateGuestWriteFault(uint64_t vaddr);
@@ -521,9 +535,12 @@ private:
 	static constexpr uint64_t MirrorMaxRead       = 256;
 	static constexpr uint32_t MaxMirrorLines      = 8192;
 	static constexpr uint64_t MirrorFlushLifetime = 4096;
-	void                      SubmitGuestMirror();
-	void                      TickGuestMirror();
+	void                      SubmitGuestMirror(SubmitInfo& submit);
+	void                      TickGuestMirror(bool summary_now = false);
 	std::unique_ptr<GuestMirror> m_guest_mirror;
+	bool                         m_windows             = false;
+	bool                         m_trim_mirror         = false;
+	bool                         m_trim_everything     = false;
 	uint64_t                     m_guest_mirror_line   = 0;
 	uint64_t                     m_guest_mirror_frames = 0;
 	uint64_t                     m_guest_mirror_trim   = 0;

@@ -19,9 +19,26 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr auto     BufferUsage = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc |
-                             vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eShaderDeviceAddress;
+                             vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eShaderDeviceAddress |
+                             vk::BufferUsageFlagBits::eUniformBuffer | vk::BufferUsageFlagBits::eUniformTexelBuffer |
+                             vk::BufferUsageFlagBits::eStorageTexelBuffer | vk::BufferUsageFlagBits::eIndexBuffer |
+                             vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eIndirectBuffer;
 constexpr auto     BufferFlags = vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency;
 constexpr uint64_t ProbeWaitNs = 5'000'000'000;
+
+std::atomic<VkBuffer> g_mirror_buffer {VK_NULL_HANDLE};
+PFN_vkCmdUpdateBuffer g_update_buffer = nullptr;
+
+void VKAPI_CALL UpdateOutsideMirror(VkCommandBuffer command, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size,
+                                    const void* data) {
+	if (buffer == g_mirror_buffer.load(std::memory_order_relaxed)) {
+		EXIT("[kyty-mirror] vkCmdUpdateBuffer into the mirror at 0x%" PRIx64 " (%" PRIu64
+		     " bytes): write through a stream buffer and vkCmdCopyBuffer\n",
+		     static_cast<uint64_t>(offset), static_cast<uint64_t>(size));
+	}
+	EXIT_IF(g_update_buffer == nullptr);
+	g_update_buffer(command, buffer, offset, size, data);
+}
 
 uint64_t Now() {
 	return static_cast<uint64_t>(
@@ -212,7 +229,7 @@ GuestMirror::ProbeResult GuestMirror::Probe(const GraphicContext& graphics, std:
 GuestMirror::GuestMirror(GraphicContext& graphics, std::span<const uint64_t> sizes): m_graphics(graphics) {
 	const auto probe = Probe(graphics, sizes);
 	if (probe.size == 0) {
-		m_description = fmt::format("no mirror: {}; the buffer cache works without it", probe.refusal);
+		m_description = fmt::format("no mirror: {}; the buffer cache keeps buffers of its own", probe.refusal);
 		return;
 	}
 	m_size = probe.size;
@@ -221,18 +238,26 @@ GuestMirror::GuestMirror(GraphicContext& graphics, std::span<const uint64_t> siz
 		return;
 	}
 	m_shared_queue = graphics.sparse_queue == graphics.queue;
-	m_bound.assign(((m_size >> m_block_bits) + 63) / 64, 0);
+	m_words        = ((m_size >> m_block_bits) + 63) / 64;
+	m_bound        = std::make_unique<std::atomic<uint64_t>[]>(m_words);
+	m_ready        = std::make_unique<std::atomic<uint64_t>[]>(m_words);
 	vk::PhysicalDeviceVulkan13Properties properties13 {};
 	vk::PhysicalDeviceProperties2        properties {.pNext = &properties13};
 	graphics.physical_device.getProperties2(&properties);
 	m_description = fmt::format(
 	    "sparse mirror of {} at base 0, device address 0x{:x} to 0x{:x} (probe {:.1f} ms: {}), blocks of {} KiB, {} queue of "
-	    "family {}, memory type {}{}",
+	    "family {}, memory type {}, every usage of the cache's buffers, shared with the readback family{}",
 	    Gib(m_size), m_device_address, m_device_address + m_size, probe.ms, probe.trials, BlockSize() >> 10u,
 	    m_shared_queue ? "the work" : fmt::format("its own (index {})", graphics.sparse_queue_index),
 	    graphics.sparse_family, m_memory_type,
 	    m_size > properties13.maxBufferSize ? fmt::format(", above maxBufferSize ({})", Gib(properties13.maxBufferSize))
 	                                        : std::string {});
+	auto& dispatch = VULKAN_HPP_DEFAULT_DISPATCHER;
+	if (dispatch.vkCmdUpdateBuffer != UpdateOutsideMirror) {
+		g_update_buffer            = dispatch.vkCmdUpdateBuffer;
+		dispatch.vkCmdUpdateBuffer = UpdateOutsideMirror;
+	}
+	g_mirror_buffer.store(static_cast<VkBuffer>(m_buffer), std::memory_order_relaxed);
 	m_binder = std::jthread([this](std::stop_token stop) { BinderThread(stop); });
 }
 
@@ -242,12 +267,20 @@ GuestMirror::~GuestMirror() {
 		m_changed.notify_all();
 		m_binder.join();
 	}
+	auto expected = static_cast<VkBuffer>(m_buffer);
+	if (expected != VK_NULL_HANDLE) g_mirror_buffer.compare_exchange_strong(expected, VK_NULL_HANDLE);
 	DestroyBuffer();
 }
 
 bool GuestMirror::CreateBuffer() {
-	const auto                 device = m_graphics.device;
-	const vk::BufferCreateInfo info {.flags = BufferFlags, .size = m_size, .usage = BufferUsage};
+	const auto                    device = m_graphics.device;
+	const std::array<uint32_t, 2> families {m_graphics.queue_family, m_graphics.readback_family};
+	vk::BufferCreateInfo          info {.flags = BufferFlags, .size = m_size, .usage = BufferUsage};
+	if (m_graphics.readback_family != static_cast<uint32_t>(-1) && m_graphics.readback_family != m_graphics.queue_family) {
+		info.sharingMode           = vk::SharingMode::eConcurrent;
+		info.queueFamilyIndexCount = static_cast<uint32_t>(families.size());
+		info.pQueueFamilyIndices   = families.data();
+	}
 	if (const auto made = device.createBuffer(&info, nullptr, &m_buffer); made != vk::Result::eSuccess) {
 		m_buffer      = nullptr;
 		m_description = fmt::format("no mirror: the device refused a sparse buffer of {} ({})", Gib(m_size),
@@ -258,14 +291,17 @@ bool GuestMirror::CreateBuffer() {
 	device.getBufferMemoryRequirements(m_buffer, &requirements);
 	const vk::BufferDeviceAddressInfo address_info {.buffer = m_buffer};
 	m_device_address = device.getBufferAddress(&address_info);
-	m_block_bits  = std::max<uint32_t>(
+	m_block_bits     = std::max<uint32_t>(
         MinBlockBits, static_cast<uint32_t>(std::bit_width(std::max<uint64_t>(requirements.alignment, 1)) - 1));
 	m_memory_type = PickMemoryType(m_graphics.physical_device_memory_properties, requirements.memoryTypeBits);
-	const vk::FenceCreateInfo fence_info {};
+	const vk::FenceCreateInfo         fence_info {};
+	vk::SemaphoreTypeCreateInfo       timeline {.semaphoreType = vk::SemaphoreType::eTimeline, .initialValue = 0};
+	const vk::SemaphoreCreateInfo     semaphore_info {.pNext = &timeline};
 	if (!std::has_single_bit(requirements.alignment) || m_memory_type == UINT32_MAX ||
-	    device.createFence(&fence_info, nullptr, &m_fence) != vk::Result::eSuccess) {
-		m_description = fmt::format("no mirror: page of {} bytes, memory types 0x{:x}", requirements.alignment,
-		                            requirements.memoryTypeBits);
+	    device.createFence(&fence_info, nullptr, &m_fence) != vk::Result::eSuccess ||
+	    device.createSemaphore(&semaphore_info, nullptr, &m_semaphore) != vk::Result::eSuccess) {
+		m_description = fmt::format("no mirror: page of {} bytes, memory types 0x{:x}, or no timeline semaphore",
+		                            requirements.alignment, requirements.memoryTypeBits);
 		DestroyBuffer();
 		return false;
 	}
@@ -279,25 +315,37 @@ void GuestMirror::DestroyBuffer() {
 		if (chunk.memory) device.freeMemory(chunk.memory);
 	}
 	if (m_fence) device.destroyFence(m_fence);
-	m_buffer = nullptr;
-	m_fence  = nullptr;
+	if (m_semaphore) device.destroySemaphore(m_semaphore);
+	m_buffer    = nullptr;
+	m_fence     = nullptr;
+	m_semaphore = nullptr;
 	m_chunks.clear();
-}
-
-vk::Buffer GuestMirror::Handle() {
-	return m_buffer;
 }
 
 bool GuestMirror::IsBound(uint64_t vaddr) const noexcept {
 	const auto block = vaddr >> m_block_bits;
-	return block / 64 < m_bound.size() && (m_bound[block / 64] & (uint64_t {1} << (block % 64))) != 0;
+	return block / 64 < m_words && (m_bound[block / 64].load(std::memory_order_relaxed) & (uint64_t {1} << (block % 64))) != 0;
 }
 
-void GuestMirror::SetBound(uint64_t first, uint64_t count, bool bound) noexcept {
-	for (auto block = first; block < first + count; block++) {
-		const auto bit = uint64_t {1} << (block % 64);
-		m_bound[block / 64] = bound ? (m_bound[block / 64] | bit) : (m_bound[block / 64] & ~bit);
+bool GuestMirror::AllSet(const std::atomic<uint64_t>* bits, uint64_t vaddr, uint64_t size) const noexcept {
+	if (!Holds(vaddr, size)) return false;
+	const auto first = vaddr >> m_block_bits;
+	const auto last  = (vaddr + size - 1) >> m_block_bits;
+	for (auto word = first / 64; word <= last / 64; word++) {
+		const auto low  = word == first / 64 ? first % 64 : 0;
+		const auto high = word == last / 64 ? last % 64 : 63;
+		const auto mask = (high == 63 ? ~uint64_t {0} : (uint64_t {2} << high) - 1) & ~((uint64_t {1} << low) - 1);
+		if ((bits[word].load(std::memory_order_acquire) & mask) != mask) return false;
 	}
+	return true;
+}
+
+bool GuestMirror::Requested(uint64_t vaddr, uint64_t size) const noexcept {
+	return AllSet(m_bound.get(), vaddr, size);
+}
+
+bool GuestMirror::Ready(uint64_t vaddr, uint64_t size) const noexcept {
+	return AllSet(m_ready.get(), vaddr, size);
 }
 
 void GuestMirror::NoteRange(uint64_t vaddr, uint64_t size) {
@@ -314,10 +362,12 @@ void GuestMirror::NoteRange(uint64_t vaddr, uint64_t size) {
 		last = blocks - 1;
 	}
 	for (auto block = first; block <= last; block++) {
-		auto&      word = m_bound[block / 64];
-		const auto bit  = uint64_t {1} << (block % 64);
-		if ((word & bit) != 0) continue;
-		word |= bit;
+		auto&      word  = m_bound[block / 64];
+		const auto bit   = uint64_t {1} << (block % 64);
+		const auto value = word.load(std::memory_order_relaxed);
+		if ((value & bit) != 0) continue;
+		word.store(value | bit, std::memory_order_relaxed);
+		if (m_pending.empty()) m_first_pending = Now();
 		m_pending_blocks++;
 		if (!m_pending.empty() && m_pending.back().first + m_pending.back().count == block) {
 			m_pending.back().count++;
@@ -327,49 +377,60 @@ void GuestMirror::NoteRange(uint64_t vaddr, uint64_t size) {
 	}
 }
 
-void GuestMirror::Post(Kind kind, std::vector<Run>&& runs) {
+void GuestMirror::Post(Command&& command) {
 	{
 		Common::ScopedLock lock(m_mutex);
-		if (kind == Kind::Bind && !m_commands.empty() && m_commands.back().kind == Kind::Bind) {
-			auto& queued = m_commands.back().runs;
-			queued.insert(queued.end(), runs.begin(), runs.end());
+		if (command.kind == Kind::Bind && !m_commands.empty() && m_commands.back().kind == Kind::Bind) {
+			auto& queued = m_commands.back();
+			queued.runs.insert(queued.runs.end(), command.runs.begin(), command.runs.end());
+			queued.value     = std::max(queued.value, command.value);
+			queued.requested = std::min(queued.requested, command.requested);
 		} else {
-			m_commands.push_back({kind, std::move(runs)});
+			m_commands.push_back(std::move(command));
 		}
 	}
 	m_changed.notify_all();
 }
 
-void GuestMirror::Submit() {
-	if (m_pending.empty()) return;
-	if (m_pending_blocks < FlushBlocks && Now() - m_last_post < FlushNs) return;
+GuestMirror::Wait GuestMirror::Submit() {
+	if (m_size == 0) return {};
 	Flush();
+	if (m_bind_signaled.load(std::memory_order_acquire) >= m_bind_posted) return {};
+	m_waits.fetch_add(1, std::memory_order_relaxed);
+	if (m_shared_queue) {
+		WaitBound(m_bind_posted);
+		return {};
+	}
+	return {m_semaphore, m_bind_posted};
 }
 
 void GuestMirror::Flush() {
 	if (m_pending.empty()) return;
-	m_last_post      = Now();
 	m_pending_blocks = 0;
-	Post(Kind::Bind, std::move(m_pending));
+	Post({.kind = Kind::Bind, .runs = std::move(m_pending), .value = ++m_bind_posted, .requested = m_first_pending});
 	m_pending.clear();
 }
 
-void GuestMirror::Trim(std::span<const std::pair<uint64_t, uint64_t>> live) {
+void GuestMirror::Trim(std::span<const std::pair<uint64_t, uint64_t>> live, Wait after) {
 	if (m_size == 0) return;
 	Flush();
-	std::vector<uint64_t> covered(m_bound.size(), 0);
+	std::vector<uint64_t> covered(m_words, 0);
 	const uint64_t        blocks = m_size >> m_block_bits;
 	for (const auto& [vaddr, size]: live) {
-		if (size == 0 || UINT64_MAX - vaddr < size) continue;
+		if (size == 0 || UINT64_MAX - vaddr < size || (vaddr >> m_block_bits) >= blocks) continue;
 		const auto first = vaddr >> m_block_bits;
 		const auto last  = std::min((vaddr + size - 1) >> m_block_bits, blocks - 1);
-		for (auto block = first; block <= last && block < blocks; block++) {
+		for (auto block = first; block <= last; block++) {
 			covered[block / 64] |= uint64_t {1} << (block % 64);
 		}
 	}
 	std::vector<Run> runs;
-	for (uint64_t word = 0; word < m_bound.size(); word++) {
-		const auto unused = m_bound[word] & ~covered[word];
+	for (uint64_t word = 0; word < m_words; word++) {
+		const auto bound  = m_bound[word].load(std::memory_order_relaxed);
+		const auto unused = bound & ~covered[word];
+		if (unused == 0) continue;
+		m_ready[word].fetch_and(~unused, std::memory_order_acq_rel);
+		m_bound[word].store(bound & covered[word], std::memory_order_relaxed);
 		for (auto bits = unused; bits != 0; bits &= bits - 1) {
 			const auto block = word * 64 + static_cast<uint64_t>(std::countr_zero(bits));
 			if (!runs.empty() && runs.back().first + runs.back().count == block) {
@@ -378,15 +439,22 @@ void GuestMirror::Trim(std::span<const std::pair<uint64_t, uint64_t>> live) {
 				runs.push_back({block, 1});
 			}
 		}
-		m_bound[word] &= covered[word];
 	}
-	if (!runs.empty()) Post(Kind::Unbind, std::move(runs));
+	if (!runs.empty()) Post({.kind = Kind::Unbind, .runs = std::move(runs), .after = after});
 }
 
 void GuestMirror::WaitIdle() {
 	if (m_size == 0) return;
 	Common::UniqueLock lock(m_mutex);
 	m_changed.wait(lock.Native(), [this]() KYTY_REQUIRES(m_mutex) { return m_commands.empty() && !m_busy; });
+}
+
+void GuestMirror::WaitBound(uint64_t value) {
+	if (m_size == 0) return;
+	Common::UniqueLock lock(m_mutex);
+	m_changed.wait(lock.Native(), [this, value]() KYTY_REQUIRES(m_mutex) {
+		return m_bind_signaled.load(std::memory_order_acquire) >= value;
+	});
 }
 
 void GuestMirror::BinderThread(std::stop_token stop) {
@@ -402,11 +470,12 @@ void GuestMirror::BinderThread(std::stop_token stop) {
 			m_busy = true;
 		}
 		switch (command.kind) {
-			case Kind::Bind: Bind(command.runs); break;
-			case Kind::Unbind: Unbind(command.runs); break;
+			case Kind::Bind: Bind(command); break;
+			case Kind::Unbind: Unbind(command); break;
 		}
 		{
 			Common::ScopedLock lock(m_mutex);
+			if (command.kind == Kind::Bind) m_bind_signaled.store(command.value, std::memory_order_release);
 			m_busy = false;
 		}
 		m_changed.notify_all();
@@ -450,14 +519,21 @@ GuestMirror::Grant GuestMirror::Allocate(uint64_t wanted) {
 	return Allocate(wanted);
 }
 
-void GuestMirror::Bind(const std::vector<Run>& runs) {
+void GuestMirror::Bind(const Command& command) {
 	m_binds.clear();
 	uint64_t blocks = 0;
-	for (const auto& run: runs) {
+	for (const auto& run: command.runs) {
 		auto block = run.first;
 		auto left  = run.count;
 		while (left != 0) {
-			const auto [chunk, index, count] = Allocate(left);
+			if (m_block_slots.contains(block)) {
+				block++;
+				left--;
+				continue;
+			}
+			uint64_t fresh = 1;
+			while (fresh < left && !m_block_slots.contains(block + fresh)) fresh++;
+			const auto [chunk, index, count] = Allocate(fresh);
 			m_binds.push_back({.resourceOffset = block << m_block_bits,
 			                   .size           = uint64_t {count} << m_block_bits,
 			                   .memory         = m_chunks[chunk].memory,
@@ -468,19 +544,42 @@ void GuestMirror::Bind(const std::vector<Run>& runs) {
 			blocks += count;
 		}
 	}
-	Execute(m_binds, "bind");
+	Execute(m_binds, "bind", command.value);
+	for (const auto& run: command.runs) {
+		for (auto block = run.first; block < run.first + run.count; block++) {
+			if (m_bound[block / 64].load(std::memory_order_relaxed) & (uint64_t {1} << (block % 64))) {
+				m_ready[block / 64].fetch_or(uint64_t {1} << (block % 64), std::memory_order_acq_rel);
+			}
+		}
+	}
+	if (command.requested != 0) {
+		const auto waited = Now() - command.requested;
+		m_requests.fetch_add(1, std::memory_order_relaxed);
+		m_request_ns.fetch_add(waited, std::memory_order_relaxed);
+		auto longest = m_request_longest_ns.load(std::memory_order_relaxed);
+		while (waited > longest && !m_request_longest_ns.compare_exchange_weak(longest, waited, std::memory_order_relaxed)) {
+		}
+	}
 	m_blocks.fetch_add(blocks, std::memory_order_relaxed);
 	m_bound_blocks.fetch_add(blocks, std::memory_order_relaxed);
 }
 
-void GuestMirror::Unbind(const std::vector<Run>& runs) {
+void GuestMirror::Unbind(const Command& command) {
 	m_binds.clear();
 	uint64_t blocks = 0;
-	for (const auto& run: runs) {
+	for (const auto& run: command.runs) {
 		m_binds.push_back({.resourceOffset = run.first << m_block_bits, .size = run.count << m_block_bits});
 	}
-	Execute(m_binds, "unbind");
-	for (const auto& run: runs) {
+	if (command.after.semaphore) {
+		const vk::SemaphoreWaitInfo wait {
+		    .semaphoreCount = 1, .pSemaphores = &command.after.semaphore, .pValues = &command.after.value};
+		if (const auto waited = m_graphics.device.waitSemaphores(&wait, UINT64_MAX); waited != vk::Result::eSuccess) {
+			EXIT("[kyty-mirror] waiting for tick %" PRIu64 " before an unbind failed: %s\n", command.after.value,
+			     vk::to_string(waited).c_str());
+		}
+	}
+	Execute(m_binds, "unbind", 0);
+	for (const auto& run: command.runs) {
 		for (auto block = run.first; block < run.first + run.count; block++) {
 			const auto found = m_block_slots.find(block);
 			if (found == m_block_slots.end()) continue;
@@ -511,15 +610,24 @@ void GuestMirror::Free(Slot slot) {
 	m_free_slots.push_back(slot);
 }
 
-void GuestMirror::Execute(std::vector<vk::SparseMemoryBind>& binds, const char* what) {
+void GuestMirror::Execute(std::vector<vk::SparseMemoryBind>& binds, const char* what, uint64_t signal) {
 	const auto device = m_graphics.device;
-	for (size_t begin = 0; begin < binds.size(); begin += MaxBindsPerCall) {
-		const auto                           count = std::min(MaxBindsPerCall, binds.size() - begin);
+	const auto calls  = std::max<size_t>((binds.size() + MaxBindsPerCall - 1) / MaxBindsPerCall, 1);
+	for (size_t call = 0; call < calls; call++) {
+		const auto begin = call * MaxBindsPerCall;
+		const auto count = std::min(MaxBindsPerCall, binds.size() - begin);
 		const vk::SparseBufferMemoryBindInfo buffer_bind {
 		    .buffer = m_buffer, .bindCount = static_cast<uint32_t>(count), .pBinds = binds.data() + begin};
-		const vk::BindSparseInfo info {.bufferBindCount = 1, .pBufferBinds = &buffer_bind};
-		const auto               start = Now();
-		vk::Result               result;
+		const bool                      signals = call + 1 == calls && signal != 0;
+		vk::TimelineSemaphoreSubmitInfo timeline {.signalSemaphoreValueCount = signals ? 1u : 0u,
+		                                          .pSignalSemaphoreValues    = &signal};
+		const vk::BindSparseInfo info {.pNext                = &timeline,
+		                               .bufferBindCount      = count != 0 ? 1u : 0u,
+		                               .pBufferBinds         = &buffer_bind,
+		                               .signalSemaphoreCount = signals ? 1u : 0u,
+		                               .pSignalSemaphores    = &m_semaphore};
+		const auto start = Now();
+		vk::Result result;
 		if (m_shared_queue) {
 			Common::LockGuard lock(m_graphics.queue_mutex);
 			result = m_graphics.sparse_queue.bindSparse(1, &info, m_fence);
@@ -532,10 +640,11 @@ void GuestMirror::Execute(std::vector<vk::SparseMemoryBind>& binds, const char* 
 		}
 		if (result != vk::Result::eSuccess) {
 			EXIT("[kyty-mirror] vkQueueBindSparse (%s of %zu ranges at 0x%" PRIx64 ") failed: %s\n", what, count,
-			     binds[begin].resourceOffset, vk::to_string(result).c_str());
+			     count != 0 ? binds[begin].resourceOffset : 0, vk::to_string(result).c_str());
 		}
 		(void)device.resetFences(1, &m_fence);
 		const auto done = Now();
+		if (count == 0) continue;
 		m_calls.fetch_add(1, std::memory_order_relaxed);
 		m_call_ns.fetch_add(called - start, std::memory_order_relaxed);
 		m_done_ns.fetch_add(done - start, std::memory_order_relaxed);
@@ -547,26 +656,36 @@ void GuestMirror::Execute(std::vector<vk::SparseMemoryBind>& binds, const char* 
 }
 
 GuestMirror::Stats GuestMirror::Totals() const {
-	return {.bound_blocks   = m_bound_blocks.load(std::memory_order_relaxed),
-	        .chunks         = m_chunk_count.load(std::memory_order_relaxed),
-	        .calls          = m_calls.load(std::memory_order_relaxed),
-	        .blocks         = m_blocks.load(std::memory_order_relaxed),
-	        .unbound_blocks = m_unbound_blocks.load(std::memory_order_relaxed),
-	        .call_ns        = m_call_ns.load(std::memory_order_relaxed),
-	        .done_ns        = m_done_ns.load(std::memory_order_relaxed),
-	        .longest_ns     = m_longest_ns.load(std::memory_order_relaxed)};
+	return {.bound_blocks       = m_bound_blocks.load(std::memory_order_relaxed),
+	        .chunks             = m_chunk_count.load(std::memory_order_relaxed),
+	        .calls              = m_calls.load(std::memory_order_relaxed),
+	        .blocks             = m_blocks.load(std::memory_order_relaxed),
+	        .unbound_blocks     = m_unbound_blocks.load(std::memory_order_relaxed),
+	        .call_ns            = m_call_ns.load(std::memory_order_relaxed),
+	        .done_ns            = m_done_ns.load(std::memory_order_relaxed),
+	        .longest_ns         = m_longest_ns.load(std::memory_order_relaxed),
+	        .requests           = m_requests.load(std::memory_order_relaxed),
+	        .request_ns         = m_request_ns.load(std::memory_order_relaxed),
+	        .request_longest_ns = m_request_longest_ns.load(std::memory_order_relaxed),
+	        .waits              = m_waits.load(std::memory_order_relaxed),
+	        .unbound_reads      = m_unbound_reads.load(std::memory_order_relaxed)};
 }
 
 GuestMirror::Stats GuestMirror::TakeStats() {
 	const auto totals = Totals();
 	Stats      delta  = totals;
-	delta.calls          = totals.calls - m_taken.calls;
-	delta.blocks         = totals.blocks - m_taken.blocks;
-	delta.unbound_blocks = totals.unbound_blocks - m_taken.unbound_blocks;
-	delta.call_ns        = totals.call_ns - m_taken.call_ns;
-	delta.done_ns        = totals.done_ns - m_taken.done_ns;
-	m_taken              = totals;
-	delta.longest_ns     = m_longest_ns.exchange(0, std::memory_order_relaxed);
+	delta.calls              = totals.calls - m_taken.calls;
+	delta.blocks             = totals.blocks - m_taken.blocks;
+	delta.unbound_blocks     = totals.unbound_blocks - m_taken.unbound_blocks;
+	delta.call_ns            = totals.call_ns - m_taken.call_ns;
+	delta.done_ns            = totals.done_ns - m_taken.done_ns;
+	delta.requests           = totals.requests - m_taken.requests;
+	delta.request_ns         = totals.request_ns - m_taken.request_ns;
+	delta.waits              = totals.waits - m_taken.waits;
+	delta.unbound_reads      = totals.unbound_reads - m_taken.unbound_reads;
+	m_taken                  = totals;
+	delta.longest_ns         = m_longest_ns.exchange(0, std::memory_order_relaxed);
+	delta.request_longest_ns = m_request_longest_ns.exchange(0, std::memory_order_relaxed);
 	return delta;
 }
 

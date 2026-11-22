@@ -77,7 +77,7 @@ public:
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
 	[[nodiscard]] HostCopyQueue* HostCopies() noexcept { return m_host_copies.get(); }
-	using SubmitHook = void (*)(void* userdata, CommandBuffer& command);
+	using SubmitHook = void (*)(void* userdata, CommandBuffer& command, SubmitInfo& submit);
 	void SetSubmitHook(SubmitHook hook, void* userdata) noexcept {
 		m_submit_hook      = hook;
 		m_submit_hook_data = userdata;

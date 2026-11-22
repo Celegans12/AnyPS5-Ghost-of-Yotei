@@ -37,12 +37,19 @@ inline constexpr vk::BufferUsageFlags ReadFlags =
 inline constexpr vk::BufferUsageFlags AllFlags =
     ReadFlags | vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eStorageBuffer;
 
+struct MirrorWindow {
+	vk::Buffer        buffer  = nullptr;
+	vk::DeviceAddress address = 0;
+};
+
 class Buffer {
 public:
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
 	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size);
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address, uint64_t size,
 	       vk::Buffer imported, vk::DeviceAddress device_address);
+	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address, uint64_t size,
+	       MirrorWindow mirror);
 	~Buffer();
 	KYTY_CLASS_NO_COPY(Buffer);
 
@@ -55,13 +62,22 @@ public:
 #endif
 	[[nodiscard]] MemoryUsage        Usage() const noexcept { return m_usage; }
 	[[nodiscard]] bool               InPlace() const noexcept { return m_in_place; }
+	[[nodiscard]] bool               IsWindow() const noexcept { return m_window; }
 	[[nodiscard]] uint64_t           CpuAddress() const noexcept { return m_cpu_address; }
+	[[nodiscard]] uint64_t           HandleOffset() const noexcept { return m_handle_offset; }
+	[[nodiscard]] uint64_t           HandleOrigin() const noexcept { return m_cpu_address - m_handle_offset; }
 	[[nodiscard]] vk::DeviceAddress  BufferDeviceAddress() const noexcept {
 		EXIT_IF(m_device_address == 0);
 		return m_device_address;
 	}
 	[[nodiscard]] uint64_t           Offset(uint64_t address) const noexcept {
-		return address - m_cpu_address;
+		return address - m_cpu_address + m_handle_offset;
+	}
+	[[nodiscard]] bool HoldsOffsets(uint64_t offset, uint64_t size) const noexcept {
+		return offset >= m_handle_offset && size <= Size() && offset - m_handle_offset <= Size() - size;
+	}
+	[[nodiscard]] uint64_t Capacity(uint64_t offset) const noexcept {
+		return HoldsOffsets(offset, 0) ? Size() - (offset - m_handle_offset) : 0;
 	}
 	[[nodiscard]] bool IsInBounds(uint64_t address, uint64_t size) const noexcept {
 		return address >= m_cpu_address && size <= Size() &&
@@ -94,12 +110,14 @@ private:
 	CommandScheduler*             m_scheduler   = nullptr;
 	MemoryUsage                   m_usage       = MemoryUsage::DeviceLocal;
 	uint64_t                      m_cpu_address = 0;
+	uint64_t                      m_handle_offset = 0;
 	vk::DeviceAddress             m_device_address = 0;
 	vk::Buffer                    m_buffer     = nullptr;
 	VmaAllocation                 m_allocation = nullptr;
 	uint64_t                      m_size;
 	bool                          m_coherent = false;
 	bool                          m_in_place = false;
+	bool                          m_window   = false;
 #if defined(ANYPS5_KYTY)
 	bool                          m_device_local = false;
 #endif

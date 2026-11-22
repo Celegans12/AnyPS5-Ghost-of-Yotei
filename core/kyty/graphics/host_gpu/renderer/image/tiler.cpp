@@ -418,8 +418,7 @@ bool TileManager::TileThroughDevice(vk::Buffer linear, uint64_t linear_offset,
                                     uint64_t linear_capacity, const Buffer& tiled,
                                     uint64_t tiled_offset, uint64_t tiled_capacity,
                                     const ImageInfo& info, uint32_t levels) {
-	EXIT_IF(tiled_capacity == 0 || tiled_offset > tiled.Size() ||
-	        tiled_capacity > tiled.Size() - tiled_offset);
+	EXIT_IF(tiled_capacity == 0 || !tiled.HoldsOffsets(tiled_offset, tiled_capacity));
 	const auto  staging = GetScratchBuffer(tiled_capacity, linear);
 	const auto& owner =
 	    *m_scratch[m_scratch[0] && m_scratch[0]->Handle() == staging.buffer ? 0 : 1];
