@@ -70,6 +70,10 @@ struct GraphicContext {
 	vk::Queue                          queue        = nullptr;
 	vk::Queue                          readback_queue  = nullptr;
 	uint32_t                           readback_family = static_cast<uint32_t>(-1);
+	bool                               sparse_buffers_enabled = false;
+	vk::Queue                          sparse_queue           = nullptr;
+	uint32_t                           sparse_family          = static_cast<uint32_t>(-1);
+	uint32_t                           sparse_queue_index     = 0;
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;
