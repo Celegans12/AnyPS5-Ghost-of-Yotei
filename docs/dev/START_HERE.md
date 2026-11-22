@@ -91,7 +91,7 @@ python3 tools/check_conventions.py --base origin/AnyKyty
 python3 tools/check_kyty_settings.py
 ```
 
-The first checks commit subjects, comments in code, file types and paths, links in Markdown; the second checks that every `KYTY_*` setting the code reads has its row in [THIRD_PARTY_KYTY.md](THIRD_PARTY_KYTY.md#settings-of-the-kyty-build). A new test goes in `KytyShim/tests/` with its registration in that folder's `CMakeLists.txt`, and finishes in 30 s.
+The first checks commit subjects, comments in code, file types and paths, links in Markdown; the second checks that every `KYTY_*` setting the code reads has its row in [THIRD_PARTY_KYTY.md](THIRD_PARTY_KYTY.md#settings-of-the-kyty-build) and its name in the list of `KytyShim/src/Settings.cpp`. A new test goes in `KytyShim/tests/` with its registration in that folder's `CMakeLists.txt`, and finishes in 30 s.
 
 ## Measure
 
