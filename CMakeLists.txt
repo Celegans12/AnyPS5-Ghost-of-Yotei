@@ -504,9 +504,6 @@ if(BUILD_TESTING)
                 ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_conventions_comments.py --shard ${shard}/12)
             set_tests_properties(${conventions_test_name} PROPERTIES TIMEOUT 120)
         endforeach()
-        add_test(NAME performance_csv COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_performance_csv.py)
-        set_tests_properties(performance_csv PROPERTIES TIMEOUT 20)
         add_test(NAME performance_bisect COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_performance_bisect.py)
         set_tests_properties(performance_bisect PROPERTIES TIMEOUT 20)
@@ -885,15 +882,6 @@ if(BUILD_TESTING)
         add_test(NAME conventions_alignment COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_conventions_alignment.py)
         set_tests_properties(conventions_alignment PROPERTIES TIMEOUT 20)
-        add_test(NAME tools_intervals_complete COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_intervals_complete.py)
-        set_tests_properties(tools_intervals_complete PROPERTIES TIMEOUT 20)
-        add_test(NAME trace_intervals_csv COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_trace_intervals_csv.py)
-        set_tests_properties(trace_intervals_csv PROPERTIES TIMEOUT 20)
-        add_test(NAME trace_timeline COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_trace_timeline.py)
-        set_tests_properties(trace_timeline PROPERTIES TIMEOUT 60)
         set(trace_digest_test_source "${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_trace_digest.py")
         set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${trace_digest_test_source}")
         file(STRINGS "${trace_digest_test_source}" trace_digest_cases REGEX "^class |^    def test_")

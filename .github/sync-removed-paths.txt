@@ -64,3 +64,10 @@ docs/dev/debt/shader.md
 tools/agc_test_split.py
 tools/tests/test_agc_test_split.py
 tools/tests/test_shader_cache_runtime_sources.py
+tools/trace_timeline.py
+tools/trace_intervals_csv.py
+tools/performance_csv.py
+tools/tests/test_trace_timeline.py
+tools/tests/test_trace_intervals_csv.py
+tools/tests/test_intervals_complete.py
+tools/tests/test_performance_csv.py

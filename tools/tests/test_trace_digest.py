@@ -1623,7 +1623,7 @@ class IntervalSchemaTests(unittest.TestCase):
             record = interval_line(0, 1, 20, 1)
             del record[field]
             self.write(record)
-            for script in (trace_digest.__file__, Path(trace_digest.__file__).with_name("trace_intervals_csv.py")):
+            for script in (trace_digest.__file__,):
                 with self.subTest(field=field, script=script):
                     result = subprocess.run([sys.executable, str(script), str(self.path)],
                                             capture_output=True, text=True, encoding="utf-8", timeout=10)
@@ -1635,7 +1635,7 @@ class IntervalSchemaTests(unittest.TestCase):
         for frames in (dict(p50=2, p90=1, p99=3, max=4), dict(p50=1, p90=3, p99=2, max=4),
                        dict(p50=1, p90=2, p99=4, max=3)):
             self.write(interval_line(0, 1, 20, 1, frame_ms=frames))
-            for script in (trace_digest.__file__, Path(trace_digest.__file__).with_name("trace_intervals_csv.py")):
+            for script in (trace_digest.__file__,):
                 with self.subTest(frames=frames, script=script):
                     result = subprocess.run([sys.executable, str(script), str(self.path)],
                                             capture_output=True, text=True, encoding="utf-8", timeout=10)
