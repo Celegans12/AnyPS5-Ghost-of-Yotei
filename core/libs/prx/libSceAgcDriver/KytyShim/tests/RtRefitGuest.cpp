@@ -82,7 +82,7 @@ void KeepsEverythingInside() {
 
 }
 
-int main() {
+extern "C" int RunKytyRtRefitGuestTest() {
     DropsOutsideGuest();
     KeepsEverythingInside();
     using Libs::Graphics::RayTracingTestAccess;

@@ -283,7 +283,7 @@ void AtomicBitsLoseNoConcurrentWrite() {
 
 }
 
-int main() {
+extern "C" int RunKytyWriteFaultTrackingTest() {
 	UncontendedLockCountsNothing();
 	ContentionIsCountedPerFamily();
 	PageManager   pages;
