@@ -34,14 +34,14 @@ void Require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
 }
 
-template <class T>
-T Checked(vk::ResultValue<T> result, const char* what) {
-    Require(result.result == vk::Result::eSuccess, std::string(what) + " failed: " + vk::to_string(result.result));
-    return std::move(result.value);
+void Checked(vk::Result result, const char* what) {
+    if (result != vk::Result::eSuccess) throw std::runtime_error(std::string(what) + " failed: " + vk::to_string(result));
 }
 
-void Checked(vk::Result result, const char* what) {
-    Require(result == vk::Result::eSuccess, std::string(what) + " failed: " + vk::to_string(result));
+template <class T>
+T Checked(vk::ResultValue<T> result, const char* what) {
+    Checked(result.result, what);
+    return std::move(result.value);
 }
 
 std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t bytes) {
@@ -414,9 +414,12 @@ std::vector<std::uint32_t> Device::Run(const Kernel& kernel, const Program& prog
     const auto module = Compile(kernel, program, threads, host_subgroup, s.profile, user_data);
     const bool fixed = s.min_subgroup == host_subgroup && s.max_subgroup == host_subgroup;
     if (!module.lane_local && !enforced && !fixed) {
+        const auto widths = s.min_subgroup == s.max_subgroup
+                                ? std::to_string(s.min_subgroup)
+                                : std::to_string(s.min_subgroup) + " to " + std::to_string(s.max_subgroup);
         throw NotLaneLocal("the program is not lane-local and the device cannot run it on " + std::to_string(host_subgroup) +
-                           "-lane subgroups: its subgroups hold " + std::to_string(s.min_subgroup) + " to " +
-                           std::to_string(s.max_subgroup) + " lanes" + (s.subgroup_control ? "" : " and their size cannot be chosen"));
+                           "-lane subgroups: its subgroups hold " + widths + " lanes" +
+                           (s.subgroup_control ? "" : " and their size cannot be chosen"));
     }
 
     const auto& layout = module.info.bindings;
