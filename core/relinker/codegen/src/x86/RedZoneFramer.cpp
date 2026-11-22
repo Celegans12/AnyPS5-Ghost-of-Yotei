@@ -601,7 +601,7 @@ void frameSegment(
         const auto start = static_cast<std::size_t>(function.Begin - ph.MappedAddress);
         const auto limit = static_cast<std::size_t>(function.End - ph.MappedAddress);
         const auto nextSpan = std::upper_bound(functionBegins.begin(), functionBegins.end(), function.Begin);
-        const auto nextBegin = nextSpan == functionBegins.end() ? std::numeric_limits<std::uint64_t>::max() : *nextSpan;
+        const auto nextLimit = nextSpan == functionBegins.end() ? std::numeric_limits<std::size_t>::max() : static_cast<std::size_t>(*nextSpan - ph.MappedAddress);
         ++report.Functions;
         const auto skip = [&](const char* reason, const char* first = nullptr) {
             ++report.Skipped[reason];
@@ -612,6 +612,7 @@ void frameSegment(
         std::vector<std::uint8_t> code(seg.begin() + static_cast<std::ptrdiff_t>(start), seg.begin() + static_cast<std::ptrdiff_t>(codeEnd));
         code.resize(code.size() + 15, 0xcc);
         std::vector<Insn> body;
+        bool invalid = false;
         for (const auto& match : scanner->ScanCodeSection(code, 0, code.size())) {
             const auto address = start + static_cast<std::size_t>(match.Offset);
             if (address >= limit) break;
@@ -624,15 +625,16 @@ void frameSegment(
                                         info.FlowKind == ControlFlowKind::Return ||
                                         info.FlowKind == ControlFlowKind::Trap;
                 const bool tls = info.HasMemoryOperand && (info.SegmentPrefix == 0x64 || info.SegmentPrefix == 0x65);
-                if (!terminator || tls || address + match.Length > nextBegin) {
+                if (!terminator || tls || address + match.Length > nextLimit) {
                     skip("instruction crosses the range end");
-                    continue;
+                    invalid = true;
+                    break;
                 }
             }
             body.push_back({address, match.Length, info});
             if (crossing) break;
         }
-        if (body.size() < 3) continue;
+        if (invalid || body.size() < 3) continue;
         const auto at = [&](const std::size_t k) { return seg.data() + body[k].Offset; };
         std::map<std::size_t, std::size_t> indexOf;
         for (std::size_t k = 0; k < body.size(); ++k) indexOf[body[k].Offset] = k;
