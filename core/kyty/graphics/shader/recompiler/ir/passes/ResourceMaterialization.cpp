@@ -3288,7 +3288,8 @@ FormedView FormView(const BufferResource& buffer, uint32_t element, std::span<co
 	}
 	view.serves        = element != 0u && records != UINT32_MAX &&
 	              !(view.stride != 0u && (words[1] >> 31u) != 0u) && ((words[3] >> 23u) & 1u) == 0u &&
-	              view.base % element == 0u && (!buffer.written || view.bytes % 4u == 0u) && view.base < limit &&
+	              view.base % std::min(element, 4u) == 0u && (!buffer.written || view.bytes % 4u == 0u) &&
+	              view.bytes < (uint64_t {1} << 32u) - 16u && view.base < limit &&
 	              view.bytes <= limit - view.base;
 	return view;
 }

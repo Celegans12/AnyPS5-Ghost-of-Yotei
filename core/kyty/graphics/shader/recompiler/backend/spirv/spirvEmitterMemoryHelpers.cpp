@@ -289,8 +289,8 @@ static FormedSlot EmitFormedView(EmitterState& state, const IR::BufferResource& 
 	auto miss = either(is(records, UINT32_MAX),
 	                   Binary(state, spv::OpLogicalAnd, boolean, strided, is(bits(words[1], 31u, 1u), 1u)));
 	miss      = either(miss, is(bits(words[3], 23u, 1u), 1u));
-	miss      = either(miss, low_bits(base, element - 1u));
-	miss      = either(miss, low_bits(bytes, 0xffffffff00000000ull));
+	miss      = either(miss, low_bits(base, std::min(element, 4u) - 1u));
+	miss      = either(miss, low_bits(Binary(state, spv::OpIAdd, u64, bytes, ConstantU64(state, 16u)), 0xffffffff00000000ull));
 	if (buffer.written) miss = either(miss, low_bits(bytes, 3u));
 	miss      = either(miss, Binary(state, spv::OpUGreaterThan, boolean, end, size));
 	miss      = Binary(state, spv::OpLogicalAnd, boolean, miss, Unary(state, spv::OpLogicalNot, boolean, empty));
@@ -299,9 +299,13 @@ static FormedSlot EmitFormedView(EmitterState& state, const IR::BufferResource& 
 	state.formed_bases[slot]  = base;
 	state.formed_bytes[slot]  = bytes;
 	state.formed_misses[slot] = miss;
-	return {.view  = base,
-	        .range = Select(state, u32, either(empty, miss), zero, Unary(state, spv::OpUConvert, u32, bytes)),
-	        .word  = Binary(state, spv::OpBitwiseOr, u32, Binary(state, spv::OpShiftLeftLogical, u32, stride, ConstantU32(state, 8u)),
+	const auto adjustment = Unary(state, spv::OpUConvert, u32, Binary(state, spv::OpBitwiseAnd, u64, base, ConstantU64(state, 15u)));
+	return {.view  = Binary(state, spv::OpBitwiseAnd, u64, base, ConstantU64(state, ~uint64_t {15})),
+	        .range = Select(state, u32, either(empty, miss), zero,
+	                        Binary(state, spv::OpIAdd, u32, Unary(state, spv::OpUConvert, u32, bytes), adjustment)),
+	        .word  = Binary(state, spv::OpBitwiseOr, u32,
+	                        Binary(state, spv::OpBitwiseOr, u32, adjustment,
+	                               Binary(state, spv::OpShiftLeftLogical, u32, stride, ConstantU32(state, 8u))),
 	                        Select(state, u32, none, ConstantU32(state, 1u << 31u), zero))};
 }
 

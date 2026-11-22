@@ -42,14 +42,17 @@ constexpr std::uint32_t SwizzleXyzw = 0xfacu;
 constexpr std::uint32_t EndProgram = 0xbf810000;
 constexpr std::uint32_t WaitAll = 0xbf8c0000;
 constexpr std::uint32_t LaneTimes4 = 0x34020082;
+constexpr std::uint32_t LaneTimes8 = 0x34020083;
 constexpr std::string_view BuildLine = "[kyty-variant] build stage=CS";
 constexpr std::string_view CheckedLine = "[kyty-e2f] view log checked";
 
-enum Program : std::uint32_t { Copy, Formed, ProgramCount };
+enum Program : std::uint32_t { Copy, Formed, FormedPair, ProgramCount };
 
 const std::array<std::vector<std::uint32_t>, ProgramCount> Programs{{
     {LaneTimes4, 0xe0301000, 0x80000201, WaitAll, 0xe0701000, 0x80010201, EndProgram},
     {0xf4080200, 0xfa000000, LaneTimes4, WaitAll, 0xe0301000, 0x80020201, WaitAll, 0xe0701000, 0x80010201, 0xe0701080,
+     0x80020201, EndProgram},
+    {0xf4080200, 0xfa000000, LaneTimes8, WaitAll, 0xe0345000, 0x80020201, WaitAll, 0xe0741000, 0x80010201, 0xe0745100,
      0x80020201, EndProgram},
 }};
 
@@ -72,6 +75,8 @@ struct Case {
     Sharp sharp;
     bool formed = false;
     std::string view;
+    Program program = Formed;
+    std::uint64_t reader = 0;
 };
 
 std::string hex(std::uint64_t value) {
@@ -89,10 +94,14 @@ std::vector<Case> cases() {
         {sharp(Views + 3 * ViewStride, {.records = 0x100, .type = 1}), true, view(0, 0)},
         {sharp(Views + 4 * ViewStride + 2u, {.records = 0x100}), false, view(Views + 4 * ViewStride + 2u, 0x100)},
         {sharp(Views + 5 * ViewStride, {.records = UINT32_MAX}), false, " 0:" + hex(Views + 5 * ViewStride) + "+0xffffffff"},
+        {sharp(Views + 6 * ViewStride + 4u, {.records = 0x200}), true, view(Views + 6 * ViewStride + 4u, 0x200), FormedPair,
+         Views + 6 * ViewStride + 4u + 0x100u},
+        {sharp(Views + 8 * ViewStride, {.records = 0x200}), true, view(Views + 8 * ViewStride, 0x200), FormedPair,
+         Views + 8 * ViewStride + 0x100u},
     };
 }
 
-constexpr std::uint32_t Height = 12;
+constexpr std::uint32_t Height = 16;
 
 std::uint32_t low(std::uint64_t address) {
     return static_cast<std::uint32_t>(address >> 8u);
@@ -132,12 +141,12 @@ std::vector<std::uint32_t> dispatchWords() {
         const auto table = Tables + index * 16u;
         dispatch(words, Copy, pair(sharp(Sources + index * 16u, {.records = 16}), sharp(table, {.records = 16})));
         const auto target = sharp(Output + 2u * index * Row, {.records = Row});
-        dispatch(words, Formed,
+        dispatch(words, list[index].program,
                  {static_cast<std::uint32_t>(table), static_cast<std::uint32_t>(table >> 32u), 0u, 0u, target[0],
                   target[1], target[2], target[3]});
+        const auto reader = list[index].reader != 0 ? list[index].reader : Views + index * ViewStride + 0x80u;
         dispatch(words, Copy,
-                 pair(sharp(Views + index * ViewStride + 0x80u, {.records = 0x80}),
-                      sharp(Output + (2u * index + 1u) * Row, {.records = Row})));
+                 pair(sharp(reader, {.records = 0x80}), sharp(Output + (2u * index + 1u) * Row, {.records = Row})));
     }
     return words;
 }
