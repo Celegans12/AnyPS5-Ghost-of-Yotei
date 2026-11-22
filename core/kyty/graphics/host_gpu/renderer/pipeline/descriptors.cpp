@@ -2871,6 +2871,11 @@ struct FormedCounters {
 	std::atomic<uint64_t> around_reads {0};
 	std::atomic<uint64_t> fault_reads {0};
 	std::atomic<uint64_t> fallbacks {0};
+	std::atomic<uint64_t> refused_size {0};
+	std::atomic<uint64_t> refused_shape {0};
+	std::atomic<uint64_t> refused_range {0};
+	std::atomic<uint64_t> refused_clamp {0};
+	std::atomic<uint64_t> refused_slot {0};
 	std::atomic<uint64_t> entries {0};
 	std::atomic<uint64_t> waits {0};
 };
@@ -2917,25 +2922,30 @@ bool RenderExecutor::PrepareFormedViews(const ShaderStageRuntime& stage, uint64_
 	const auto& program = stage.module->info;
 	const auto  limit   = ShaderRecompiler::IR::MirrorSize();
 	const auto  range   = m_context.GetGraphics().GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
-	if (waves == 0 || limit == 0 || waves * snapshot.gpu_formed.size() > ViewLogBytes / ViewLog::EntryBytes / 4u) {
+	const auto refuse = [](std::atomic<uint64_t>& reason) {
+		reason.fetch_add(1, std::memory_order_relaxed);
 		return false;
+	};
+	if (waves == 0 || limit == 0 || waves * snapshot.gpu_formed.size() > ViewLogBytes / ViewLog::EntryBytes / 4u) {
+		return refuse(g_formed.refused_size);
 	}
 	for (const auto& formed: snapshot.gpu_formed) {
-		if (formed.resource >= program.info.buffers.size()) return false;
+		if (formed.resource >= program.info.buffers.size()) return refuse(g_formed.refused_slot);
 		const auto& resource = program.info.buffers[formed.resource];
+		if (!resource.live) continue;
 		if (resource.mirror_index == UINT32_MAX || !ShaderRecompiler::IR::IsGpuFormedBuffer(resource.packed_stride)) {
-			return false;
+			return refuse(g_formed.refused_slot);
 		}
 		FormedRead read {.resource = formed.resource, .address = formed.address};
 		ReadFormedWords(formed.address, read.words);
 		read.view = ShaderRecompiler::IR::FormView(resource, formed.element, read.words, limit);
-		if (!read.view.serves) return false;
+		if (!read.view.serves) return refuse(g_formed.refused_shape);
 		if (read.view.base != 0 && read.view.bytes != 0) {
-			if (read.view.bytes > range) return false;
+			if (read.view.bytes > range) return refuse(g_formed.refused_range);
 			if (read.view.bytes >= BufferMapCheckFloor(read.view.base, read.view.bytes) &&
 			    (!Libs::LibKernel::Memory::IsFullyMapped(read.view.base, 1) ||
 			     Libs::LibKernel::Memory::ClampRangeSize(read.view.base, read.view.bytes) != read.view.bytes)) {
-				return false;
+				return refuse(g_formed.refused_clamp);
 			}
 		}
 		m_formed_reads.push_back(read);
@@ -3011,10 +3021,12 @@ void RenderExecutor::LogFormedSummary() {
 	const auto stats = m_view_log != nullptr ? m_view_log->TakeStats() : ViewLog::Stats {};
 	Log::WriteToConsoleAndLog(fmt::format(
 	    "[kyty-e2f] gpu-formed dispatches {} views {} entries {} (waits {}), cpu-known formed views {}, record-time V# "
-	    "reads clean {} mirror-lines {} readback {}, fallbacks {}; view log segments checked {} logged {} distinct {} "
-	    "expected {} matched {} missing {} extra {} overflow {} form-miss {}\n",
+	    "reads clean {} mirror-lines {} readback {}, fallbacks {} (size {}, slot {}, shape {}, range {}, clamp {}); view "
+	    "log segments checked {} logged {} distinct {} expected {} matched {} missing {} extra {} overflow {} form-miss {}\n",
 	    dispatches, take(g_formed.views), take(g_formed.entries), take(g_formed.waits), known, take(g_formed.clean_reads),
-	    take(g_formed.around_reads), take(g_formed.fault_reads), fallbacks, stats.checked, stats.logged, stats.distinct,
+	    take(g_formed.around_reads), take(g_formed.fault_reads), fallbacks, take(g_formed.refused_size),
+	    take(g_formed.refused_slot), take(g_formed.refused_shape), take(g_formed.refused_range),
+	    take(g_formed.refused_clamp), stats.checked, stats.logged, stats.distinct,
 	    stats.expected, stats.matched, stats.missing, stats.extra, stats.overflow, stats.misses));
 	if (m_view_log != nullptr) {
 		for (const auto& report: m_view_log->TakeReports()) {
@@ -3097,7 +3109,8 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared, uint64_t invocati
 		const auto& resource = program.info.buffers[i];
 		if (resource.mirror_index == UINT32_MAX || resource.mirror_index >= prepared.mirror_sources.size()) continue;
 		const auto dword = layout.MirrorDword() + layout.MirrorSlotDwords() * resource.mirror_index;
-		if (std::ranges::any_of(snapshot.gpu_formed, [&](const auto& formed) { return formed.resource == i; })) {
+		if (resource.live &&
+		    std::ranges::any_of(snapshot.gpu_formed, [&](const auto& formed) { return formed.resource == i; })) {
 			const auto read = std::ranges::find(m_formed_reads, i, &FormedRead::resource);
 			if (read == m_formed_reads.end() || !ShaderRecompiler::IR::IsGpuFormedBuffer(resource.packed_stride)) {
 				EXIT("GPU-formed buffer %u of shader 0x%016" PRIx64 " has no record-time view\n", i,
