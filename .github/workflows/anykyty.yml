@@ -70,22 +70,10 @@ jobs:
         run: python3 -I tools/check_kyty_settings.py
 
   linux:
-    name: Linux ${{ matrix.name }}
+    name: Linux kyty
     if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: normal
-            backend: anyps5
-            testing: 'OFF'
-            targets: libs relinker agc_frame_replay
-          - name: kyty
-            backend: kyty
-            testing: 'ON'
-            targets: kyty_gpu libs relinker kyty_rt_probe agc_frame_replay agc_frame_replay_inspection_tests
     steps:
       - uses: actions/checkout@v7
         with:
@@ -117,22 +105,18 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: ${{ runner.temp }}/apt-archives
-          key: apt-${{ runner.os }}-${{ matrix.backend }}-${{ hashFiles('.github/workflows/anykyty.yml') }}
-          restore-keys: apt-${{ runner.os }}-${{ matrix.backend }}-
+          key: apt-${{ runner.os }}-kyty-${{ hashFiles('.github/workflows/anykyty.yml') }}
+          restore-keys: apt-${{ runner.os }}-kyty-
       - name: Install the build dependencies
-        env:
-          BACKEND: ${{ matrix.backend }}
         run: |
           packages=(gcc-14 g++-14 ninja-build pkg-config ccache
             libx11-dev libxext-dev libxrandr-dev libxkbcommon-dev libwayland-dev libegl-dev libdecor-0-dev
             libxcursor-dev libxi-dev libxfixes-dev libxinerama-dev libxss-dev libxxf86vm-dev libudev-dev libdrm-dev libgbm-dev
             libasound2-dev libpulse-dev libpipewire-0.3-dev libvulkan1 libvulkan-dev mesa-vulkan-drivers)
-          if [ "$BACKEND" = kyty ]; then
-            sudo curl -fsSL --retry 3 -o /etc/apt/trusted.gpg.d/apt.llvm.org.asc https://apt.llvm.org/llvm-snapshot.gpg.key
-            echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list
-            packages+=(clang-21 lld-21 llvm-21)
-            echo /usr/lib/llvm-21/bin >> "$GITHUB_PATH"
-          fi
+          sudo curl -fsSL --retry 3 -o /etc/apt/trusted.gpg.d/apt.llvm.org.asc https://apt.llvm.org/llvm-snapshot.gpg.key
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list
+          packages+=(clang-21 lld-21 llvm-21)
+          echo /usr/lib/llvm-21/bin >> "$GITHUB_PATH"
           mkdir -p "$RUNNER_TEMP/apt-archives/partial"
           apt=(sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o Dir::Cache::Archives="$RUNNER_TEMP/apt-archives" -o APT::Keep-Downloaded-Packages=true)
           start=$SECONDS
@@ -150,20 +134,17 @@ jobs:
           path: ${{ runner.temp }}/apt-archives
           key: ${{ steps.apt-cache.outputs.cache-primary-key }}
       - name: Show the toolchain
-        env:
-          BACKEND: ${{ matrix.backend }}
         run: |
           g++-14 --version | head -1
           cmake --version | head -1
-          if [ "$BACKEND" = kyty ]; then command -v clang++; clang++ --version | head -1; ld.lld --version; "$(clang++ -print-prog-name=llvm-profdata)" --version | head -2; fi
+          command -v clang++; clang++ --version | head -1; ld.lld --version; "$(clang++ -print-prog-name=llvm-profdata)" --version | head -2
       - name: Check the age of the Kyty PGO profile
-        if: matrix.backend == 'kyty'
         run: |
           python3 -I tools/kyty_pgo.py check || echo "The Kyty PGO profile is older than the sources listed above; the report after the build says which hot functions lost their counts."
       - id: ccache
         uses: hendrikmuhs/ccache-action@v1.2.24
         with:
-          key: linux-${{ matrix.name }}
+          key: linux-kyty
           max-size: 3G
           evict-old-files: job
       - id: ffmpeg-cache
@@ -172,16 +153,11 @@ jobs:
           path: build/externals
           key: ffmpeg-${{ runner.os }}-${{ steps.submodules.outputs.ffmpeg }}
       - name: Configure
-        env:
-          BACKEND: ${{ matrix.backend }}
-          TESTING: ${{ matrix.testing }}
         run: |
-          options=()
-          if [ "$BACKEND" = kyty ]; then options+=(-DANYPS5_KYTY_JOBS="$(nproc)"); fi
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING="$TESTING" \
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
             -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-            -DANYPS5_GPU_BACKEND="$BACKEND" "${options[@]}"
+            -DANYPS5_KYTY_JOBS="$(nproc)"
       - if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         continue-on-error: true
@@ -189,33 +165,26 @@ jobs:
           path: build/externals
           key: ${{ steps.ffmpeg-cache.outputs.cache-primary-key }}
       - name: Build
-        env:
-          TARGETS: ${{ matrix.targets }}
-          TESTING: ${{ matrix.testing }}
         run: |
-          read -ra targets <<< "$TARGETS"
-          if [ "$TESTING" = ON ]; then
-            mapfile -t tests < <(ninja -C build -t targets all | grep -oE '^(kyty_shim_[A-Za-z0-9_]+_tests|guest_gpu_fault_tests|guest_host_write_filter_tests|agc_kyty_shaders_tests):' | tr -d ':' | sort -u)
-            echo "Shim test targets: ${tests[*]}"
-            targets+=("${tests[@]}")
-          fi
+          targets=(kyty_gpu libs relinker kyty_rt_probe agc_frame_replay agc_frame_replay_inspection_tests)
+          mapfile -t tests < <(ninja -C build -t targets all | grep -oE '^(kyty_shim_[A-Za-z0-9_]+_tests|guest_gpu_fault_tests|guest_host_write_filter_tests|agc_kyty_shaders_tests):' | tr -d ':' | sort -u)
+          echo "Shim test targets: ${tests[*]}"
+          targets+=("${tests[@]}")
           set -o pipefail
           cmake --build build --target "${targets[@]}" --parallel "$(nproc)" 2>&1 | tee "$RUNNER_TEMP/build.log"
       - name: Report the Kyty functions that lost their PGO counts
-        if: always() && matrix.backend == 'kyty'
+        if: always()
         run: |
           if [ -s "$RUNNER_TEMP/build.log" ]; then
             python3 -I tools/kyty_pgo.py report --annotate --summary "$GITHUB_STEP_SUMMARY" "$RUNNER_TEMP/build.log"
           fi
       - name: Run the shim tests
-        if: matrix.testing == 'ON'
         run: |
           echo "core_pattern was $(cat /proc/sys/kernel/core_pattern), core limit $(ulimit -c)"
           sudo sysctl -w vm.unprivileged_userfaultfd=1 vm.max_map_count=2147483642 kernel.core_pattern=core
           ulimit -c 0
           ctest --test-dir build -R '^(kyty_shim_.*|guest_gpu_fault|guest_host_write_filter|agc_kyty_shaders)$' --output-on-failure --timeout 300 --no-tests=error
       - name: Run the replay tool tests
-        if: matrix.backend == 'kyty'
         run: |
           for test in $KYTY_REPLAY_TESTS; do
             ctest --test-dir build -R "^${test}$" --output-on-failure --no-tests=error
@@ -319,7 +288,7 @@ jobs:
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_TESTING=ON \
             -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-            -DANYPS5_GPU_BACKEND=kyty -DANYPS5_KYTY_JOBS="$(nproc)" -DANYPS5_KYTY_PGO= \
+            -DANYPS5_KYTY_JOBS="$(nproc)" -DANYPS5_KYTY_PGO= \
             "-D$OPTION=ON"
       - if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
@@ -456,7 +425,7 @@ jobs:
           key: ffmpeg-${{ runner.os }}-winlibs-${{ env.WINLIBS_ZIP }}-${{ steps.submodules.outputs.ffmpeg }}
       - name: Configure
         shell: cmd
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DANYPS5_GPU_BACKEND=kyty -DANYPS5_KYTY_JOBS=%NUMBER_OF_PROCESSORS%
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DANYPS5_KYTY_JOBS=%NUMBER_OF_PROCESSORS%
       - if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         continue-on-error: true

@@ -85,7 +85,7 @@ jobs:
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
             -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-            -DANYPS5_GPU_BACKEND=kyty -DANYPS5_KYTY_JOBS="$(nproc)" -DANYPS5_VIDEO_OUT_TEST_DRIVER=offscreen
+            -DANYPS5_KYTY_JOBS="$(nproc)" -DANYPS5_VIDEO_OUT_TEST_DRIVER=offscreen
       - if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         continue-on-error: true

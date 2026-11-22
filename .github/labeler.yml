@@ -2,10 +2,6 @@ relinker:
   - changed-files:
       - any-glob-to-any-file: 'core/relinker/**'
 
-shader:
-  - changed-files:
-      - any-glob-to-any-file: 'core/shader/**'
-
 agc:
   - changed-files:
       - any-glob-to-any-file: 'core/libs/prx/libSceAgc*/**'
