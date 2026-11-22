@@ -90,8 +90,13 @@ Outcome ProbeOnce(const GraphicContext& graphics, uint64_t size, std::string& de
 	}
 	vk::MemoryRequirements requirements {};
 	device.getBufferMemoryRequirements(buffer, &requirements, d);
+	const vk::BufferDeviceAddressInfo address_info {.buffer = buffer};
+	const uint64_t                    address = device.getBufferAddress(&address_info, d);
+	const auto                        where   = fmt::format("at 0x{:x}, end 0x{:x}", address, address + size);
 	const auto type = PickMemoryType(graphics.physical_device_memory_properties, requirements.memoryTypeBits);
-	const vk::MemoryAllocateInfo allocate {.allocationSize = requirements.alignment, .memoryTypeIndex = type};
+	const vk::MemoryAllocateFlagsInfo allocate_flags {.flags = vk::MemoryAllocateFlagBits::eDeviceAddress};
+	const vk::MemoryAllocateInfo      allocate {
+	         .pNext = &allocate_flags, .allocationSize = requirements.alignment, .memoryTypeIndex = type};
 	const vk::FenceCreateInfo    fence_info {};
 	if (type == UINT32_MAX || device.allocateMemory(&allocate, nullptr, &memory, d) != vk::Result::eSuccess ||
 	    device.createFence(&fence_info, nullptr, &fence, d) != vk::Result::eSuccess) {
@@ -127,7 +132,7 @@ Outcome ProbeOnce(const GraphicContext& graphics, uint64_t size, std::string& de
 		if (device.createBuffer(&room_info, nullptr, &room, d) != vk::Result::eSuccess) {
 			room = nullptr;
 			cleanup(true);
-			detail = fmt::format("bound, but no room for {} of other memory beside it", Gib(room_size));
+			detail = fmt::format("{}: bound, but no room for {} of other memory beside it", where, Gib(room_size));
 			return Outcome::Failed;
 		}
 		const vk::SparseMemoryBind room_bind {.resourceOffset = room_size - requirements.alignment,
@@ -145,11 +150,11 @@ Outcome ProbeOnce(const GraphicContext& graphics, uint64_t size, std::string& de
 	switch (result) {
 		case vk::Result::eSuccess:
 			outcome = Outcome::Bound;
-			detail  = fmt::format("bound, {} of room beside it", Gib(room_size));
+			detail  = fmt::format("{}: bound, {} of room beside it", where, Gib(room_size));
 			break;
 		case vk::Result::eErrorDeviceLost:
 			outcome = Outcome::Lost;
-			detail  = "device lost";
+			detail  = where + ": device lost";
 			break;
 		case vk::Result::eTimeout:
 			outcome = Outcome::Stuck;
@@ -221,8 +226,9 @@ GuestMirror::GuestMirror(GraphicContext& graphics, std::span<const uint64_t> siz
 	vk::PhysicalDeviceProperties2        properties {.pNext = &properties13};
 	graphics.physical_device.getProperties2(&properties);
 	m_description = fmt::format(
-	    "sparse mirror of {} at base 0 (probe {:.1f} ms: {}), blocks of {} KiB, {} queue of family {}, memory type {}{}",
-	    Gib(m_size), probe.ms, probe.trials, BlockSize() >> 10u,
+	    "sparse mirror of {} at base 0, device address 0x{:x} to 0x{:x} (probe {:.1f} ms: {}), blocks of {} KiB, {} queue of "
+	    "family {}, memory type {}{}",
+	    Gib(m_size), m_device_address, m_device_address + m_size, probe.ms, probe.trials, BlockSize() >> 10u,
 	    m_shared_queue ? "the work" : fmt::format("its own (index {})", graphics.sparse_queue_index),
 	    graphics.sparse_family, m_memory_type,
 	    m_size > properties13.maxBufferSize ? fmt::format(", above maxBufferSize ({})", Gib(properties13.maxBufferSize))
@@ -250,6 +256,8 @@ bool GuestMirror::CreateBuffer() {
 	}
 	vk::MemoryRequirements requirements {};
 	device.getBufferMemoryRequirements(m_buffer, &requirements);
+	const vk::BufferDeviceAddressInfo address_info {.buffer = m_buffer};
+	m_device_address = device.getBufferAddress(&address_info);
 	m_block_bits  = std::max<uint32_t>(
         MinBlockBits, static_cast<uint32_t>(std::bit_width(std::max<uint64_t>(requirements.alignment, 1)) - 1));
 	m_memory_type = PickMemoryType(m_graphics.physical_device_memory_properties, requirements.memoryTypeBits);
@@ -440,7 +448,9 @@ GuestMirror::Grant GuestMirror::Allocate(uint64_t wanted) {
 		m_chunks[slot.chunk].used++;
 		return {slot.chunk, slot.index, 1};
 	}
-	const vk::MemoryAllocateInfo info {.allocationSize = uint64_t {slots} << m_block_bits, .memoryTypeIndex = m_memory_type};
+	const vk::MemoryAllocateFlagsInfo flags {.flags = vk::MemoryAllocateFlagBits::eDeviceAddress};
+	const vk::MemoryAllocateInfo      info {
+	         .pNext = &flags, .allocationSize = uint64_t {slots} << m_block_bits, .memoryTypeIndex = m_memory_type};
 	vk::DeviceMemory             memory;
 	const auto                   made = m_graphics.device.allocateMemory(&info, nullptr, &memory);
 	if (made != vk::Result::eSuccess) {
