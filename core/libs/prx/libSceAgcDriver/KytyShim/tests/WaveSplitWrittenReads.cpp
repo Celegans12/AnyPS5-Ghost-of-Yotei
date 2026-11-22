@@ -228,7 +228,11 @@ Replay replay(const std::filesystem::path& tool, const std::filesystem::path& ro
                          " --strict --no-synthesize --repeat 1 --cold-pipelines --frames " + quote(directory / "frames") +
                          dumps + " > " + quote(log) + " 2>&1";
     std::fflush(nullptr);
+#ifdef _WIN32
+    const int status = std::system(('"' + command + '"').c_str());
+#else
     const int status = std::system(command.c_str());
+#endif
     Replay result;
     result.log = readFile(log);
     std::string raw;

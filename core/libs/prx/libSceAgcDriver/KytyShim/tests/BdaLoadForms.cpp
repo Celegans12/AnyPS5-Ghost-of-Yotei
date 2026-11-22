@@ -181,7 +181,11 @@ int main(int argc, char** argv) {
                              quote(root / "frames") + " --dump " + address + ":" + std::to_string(DumpBytes) + ":" + quote(dump) + " > " +
                              quote(log) + " 2>&1";
         std::fflush(nullptr);
+#ifdef _WIN32
+        const int status = std::system(('"' + command + '"').c_str());
+#else
         const int status = std::system(command.c_str());
+#endif
         const auto raw = readFile(dump);
         if (status != 0 || raw.size() != DumpBytes) {
             const bool vulkanRequired = std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr;
