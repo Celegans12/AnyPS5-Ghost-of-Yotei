@@ -10,6 +10,11 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+#include <windows.h>
+#include <xbyak/xbyak.h>
+#endif
+
 namespace {
 
 using namespace Libs::Graphics;
@@ -228,11 +233,30 @@ void ControlThroughLaneMask() {
 	      "the variant of both branches of the lane mask is the variant of a mask with its first bit set");
 }
 
+void WalkerCodePages() {
+#if defined(_WIN32)
+	const auto plan = Translate({ShiftLane, LoadCount[0], LoadCount[1], LoadTarget[0], LoadTarget[1], WaitAll,
+	                             CountIsZero, SkipStore, MoveCount, StoreCount[0], StoreCount[1], EndProgram},
+	                            0x54u);
+	Check(plan.srt_code != nullptr, "the walker is compiled");
+	if (plan.srt_code == nullptr) return;
+	const auto*              code = plan.srt_code->getCode();
+	MEMORY_BASIC_INFORMATION page {};
+	Check(VirtualQuery(code, &page, sizeof(page)) == sizeof(page), "the walker code is mapped");
+	Check(page.AllocationBase == code, "the walker code starts an allocation of its own, not a block of the C runtime heap");
+	Check(page.State == MEM_COMMIT && page.Protect == PAGE_EXECUTE_READ, "the walker code is read and execute");
+	Check(page.RegionSize >= plan.srt_code->getSize(), "every page of the walker code is read and execute");
+	g_guest.sharps[0] = StorageSharp(TargetAddress, Records * 4u);
+	Check(Materialize(plan, Pointers::WordAndSharps, 7u, false, false).ok, "the walker in its own pages runs");
+#endif
+}
+
 }
 
 int main() {
 	ControlAndData();
 	ControlThroughLaneMask();
+	WalkerCodePages();
 	if (g_failures != 0) {
 		std::fprintf(stderr, "%d check(s) failed\n", g_failures);
 		return 1;
