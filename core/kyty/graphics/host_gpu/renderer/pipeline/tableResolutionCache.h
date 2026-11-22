@@ -11,8 +11,6 @@
 
 namespace Libs::Graphics {
 
-inline constexpr size_t LegacyTableResolutions = 8;
-
 struct TableResolutionCounters {
 	uint64_t lookups     = 0;
 	uint64_t hits        = 0;
@@ -27,14 +25,9 @@ struct TableResolutionCounters {
 template <typename Entry, typename Key, typename Hash>
 class TableResolutionCache {
 public:
-	void Configure(size_t capacity, bool shared_generation) {
-		m_capacity          = std::max<size_t>(capacity, 1);
-		m_shared_generation = shared_generation;
-	}
+	void Configure(size_t capacity) { m_capacity = std::max<size_t>(capacity, 1); }
 
 	[[nodiscard]] size_t   Capacity() const { return m_capacity; }
-	[[nodiscard]] bool     SharedGeneration() const { return m_shared_generation; }
-	[[nodiscard]] uint64_t Generation() const { return m_generation; }
 	[[nodiscard]] size_t   Size() const { return m_entries.size(); }
 	[[nodiscard]] size_t   KnownKeys() const { return m_known.size(); }
 	[[nodiscard]] const TableResolutionCounters& Counters() const { return m_counters; }
@@ -80,19 +73,6 @@ public:
 		return true;
 	}
 
-	[[nodiscard]] bool SharedCurrent(uint64_t shared_generation) const {
-		return !m_shared_generation || shared_generation == m_generation;
-	}
-
-	template <typename FindEntry, typename Oversized>
-	bool Reusable(Entry& entry, uint64_t generation, uint64_t shared_generation, FindEntry&& find,
-	              Oversized&& oversized) {
-		if (m_shared_generation) {
-			return &find() == &entry && shared_generation == m_generation;
-		}
-		return Touch(entry, generation, oversized);
-	}
-
 	template <typename Weight, typename Retire>
 	bool ClearLeastRecent(Weight&& weight, Retire&& retire) {
 		Entry* oldest = nullptr;
@@ -111,10 +91,7 @@ public:
 	}
 
 	template <typename Ranges>
-	[[nodiscard]] bool Current(uint64_t shared_generation, const Ranges& ranges) const {
-		if (m_shared_generation) {
-			return shared_generation == m_generation;
-		}
+	[[nodiscard]] static bool Current(const Ranges& ranges) {
 		return std::ranges::all_of(ranges, [](const auto& range) {
 			return range.resolution->generation == range.generation;
 		});
@@ -130,10 +107,9 @@ private:
 	std::unordered_map<Key, Entry*, Hash> m_index;
 	std::unordered_set<size_t>            m_known;
 	TableResolutionCounters               m_counters;
-	size_t                                m_capacity          = LegacyTableResolutions;
-	bool                                  m_shared_generation = true;
-	uint64_t                              m_generation        = 0;
-	uint64_t                              m_tick              = 0;
+	size_t                                m_capacity   = 1;
+	uint64_t                              m_generation = 0;
+	uint64_t                              m_tick       = 0;
 };
 
 }

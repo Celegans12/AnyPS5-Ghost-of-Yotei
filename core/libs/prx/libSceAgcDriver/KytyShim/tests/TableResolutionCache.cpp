@@ -54,15 +54,14 @@ struct Range {
 
 struct State {
 	std::vector<Range> ranges;
-	uint64_t           generation = 0;
-	bool               valid      = false;
+	bool               valid = false;
 };
 
 using Keys = std::initializer_list<uint32_t>;
 
 class Renderer {
 public:
-	Renderer(size_t capacity, bool legacy) { m_cache.Configure(capacity, legacy); }
+	explicit Renderer(size_t capacity) { m_cache.Configure(capacity); }
 
 	Cache& Resolutions() { return m_cache; }
 
@@ -72,25 +71,20 @@ public:
 	}
 
 	bool Reuse(State& state, Keys keys) {
-		if (!state.valid || !m_cache.SharedCurrent(state.generation) || state.ranges.size() != keys.size()) {
+		if (!state.valid || state.ranges.size() != keys.size()) {
 			return false;
 		}
 		size_t index = 0;
 		for (const auto key: keys) {
 			auto& range = state.ranges[index++];
 			if (range.key != key) return false;
-			if (!m_cache.Reusable(
-			        *range.resolution, range.generation, state.generation,
-			        [&]() -> Table& { return Find(key); }, Oversized)) {
-				return false;
-			}
+			if (!m_cache.Touch(*range.resolution, range.generation, Oversized)) return false;
 		}
 		return true;
 	}
 
 	void Prepare(State& state, Keys keys) {
-		state.valid      = false;
-		state.generation = m_cache.Generation();
+		state.valid = false;
 		state.ranges.clear();
 		for (const auto key: keys) {
 			auto& table = Find(key);
@@ -99,7 +93,7 @@ public:
 		}
 	}
 
-	void Complete(State& state) { state.valid = m_cache.Current(state.generation, state.ranges); }
+	void Complete(State& state) { state.valid = Cache::Current(state.ranges); }
 
 	bool Draw(State& state, Keys keys) {
 		if (Reuse(state, keys)) {
@@ -153,7 +147,7 @@ bool PointsAtCurrentTables(const State& state, Keys keys, const std::string& wha
 }
 
 void EvictionKeepsOtherStates() {
-	Renderer renderer(4, false);
+	Renderer renderer(4);
 	State    a;
 	State    b;
 	State    c;
@@ -188,7 +182,7 @@ void EvictionKeepsOtherStates() {
 }
 
 void EvictionBetweenPrepareAndFinish() {
-	Renderer renderer(2, false);
+	Renderer renderer(2);
 	State    vertex;
 	State    pixel;
 	renderer.Prepare(vertex, {1});
@@ -205,7 +199,7 @@ void EvictionBetweenPrepareAndFinish() {
 }
 
 void RewrittenTableInvalidatesItsStates() {
-	Renderer renderer(8, false);
+	Renderer renderer(8);
 	State    a;
 	State    b;
 	State    other;
@@ -231,7 +225,7 @@ void RewrittenTableInvalidatesItsStates() {
 }
 
 void TrimClearsLeastRecentTable() {
-	Renderer renderer(8, false);
+	Renderer renderer(8);
 	State    a;
 	State    b;
 	State    c;
@@ -256,34 +250,26 @@ void TrimClearsLeastRecentTable() {
 	PointsAtCurrentTables(c, {3}, "trim, rebuilt state c");
 }
 
-void LegacyInvalidatesEveryState() {
-	Renderer legacy(LegacyTableResolutions, true);
-	Renderer targeted(LegacyTableResolutions, false);
-	for (auto* renderer: {&legacy, &targeted}) {
-		State a;
-		State b;
-		renderer->Draw(a, {1});
-		renderer->Draw(a, {1});
-		renderer->Draw(b, {2});
-		const bool reused = renderer->Draw(a, {1});
-		if (renderer == &legacy) {
-			Check(!reused, "legacy: a new key elsewhere invalidates every state");
-		} else {
-			Check(reused, "targeted: a new key elsewhere leaves the other states valid");
-		}
-		PointsAtCurrentTables(a, {1}, renderer == &legacy ? "legacy, state a" : "targeted, state a");
-	}
+void NewKeyKeepsOtherStates() {
+	Renderer renderer(8);
+	State    a;
+	State    b;
+	renderer.Draw(a, {1});
+	renderer.Draw(a, {1});
+	renderer.Draw(b, {2});
+	Check(renderer.Draw(a, {1}), "new key: a new key elsewhere leaves the other states valid");
+	PointsAtCurrentTables(a, {1}, "new key, state a");
 }
 
-uint64_t RebuildsOverFrames(size_t capacity, bool legacy, uint32_t programs, uint32_t frames) {
-	Renderer           renderer(capacity, legacy);
+uint64_t RebuildsOverFrames(size_t capacity, uint32_t programs, uint32_t frames) {
+	Renderer           renderer(capacity);
 	std::vector<State> states(programs);
 	for (uint32_t frame = 0; frame < frames; frame++) {
 		for (uint32_t program = 0; program < programs; program++) {
 			renderer.Draw(states[program], {program + 1u});
 			PointsAtCurrentTables(states[program], {program + 1u},
 			                      "frames, program " + std::to_string(program) + " capacity " +
-			                          std::to_string(capacity) + (legacy ? " legacy" : ""));
+			                          std::to_string(capacity));
 		}
 	}
 	return renderer.Rebuilt();
@@ -291,15 +277,10 @@ uint64_t RebuildsOverFrames(size_t capacity, bool legacy, uint32_t programs, uin
 
 void RebuildsPerFrame() {
 	constexpr uint32_t Frames = 10;
-	Check(RebuildsOverFrames(8, true, 8, Frames) == 16,
-	      "frames: legacy, 8 programs in 8 entries rebuild twice each (their own creation invalidates them)");
-	Check(RebuildsOverFrames(8, false, 8, Frames) == 8,
-	      "frames: one generation per entry, 8 programs in 8 entries rebuild once each");
-	Check(RebuildsOverFrames(8, true, 9, Frames) == 9 * Frames,
-	      "frames: legacy, 9 programs in 8 entries rebuild on every draw");
-	Check(RebuildsOverFrames(DefaultTableResolutions, false, 9, Frames) == 9,
+	Check(RebuildsOverFrames(8, 8, Frames) == 8, "frames: 8 programs in 8 entries rebuild once each");
+	Check(RebuildsOverFrames(DefaultTableResolutions, 9, Frames) == 9,
 	      "frames: the default cache holds 9 programs, each rebuilt once");
-	Check(RebuildsOverFrames(DefaultTableResolutions, false, 200, Frames) == 200,
+	Check(RebuildsOverFrames(DefaultTableResolutions, 200, Frames) == 200,
 	      "frames: the default cache holds 200 programs, each rebuilt once");
 }
 
@@ -308,20 +289,18 @@ int CacheTests() {
 	EvictionBetweenPrepareAndFinish();
 	RewrittenTableInvalidatesItsStates();
 	TrimClearsLeastRecentTable();
-	LegacyInvalidatesEveryState();
+	NewKeyKeepsOtherStates();
 	RebuildsPerFrame();
 	const auto settings = ReadTableResolutionSettings();
-	Check(settings.capacity == DefaultTableResolutions && !settings.legacy,
-	      "settings: unset means the default cache with one generation per entry");
+	Check(settings.capacity == DefaultTableResolutions, "settings: unset means the default cache");
 	return Finish();
 }
 
-int SettingsTest(size_t capacity, bool legacy) {
+int SettingsTest(size_t capacity) {
 	g_name              = "kyty_shim_table_resolution_cache_settings";
 	const auto settings = ReadTableResolutionSettings();
 	Check(settings.capacity == capacity, "settings: capacity " + std::to_string(settings.capacity) +
 	                                         ", expected " + std::to_string(capacity));
-	Check(settings.legacy == legacy, "settings: legacy flag");
 	return Finish();
 }
 
@@ -335,9 +314,8 @@ int BadSetting() {
 }
 
 int main(int argc, char** argv) {
-	if (argc > 1 && std::strcmp(argv[1], "capacity") == 0) return SettingsTest(64, false);
-	if (argc > 1 && std::strcmp(argv[1], "legacy") == 0) return SettingsTest(LegacyTableResolutions, true);
-	if (argc > 1 && std::strcmp(argv[1], "default") == 0) return SettingsTest(DefaultTableResolutions, false);
+	if (argc > 1 && std::strcmp(argv[1], "capacity") == 0) return SettingsTest(64);
+	if (argc > 1 && std::strcmp(argv[1], "default") == 0) return SettingsTest(DefaultTableResolutions);
 	if (argc > 1 && std::strcmp(argv[1], "bad") == 0) return BadSetting();
 	return CacheTests();
 }

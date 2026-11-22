@@ -406,7 +406,6 @@ private:
 			uint32_t                  element_version = 0;
 		};
 		std::vector<Checked>                 checked;
-		uint64_t                             generation = 0;
 		uint64_t                             set_epoch  = 0;
 		uint64_t                             backing_epoch = 0;
 		bool                                 valid = false;

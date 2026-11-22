@@ -24,7 +24,6 @@ On by default unless the row says otherwise.
 | `KYTY_LABELS_AROUND_GPU_WRITES` | `0`, `1` (default) | A label next to bytes the GPU writes is deferred behind the pending labels instead of draining the GPU |
 | `KYTY_TABLE_DESCRIPTOR_WRITES` | `0`, `1`; default `1` on RADV, `0` on other drivers | Fill a draw's bindless texture tables with descriptor writes instead of descriptor copies, which are slow on RADV. `0` copies them and `1` writes them on any driver |
 | `KYTY_TABLE_RESOLUTIONS` | 1 to 4096, `256` by default | Size of the cache of resolved bindless texture tables. Evicting a table only makes the draws that use it resolve their tables again |
-| `KYTY_TABLE_RESOLUTION_LEGACY` | `0` (default), `1` | `1` restores Kyty's 8-entry cache, where any eviction makes every draw with tables resolve them again |
 | `KYTY_DRAW_TEMPLATES`, `KYTY_DRAW_BUFFERS` | `2` and `1` by default; `0` turns off | Kyty's draw templates and grouped draw-buffer copies, on by default in AnyKyty |
 | `KYTY_WRITE_BACK_IMAGES` | `0`, `1` (default) | Copy GPU-written images back at the write-backs the game requests |
 | `KYTY_TILE_VIA_VRAM` | `0`, `1` (default) | Read tiled images back through VRAM: one copy to host memory instead of scattered writes across PCIe |

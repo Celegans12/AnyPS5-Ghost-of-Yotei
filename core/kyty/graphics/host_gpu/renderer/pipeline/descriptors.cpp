@@ -56,7 +56,7 @@ namespace {
 using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
 
 constexpr size_t MaxTableElements   = size_t {1} << 16u;
-constexpr size_t TableElementBudget = LegacyTableResolutions * MaxTableElements;
+constexpr size_t TableElementBudget = 8 * MaxTableElements;
 
 constexpr auto TableOversized = [](const auto& table) { return table.elements.size() > MaxTableElements; };
 
@@ -85,17 +85,6 @@ bool TableDescriptorWrites(vk::DriverId driver) {
 
 TableResolutionSettings ReadTableResolutionSettings() {
 	TableResolutionSettings settings;
-	if (const char* value = std::getenv("KYTY_TABLE_RESOLUTION_LEGACY"); value != nullptr && value[0] != '\0') {
-		const std::string_view text(value);
-		if (text != "0" && text != "1") {
-			EXIT("invalid KYTY_TABLE_RESOLUTION_LEGACY: %s (0 or 1)\n", value);
-		}
-		settings.legacy = text == "1";
-	}
-	if (settings.legacy) {
-		settings.capacity = LegacyTableResolutions;
-		return settings;
-	}
 	if (const char* value = std::getenv("KYTY_TABLE_RESOLUTIONS"); value != nullptr && value[0] != '\0') {
 		const std::string_view text(value);
 		size_t                 capacity = 0;
@@ -1280,7 +1269,7 @@ size_t RenderExecutor::TableResolutionKeyHash::operator()(
 
 void RenderExecutor::ConfigureTableResolutions() {
 	const auto settings = ReadTableResolutionSettings();
-	m_table_resolutions.Configure(settings.capacity, settings.legacy);
+	m_table_resolutions.Configure(settings.capacity);
 }
 
 void RenderExecutor::RetireTableResolution(TableResolution& table) {
@@ -1324,16 +1313,13 @@ void RenderExecutor::LogTableSummary() {
 	    "[kyty-tables] summary of the last {:.0f} s: {} of {} binding preparations had image tables; {} reused "
 	    "their table state, {} rebuilt it ({} without a finished state, {} after a table entry it used was "
 	    "renewed, {} with other tables); {} finished states left invalid ({} for a renewed table entry, {} for "
-	    "a size mismatch); table cache of {} entries, {}: {} lookups, {} hits, {} new keys, {} keys made again "
-	    "after an eviction, {} evictions, {} cleared past {} elements, {} cleared for the element budget, {} "
-	    "generation bumps; {} entries in use, {} keys seen, {} elements\n",
+	    "a size mismatch); table cache of {} entries, one generation per entry: {} lookups, {} hits, {} new keys, "
+	    "{} keys made again after an eviction, {} evictions, {} cleared past {} elements, {} cleared for the element "
+	    "budget, {} generation bumps; {} entries in use, {} keys seen, {} elements\n",
 	    seconds, taken.prepared, taken.bindings, taken.reused, taken.prepared - taken.reused, taken.unfinished,
 	    taken.renewed, taken.layout, taken.left_renewed + taken.left_size, taken.left_renewed, taken.left_size,
-	    m_table_resolutions.Capacity(),
-	    m_table_resolutions.SharedGeneration() ? "one generation for every state (KYTY_TABLE_RESOLUTION_LEGACY=1)"
-	                                           : "one generation per entry",
-	    cache.lookups, cache.hits, cache.created, cache.recreated, cache.evicted, cache.overflowed,
-	    MaxTableElements, cache.trimmed, cache.generations, m_table_resolutions.Size(),
+	    m_table_resolutions.Capacity(), cache.lookups, cache.hits, cache.created, cache.recreated, cache.evicted,
+	    cache.overflowed, MaxTableElements, cache.trimmed, cache.generations, m_table_resolutions.Size(),
 	    m_table_resolutions.KnownKeys(), m_table_element_count));
 }
 
@@ -1845,7 +1831,7 @@ void RenderExecutor::DropUnusedTableElements(TableBindingState& state) {
 
 void RenderExecutor::FinishTableBindings(TableBindingState& state,
                                          const PreparedBindings& prepared) {
-	if (!m_table_resolutions.Current(state.generation, state.ranges)) {
+	if (!TableResolutions::Current(state.ranges)) {
 		m_table_stats.left_renewed++;
 		UnpinTableBindings(state);
 		return;
@@ -1902,10 +1888,6 @@ bool RenderExecutor::ReuseTableBindings(const ShaderRecompiler::IR::CompiledShad
 		m_table_stats.unfinished++;
 		return false;
 	}
-	if (!m_table_resolutions.SharedCurrent(state.generation)) {
-		m_table_stats.renewed++;
-		return false;
-	}
 	const ShaderRecompiler::IR::DescriptorValue null_value {.dword_count = 8u};
 	size_t                                      range_index = 0;
 	size_t                                      slot_index  = 0;
@@ -1927,9 +1909,7 @@ bool RenderExecutor::ReuseTableBindings(const ShaderRecompiler::IR::CompiledShad
 			same = false;
 			return;
 		}
-		if (!m_table_resolutions.Reusable(
-		        *cached.resolution, cached.generation, state.generation,
-		        [&]() -> TableResolution& { return FindTableResolution(root); }, TableOversized)) {
+		if (!m_table_resolutions.Touch(*cached.resolution, cached.generation, TableOversized)) {
 			renewed = true;
 			same    = false;
 			return;
@@ -2210,7 +2190,7 @@ void RenderExecutor::ResetBindings() {
 		}
 	}
 	m_retired_table_elements.clear();
-	if (!m_table_resolutions.SharedGeneration() && m_table_element_count > TableElementBudget) {
+	if (m_table_element_count > TableElementBudget) {
 		TrimTableResolutions();
 	}
 	if ((++m_table_stats.resets & 255u) == 0) {
@@ -2315,7 +2295,6 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		if (!prepared.tables_reused) {
 			UnpinTableBindings(*table_state);
 			table_state->valid         = false;
-			table_state->generation    = m_table_resolutions.Generation();
 			table_state->set_epoch     = m_context.GetTextureCache().ImageSetEpoch();
 			table_state->backing_epoch = Libs::LibKernel::Memory::BackingEpoch();
 			table_state->ranges.clear();

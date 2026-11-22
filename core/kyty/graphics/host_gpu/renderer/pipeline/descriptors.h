@@ -124,7 +124,6 @@ inline constexpr size_t MaxTableResolutions     = 4096;
 
 struct TableResolutionSettings {
 	size_t capacity = DefaultTableResolutions;
-	bool   legacy   = false;
 };
 
 [[nodiscard]] TableResolutionSettings ReadTableResolutionSettings();
