@@ -838,6 +838,41 @@ void SumOfAbsoluteDifferencesClamp(const Gpu& gpu) {
 	         {"v_qsad_pk_u16_u8 low", "v_qsad_pk_u16_u8 high", "v_mqsad_pk_u16_u8 low", "v_mqsad_pk_u16_u8 high", "v_mqsad_u32_u8 0", "v_mqsad_u32_u8 1", "v_mqsad_u32_u8 2", "v_mqsad_u32_u8 3", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr});
 }
 
+alignas(256) constexpr std::array<uint32_t, 15> ProductRoundingCode {
+    0x34020084, 0x34060086, 0xe0381000, 0x80000401, 0xbf8c3f70, 0x10100b04, 0x08140d08, 0x10120b07,
+    0xd503000b, 0x20020d09, 0xe0701000, 0x80010a03, 0xe0701004, 0x80010b03, 0xbf810000,
+};
+
+struct ProductRoundingTable {
+	uint32_t rows[QuadThreads][4]      = {};
+	uint32_t expected[QuadThreads][16] = {};
+};
+
+constexpr ProductRoundingTable MakeProductRoundingTable() {
+	constexpr uint32_t Edges[4][6] = {
+	    {0x3f800001u, 0x3f7ffffeu, 0x3f800000u, 0x3f800001u, 0x00000000u, 0x00000000u},
+	    {0x3f800001u, 0x3f800002u, 0x3f800000u, 0x3f800001u, 0x34c00000u, 0xb4c00000u},
+	    {0x40000000u, 0x40400000u, 0x40c00000u, 0x40000000u, 0x00000000u, 0x00000000u},
+	    {0x3fc00000u, 0x40000000u, 0x3f800000u, 0x3fc00000u, 0x40000000u, 0xc0000000u},
+	};
+	ProductRoundingTable table;
+	for (uint32_t tid = 0; tid < QuadThreads; ++tid) {
+		const auto& edge = Edges[tid % 4u];
+		for (uint32_t j = 0; j < 4u; ++j) table.rows[tid][j] = edge[j];
+		table.expected[tid][0] = edge[4];
+		table.expected[tid][1] = edge[5];
+	}
+	return table;
+}
+
+constexpr ProductRoundingTable ProductRounding = MakeProductRoundingTable();
+
+void MultiplyThenAddRoundsProduct(const Gpu& gpu) {
+	RunTable(gpu, "f32 multiply then add", ProductRoundingCode, ProductRounding.rows, ProductRounding.expected,
+	         {"v_mul_f32 then v_sub_f32", "v_mul_f32 then v_add_f32 of the negated product", nullptr, nullptr, nullptr,
+	          nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr});
+}
+
 }
 
 int main() {
@@ -848,6 +883,7 @@ int main() {
 	ByteAverage(*gpu);
 	QuadSumOfAbsoluteDifferences(*gpu);
 	SumOfAbsoluteDifferencesClamp(*gpu);
+	MultiplyThenAddRoundsProduct(*gpu);
 	const auto name = gpu->name;
 	CloseGpu(*gpu);
 	if (g_failures != 0) {

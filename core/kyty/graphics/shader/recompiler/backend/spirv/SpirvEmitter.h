@@ -20,6 +20,7 @@ struct Profile {
 	bool ray_query = false;
 	bool lds_lane_sync = true;
 	bool native_float16 = true;
+	bool f32_product_no_contraction = true;
 };
 
 inline constexpr Profile DefaultProfile {};

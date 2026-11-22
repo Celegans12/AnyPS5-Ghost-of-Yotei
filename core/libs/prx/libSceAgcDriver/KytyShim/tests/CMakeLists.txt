@@ -441,6 +441,19 @@ add_test(NAME kyty_shim_pair_codegen COMMAND kyty_shim_pair_codegen_tests)
 set_tests_properties(kyty_shim_pair_codegen PROPERTIES TIMEOUT 60
         PASS_REGULAR_EXPRESSION "kyty_shim_pair_codegen: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
 
+add_test_executable(kyty_shim_f32_product_contraction_tests ${CMAKE_CURRENT_SOURCE_DIR}/F32ProductContraction.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+target_include_directories(kyty_shim_f32_product_contraction_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_include_directories(kyty_shim_f32_product_contraction_tests SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/3rdparty/SPIRV-Tools/include
+        ${CMAKE_SOURCE_DIR}/3rdparty/xxHash ${CMAKE_SOURCE_DIR}/3rdparty/zstd/lib)
+configure_host_test_executable(kyty_shim_f32_product_contraction_tests)
+if(MINGW)
+    target_link_libraries(kyty_shim_f32_product_contraction_tests PRIVATE stdc++ gcc_eh)
+endif()
+target_link_libraries(kyty_shim_f32_product_contraction_tests PRIVATE Kyty::gpu libkernel libc)
+add_test(NAME kyty_shim_f32_product_contraction COMMAND kyty_shim_f32_product_contraction_tests)
+set_tests_properties(kyty_shim_f32_product_contraction PROPERTIES TIMEOUT 60
+        PASS_REGULAR_EXPRESSION "kyty_shim_f32_product_contraction: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+
 if(NOT ANYPS5_KYTY_DLL)
     target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/DescriptorTables.cpp)
     add_test_executable(kyty_shim_descriptor_tables_tests ${CMAKE_CURRENT_SOURCE_DIR}/DescriptorTablesMain.cpp)

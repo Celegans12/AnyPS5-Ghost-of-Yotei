@@ -119,7 +119,9 @@ uint32_t EmitFPMad32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 	const auto product = EmitFPMul32(state, a, b);
 	state.builder.AddAnnotation(spv::OpDecorate, product, spv::DecorationNoContraction);
 	const auto sum = EmitFPAdd32(state, product, c);
-	state.builder.AddAnnotation(spv::OpDecorate, sum, spv::DecorationNoContraction);
+	if (!state.profile.f32_product_no_contraction) {
+		state.builder.AddAnnotation(spv::OpDecorate, sum, spv::DecorationNoContraction);
+	}
 	return sum;
 }
 
