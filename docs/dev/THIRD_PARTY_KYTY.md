@@ -1,9 +1,8 @@
 # Kyty code in AnyPS5
 
 `core/kyty/` and `core/libs/prx/libSceAgcDriver/KytyShim/include/` hold the Kyty core. `core/kyty` is maintained in this repository; it derives from [KytyPS5](https://github.com/KytyPS5/KytyPS5) (GPL-2.0).
-It is the second GPU driver of plan B, built only with
-`-DANYPS5_GPU_BACKEND=kyty`; the default `-DANYPS5_GPU_BACKEND=anyps5` builds AnyPS5 exactly as before and reads none of
-these files.
+It is the GPU driver of AnyKyty, the only one: the historical AnyPS5 driver (the `Execution/` and `Graphics/` folders of
+`libSceAgcDriver`) and its shader recompiler (`core/shader`) were removed, and the build takes no GPU driver option.
 
 ## Licence
 
@@ -28,7 +27,7 @@ verbatim at their top:
 | `core/libs/prx/libSceAgcDriver/KytyShim/include/libs/` | `src/libs/` | `agc.h`, `controller.h`, `errno.h`, `hmd2.h`, `libs.h` |
 | `core/libs/prx/libSceAgcDriver/KytyShim/include/loader/` | `src/loader/` | `demonsSoulsPageFree.h`, `demonsSoulsTitle.h`, `guestOodle.h`, `systemContent.h`, `timer.h` |
 
-Outside those folders, code adapted from the Kyty core is built only with `-DANYPS5_GPU_BACKEND=kyty`:
+Outside those folders, code adapted from the Kyty core is built into AnyKyty as well:
 
 | AnyPS5 path | Path in the imported tree | What |
 |---|---|---|
@@ -39,6 +38,8 @@ library and loader functions that `graphics/` and `common/` call, and the shim i
 `libs/dialog.h` is left out: no source of `kyty_gpu` includes it, and its `ErrorDialogOpen` and `ErrorDialogClose` would
 be second declarations of AnyPS5 exports for `core/libs/tests/test_public_headers.py`, which reads every header under
 `core/` without namespaces.
+
+`core/kyty/cmake/PatchSpirvTools.cmake` is not from KytyPS5: it is AnyPS5's patch of the bundled SPIRV-Tools, which `core/kyty/CMakeLists.txt` includes, moved here from the removed `core/shader/recompiler`.
 
 ## Changes from the import
 
@@ -69,8 +70,7 @@ be second declarations of AnyPS5 exports for `core/libs/tests/test_public_header
   `Presenter::PrepareFrame` takes the VideoOut pixel format since `50c0c066`: the shim passes the display buffer's
   `pixelFormat`.
 - Nothing else is changed in the imported files. Adaptations to AnyPS5 go in the shim, or under
-  `#if defined(ANYPS5_KYTY)` in `core/kyty/`. `ANYPS5_KYTY=1` is defined for every target of a
-  `-DANYPS5_GPU_BACKEND=kyty` build and never otherwise.
+  `#if defined(ANYPS5_KYTY)` in `core/kyty/`. `ANYPS5_KYTY=1` is defined for every target.
 - `graphics/` calls four functions of SDL3 (`SDL_LoadObject`, `SDL_LoadFunction`, `SDL_UnloadObject` to open the
   DLSS and FSR libraries when the user supplies them, `SDL_GetBasePath` to find shipped pipeline manifests). AnyPS5 has
   SDL2, so `core/libs/prx/libSceAgcDriver/KytyShim/compat/SDL3/` gives `kyty_gpu` these four over `dlopen` and
@@ -83,7 +83,7 @@ be second declarations of AnyPS5 exports for `core/libs/tests/test_public_header
 
 The Kyty core builds with Clang only (GCC rejects its Vulkan-Hpp aggregate assignments and `__builtin_memcpy_inline`).
 `core/kyty/CMakeLists.txt` is therefore a project of its own, which `core/kyty/cmake/KytyBackend.cmake` builds with
-`clang` and `clang++` as the external project `kyty_gpu` when `-DANYPS5_GPU_BACKEND=kyty` is set; the rest of AnyPS5 stays
+`clang` and `clang++` as the external project `kyty_gpu` in every full build; the rest of AnyPS5 stays
 on GCC. Clang is given `--gcc-install-dir` of the GCC that builds AnyPS5, so both sides use the same libstdc++ headers.
 The sub-build uses upstream's compiler options (`-march=x86-64-v3 -ffp-contract=off -fno-rtti -fno-exceptions -g`,
 `-fexceptions` for `common/`, `descriptors.cpp` and `pipelineCache.cpp`), Tracy on demand, and its own SPIRV-Tools and
@@ -144,7 +144,7 @@ from [KytyPS5](https://github.com/KytyPS5/KytyPS5) carry a `Ported-from: KytyPS5
 
 ## Settings of the kyty build
 
-A build with `-DANYPS5_GPU_BACKEND=kyty` reads its settings from environment variables, once per process. The tables below list every `KYTY_*` name the code under `core/` reads, one row each, and `tools/check_kyty_settings.py` fails when a name read in `core/` has no row here or a row names something the code no longer reads. Three kinds of reader exist:
+A build reads its settings from environment variables, once per process. The tables below list every `KYTY_*` name the code under `core/` reads, one row each, and `tools/check_kyty_settings.py` fails when a name read in `core/` has no row here or a row names something the code no longer reads. Three kinds of reader exist:
 
 - `KytyShim::StartRuntime()` (`core/libs/prx/libSceAgcDriver/KytyShim/src/Config.cpp`) loads KytyPS5's `ConfigOptions` at their defaults, then reads the variables named after KytyPS5's command-line options. An empty value counts as unset; an invalid value stops the emulator with a message naming the variable. Rows of this kind say "stops" in their values.
 - Code of `core/kyty/`, imported or ours, reads `KYTY_*` names with `std::getenv` or with a small helper that takes the name as a string literal. Each is read once; most accept anything and fall back to the default, as their values column says.
@@ -167,7 +167,7 @@ AnyPS5 opens the window, so Kyty's window options do nothing; `ANYPS5_FULLSCREEN
 |---|---|---|---|---|---|---|
 | `KYTY_HDR` | `0` or `1`, else stops | `0` | Asks for an HDR10 swapchain format; without one the log says `HDR10 surface unavailable; using SDR output` | option | all | Kyty option |
 | `KYTY_STRETCH` | `0` or `1`, else stops | `0` | Fills the whole window with the game's image instead of fitting its aspect ratio | option | all | Kyty option |
-| `KYTY_PRESENT_MODE` | `Fifo`, `Mailbox`, `Immediate`, any case, else stops | `Mailbox` | Vulkan present mode of the swapchain; `ANYPS5_PRESENT_MODE` is not read with this backend | option | all | Kyty option |
+| `KYTY_PRESENT_MODE` | `Fifo`, `Mailbox`, `Immediate`, any case, else stops | `Mailbox` | Vulkan present mode of the swapchain | option | all | Kyty option |
 | `KYTY_VBLANK_FREQUENCY` | whole number, clamped to 30 to 360, else stops | unset | Vblank rate when `ANYPS5_VBLANK_HZ` is unset or empty; it also becomes Kyty's own vblank frequency. Unset keeps the output's 59.94 Hz and 119.88 Hz | option | all | Kyty option; `bffccd0fbf` |
 | `KYTY_PSSR_UPSCALER` | `Linear`, `DLSS`, `FSR`, any case, else stops | `Linear` | Upscaler of the PSSR path; `DLSS` and `FSR` load the vendor's library from the folder below through `SDL_LoadObject` | option | all | Kyty option |
 | `KYTY_TRINITY` | `0` or `1`, else stops | `0` | Kyty's PS5 Pro mode (`pro_enabled`), which only the DLSS and FSR upscalers read | option | all | Kyty option |
@@ -297,7 +297,7 @@ The window, the flip and vblank pacing, the guest memory and the thread priority
 |---|---|---|---|---|---|---|
 | `ANYPS5_VBLANK_HZ` | whole number, 30 to 360, else stops | unset | Vblank rate; unset or empty takes `KYTY_VBLANK_FREQUENCY`, and the value also becomes Kyty's vblank frequency, so `ANYPS5_VBLANK_HZ=240` lifts the 60 FPS cap of titles that pace on vblank | option | all | `bffccd0fbf` |
 | `APS5_UNPACED_FLIPS` | `0`, `1` or empty, else stops | `0` | Benchmark aid: each flip completes once presented, not at the next vblank, so a title that renders faster than the vblank presents as fast as it can; set `KYTY_PRESENT_MODE=Immediate` or `Mailbox` too to present above the display's rate | debug | all | `b3691289ef` |
-| `ANYPS5_GPU` | part of a Vulkan device name, any case; empty counts as unset | unset | Runs on the first device whose name contains the text and that the renderer accepts, as AnyPS5's own driver does; it wins over the headset's device. Unset, the renderer picks a discrete GPU when it has one. A text that matches no device stops the game with a message that lists the devices; a match the renderer rejects stops it with the reasons. It replaces `KYTY_GPU`, an index that is no longer read | option | all | AnyPS5 |
+| `ANYPS5_GPU` | part of a Vulkan device name, any case; empty counts as unset | unset | Runs on the first device whose name contains the text and that the renderer accepts; it wins over the headset's device. Unset, the renderer picks a discrete GPU when it has one. A text that matches no device stops the game with a message that lists the devices; a match the renderer rejects stops it with the reasons. It replaces `KYTY_GPU`, an index that is no longer read | option | all | AnyPS5 |
 | `ANYPS5_KYTY_PRESTART` | `0` or `1`, empty counts as unset, else stops | `1` | Starts the Kyty GPU on a host thread as soon as the video output is created; `0` starts it after the window exists | perf | all | `e465445589` |
 | `ANYPS5_KYTY_SPARSE_READS` | `0` or `1`, empty counts as unset, else stops | `1` | The Kyty GPU asks the memory files where the data of a 64 KiB or larger range is (`SEEK_DATA`) and writes zeros for the never-written parts without touching them; `0` reads every byte | perf | Linux | `21c1eae177` |
 | `APS5_NO_DIRECT_GUEST_COPY` | presence | unset | On Linux x86-64 the checked guest copies read with plain loads whose faults the signal handlers turn into a failed copy; set, every checked read is a `process_vm_readv` system call again | debug | Linux | `004c1c4ede` |
@@ -598,7 +598,7 @@ every stop, except a write of 0 to context register `0x24a`, which Kyty already 
 ignores in a direct `SET_CONTEXT_REG`.
 
 `CONTEXT_CONTROL` (PM4 opcode `0x28`) with register loading and shadowing off is accepted as the no-op it is on the
-console, as AnyPS5's driver does; with either on, it still stops with the two control words.
+console; with either on, it still stops with the two control words.
 
 Blending into 11_11_10 UNorm color targets: KytyPS5 writes a format 30 target through its R32_UINT backing, the pixel
 shader packing the three channels, so the host cannot blend it and pipeline creation stops on any enabled blend. Under

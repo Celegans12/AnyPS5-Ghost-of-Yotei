@@ -2,7 +2,7 @@
 
 **No setting needed.** Convert your game and start it: every default is the fastest and most stable choice measured so far, and a few options only change how the game is shown ([Settings](#settings)).
 
-**AnyKyty is [AnyPS5](https://github.com/boykopovar/AnyPS5) running the Kyty graphics core.** Everything else stays AnyPS5: the relinker, `libkernel`, the system libraries, the window, input and audio. Only the GPU driver behind the AGC interface changes, selected at configure time with `-DANYPS5_GPU_BACKEND=kyty`.
+**AnyKyty is [AnyPS5](https://github.com/boykopovar/AnyPS5) running the Kyty graphics core.** Everything else stays AnyPS5: the relinker, `libkernel`, the system libraries, the window, input and audio. Only the GPU driver behind the AGC interface changes: the Kyty core is the only one.
 
 It exists for speed. On the same PC and scene, AnyKyty renders **63 % more frames per second than native Kyty**, with 38 to 53 % less CPU time per draw call on each of its stages.
 
@@ -100,7 +100,7 @@ Other titles have not been tried on AnyKyty by us. A report of any title, workin
 
 ## Building
 
-AnyKyty is the `AnyKyty` branch of this fork, its default branch. The default `-DANYPS5_GPU_BACKEND=anyps5` builds AnyPS5 as before and compiles none of the Kyty files. The Kyty core does not build with GCC: it is compiled by Clang in a sub-project, against the same libstdc++ as the rest of AnyPS5. The commands below are the ones of the [`AnyKyty` workflow](../../.github/workflows/anykyty.yml), which builds every pull request.
+AnyKyty is the `AnyKyty` branch of this fork, its default branch, and it has one way to build: the Kyty core is the only GPU driver, and there is no option to choose it. The Kyty core does not build with GCC: it is compiled by Clang in a sub-project, against the same libstdc++ as the rest of AnyPS5. The commands below are the ones of the [`AnyKyty` workflow](../../.github/workflows/anykyty.yml), which builds every pull request.
 
 ### Linux
 
@@ -121,7 +121,7 @@ git clone --recurse-submodules https://github.com/simnJS/AnyPS5.git
 cd AnyPS5
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
   -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 \
-  -DANYPS5_GPU_BACKEND=kyty -DANYPS5_KYTY_JOBS="$(nproc)"
+  -DANYPS5_KYTY_JOBS="$(nproc)"
 cmake --build build --target kyty_gpu libs relinker --parallel "$(nproc)"
 ```
 
@@ -140,7 +140,7 @@ Put the WinLibs and LLVM `bin` directories first on `PATH`, then, from `cmd.exe`
 ```bat
 git clone --recurse-submodules https://github.com/simnJS/AnyPS5.git
 cd AnyPS5
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DANYPS5_GPU_BACKEND=kyty -DANYPS5_KYTY_JOBS=%NUMBER_OF_PROCESSORS%
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DANYPS5_KYTY_JOBS=%NUMBER_OF_PROCESSORS%
 cmake --build build --target kyty_gpu libs relinker --parallel %NUMBER_OF_PROCESSORS%
 ```
 

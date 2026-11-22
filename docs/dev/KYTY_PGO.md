@@ -57,7 +57,7 @@ by whoever has the titles, as below, after the series of changes that caused it.
 
 ## Recording the profile
 
-1. Configure a separate build directory with `-DANYPS5_KYTY_PGO_GENERATE=ON` (and `-DANYPS5_GPU_BACKEND=kyty`), and build `libs`
+1. Configure a separate build directory with `-DANYPS5_KYTY_PGO_GENERATE=ON`, and build `libs`
    and `agc_frame_replay`.
 2. Run what the profile should represent with `LLVM_PROFILE_FILE=<directory>/kyty-%p.profraw` in the environment, one file per
    process:

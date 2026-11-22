@@ -82,7 +82,7 @@ Values pass through the same text filter as the report, so a path or a user name
 
 ## With the Kyty backend
 
-A build with `-DANYPS5_GPU_BACKEND=kyty` (AnyKyty) feeds the report from the Kyty presenter. `milestones.firstPresent`, `framesPresented`, `averageFps`, `fpsWindowSeconds` and `frameMs` count the display buffers of the game that the Kyty swapchain accepted: a cleared or blank frame is not counted, and neither is a frame the swapchain dropped. `system.gpu` is the Vulkan device Kyty selected, which `ANYPS5_GPU` picks, with the driver's name and version. `milestones.firstDraw` is not recorded, so a run that presents has the stage `presents` and a run that stops before its first frame has the stage `unknown`.
+AnyKyty feeds the report from the Kyty presenter. `milestones.firstPresent`, `framesPresented`, `averageFps`, `fpsWindowSeconds` and `frameMs` count the display buffers of the game that the Kyty swapchain accepted: a cleared or blank frame is not counted, and neither is a frame the swapchain dropped. `system.gpu` is the Vulkan device Kyty selected, which `ANYPS5_GPU` picks, with the driver's name and version. `milestones.firstDraw` is not recorded, so a run that presents has the stage `presents` and a run that stops before its first frame has the stage `unknown`.
 
 Kyty translates and compiles its own shaders, so the shader, instruction, format and descriptor counters of AnyPS5's driver stay at zero: `coverage.shaders`, `coverage.unsupported`, `coverage.imageFormats` and `coverage.descriptors` are `false`, and the `shaders` section of such a report says nothing about what was compiled. The missing functions are counted as with the default driver.
 

@@ -16,7 +16,6 @@ Set a switch before starting the emulator. Unless noted, any value enables it. M
 | `APS5_TRACE_EXIT` | Guest `exit` and `_Exit` calls and process-exit backtraces. |
 | `APS5_TRACE_FIBER` | Fiber initialization, switches and returns. |
 | `APS5_TRACE_MEMORY` | Direct-memory allocation, mapping and protection operations. |
-| `APS5_TRACE_PREPARATION_WAIT` | Shader preparation tasks moved to the front of the queue to satisfy a waiting caller. |
 | `APS5_TRACE_SSE4A` | Each emulated SSE4A instruction once per guest instruction address (Windows). |
 | `APS5_TRACE_SYNC` | Event-flag and semaphore operations and their wait and wake results. |
 | `APS5_TRACE_TIMERS` | Timing measurements for the host wait primitives used by the emulator. |
@@ -35,35 +34,7 @@ unmapped.
 
 | Switch | Output |
 | --- | --- |
-| `APS5_TRACE_BIGBUF` | Each copied or written-back guest-memory range of at least 1 MiB. |
-| `APS5_TRACE_BDA` | Shader memory accesses that make a program use the buffer-device-address path. |
-| `APS5_TRACE_BUFFER_WRITTEN` | Guest buffer elements classified as writable or read-only after descriptor population. |
-| `APS5_TRACE_CAPSYNC` | Waits for GPU writes needed by CPU accesses, including submission and range details. |
-| `APS5_TRACE_CONTEXT_STATE` | PM4 context-state operations and registers written while context state is pushed. |
-| `APS5_TRACE_COPY_HLE` | Pending host-side copies, their ranges, GPU batches and known writers. |
-| `APS5_TRACE_DCC_KEYS` | Display and storage-image DCC key reads, writes, fills and clears. |
-| `APS5_TRACE_DISPATCH_CACHE` | Compute dispatch cache hits, misses and changed user-data words. |
-| `APS5_TRACE_DISPATCH_IO` | Compute dispatch queue, submission serial, shader and resources; value `2` also prints small user-data buffers. |
-| `APS5_TRACE_DRAW_CACHE` | Draw-cache lookups, hits, misses, and key differences, reported every ten seconds. |
-| `APS5_TRACE_DRAWS` | Draw inputs and per-draw timing phases. With `APS5_PROFILE_DRAW`, also prints the detailed draw lines. |
-| `APS5_TRACE_DRAW_PROGRAMS` | One line per draw listing selected shader stages, roles, code addresses and entry addresses. |
-| `APS5_TRACE_FILL_COVER` | Initial fill/image coverage mismatches and refused image-layer clears. |
-| `APS5_TRACE_FLUSH` | Storage images flushed to guest memory and ranges left for the CPU. |
-| `APS5_TRACE_GPU` | Queue submissions, packet execution, waits and display-buffer scanouts. |
-| `APS5_TRACE_HOST_IMPORT` | Host-import mapping attempts, memory-map details, failures and retirement. |
-| `APS5_TRACE_IMAGE_TABLE` | Image-table resource materialization and descriptor selection. |
-| `APS5_TRACE_INDIRECT_DRAWS` | Indirect draw packets that pass the draw precheck. |
 | `APS5_TRACE_LABEL` | A matching `RELEASE_MEM` when recorded, and nearby `RELEASE_MEM`, `WRITE_DATA`, `COPY_DATA`, `DMA_DATA` and `WAIT_REG_MEM` packets when executed. Set the value to the guest address in hexadecimal. |
-| `APS5_TRACE_LATE_LABELS` | GPU label writes observed after their waiting submission was handled. |
-| `APS5_TRACE_QUERY` | Every sixteenth guest-memory page query, including cost and caller address. |
-| `APS5_TRACE_RESOURCE_KEY_MISSES` | Resource-content key changes that cause draw or dispatch resource-cache misses. |
-| `APS5_TRACE_SHADOW` | Unit-shadow publish, seed, eviction and retirement events; a number limits publish output. |
-| `APS5_TRACE_SKIPS` | GPU operations skipped by diagnostics, with a bounded number of recompile-request dumps per reason. |
-| `APS5_TRACE_STAGING` | Distinct guest-buffer ranges admitted to the write-staging window. |
-| `APS5_TRACE_TEXTURES` | Sampled texture addresses, dimensions, format, tile mode, and how many of the bytes at offsets 0, 64, 128 and so on are nonzero. |
-| `APS5_TRACE_UNREADABLE` | Call sites that check inaccessible guest-memory ranges or fail to read them. |
-| `APS5_TRACE_UPLOAD` | Reasons storage-image data is uploaded again. |
-| `APS5_TRACE_BARRIERS` | Set to a positive integer to print that many skipped barrier decisions and their ranges. |
 
 ## Performance captures
 
@@ -74,9 +45,6 @@ See [Build](BUILD.md#performance-trace) for the trace format, summary fields and
 | `APS5_TRACE_FRAMES=<start>:<count>` | Records a window of presents by zero-based frame number. |
 | `APS5_TRACE_SECONDS=<start>:<length>` | Records a window of presents by elapsed seconds after the first present. Cannot be set with `APS5_TRACE_FRAMES`. |
 | `APS5_TRACE_SUMMARY_EVERY=<seconds>` | Writes periodic summary lines without recording trace events. Can be combined with either window switch. |
-| `APS5_TRACE_EVENTS=<count>` | Sets the per-thread event-buffer capacity for a frame or seconds window (1–4,194,304; default 262,144). |
-| `APS5_TRACE_DIR=<path>` | Writes performance capture and summary files to this directory instead of the working directory. |
-| `APS5_AB=<seconds>:<switch>[+<switch>...]` | Alternates phase A (the environment's settings) and phase B (the listed switches toggled) at flip packets within one run, each phase at least `<seconds>` long. Every phase change prints `[ab] phase A\|B <k> begins at present <n> (t <s> s)` and, `APS5_AB_SETTLE` seconds (default 2) later, `[ab] phase A\|B <k> settled at present <n> (t <s> s)`; `t` counts from the first flip. `APS5_AB_START=<n>` starts at flip `<n>`, `APS5_AB_START=<n>s` `<n>` seconds after the first flip. Only runtime switches (`RuntimeSwitch` in `core/libs/prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp`; their rows in `docs/dev/ENVIRONMENT.md` say that `APS5_AB` can toggle them) can be listed; any other name fails the first flip. `python tools/ab_split.py <log>` prints the mean of each periodic report (`[present]`, `[gputime]`, `[draw] pipelined`, `[syncwait]`) per phase, counting only reports that lie wholly inside a settled phase, and each B phase against its neighbouring A phases. |
 | `KYTY_AB=<seconds>:<setting>[+<setting>...]` | The same with the Kyty backend, for the settings it can change at a flip; prints `[kyty-ab]` lines, and `python3 tools/kyty_ab_report.py <session>` gives each arm. See [the Kyty settings](THIRD_PARTY_KYTY.md#details). |
 | `APS5_VIDEOOUT_TELEMETRY_DIR=<path>` | Writes the presents and the pad changes of a run to `<path>/videoout.jsonl`; see [Usage](../user/USAGE.md#video-out-and-pad-telemetry). |
 

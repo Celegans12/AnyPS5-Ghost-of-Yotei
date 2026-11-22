@@ -2,7 +2,7 @@
 
 `tools/hw-oracle/` runs a few lines of RDNA assembly on a local AMD GPU, one input row per lane, and returns what the
 hardware computed. Use it to settle instruction semantics that the ISA documentation, LLVM or Mesa leave open, then pin the
-measured rows as expected values in `core/libs/prx/libSceAgcDriver/tests/execution/`.
+measured rows as expected values in a test.
 
 The PS5 GPU is gfx1013. Other RDNA2 GPUs (gfx103x) share the VALU, SALU, DS, MUBUF and MIMG encodings, apart from ops that
 exist only on gfx10.1 (`v_mad_legacy_f32`, `v_mac_legacy_f32`, `v_mul_lo_i32`, `s_dcache_discard`, ...). RDNA3 also runs
@@ -146,20 +146,16 @@ python3 tools/hw-oracle/probe_catalog.py run-ps5-linux \
 
 ## Recompiler comparison
 
-The `vulkan` runtime runs the same assembled kernel through the shader recompiler on the Vulkan device instead of on AMD
-hardware, so one body and one set of rows can be measured on both and the results compared. Build the runner:
-
-```sh
-cmake --build build --target agc_oracle_runner
-```
+The `vulkan` runtime ran the same assembled kernel through the historical AnyPS5 shader recompiler on the Vulkan device instead of on AMD
+hardware, so one body and one set of rows could be measured on both and the results compared. That recompiler and its runner,
+`agc_oracle_runner`, were removed with the historical GPU driver: the runtime now needs a runner built from a revision that still has them.
 
 | Variable | Meaning |
 | --- | --- |
 | `HW_ORACLE_RUNTIME=vulkan` | selects the runtime |
 | `HW_ORACLE_VULKAN_RUNNER` | path of the built `agc_oracle_runner` executable |
-| `ANYPS5_GPU` | case-insensitive substring of the Vulkan device name, as for every AnyPS5 tool |
 
-On Windows the runner needs `build/core/libs/libs/unpatched` in `PATH` ([BUILD](BUILD.md)). Run the hardware with the default
+Run the hardware with the default
 runtime and the recompiler with `vulkan`, with the same body, rows and settings, each with `--json`, then compare:
 
 ```sh
