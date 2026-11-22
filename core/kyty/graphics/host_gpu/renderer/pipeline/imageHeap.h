@@ -67,6 +67,15 @@ private:
 
 	enum class State : uint8_t { Live, Stale, Buried };
 
+	struct View;
+	struct List;
+
+	struct Use {
+		View*    view = nullptr;
+		List*    list = nullptr;
+		uint32_t slot = 0;
+	};
+
 	struct Element {
 		Key      key;
 		ImageId  image;
@@ -86,6 +95,7 @@ private:
 		uint64_t                     limit   = 0;
 		uint32_t                     profile = 0;
 		std::vector<uint32_t>        slots;
+		std::vector<uint32_t>        uses;
 		std::vector<uint32_t>        kind_keys;
 		std::vector<DescriptorValue> kinds;
 		std::unique_ptr<Buffer>      buffer;
@@ -93,6 +103,7 @@ private:
 		size_t                       dirty_end     = 0;
 		size_t                       changed_begin = 0;
 		size_t                       changed_end   = 0;
+		size_t                       order         = 0;
 		bool                         overflowed    = false;
 		bool                         released      = false;
 	};
@@ -111,9 +122,11 @@ private:
 	struct List {
 		View*                   view = nullptr;
 		std::vector<uint32_t>   slots;
+		std::vector<uint32_t>   uses;
 		std::unique_ptr<Buffer> buffer;
 		size_t                  dirty_begin = 0;
 		size_t                  dirty_end   = 0;
+		size_t                  order       = 0;
 	};
 
 	[[nodiscard]] bool Refresh(Memory& memory);
@@ -126,6 +139,10 @@ private:
 	void     UpdateProbe(View& view, uint64_t probe);
 	void     Assign(View& view, size_t slot, uint32_t entry);
 	void     Assign(List& list, size_t slot, uint32_t entry);
+	template <typename Owner>
+	void Link(Owner& owner, size_t slot, uint32_t entry);
+	template <typename Owner>
+	void Unlink(Owner& owner, size_t slot, uint32_t entry);
 	void     Upload(CommandBuffer& buffer, const std::vector<uint32_t>& slots, Buffer& device,
 	                size_t& dirty_begin, size_t& dirty_end);
 	uint32_t Intern(View& view, uint32_t kind, const Key& key);
@@ -155,6 +172,9 @@ private:
 	std::vector<ShaderRecompiler::IR::ImageResource>  m_profiles;
 	std::vector<bool>                                 m_table_profiles;
 	std::vector<Element>                              m_elements;
+	std::vector<std::vector<Use>>                     m_uses;
+	std::vector<uint32_t>                             m_marked;
+	std::vector<Use>                                  m_visits;
 	std::unordered_map<Key, uint32_t, KeyHash>        m_index;
 	std::vector<uint32_t>                             m_free;
 	std::vector<uint32_t>                             m_pending;
