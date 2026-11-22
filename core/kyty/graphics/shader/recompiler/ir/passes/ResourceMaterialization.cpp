@@ -9,6 +9,7 @@
 #include "graphics/shader/shaderBindings.h"
 
 #include <algorithm>
+#include <atomic>
 #include <optional>
 #include <array>
 #include <atomic>
@@ -2561,6 +2562,9 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		}
 #endif
 	}
+#if defined(ANYPS5_KYTY)
+	if (MirrorsVsharpBuffers()) MirrorBuffers(program, snapshot, specialization);
+#endif
 	snapshot.images.resize(program.info.images.size());
 	specialization.images.resize(program.info.images.size());
 	auto previous_tables = std::move(snapshot.image_tables);
@@ -3113,6 +3117,65 @@ bool LoadResourcePlan(std::span<const uint8_t> bytes, ResourcePlan& plan) {
 #if defined(ANYPS5_KYTY)
 bool GenericComputeVariants() {
 	return Common::RuntimeSwitches::On(Common::RuntimeSwitches::Switch::GenericComputeVariant);
+}
+
+static std::atomic<uint64_t> g_mirror_size {0};
+
+void SetMirrorSize(uint64_t size) {
+	g_mirror_size.store(size, std::memory_order_relaxed);
+}
+
+bool MirrorsVsharpBuffers() {
+	return g_mirror_size.load(std::memory_order_relaxed) != 0 &&
+	       Common::RuntimeSwitches::On(Common::RuntimeSwitches::Switch::E2VsharpMirror);
+}
+
+uint32_t MirrorElementBytes(const ResourcePlan& program, uint32_t index) {
+	if (program.stage != ShaderType::Compute || index >= program.info.buffers.size() || program.info.ray_query ||
+	    program.info.bvh || index >= program.buffer_vector_access.size() || program.buffer_vector_access[index] == 0u) {
+		return 0;
+	}
+	const auto& buffer = program.info.buffers[index];
+	if (buffer.written || buffer.atomic || buffer.formatted || buffer.indirect_write_table ||
+	    !buffer.proven_writes.empty() || buffer.indirect_root != BufferResource::NoIndirectBuffer ||
+	    !buffer.indirect_resources.empty() || buffer.source >= program.descriptor_sources.size() ||
+	    program.descriptor_sources[buffer.source].indirect_descriptor.has_value() ||
+	    program.descriptor_sources[buffer.source].dword_count != 4u) {
+		return 0;
+	}
+	uint32_t bytes = 1;
+	for (const auto& memory: program.memory_info) {
+		if (memory.resource != index) continue;
+		if (memory.kind == ResourceKind::IndirectBuffer) return 0;
+		if (memory.kind != ResourceKind::Buffer && memory.kind != ResourceKind::ScalarBuffer) continue;
+		if (memory.typed || memory.formatted) return 0;
+		const uint32_t element = memory.kind == ResourceKind::Buffer && memory.data_bits < 32u ? memory.data_bits / 8u
+		                         : memory.coherent && memory.data_dwords >= 2u                 ? 8u
+		                                                                                       : 4u;
+		bytes = std::max(bytes, element);
+	}
+	return bytes;
+}
+
+void MirrorBuffers(const ResourcePlan& program, const ResourceSnapshot& snapshot,
+                   ResourceSpecialization& specialization) {
+	const auto count = std::min({specialization.buffers.size(), program.info.buffers.size(), snapshot.buffers.size()});
+	const auto limit = g_mirror_size.load(std::memory_order_relaxed);
+	for (uint32_t index = 0; index < count; ++index) {
+		auto& buffer = specialization.buffers[index];
+		if (buffer.indirect_root != BufferResource::NoIndirectBuffer) continue;
+		const auto bytes = MirrorElementBytes(program, index);
+		ShaderBufferResource descriptor;
+		if (bytes == 0u || !DecodeBufferDescriptor(snapshot.buffers[index], descriptor) ||
+		    descriptor.Base48() % bytes != 0u) {
+			continue;
+		}
+		const auto extent = std::max(descriptor.GetSize(), uint64_t {program.info.buffers[index].max_byte_extent});
+		if (descriptor.Base48() >= limit || extent > limit - descriptor.Base48()) continue;
+		buffer.packed_stride   = (buffer.packed_stride & ~BufferStrideMask) | RuntimeBufferStride | MirrorBufferBit;
+		buffer.zero_stride_oob = false;
+		buffer.scalar_empty    = false;
+	}
 }
 
 namespace {

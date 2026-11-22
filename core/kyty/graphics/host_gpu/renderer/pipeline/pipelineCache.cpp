@@ -185,12 +185,12 @@ void LogShaderVariantBuild(const char* stage, uint64_t shader_hash, uint32_t use
 	PipelineCacheLog(
 	    "[kyty-variant] build stage={} shader={:016x} module={:016x} user_data_count={} "
 	    "static={:016x} push_start={} push_cursor={} buffers={:016x} images={:016x} "
-	    "samplers={:016x} linked_code={:016x} table={} spirv_words={}{} @{}",
+	    "samplers={:016x} linked_code={:016x} table={} mirrored={} spirv_words={}{} @{}",
 	    stage, shader_hash, module.id, user_data_count, fingerprint(static_state),
 	    module.info.bindings.push_data_start_dword, push_data_cursor,
 	    fingerprint(specialization.buffers), fingerprint(specialization.images),
 	    fingerprint(specialization.samplers), XXH3_64bits(functions.data(), functions.size() * sizeof(uint32_t)),
-	    module.info.table_mode, module.spirv_words, plain_fields,
+	    module.info.table_mode, module.info.bindings.mirror_count, module.spirv_words, plain_fields,
 	    std::chrono::steady_clock::now().time_since_epoch().count());
 }
 #endif

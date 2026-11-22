@@ -21,17 +21,20 @@ struct Entry {
 	const char* name;
 	const char* off;
 	const char* on;
+	bool        initially_on;
 };
 
 constexpr Entry Entries[] = {
-    {"KYTY_GENERIC_COMPUTE_VARIANT", "0", "1"},
+    {"KYTY_GENERIC_COMPUTE_VARIANT", "0", "1", true},
+    {"KYTY_E2_VSHARP_MIRROR", "0", "1", false},
 };
 
 static_assert(std::size(Entries) == SwitchCount);
 
 bool Initial(size_t index) {
 	const char* value = std::getenv(Entries[index].name);
-	return value == nullptr || std::string_view {value} != Entries[index].off;
+	if (value == nullptr) return Entries[index].initially_on;
+	return std::string_view {value} != Entries[index].off;
 }
 
 }
