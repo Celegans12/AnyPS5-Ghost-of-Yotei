@@ -28,9 +28,6 @@ enum class PresentMode { Fifo, Mailbox, Immediate };
 
 enum class PssrUpscaler { Linear, DLSS, FSR };
 
-using Keymap = std::vector<std::string>;
-using ControllerColor = std::array<uint8_t, 3>;
-
 enum GpuPipelineStage : uint32_t {
 	GPU_PIPELINE_RECORDING = 1u << 0u,
 	GPU_PIPELINE_COMMAND_PROCESSOR = 1u << 1u,
@@ -39,53 +36,19 @@ enum GpuPipelineStage : uint32_t {
 	    GPU_PIPELINE_RECORDING | GPU_PIPELINE_COMMAND_PROCESSOR | GPU_PIPELINE_RESOLVE,
 };
 
-constexpr uint32_t DEFAULT_CONSOLE_LANGUAGE = 1;
-constexpr uint32_t MAX_CONSOLE_LANGUAGE     = 29;
-constexpr std::size_t MAX_USER_NAME_LENGTH = 16;
-constexpr int32_t DEFAULT_USER_ID           = 1000;
-
-constexpr int     MAX_PLAYERS         = 4;
-constexpr int32_t PLAYER_USER_ID_STEP = 0x100;
-constexpr int32_t MAX_USER_ID =
-    std::numeric_limits<int32_t>::max() - (MAX_PLAYERS - 1) * PLAYER_USER_ID_STEP;
-
-constexpr bool IsConfiguredUserIdValid(int32_t user_id) {
-	constexpr int32_t USER_ID_EVERYONE = 0xfe;
-	constexpr int32_t USER_ID_SYSTEM   = 0xff;
-	return user_id >= 0 && user_id <= MAX_USER_ID && user_id != USER_ID_EVERYONE &&
-	       user_id != USER_ID_SYSTEM;
-}
-
 struct ConfigOptions {
 	uint32_t               screen_width                = 1280;
 	uint32_t               screen_height               = 720;
-	std::string            user_name                   = "Kyty";
-	int32_t                user_id                     = DEFAULT_USER_ID;
-	std::string            audio_input_device;
-	std::optional<ControllerColor> controller_color;
-	uint32_t               controller_speaker_volume      = 50;
-	uint32_t               controller_vibration_intensity = 100;
-	uint32_t               keyboard_player                = 0;
-	bool                   pad_haptic_rumble           = false;
 	PresentMode            present_mode                = PresentMode::Mailbox;
 	std::string            gpu_name;
-	bool                   fullscreen_enabled          = false;
 	bool                   hdr_enabled                 = false;
-	bool                   hide_cursor_enabled         = false;
 	bool                   stretch_enabled             = false;
-	bool                   splash_enabled              = true;
-	bool                   vr_enabled                  = false;
 	bool                   pro_enabled                 = false;
 	PssrUpscaler           pssr_upscaler               = PssrUpscaler::Linear;
 	std::filesystem::path  dlss_folder;
 	uint32_t               dlss_preset                 = 0;
 	std::filesystem::path  fsr_folder;
-	bool                   amd_cpu_enabled             = false;
-	bool                   guest_tsc_enabled           = true;
-	bool                   network_connected           = false;
-	bool                   psn_emulation_enabled       = false;
 	uint32_t               vblank_frequency            = 60;
-	uint32_t               console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
 	bool                   shader_validation_enabled   = false;
 	bool                   shader_cache_enabled        = false;
@@ -103,7 +66,6 @@ struct ConfigOptions {
 	bool                   profiler_enabled            = false;
 	bool                   spirv_debug_printf_enabled  = false;
 	bool                   gpu_assisted_validation_enabled = false;
-	bool                   renderdoc_enabled           = false;
 	bool                   tessellation_enabled        = true;
 	bool                   occlusion_queries_enabled   = true;
 	bool                   relaxed_shader_float        = false;
@@ -116,52 +78,24 @@ struct ConfigOptions {
 	uint32_t               rt_check_period             = 0;
 	uint32_t               rt_check_ppm                = 1000;
 	uint32_t               rt_check_strikes            = 3;
-	bool                   trophy_enabled              = true;
-	uint32_t               trophy_duration_seconds     = 6;
 	bool                   perf_overlay_enabled            = false;
-	bool                   playgo_hack_enabled         = false;
-	bool                   skip_notice_screen          = false;
 	uint32_t               gpu_pipeline_stages         = GPU_PIPELINE_ALL;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	bool red_zone_protection_enabled = true;
-#endif
-	Keymap keymap;
-	std::vector<std::string> guest_arguments {""};
 };
 
 void Load(const ConfigOptions& cfg);
 
 uint32_t GetScreenWidth();
 uint32_t GetScreenHeight();
-const std::string& GetUserName();
-int32_t  GetUserId();
-const std::string& GetAudioInputDevice();
-const std::optional<ControllerColor>& GetControllerColor();
-uint32_t GetControllerSpeakerVolume();
-uint32_t GetControllerVibrationIntensity();
-uint32_t GetKeyboardPlayer();
-int32_t  GetPlayerUserId(int player);
-int      GetPlayerFromUserId(int32_t user_id);
-bool     IsGuestUserId(int32_t user_id);
-bool     PadHapticRumbleEnabled();
 PresentMode GetPresentMode();
 const std::string& GetGpuName();
-bool     FullscreenEnabled();
 bool     HdrEnabled();
-bool     HideCursorEnabled();
 bool     StretchEnabled();
-bool     VrEnabled();
 bool     Ps5ProEnabled();
 PssrUpscaler GetPssrUpscaler();
 const std::filesystem::path& GetDlssFolder();
 uint32_t GetDlssPreset();
 const std::filesystem::path& GetFsrFolder();
-bool     AmdCpuEnabled();
-bool     GuestTscEnabled();
-bool     IsNetworkConnected();
-bool     PsnEmulationEnabled();
 uint32_t GetVblankFrequency();
-uint32_t GetConsoleLanguage();
 bool     VulkanValidationEnabled();
 
 bool                   ShaderValidationEnabled();
@@ -187,7 +121,6 @@ bool SpirvDebugPrintfEnabled();
 
 bool GpuAssistedValidationEnabled();
 
-bool RenderDocEnabled();
 bool TessellationEnabled();
 bool OcclusionQueriesEnabled();
 bool RelaxedShaderFloatEnabled();
@@ -195,16 +128,11 @@ uint32_t WaveSplitCheckPeriod();
 bool NativeRtEnabled();
 bool AsyncPipelinesEnabled();
 bool AsyncPipelinesSkipMore();
-bool NativeRayTracingEnabled();
 bool RayTracingStatsEnabled();
 uint32_t RayTracingOracle();
 uint32_t RayTracingCheckPeriod();
 uint32_t RayTracingCheckPpm();
 uint32_t RayTracingCheckStrikes();
-bool TrophyEnabled();
-uint32_t GetTrophyDurationSeconds();
-bool PlayGoHackEnabled();
-bool SkipNoticeScreen();
 uint32_t GpuPipelineStages();
 uint32_t ParseGpuPipelineStages(const char* value);
 
@@ -216,12 +144,6 @@ enum class GpuStageThread : uint32_t {
 	HostCopy         = 4
 };
 void ConfigureGpuStageThread(GpuStageThread stage);
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-bool RedZoneProtectionEnabled();
-#endif
-
-const Keymap& GetKeymap();
-const std::vector<std::string>& GetGuestArguments();
 
 }
 

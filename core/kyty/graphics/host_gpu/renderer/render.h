@@ -702,7 +702,6 @@ private:
 		~CatalogLock() {}
 	};
 	[[nodiscard]] static CatalogLock CatalogWrite() noexcept { return {}; }
-	[[nodiscard]] static CatalogLock CatalogRead() noexcept { return {}; }
 	void TableMemoRetired();
 	void TableForgetStates();
 	void TableSweepPairs();

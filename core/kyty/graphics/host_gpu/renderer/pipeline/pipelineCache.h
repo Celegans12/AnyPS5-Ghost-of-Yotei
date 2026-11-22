@@ -119,7 +119,6 @@ public:
 	void                   NoteDeferredLoads(std::span<uint64_t> addresses);
 	[[nodiscard]] uint32_t DeferredWords() const { return m_deferred_words; }
 	[[nodiscard]] uint32_t DeferredGpuWords() const { return m_deferred_gpu_words; }
-	static void            ReadGuestNow(uint64_t address, void* bytes, uint32_t size);
 #else
 	void RefreshFlatLoads(std::span<ShaderRecompiler::IR::ResourceSnapshot> resources,
 	                      bool gpu_copies = false) const;

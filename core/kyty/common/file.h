@@ -61,16 +61,12 @@ public:
 
 	[[nodiscard]] bool IsInvalid() const;
 
-	[[nodiscard]] bool IsEOF() const { return Tell() >= Size(); }
-
 	[[nodiscard]] std::optional<Times> GetTimes() const;
 
 	void Read(void* data, uint32_t size, uint32_t* bytes_read = nullptr);
 	void Write(const void* data, uint32_t size, uint32_t* bytes_written = nullptr);
 
 	void Printf(const char* format, ...) KYTY_FORMAT_PRINTF(2, 3);
-
-	std::vector<std::byte> ReadWholeBuffer();
 
 	static uint64_t Size(const std::filesystem::path& name);
 	static std::optional<Info> GetInfo(const std::filesystem::path& name);

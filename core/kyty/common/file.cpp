@@ -324,22 +324,6 @@ bool File::Flush() {
 	return SysFileFlush(*m_p->f);
 }
 
-std::vector<std::byte> File::ReadWholeBuffer() {
-	EXIT_IF(IsInvalid());
-	EXIT_IF(Tell() != 0);
-
-	uint64_t s = Size();
-
-	EXIT_IF((s >> 32u) != 0);
-
-	const auto            read_size = static_cast<uint32_t>(s);
-	std::vector<std::byte> buf(read_size);
-
-	Read(buf.data(), read_size);
-
-	return buf;
-}
-
 std::vector<File::DirEntry> File::GetDirEntries(const std::filesystem::path& path) {
 	if (IsArchivePath(path)) {
 		return GetArchiveDirEntries(path);

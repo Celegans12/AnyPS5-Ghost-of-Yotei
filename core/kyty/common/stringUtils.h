@@ -5,9 +5,7 @@
 
 #include <algorithm>
 #include <cctype>
-#include <codecvt>
 #include <filesystem>
-#include <locale>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -26,20 +24,6 @@ inline std::string PathToGenericString(const std::filesystem::path& path) {
 
 inline std::filesystem::path PathFromUtf8(std::string_view text) {
 	return std::filesystem::path(std::u8string(text.begin(), text.end()));
-}
-
-inline bool EqualNoCase(std::string_view lhs, std::string_view rhs) {
-	if (lhs.size() != rhs.size()) {
-		return false;
-	}
-	for (size_t i = 0; i < lhs.size(); i++) {
-		auto l = static_cast<unsigned char>(lhs[i]);
-		auto r = static_cast<unsigned char>(rhs[i]);
-		if (std::tolower(l) != std::tolower(r)) {
-			return false;
-		}
-	}
-	return true;
 }
 
 inline std::string ToLower(std::string_view text) {
@@ -76,10 +60,6 @@ inline std::string ReplaceStr(std::string text, std::string_view old_str,
 	return text;
 }
 
-inline std::string FixFilenameSlash(std::string_view text) {
-	return ReplaceChar(text, '\\', '/');
-}
-
 inline std::vector<std::string> Split(std::string_view text, std::string_view sep,
                                       bool keep_empty = false) {
 	std::vector<std::string> ret;
@@ -109,14 +89,6 @@ inline std::vector<std::string> Split(std::string_view text, std::string_view se
 
 inline std::vector<std::string> Split(std::string_view text, char sep, bool keep_empty = false) {
 	return Split(text, std::string_view(&sep, 1), keep_empty);
-}
-
-inline std::string Utf16ToUtf8(std::u16string_view utf16) {
-	if (utf16.empty()) {
-		return {};
-	}
-	std::wstring_convert<std::codecvt_utf8_utf16<char16_t>, char16_t> convert;
-	return convert.to_bytes(utf16.data(), utf16.data() + utf16.size());
 }
 
 }

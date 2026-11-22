@@ -834,13 +834,6 @@ void GuestReadLog::NoteAroundLoads(std::span<uint64_t> addresses) {
 	}
 }
 
-void GuestReadLog::ReadGuestNow(uint64_t address, void* bytes, uint32_t size) {
-	if (!Libs::LibKernel::Memory::MayFaultOnGpuRead(address, size) ||
-	    !Libs::LibKernel::Memory::TryReadAroundGpuWrites(address, bytes, size)) {
-		std::memcpy(bytes, reinterpret_cast<const void*>(address), size);
-	}
-}
-
 void GuestReadLog::RefreshFlatLoads(std::span<ShaderRecompiler::IR::ResourceSnapshot> resources, bool gpu_copies_allowed,
                                     const ShaderRecompiler::IR::CompiledShaderInfo* program) const {
 	m_deferred_gpu_words = 0;

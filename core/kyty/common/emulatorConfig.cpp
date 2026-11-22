@@ -28,10 +28,6 @@ void Shutdown() {
 
 void Load(const ConfigOptions& cfg) {
 	EXIT_IF(g_config == nullptr);
-	EXIT_IF(cfg.user_name.empty() || cfg.user_name.size() > MAX_USER_NAME_LENGTH);
-	EXIT_IF(!IsConfiguredUserIdValid(cfg.user_id));
-	EXIT_IF(cfg.controller_speaker_volume > 100 || cfg.controller_vibration_intensity > 100);
-	EXIT_IF(cfg.keyboard_player > static_cast<uint32_t>(MAX_PLAYERS));
 
 	*g_config = cfg;
 	Common::DebugCounters::SetEnabled(cfg.perf_overlay_enabled);
@@ -45,55 +41,6 @@ uint32_t GetScreenHeight() {
 	return g_config->screen_height;
 }
 
-const std::string& GetUserName() {
-	return g_config->user_name;
-}
-
-int32_t GetUserId() {
-	return g_config->user_id;
-}
-
-const std::string& GetAudioInputDevice() {
-	return g_config->audio_input_device;
-}
-
-const std::optional<ControllerColor>& GetControllerColor() {
-	return g_config->controller_color;
-}
-
-uint32_t GetControllerSpeakerVolume() {
-	return g_config->controller_speaker_volume;
-}
-
-uint32_t GetControllerVibrationIntensity() {
-	return g_config->controller_vibration_intensity;
-}
-
-uint32_t GetKeyboardPlayer() {
-	return g_config->keyboard_player;
-}
-
-int32_t GetPlayerUserId(int player) {
-	return g_config->user_id + player * PLAYER_USER_ID_STEP;
-}
-
-int GetPlayerFromUserId(int32_t user_id) {
-	for (int player = 0; player < MAX_PLAYERS; player++) {
-		if (user_id == GetPlayerUserId(player)) {
-			return player;
-		}
-	}
-	return -1;
-}
-
-bool IsGuestUserId(int32_t user_id) {
-	return GetPlayerFromUserId(user_id) > 0;
-}
-
-bool PadHapticRumbleEnabled() {
-	return g_config->pad_haptic_rumble;
-}
-
 PresentMode GetPresentMode() {
 	return g_config->present_mode;
 }
@@ -102,24 +49,12 @@ const std::string& GetGpuName() {
 	return g_config->gpu_name;
 }
 
-bool FullscreenEnabled() {
-	return g_config->fullscreen_enabled;
-}
-
 bool HdrEnabled() {
 	return g_config->hdr_enabled;
 }
 
-bool HideCursorEnabled() {
-	return g_config->hide_cursor_enabled;
-}
-
 bool StretchEnabled() {
 	return g_config->stretch_enabled;
-}
-
-bool VrEnabled() {
-	return g_config->vr_enabled;
 }
 
 bool Ps5ProEnabled() {
@@ -142,32 +77,12 @@ const std::filesystem::path& GetFsrFolder() {
 	return g_config->fsr_folder;
 }
 
-bool AmdCpuEnabled() {
-	return g_config->amd_cpu_enabled;
-}
-
-bool GuestTscEnabled() {
-	return g_config->guest_tsc_enabled;
-}
-
 uint32_t GetVblankFrequency() {
 	return std::clamp(g_config->vblank_frequency, 30u, 360u);
 }
 
-uint32_t GetConsoleLanguage() {
-	return g_config->console_language;
-}
-
 bool VulkanValidationEnabled() {
 	return g_config->vulkan_validation_enabled;
-}
-
-bool IsNetworkConnected() {
-	return g_config->network_connected;
-}
-
-bool PsnEmulationEnabled() {
-	return g_config->psn_emulation_enabled;
 }
 
 bool ShaderValidationEnabled() {
@@ -234,10 +149,6 @@ bool GpuAssistedValidationEnabled() {
 	return g_config->gpu_assisted_validation_enabled && g_config->vulkan_validation_enabled;
 }
 
-bool RenderDocEnabled() {
-	return g_config->renderdoc_enabled;
-}
-
 bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
 }
@@ -266,10 +177,6 @@ bool AsyncPipelinesSkipMore() {
 	return g_config->async_pipelines_skip_more;
 }
 
-bool NativeRayTracingEnabled() {
-	return g_config->native_rt;
-}
-
 bool RayTracingStatsEnabled() {
 	return g_config->native_rt && g_config->rt_stats_enabled;
 }
@@ -288,22 +195,6 @@ uint32_t RayTracingCheckPpm() {
 
 uint32_t RayTracingCheckStrikes() {
 	return std::max(g_config->rt_check_strikes, 1u);
-}
-
-bool TrophyEnabled() {
-	return g_config->trophy_enabled;
-}
-
-uint32_t GetTrophyDurationSeconds() {
-	return std::clamp(g_config->trophy_duration_seconds, 5u, 10u);
-}
-
-bool PlayGoHackEnabled() {
-	return g_config->playgo_hack_enabled;
-}
-
-bool SkipNoticeScreen() {
-	return g_config->skip_notice_screen;
 }
 
 uint32_t ParseGpuPipelineStages(const char* value) {
@@ -361,20 +252,6 @@ uint32_t GpuPipelineStages() {
 		return ParseGpuPipelineStages(value);
 	}
 	return g_config != nullptr ? g_config->gpu_pipeline_stages : 0;
-}
-
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-bool RedZoneProtectionEnabled() {
-	return g_config->red_zone_protection_enabled;
-}
-#endif
-
-const Keymap& GetKeymap() {
-	return g_config->keymap;
-}
-
-const std::vector<std::string>& GetGuestArguments() {
-	return g_config->guest_arguments;
 }
 
 }
