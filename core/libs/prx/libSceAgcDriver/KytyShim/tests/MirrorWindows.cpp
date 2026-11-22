@@ -27,7 +27,6 @@ struct MirrorWindowsTestAccess {
 		cache.CollectDownloadCopies(buffer, address, size, copies, total);
 		return !copies.empty() && cache.DownloadOnReadbackQueue(buffer, copies, total);
 	}
-	static void SwitchStorage(BufferCache& cache, bool windows) { cache.SwitchStorage(windows); }
 	static void CheckRange(BufferCache& cache, const Buffer& buffer, uint64_t address, uint64_t size) {
 		cache.CheckMirrorRange(buffer, address, size);
 	}
@@ -48,12 +47,11 @@ constexpr int         CpuReadWrite = 0x03;
 constexpr uint64_t    FirstBytes   = 0x8000;
 constexpr uint64_t    JoinedBytes  = 0x20000;
 constexpr uint64_t    WrittenAt    = 0x20000;
-constexpr uint64_t    SwitchedAt   = 0x24000;
+constexpr uint64_t    NextAt   = 0x24000;
 constexpr uint64_t    StreamedAt   = 0x30000;
 constexpr uint64_t    MirroredAt   = 0x34000;
 constexpr uint64_t    WrittenBytes = 0x1000;
 constexpr uint32_t    GpuValue     = 0x5eed1234u;
-constexpr uint32_t    SwitchValue  = 0x0ddba11u;
 
 std::string g_skipped;
 
@@ -237,31 +235,12 @@ const char* CheckWindows(GraphicContext& graphics, uint64_t address) {
 	}
 	MirrorWindowsTestAccess::DiscardGpuWrites(buffers, address + WrittenAt, WrittenBytes);
 
-	const auto [switched, switched_offset] = buffers.ObtainBuffer(address + SwitchedAt, WrittenBytes, true);
-	switched->Fill(switched_offset, WrittenBytes, SwitchValue);
-	(void)buffers.CommitWriteTicks();
-	MirrorWindowsTestAccess::SwitchStorage(buffers, false);
-	if (buffers.UsesMirror()) return "the cache still uses the mirror after the switch";
-	if (!BackingHolds(address + SwitchedAt, WrittenBytes, SwitchValue)) {
-		return "a switch of storage did not read the GPU writes back first";
-	}
-	const auto [own, own_offset] = buffers.ObtainBuffer(address + SwitchedAt, FirstBytes, false);
-	if (own->IsWindow() || own->Handle() == mirror->Handle()) return "a buffer made after the switch is still a window";
-	reader.Record(scheduler, own->BufferDeviceAddress() + own_offset, WrittenBytes);
+	const auto [back, back_offset] = buffers.ObtainBuffer(address + NextAt, FirstBytes, false);
+	if (!back->IsWindow() || back_offset != address + NextAt) return "a range next to a written one is not a window";
+	reader.Record(scheduler, mirror->DeviceAddress() + address + NextAt, FirstBytes);
 	Finish(scheduler);
-	if (!AllWords(reader.Words(WrittenBytes), SwitchValue)) {
-		return "a buffer of its own made after the switch does not read the bytes of the guest memory";
-	}
-	Finish(scheduler);
-	mirror->WaitIdle();
-	if (mirror->Totals().bound_blocks != 0) return "the switch away from the mirror left blocks bound";
-	MirrorWindowsTestAccess::SwitchStorage(buffers, true);
-	const auto [back, back_offset] = buffers.ObtainBuffer(address + SwitchedAt, FirstBytes, false);
-	if (!back->IsWindow() || back_offset != address + SwitchedAt) return "the switch back does not make windows again";
-	reader.Record(scheduler, mirror->DeviceAddress() + address + SwitchedAt, WrittenBytes);
-	Finish(scheduler);
-	if (!AllWords(reader.Words(WrittenBytes), SwitchValue)) {
-		return "a window made again does not read the bytes of the guest memory";
+	if (!ReadsPattern(reader.Words(FirstBytes), NextAt / sizeof(uint32_t))) {
+		return "a window next to a GPU-written one does not read the bytes of the guest memory";
 	}
 	if (mirror->Totals().unbound_reads != 0) return "a read of a block that was not bound was counted";
 
@@ -270,7 +249,7 @@ const char* CheckWindows(GraphicContext& graphics, uint64_t address) {
 		mirror->WaitIdle();
 		mirror->Trim({});
 		mirror->WaitIdle();
-		MirrorWindowsTestAccess::CheckRange(buffers, *back, address + SwitchedAt, WrittenBytes);
+		MirrorWindowsTestAccess::CheckRange(buffers, *back, address + NextAt, WrittenBytes);
 		if (mirror->Totals().unbound_reads != 1) return "a window whose blocks are not bound is not counted";
 	}
 

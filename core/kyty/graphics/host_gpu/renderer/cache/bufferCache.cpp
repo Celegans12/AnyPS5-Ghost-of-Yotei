@@ -7,7 +7,6 @@
 #include "common/hackNotice.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
-#include "common/runtimeSwitches.h"
 #include "common/spscQueue.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/scout.h"
@@ -409,7 +408,6 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 		} else {
 			SetVulkanObjectNameF(m_graphics.device, m_guest_mirror->Handle(), "Kyty.GuestMirror[size=0x{:x}]",
 			                     m_guest_mirror->Size());
-			m_windows = Common::RuntimeSwitches::On(Common::RuntimeSwitches::Switch::E75T1);
 		}
 	}
 	m_scheduler.SetSubmitHook(
@@ -1546,7 +1544,7 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 }
 
 BufferId BufferCache::InsertBuffer(uint64_t vaddr, uint64_t size) {
-	if (m_windows && m_guest_mirror->Holds(vaddr, size)) {
+	if (m_guest_mirror && m_guest_mirror->Holds(vaddr, size)) {
 		return m_slot_buffers.insert(m_graphics, m_scheduler, vaddr, size,
 		                             MirrorWindow {m_guest_mirror->Handle(), m_guest_mirror->DeviceAddress()});
 	}
@@ -3321,25 +3319,23 @@ void BufferCache::SubmitGuestMirror(SubmitInfo& submit) {
 	if (wait.semaphore) submit.AddWait(wait.semaphore, wait.value);
 	if (!std::exchange(m_trim_mirror, false)) return;
 	std::vector<std::pair<uint64_t, uint64_t>> live;
-	if (!std::exchange(m_trim_everything, false)) {
-		live.reserve(m_buffers.size());
-		for (const auto& [vaddr, id]: m_buffers) {
-			const auto& buffer = m_slot_buffers[id];
-			if (buffer.IsWindow()) live.emplace_back(buffer.CpuAddress(), buffer.Size());
-		}
+	live.reserve(m_buffers.size());
+	for (const auto& [vaddr, id]: m_buffers) {
+		const auto& buffer = m_slot_buffers[id];
+		if (buffer.IsWindow()) live.emplace_back(buffer.CpuAddress(), buffer.Size());
 	}
 	WaitReadbackQueueCopies(m_guest_mirror->Handle());
 	m_guest_mirror->Trim(live, {m_scheduler.GetMasterSemaphore().Handle(), m_scheduler.CurrentTick()});
 }
 
-void BufferCache::TickGuestMirror(bool summary_now) {
+void BufferCache::TickGuestMirror() {
 	static constexpr uint64_t TrimPeriod     = 64;
 	static constexpr uint64_t PressureMargin = 256 * MiB;
 	auto&                     mirror         = *m_guest_mirror;
-	if (!summary_now) m_guest_mirror_frames++;
+	m_guest_mirror_frames++;
 	const auto now     = static_cast<uint64_t>(SteadyNs());
-	const bool summary = m_guest_mirror_line != 0 && (summary_now || now - m_guest_mirror_line >= 10'000'000'000);
-	const bool check   = !summary_now && m_windows && m_gc_tick - m_guest_mirror_trim >= TrimPeriod;
+	const bool summary = m_guest_mirror_line != 0 && now - m_guest_mirror_line >= 10'000'000'000;
+	const bool check   = m_gc_tick - m_guest_mirror_trim >= TrimPeriod;
 	if (m_guest_mirror_line == 0) m_guest_mirror_line = now;
 	if (!summary && !check) return;
 	uint64_t used = 0, budget = 0;
@@ -3375,13 +3371,13 @@ void BufferCache::TickGuestMirror(bool summary_now) {
 		(buffer.IsWindow() ? window_bytes : buffer_bytes) += buffer.Size();
 	}
 	::Log::WriteToConsoleAndLog(fmt::format(
-	    "[kyty-mirror] summary of the last {:.1f} s ({}): {} frames; {} blocks of {} KiB bound ({:.1f} MiB, {} chunks of {} MiB) "
+	    "[kyty-mirror] summary of the last {:.1f} s: {} frames; {} blocks of {} KiB bound ({:.1f} MiB, {} chunks of {} MiB) "
 	    "in a mirror of {} GiB; {} blocks bound in {} vkQueueBindSparse calls ({:.3f} calls and {:.2f} blocks per frame), {:.2f} "
 	    "ms in the calls, {:.1f} ms until they were done (longest {:.2f} ms); {} submissions waited for a bind; {} blocks unbound "
 	    "in {} trims under memory pressure; {} blocks noted outside the mirror; {} reads of unbound blocks; {} windows ({:.1f} "
 	    "MiB) and {} buffers of their own ({:.1f} MiB); device-local memory {} MiB used of a {} MiB budget; {} bind requests, "
 	    "{:.3f} ms from the request to the bound block on average (longest {:.2f} ms)\n",
-	    seconds, m_windows ? "windows of the mirror" : "buffers of their own", frames, stats.bound_blocks, block >> 10u,
+	    seconds, frames, stats.bound_blocks, block >> 10u,
 	    static_cast<double>(stats.bound_blocks * block) / static_cast<double>(MiB), stats.chunks,
 	    std::max(GuestMirror::ChunkBytes, block) / MiB, mirror.Size() / GuestMirror::GiB, stats.blocks, stats.calls,
 	    per(stats.calls), per(stats.blocks), static_cast<double>(stats.call_ns) / 1e6, static_cast<double>(stats.done_ns) / 1e6,
@@ -3392,46 +3388,8 @@ void BufferCache::TickGuestMirror(bool summary_now) {
 	    static_cast<double>(stats.request_longest_ns) / 1e6));
 }
 
-void BufferCache::SwitchStorage(bool windows) {
-	if (m_guest_mirror_line != 0) TickGuestMirror(true);
-	std::vector<BufferId> ids;
-	ids.reserve(m_buffers.size());
-	for (const auto& [vaddr, id]: m_buffers) {
-		if (!m_slot_buffers[id].InPlace()) ids.push_back(id);
-	}
-	for (const auto id: ids) {
-		auto& buffer = m_slot_buffers[id];
-		if (m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size())) {
-			(void)DownloadBufferMemory<true>(buffer, buffer.CpuAddress(), buffer.Size());
-		}
-	}
-	const auto tick = m_scheduler.CurrentTick();
-	m_scheduler.Wait(tick);
-	m_scheduler.WaitPriorityOperations(tick);
-	for (const auto id: ids) {
-		auto& buffer = m_slot_buffers[id];
-		WaitReadbackQueueCopies(buffer.Handle());
-		UnmarkGpuModified(buffer.CpuAddress(), buffer.Size());
-		m_memory_tracker.MarkRegionAsCpuModified(buffer.CpuAddress(), buffer.Size());
-		if (m_record_released) {
-			m_released_ranges.Add(buffer.CpuAddress(), buffer.Size());
-		}
-		Unregister(id);
-		m_slot_buffers.erase(id);
-	}
-	m_gpu_write_generation++;
-	m_windows = windows;
-	if (!windows) {
-		m_trim_mirror     = true;
-		m_trim_everything = true;
-	}
-}
-
 void BufferCache::RunGarbageCollector() {
 	ServeInPlaceConversions();
-	if (m_guest_mirror && m_windows != Common::RuntimeSwitches::On(Common::RuntimeSwitches::Switch::E75T1)) {
-		SwitchStorage(!m_windows);
-	}
 	const auto tick = m_gc_tick++;
 	CollectStaleBuffers(tick);
 	if (m_graphics.CanReportMemoryUsage()) {

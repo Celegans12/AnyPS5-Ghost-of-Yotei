@@ -279,7 +279,7 @@ public:
 	[[nodiscard]] bool CommitWriteTicks();
 	[[nodiscard]] bool TryReadMirroredGpuWrites(uint64_t vaddr, void* data, uint64_t size);
 	[[nodiscard]] GuestMirror* GetGuestMirror() noexcept { return m_guest_mirror.get(); }
-	[[nodiscard]] bool         UsesMirror() const noexcept { return m_windows; }
+	[[nodiscard]] bool         UsesMirror() const noexcept { return m_guest_mirror != nullptr; }
 	void RequestFlushForReadbacks() noexcept {
 		if ((m_device_address_hot != 0 &&
 		     m_readback_count - m_device_address_hot < HotReadbackLifetime) ||
@@ -308,7 +308,6 @@ private:
 	[[nodiscard]] BufferId InsertBuffer(uint64_t vaddr, uint64_t size);
 	void                   CheckMirrorRange(const Buffer& buffer, uint64_t vaddr, uint64_t size) noexcept;
 	void                   CheckMirrorCopies(const Buffer& buffer, std::span<const vk::BufferCopy> copies) noexcept;
-	void                   SwitchStorage(bool windows);
 
 	bool IsBufferInvalid(BufferId id) const { return !id || m_slot_buffers[id].is_deleted; }
 	WriteFaultOwner InvalidateGuestWriteFault(uint64_t vaddr);
@@ -536,11 +535,9 @@ private:
 	static constexpr uint32_t MaxMirrorLines      = 8192;
 	static constexpr uint64_t MirrorFlushLifetime = 4096;
 	void                      SubmitGuestMirror(SubmitInfo& submit);
-	void                      TickGuestMirror(bool summary_now = false);
+	void                      TickGuestMirror();
 	std::unique_ptr<GuestMirror> m_guest_mirror;
-	bool                         m_windows             = false;
 	bool                         m_trim_mirror         = false;
-	bool                         m_trim_everything     = false;
 	uint64_t                     m_guest_mirror_line   = 0;
 	uint64_t                     m_guest_mirror_frames = 0;
 	uint64_t                     m_guest_mirror_trim   = 0;
