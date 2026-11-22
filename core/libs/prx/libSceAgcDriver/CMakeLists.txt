@@ -128,6 +128,17 @@ if(BUILD_TESTING)
     configure_host_test_executable(kyty_shim_native_rt_tests)
     add_test(NAME kyty_shim_native_rt COMMAND kyty_shim_native_rt_tests)
     set_tests_properties(kyty_shim_native_rt PROPERTIES TIMEOUT 20)
+    add_test_executable(kyty_shim_settings_tests
+            KytyShim/src/SettingsTests.cpp
+            KytyShim/src/Settings.cpp)
+    target_include_directories(kyty_shim_settings_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    set_target_properties(kyty_shim_settings_tests PROPERTIES CXX_EXTENSIONS OFF)
+    configure_host_test_executable(kyty_shim_settings_tests)
+    add_test(NAME kyty_shim_settings COMMAND kyty_shim_settings_tests)
+    set_tests_properties(kyty_shim_settings PROPERTIES TIMEOUT 20 PASS_REGULAR_EXPRESSION "kyty_shim_settings: ok")
+    add_test(NAME kyty_shim_settings_environment COMMAND kyty_shim_settings_tests environment)
+    set_tests_properties(kyty_shim_settings_environment PROPERTIES TIMEOUT 20
+            ENVIRONMENT "KYTY_SETTINGS_TEST_UNREAD=1;KYTY_HDR=0" PASS_REGULAR_EXPRESSION "kyty_shim_settings_environment: ok")
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/KytyShim/tests/CMakeLists.txt)
         add_subdirectory(KytyShim/tests)
     endif()

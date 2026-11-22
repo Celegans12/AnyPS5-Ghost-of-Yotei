@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/KytyShim/src/EntryApi.hpp"
 #include "prx/libSceAgcDriver/KytyShim/src/EntryPure.hpp"
 #include "prx/libSceAgcDriver/KytyShim/src/Replay.hpp"
+#include "prx/libSceAgcDriver/KytyShim/src/Settings.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
@@ -157,6 +158,7 @@ void Initialize() {
     KytyShim::ReportNativeRayTracing(presenter.Renderer().GetGraphics());
     KytyShim::Entry::NoteRunReportGpu(presenter.Renderer().GetGraphics());
     if (hostReport) KytyShim::Entry::ReportKytyHost(presenter.Renderer().GetGraphics());
+    KytyShim::Settings::ReportUnread(stderr);
     auto& video_out = VideoOut::VideoOutInit(width, height, presenter);
     g_renderer = &presenter.Renderer();
     g_renderer->InitializeGpu(&video_out);
