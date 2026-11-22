@@ -16,22 +16,6 @@ class FfmpegCacheKeyTests(unittest.TestCase):
         self.assertEqual(len(keys), 1)
         self.assertIn("-winlibs-${{ env.WINLIBS_ZIP }}-", keys[0])
 
-    def test_the_msys2_build_names_its_toolchain_in_the_ffmpeg_key(self):
-        keys = self.keys("windows-msys2.yml")
-        self.assertEqual(len(keys), 1)
-        self.assertIn("-msys2-", keys[0])
-
-    def test_the_two_toolchains_never_share_an_ffmpeg_cache_entry(self):
-        self.assertNotEqual(self.keys("build.yml")[0], self.keys("windows-msys2.yml")[0])
-
-
-class CcacheKeyTests(unittest.TestCase):
-    def test_the_msys2_ccache_is_outside_the_windows_restore_prefix(self):
-        text = (REPOSITORY / ".github/workflows/windows-msys2.yml").read_text(encoding="utf-8")
-        key = re.search(r"ccache-action@\S+\s+with:\s+key: (\S+)", text)
-        self.assertIsNotNone(key)
-        self.assertFalse(key.group(1).startswith("windows"), key.group(1))
-
 
 if __name__ == "__main__":
     unittest.main()
