@@ -271,6 +271,68 @@ const char* CheckPartialBufferCopy(GraphicContext& graphics, uint64_t address,
 	return stale ? "the resident image still held stale texels after the partial copy" : nullptr;
 }
 
+const char* CheckRangePicksLatestWrite(GraphicContext& graphics, uint64_t address) {
+	RenderContext renderer(graphics);
+	CommandProcessor producer(renderer, 0);
+	producer.Reset();
+	auto& scheduler = renderer.GetCommandScheduler();
+	auto& textures = renderer.GetTextureCache();
+	scheduler.Begin(producer.GetCtx(), producer.GetUcfg(), producer.GetShCtx());
+
+	constexpr uint64_t PairStride = 0x1000;
+	const auto create = [&](uint64_t at, bool packed) {
+		ImageInfo info;
+		info.data.address = at;
+		info.pixel_format = packed ? vk::Format::eR8G8B8A8Unorm : vk::Format::eR32Uint;
+		info.guest_format = packed ? Prospero::BufferFormat::k8_8_8_8UNorm : Prospero::BufferFormat::k32UInt;
+		info.extent = vk::Extent3D {ImageWords, 1, 1};
+		info.pitch = ImageWords;
+		info.UpdateSize();
+		return TextureCacheTestAccess::Create(textures, info);
+	};
+	const auto write = [&](ImageId id) {
+		auto& image = textures.GetImage(id);
+		const auto native = scheduler.Current().Handle();
+		image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, native);
+		const bool packed = image.info.pixel_format == vk::Format::eR8G8B8A8Unorm;
+		const vk::ClearColorValue clear =
+		    packed ? vk::ClearColorValue {.float32 = {std::array<float, 4> {1.0f, 0.0f, 0.0f, 1.0f}}}
+		           : vk::ClearColorValue {.uint32 = {std::array<uint32_t, 4> {ImageValue, 0, 0, 0}}};
+		const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		native.clearColorImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal, &clear, 1, &range);
+		textures.MarkGpuWritten(id);
+	};
+
+	const auto first = create(address, false);
+	const auto second = create(address, true);
+	const auto size = textures.GetImage(first).info.data.size;
+	const bool equal = textures.GetImage(second).info.data.size == size;
+	write(first);
+	write(second);
+	const auto later_registered = textures.FindImageFromRange(address, size);
+
+	const auto reversed_first = create(address + PairStride, false);
+	const auto reversed_second = create(address + PairStride, true);
+	write(reversed_second);
+	write(reversed_first);
+	const auto earlier_registered = textures.FindImageFromRange(address + PairStride, size);
+
+	const auto unwritten_first = create(address + 2 * PairStride, false);
+	(void)create(address + 2 * PairStride, true);
+	const auto unwritten = textures.FindImageFromRange(address + 2 * PairStride, size, false);
+
+	const auto last = scheduler.CurrentTick();
+	scheduler.Wait(last);
+	scheduler.WaitPriorityOperations(last);
+	if (!equal) return "the two images at one address differ in data size";
+	if (!later_registered || !earlier_registered) return "the range read-back found no GPU-written image";
+	if (later_registered != second || earlier_registered != reversed_first) {
+		return "the range read-back did not pick the image the GPU wrote last";
+	}
+	if (unwritten != unwritten_first) return "the unwritten pair did not keep the first match";
+	return nullptr;
+}
+
 }
 
 extern "C" int RunKytyImageWriteBackAliasTest() {
@@ -305,6 +367,9 @@ extern "C" int RunKytyImageWriteBackAliasTest() {
 		const auto* tiled = CheckPartialBufferCopy(graphics, address + GuestBytes / 2,
 		                                          Prospero::TileMode::kStandard4KB);
 		failure = linear != nullptr ? linear : tiled;
+	}
+	if (failure == nullptr) {
+		failure = CheckRangePicksLatestWrite(graphics, address + GuestBytes / 8 * 7);
 	}
 	if (sceKernelMunmap(address, GuestBytes) != 0) {
 		std::fputs("kyty_shim_image_write_back_alias: FAILED: could not unmap guest backing\n", stderr);

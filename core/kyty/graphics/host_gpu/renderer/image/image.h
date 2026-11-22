@@ -214,6 +214,7 @@ public:
 	static inline std::mutex              heap_mutex;
 	static inline std::vector<HeapChange> heap_changes;
 	static inline std::atomic<uint64_t>   serials {0};
+	static inline std::atomic<uint64_t>   gpu_write_sequences {0};
 
 	const uint64_t   serial = serials.fetch_add(1u, std::memory_order_relaxed) + 1u;
 	uint64_t         validity = 0;
@@ -229,6 +230,7 @@ public:
 	bool             partial_candidate = false;
 	ImageId          depth_id {};
 	uint64_t         write_count        = 0;
+	uint64_t         gpu_write_sequence = 0;
 	uint64_t         candidate_clear_key = 0;
 	bool             is_depth_copy      = false;
 	ImageId          depth_copy_source {};

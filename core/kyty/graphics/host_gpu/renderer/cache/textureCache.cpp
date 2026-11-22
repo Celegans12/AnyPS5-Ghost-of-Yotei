@@ -1225,7 +1225,9 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 		destination.CopyImageWithBuffer(source, copy_buffer, m_tiler);
 	}
 	if (source.IsGpuModified()) {
+		const uint64_t own = destination.IsGpuModified() ? destination.gpu_write_sequence : 0;
 		destination.MarkGpuModified();
+		destination.gpu_write_sequence = std::max(own, source.gpu_write_sequence);
 	}
 	destination.ClearBufferModified();
 }
@@ -1244,7 +1246,9 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 	}
 	destination.CopyMip(source, mip, layer);
 	if (source.IsGpuModified()) {
+		const uint64_t own = destination.IsGpuModified() ? destination.gpu_write_sequence : 0;
 		destination.MarkGpuModified();
+		destination.gpu_write_sequence = std::max(own, source.gpu_write_sequence);
 	}
 }
 
@@ -2698,11 +2702,19 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 	if (matches.size() == 1) {
 		selected = matches.front();
 	} else {
+		uint64_t selected_sequence = 0;
 		for (const auto id: matches) {
 			const auto& image = m_slot_images[id];
-			if (image.info.data.size == size) {
-				selected = id;
-				break;
+			if (image.info.data.size != size) {
+				continue;
+			}
+			auto sequence = image.gpu_write_sequence;
+			if (image.depth_id && m_slot_images[image.depth_id].registered) {
+				sequence = std::max(sequence, m_slot_images[image.depth_id].gpu_write_sequence);
+			}
+			if (!selected || sequence > selected_sequence) {
+				selected          = id;
+				selected_sequence = sequence;
 			}
 		}
 	}
@@ -2870,6 +2882,8 @@ void TextureCache::CommitGpuWrite(Image& image) {
 	image.ClearBufferModified();
 	image.RefreshComplete();
 	image.MarkGpuModified();
+	image.gpu_write_sequence =
+	    Image::gpu_write_sequences.fetch_add(1u, std::memory_order_relaxed) + 1u;
 }
 
 bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
