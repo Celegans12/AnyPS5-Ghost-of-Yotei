@@ -42,8 +42,8 @@ def runtime():
 def vulkan_runner():
     path = os.environ.get("HW_ORACLE_VULKAN_RUNNER")
     if not path or not Path(path).is_file():
-        sys.exit("HW_ORACLE_RUNTIME=vulkan needs HW_ORACLE_VULKAN_RUNNER to name the agc_oracle_runner executable "
-                 "(cmake --build build --target agc_oracle_runner)")
+        sys.exit("HW_ORACLE_RUNTIME=vulkan needs HW_ORACLE_VULKAN_RUNNER to name the kyty_oracle_runner executable "
+                 "(cmake --build build --target kyty_oracle_runner)")
     return path
 
 

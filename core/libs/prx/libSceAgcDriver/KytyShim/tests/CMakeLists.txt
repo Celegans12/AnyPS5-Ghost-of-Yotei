@@ -771,3 +771,17 @@ target_link_libraries(kyty_shim_wave_split_codegen_tests PRIVATE Kyty::gpu libke
 add_test(NAME kyty_shim_wave_split_codegen COMMAND kyty_shim_wave_split_codegen_tests)
 set_tests_properties(kyty_shim_wave_split_codegen PROPERTIES TIMEOUT 60
         PASS_REGULAR_EXPRESSION "kyty_shim_wave_split_codegen: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+add_subdirectory(${CMAKE_SOURCE_DIR}/tools/hw-oracle/kyty ${CMAKE_CURRENT_BINARY_DIR}/hw-oracle-kyty)
+add_test_executable(kyty_shim_hw_oracle_tests ${CMAKE_CURRENT_SOURCE_DIR}/HwOracle.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+configure_host_test_executable(kyty_shim_hw_oracle_tests)
+if(MINGW)
+    target_link_libraries(kyty_shim_hw_oracle_tests PRIVATE stdc++ gcc_eh)
+endif()
+target_link_libraries(kyty_shim_hw_oracle_tests PRIVATE kyty_hw_oracle libkernel libc)
+add_dependencies(kyty_shim_hw_oracle_tests kyty_oracle_runner)
+add_test(NAME kyty_shim_hw_oracle COMMAND kyty_shim_hw_oracle_tests)
+set_tests_properties(kyty_shim_hw_oracle PROPERTIES TIMEOUT 60
+        PASS_REGULAR_EXPRESSION "kyty_shim_hw_oracle: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+add_test(NAME kyty_shim_hw_oracle_rows COMMAND kyty_shim_hw_oracle_tests rows)
+set_tests_properties(kyty_shim_hw_oracle_rows PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "kyty_shim_hw_oracle_rows: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")

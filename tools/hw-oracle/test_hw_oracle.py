@@ -882,7 +882,7 @@ class VulkanRuntimeTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
-        self.runner = self.root / "agc_oracle_runner"
+        self.runner = self.root / "kyty_oracle_runner"
         self.runner.write_bytes(b"runner")
         environment = {key: value for key, value in os.environ.items()
                        if key not in ("HW_ORACLE_VULKAN_RUNNER", "HW_ORACLE_TARGET")}

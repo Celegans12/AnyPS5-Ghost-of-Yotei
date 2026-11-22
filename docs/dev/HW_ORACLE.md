@@ -146,26 +146,35 @@ python3 tools/hw-oracle/probe_catalog.py run-ps5-linux \
 
 ## Recompiler comparison
 
-The `vulkan` runtime ran the same assembled kernel through the historical AnyPS5 shader recompiler on the Vulkan device instead of on AMD
-hardware, so one body and one set of rows could be measured on both and the results compared. That recompiler and its runner,
-`agc_oracle_runner`, were removed with the historical GPU driver: the runtime now needs a runner built from a revision that still has them.
+The `vulkan` runtime runs the same assembled kernel through the Kyty shader recompiler (`core/kyty/graphics/shader/recompiler`)
+on a Vulkan device instead of on AMD hardware, so one body and one set of rows can be measured on both and the results compared.
+The runner is `kyty_oracle_runner` (`tools/hw-oracle/kyty/`), built with the Kyty shim tests (`-DBUILD_TESTING=ON`,
+`cmake --build build --target kyty_oracle_runner`).
+
+The recompiler refuses writable `global_*` addresses, so the runner checks that the kernel's first 24 and last 9 words are
+exactly those of `template.s` and replaces them in place with instructions of the same size: `s_load_dwordx4` becomes two
+`s_nop 0`, `global_load_dwordx4` becomes `buffer_load_dwordx4 v[4:7], v1, s[8:11], 0 offen`, and each `global_store_dwordx4`
+becomes `buffer_store_dwordx4` from the same registers through `v2, s[0:3], 0 offen` with the same offset. The output V# is in
+s[0:3] and the input V# in s[8:11]; a body that names s0-s11 is refused. The body runs unchanged.
 
 | Variable | Meaning |
 | --- | --- |
 | `HW_ORACLE_RUNTIME=vulkan` | selects the runtime |
-| `HW_ORACLE_VULKAN_RUNNER` | path of the built `agc_oracle_runner` executable |
+| `HW_ORACLE_VULKAN_RUNNER` | path of the built `kyty_oracle_runner` executable |
+| `HW_ORACLE_VULKAN_DEVICE` | index or part of the name of the Vulkan device; needed when there are several (`kyty_oracle_runner --devices` lists them) |
+| `HW_ORACLE_TARGET=gfx1013` | assembles the PS5 encoding; on Windows the target otherwise comes from the HIP device, and the runner refuses targets other than gfx10 |
 
 The example uses the `.exe` runner when it is present. Run the hardware with the default runtime and the recompiler with
 `vulkan`, with the same body, rows and settings, each with `--json`, then compare:
 
 ```sh
 SETTINGS="--ieee 0 --dx10-clamp 1 --denorm32 0 --denorm16 3 --round32 0 --round16 0 --fp16-overflow 0"
-RUNNER=build/core/libs/prx/libSceAgcDriver/agc_oracle_runner
+RUNNER=build/tests/kyty_oracle_runner
 if [ -f "$RUNNER.exe" ]; then
   RUNNER="$RUNNER.exe"
 fi
 python3 tools/hw-oracle/hw_oracle.py body.s rows.txt --json $SETTINGS > hardware.json
-HW_ORACLE_RUNTIME=vulkan HW_ORACLE_VULKAN_RUNNER="$RUNNER" \
+HW_ORACLE_RUNTIME=vulkan HW_ORACLE_VULKAN_RUNNER="$RUNNER" HW_ORACLE_TARGET=gfx1013 \
   python3 tools/hw-oracle/hw_oracle.py body.s rows.txt --json $SETTINGS > recompiler.json
 python3 tools/hw-oracle/compare_results.py hardware.json recompiler.json
 ```
@@ -175,9 +184,16 @@ The report's `runtime` field says which side produced it.
 - Compute only.
 - Whole waves: Python pads the rows with zeros to the wave size, so cross-lane instructions see the padded lanes.
 - At most 1024 lanes per dispatch (512 with `--wave64`).
-- No `coarse`.
-- The assembly target comes from the AMD driver on Windows or from `HW_ORACLE_TARGET`; the recompiler has no target of its
-  own, and the encoding assembled is the RDNA2 one.
+- No `coarse`, and no extra input words: extras need buffer device addresses.
+- A body that is not lane-local needs subgroups as wide as its wave, and the recompiler marks only wave64 programs
+  lane-local, so on lavapipe (8 lanes) only lane-local `--wave64` bodies run. Elsewhere the runner refuses with exit status 2.
+- The kernel descriptor's `FLOAT_MODE` goes to the recompiler as the compute float mode, but the recompiler models only part
+  of it: FP32 compare inputs are flushed when the FP32 input-denormal bit is clear, and f64 code needs `0xc0`. Round modes,
+  FP32 denormal outputs, IEEE, DX10 clamp and FP16 overflow are not modelled, so rows that depend on them are expected to differ.
+
+`kyty_shim_hw_oracle_rows` (`core/libs/prx/libSceAgcDriver/KytyShim/tests/HwOracle.cpp`) checks measured rows that every
+Vulkan device must reproduce, at wave32 and at wave64, skipping a wave size the device cannot run; rows whose value depends on the driver's compiler (for example single rounding of
+`v_fma_f32`) are checked in the SPIR-V by `kyty_shim_hw_oracle`, with the measured value kept as reference.
 
 ## RDNA3 (gfx11) differences
 
