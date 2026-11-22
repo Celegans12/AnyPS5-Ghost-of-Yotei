@@ -1911,9 +1911,30 @@ static void FindRefreshableSources(ResourcePlan& plan) {
 	}
 }
 
+#if defined(_WIN32)
+class WalkerCodeAllocator final: public Xbyak::Allocator {
+public:
+	uint8_t* alloc(size_t size) override {
+		return static_cast<uint8_t*>(VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+	}
+	void free(uint8_t* p) override {
+		if (p != nullptr) VirtualFree(p, 0, MEM_RELEASE);
+	}
+};
+
+Xbyak::Allocator* WalkerCode() {
+	static WalkerCodeAllocator allocator;
+	return &allocator;
+}
+#else
+Xbyak::Allocator* WalkerCode() {
+	return nullptr;
+}
+#endif
+
 void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values) {
 	if (values.empty()) FindRefreshableSources(plan);
-	plan.srt_code = std::make_unique<Xbyak::CodeGenerator>(4096, Xbyak::AutoGrow);
+	plan.srt_code = std::make_unique<Xbyak::CodeGenerator>(4096, Xbyak::AutoGrow, WalkerCode());
 	WalkerCompiler(plan, *plan.srt_code).Compile(values);
 }
 
