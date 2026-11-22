@@ -23,6 +23,7 @@ if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
             PASS_REGULAR_EXPRESSION "kyty_shim_pm4_shader_registers: ok" FAIL_REGULAR_EXPRESSION "FAILED")
 endif()
 
+if(NOT ANYPS5_KYTY_DLL)
 add_test_executable(kyty_shim_half_fallback_tests ${CMAKE_CURRENT_SOURCE_DIR}/HalfFallback.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
 target_include_directories(kyty_shim_half_fallback_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_include_directories(kyty_shim_half_fallback_tests SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/3rdparty/SPIRV-Tools/include)
@@ -34,6 +35,7 @@ target_link_libraries(kyty_shim_half_fallback_tests PRIVATE Kyty::gpu libkernel 
 add_test(NAME kyty_shim_half_fallback COMMAND kyty_shim_half_fallback_tests)
 set_tests_properties(kyty_shim_half_fallback PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77
         PASS_REGULAR_EXPRESSION "kyty_shim_half_fallback: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+endif()
 
 if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
     if(WIN32)
