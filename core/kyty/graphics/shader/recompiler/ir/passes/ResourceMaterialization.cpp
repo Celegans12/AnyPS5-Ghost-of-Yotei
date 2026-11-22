@@ -2359,7 +2359,9 @@ bool SpecializedBuffersValid(const ResourceSpecialization& specialization, bool 
 bool EmptyBufferServes(const ResourcePlan& program, const ResourceSnapshot& snapshot, uint32_t index,
                        const ResourceSpecialization::Buffer& requested,
                        const ResourceSpecialization::Buffer& candidate) {
-	if (!SharesEmptyBuffers() || index >= snapshot.buffers.size() || snapshot.buffers[index].dword_count != 4u ||
+	if (!SharesEmptyBuffers() || IsGpuFormedBuffer(requested.packed_stride) ||
+	    IsGpuFormedBuffer(candidate.packed_stride) || index >= snapshot.buffers.size() ||
+	    snapshot.buffers[index].dword_count != 4u ||
 	    snapshot.buffers[index].dwords[2] != 0u ||
 	    !DirectBufferSlot(program, index, requested) || !DirectBufferSlot(program, index, candidate) ||
 	    requested.indirect_mapping_offset != candidate.indirect_mapping_offset ||
@@ -2412,9 +2414,16 @@ bool EmptyBuffersServe(const ResourcePlan& program, const ResourceSnapshot& snap
 }
 #endif
 
-bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
+bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& given_runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
 	t_record_blocks.clear();
+#if defined(ANYPS5_KYTY)
+	snapshot.gpu_formed.clear();
+	auto runtime         = given_runtime;
+	runtime.defer_formed = runtime.defer_formed && !FormedViewsBlocked();
+#else
+	const auto& runtime = given_runtime;
+#endif
 	for (auto& keys: PlanScratch(program).selector_keys) keys.resolved = false;
 	if (!program.resource_tracking_complete) return false;
 	const auto uses_workgroup_count = [](const DescriptorSource& source) {
@@ -2430,6 +2439,46 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		return SpecializationFail(fmt::format("SRT refresh complete={} reads={} user_data={}",
 		    program.srt_plan_complete, program.srt_reads.size(), runtime.user_data.size()));
 	}
+#if defined(ANYPS5_KYTY)
+	uint64_t formed_now = 0;
+	for (const auto& formed: SrtFormedSourcesOfThread()) {
+		if (formed.deferred == 0u) continue;
+		bool whole = formed.seen == 0xfu;
+		for (uint32_t word = 1; whole && word < 4u; ++word) {
+			whole = formed.words[word] == formed.words[0] + word * sizeof(uint32_t);
+		}
+		if (!whole) {
+			formed_now = UINT64_MAX;
+			break;
+		}
+		for (uint32_t word = 0; word < 4u; ++word) {
+			const auto flat = formed.source * 8u + word;
+			if (((formed.deferred >> word) & 1u) == 0u || flat >= program.descriptor_word_flat.size() ||
+			    program.descriptor_word_flat[flat] >= snapshot.flattened_srt.size()) {
+				continue;
+			}
+			snapshot.gpu_flat_loads.push_back({formed.words[word], program.descriptor_word_flat[flat], 1u});
+		}
+		for (uint32_t index = 0; index < program.info.buffers.size() && index < 64u; ++index) {
+			if (program.info.buffers[index].source != formed.source) continue;
+			snapshot.gpu_formed.push_back(
+			    {.resource = index, .element = FormedElementBytes(program, index), .address = formed.words[0]});
+			formed_now |= uint64_t {1} << index;
+		}
+	}
+	if (formed_now == UINT64_MAX) {
+		snapshot.gpu_formed.clear();
+		snapshot.gpu_flat_loads.clear();
+		formed_now = 0;
+		if (runtime.record_load != nullptr) return false;
+		runtime.defer_formed = false;
+		reads                = program.source_reads;
+		if (!WalkSrt(program, runtime, snapshot.flattened_srt, capture_reads ? &reads : nullptr)) {
+			return SpecializationFail(fmt::format("SRT refresh complete={} reads={} user_data={}",
+			    program.srt_plan_complete, program.srt_reads.size(), runtime.user_data.size()));
+		}
+	}
+#endif
 	snapshot.flattened_srt.insert(snapshot.flattened_srt.end(), runtime.call_words.begin(),
 	                              runtime.call_words.end());
 	SrtReadCapture capture {runtime, reads};
@@ -2564,6 +2613,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	}
 #if defined(ANYPS5_KYTY)
 	if (MirrorsVsharpBuffers()) MirrorBuffers(program, snapshot, specialization);
+	if (formed_now != 0 || FormsVsharpBuffers()) FormBuffers(program, snapshot, specialization, formed_now);
 #endif
 	snapshot.images.resize(program.info.images.size());
 	specialization.images.resize(program.info.images.size());
@@ -3157,6 +3207,116 @@ uint32_t MirrorElementBytes(const ResourcePlan& program, uint32_t index) {
 	return bytes;
 }
 
+thread_local bool t_formed_views_blocked = false;
+
+void BlockFormedViews(bool blocked) {
+	t_formed_views_blocked = blocked;
+}
+
+bool FormedViewsBlocked() {
+	return t_formed_views_blocked;
+}
+
+bool FormsVsharpBuffers() {
+	return g_mirror_size.load(std::memory_order_relaxed) != 0 &&
+	       Common::RuntimeSwitches::On(Common::RuntimeSwitches::Switch::E2GpuFormed);
+}
+
+bool FormsAllVsharps() {
+	static const bool all = [] {
+		const char* value = std::getenv("KYTY_E2_GPU_FORMED_ALL");
+		return value != nullptr && std::string_view {value} == "1";
+	}();
+	return all;
+}
+
+uint64_t MirrorSize() {
+	return g_mirror_size.load(std::memory_order_relaxed);
+}
+
+uint32_t FormedElementBytes(const ResourcePlan& program, uint32_t index) {
+	if (program.stage != ShaderType::Compute || index >= program.info.buffers.size() || index >= 64u ||
+	    program.info.ray_query || program.info.bvh || index >= program.buffer_vector_access.size() ||
+	    program.buffer_vector_access[index] == 0u) {
+		return 0;
+	}
+	const auto& buffer = program.info.buffers[index];
+	if (buffer.atomic || buffer.formatted || buffer.constant_only || buffer.indirect_write_table ||
+	    buffer.indirect_root != BufferResource::NoIndirectBuffer ||
+	    !buffer.indirect_resources.empty() || buffer.source >= program.descriptor_sources.size() ||
+	    program.descriptor_sources[buffer.source].indirect_descriptor.has_value() ||
+	    program.descriptor_sources[buffer.source].dword_count != 4u) {
+		return 0;
+	}
+	uint32_t bytes = 1;
+	for (const auto& memory: program.memory_info) {
+		if (memory.resource != index) continue;
+		if (memory.kind == ResourceKind::IndirectBuffer) return 0;
+		if (memory.kind != ResourceKind::Buffer && memory.kind != ResourceKind::ScalarBuffer) continue;
+		if (memory.typed || memory.formatted) return 0;
+		const uint32_t element = memory.kind == ResourceKind::Buffer && memory.data_bits < 32u ? memory.data_bits / 8u
+		                         : memory.coherent && memory.data_dwords >= 2u                 ? 8u
+		                                                                                       : 4u;
+		bytes = std::max(bytes, element);
+	}
+	return bytes;
+}
+
+bool GpuFormableBuffer(const ResourcePlan& program, uint32_t index) {
+	return FormedElementBytes(program, index) != 0u;
+}
+
+FormedView FormView(const BufferResource& buffer, uint32_t element, std::span<const uint32_t, 4> words,
+                    uint64_t limit) {
+	FormedView view;
+	if ((words[3] >> 30u) != 0u) {
+		view.serves = true;
+		return view;
+	}
+	const auto  records = words[2];
+	const auto  oob     = (words[3] >> 28u) & 3u;
+	view.base           = words[0] | (uint64_t {words[1] & 0xffffu} << 32u);
+	view.stride         = (words[1] >> 16u) & BufferStrideMask;
+	view.bytes          = view.stride != 0u ? uint64_t {records} * view.stride : records;
+	if (view.bytes != 0u && view.stride == 0u && oob == 2u && !buffer.scalar) {
+		view.bytes = std::max(view.bytes, uint64_t {buffer.max_byte_extent});
+	}
+	view.none = oob == 0u && view.stride == 0u;
+	if (view.base == 0u || view.bytes == 0u) {
+		view.serves = true;
+		return view;
+	}
+	view.serves        = element != 0u && records != UINT32_MAX &&
+	              !(view.stride != 0u && (words[1] >> 31u) != 0u) && ((words[3] >> 23u) & 1u) == 0u &&
+	              view.base % element == 0u && (!buffer.written || view.bytes % 4u == 0u) && view.base < limit &&
+	              view.bytes <= limit - view.base;
+	return view;
+}
+
+void FormBuffers(const ResourcePlan& program, const ResourceSnapshot& snapshot,
+                 ResourceSpecialization& specialization, uint64_t formed_now) {
+	std::atomic_ref<uint64_t> sticky(program.gpu_formed_buffers);
+	if (formed_now != 0u) sticky.fetch_or(formed_now, std::memory_order_relaxed);
+	const auto known = FormsVsharpBuffers() ? sticky.load(std::memory_order_relaxed) : 0u;
+	const auto count = std::min({specialization.buffers.size(), program.info.buffers.size(), snapshot.buffers.size(),
+	                             size_t {64}});
+	const auto limit = MirrorSize();
+	for (uint32_t index = 0; index < count; ++index) {
+		const auto bit = uint64_t {1} << index;
+		if ((formed_now & bit) == 0u) {
+			if ((known & bit) == 0u || snapshot.buffers[index].dword_count != 4u ||
+			    !FormView(program.info.buffers[index], FormedElementBytes(program, index),
+			              std::span<const uint32_t, 4>(snapshot.buffers[index].dwords.data(), 4u), limit)
+			         .serves) {
+				continue;
+			}
+		}
+		auto& buffer = specialization.buffers[index];
+		buffer       = {};
+		buffer.packed_stride = RuntimeBufferStride | MirrorBufferBit | GpuFormedBufferBit;
+	}
+}
+
 void MirrorBuffers(const ResourcePlan& program, const ResourceSnapshot& snapshot,
                    ResourceSpecialization& specialization) {
 	const auto count = std::min({specialization.buffers.size(), program.info.buffers.size(), snapshot.buffers.size()});
@@ -3575,6 +3735,7 @@ bool AlignResources(const ResourcePlan& program, const ResourceSnapshot& snapsho
 		aligned->specialization_reads = snapshot.specialization_reads;
 		aligned->uniform_fill         = snapshot.uniform_fill;
 		aligned->gpu_flat_loads       = snapshot.gpu_flat_loads;
+		aligned->gpu_formed           = snapshot.gpu_formed;
 	}
 	return true;
 }

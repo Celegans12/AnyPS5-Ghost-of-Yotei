@@ -2009,6 +2009,7 @@ void EmitProgram(EmitterState& state) {
 	InitializeRayQueryVariables(state);
 	EmitTableMode(state);
 	EmitMemoryBindings(state);
+	EmitViewLog(state);
 	if (program.blocks.empty()) {
 		EmitReturn(ctx);
 	} else if (state.program.dispatcher_fallback) {

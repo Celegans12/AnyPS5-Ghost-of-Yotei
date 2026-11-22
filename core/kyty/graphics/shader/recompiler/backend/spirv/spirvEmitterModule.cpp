@@ -331,10 +331,12 @@ void DefineDescriptors(EmitterState& state) {
 	auto& buffer_count = counts[static_cast<size_t>(Kind::Buffers)];
 	const bool table = state.program.table_mode;
 	bindings.mirror_count = 0;
+	bindings.formed_count = 0;
 	for (auto& buffer: info.buffers) {
 		const bool mirror       = !table && IR::IsMirrorBuffer(buffer.packed_stride);
 		buffer.descriptor_index = buffer.live && !table && !mirror ? buffer_count++ : UINT32_MAX;
 		buffer.mirror_index     = buffer.live && mirror ? bindings.mirror_count++ : UINT32_MAX;
+		if (buffer.live && mirror && IR::IsGpuFormedBuffer(buffer.packed_stride)) bindings.formed_count++;
 	}
 	auto& uniform_count = counts[static_cast<size_t>(Kind::UniformBuffers)];
 	const auto scalar_reads = BuffersReadOnlyByScalarLoads(state.program);

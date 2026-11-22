@@ -502,6 +502,22 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		compute_module = m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info, true);
 	}
 	if (compute_module == nullptr) return;
+	const auto formed_waves = [&] {
+		const uint64_t groups = uint64_t {input_info.workgroup_counts[0]} * input_info.workgroup_counts[1] *
+		                        input_info.workgroup_counts[2];
+		const uint64_t threads =
+		    uint64_t {input_info.threads_num[0]} * input_info.threads_num[1] * input_info.threads_num[2];
+		const uint64_t lanes = std::max(input_info.host_subgroup_size, 1u);
+		return groups * ((threads + lanes - 1u) / lanes);
+	};
+	if (!PrepareFormedViews(input_info.stage, formed_waves())) {
+		NoteFormedFallback();
+		input_info = pristine;
+		ShaderRecompiler::IR::BlockFormedViews(true);
+		compute_module = ResolveComputeHere(cs_regs, input_info);
+		ShaderRecompiler::IR::BlockFormedViews(false);
+		if (compute_module == nullptr || !PrepareFormedViews(input_info.stage, formed_waves())) return;
+	}
 	const auto thread_dimensions = [&](ShaderComputeInputInfo& info) {
 		if (use_thread_dimensions) {
 			info.dispatch_threads_num[0] = thread_group_x;
@@ -513,7 +529,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 
 	const auto& resources = *input_info.stage.resources;
 	m_replicated[2] = 0;
-	if (resources.specialization_reads.empty() &&
+	if (resources.specialization_reads.empty() && resources.gpu_formed.empty() &&
 	    (TryConsumeComputeMetaClear(input_info, buffer) ||
 	     TryConsumeComputeFill(input_info, buffer, thread_group_x, thread_group_y,
 	                           thread_group_z, mode))) {

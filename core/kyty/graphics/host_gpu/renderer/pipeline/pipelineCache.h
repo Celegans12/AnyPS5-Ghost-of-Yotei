@@ -117,6 +117,8 @@ public:
 	void RefreshFlatLoads(std::span<ShaderRecompiler::IR::ResourceSnapshot> resources, bool gpu_copies = false,
 	                      const ShaderRecompiler::IR::CompiledShaderInfo* program = nullptr) const;
 	void                   NoteDeferredLoads(std::span<uint64_t> addresses);
+	void                   ForgetLoads(std::span<uint64_t> addresses);
+	void                   AddDeferredFlatLoad(uint64_t address, uint32_t slot);
 	[[nodiscard]] uint32_t DeferredWords() const { return m_deferred_words; }
 	[[nodiscard]] uint32_t DeferredGpuWords() const { return m_deferred_gpu_words; }
 #else

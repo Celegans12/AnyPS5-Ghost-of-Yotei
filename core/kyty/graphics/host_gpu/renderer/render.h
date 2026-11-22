@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/tableResolutionCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
+#include "graphics/host_gpu/renderer/viewLog.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/upscaler/upscaler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -187,6 +188,8 @@ namespace Pssr {
 struct Request;
 }
 
+class Buffer;
+
 class RenderExecutor {
 public:
 	explicit RenderExecutor(RenderContext& context): m_context(context) { ConfigureTableResolutions(); }
@@ -241,6 +244,10 @@ public:
 	[[nodiscard]] uint64_t DrawWindow() const noexcept { return m_draw_window; }
 
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
+	[[nodiscard]] bool PrepareFormedViews(const ShaderStageRuntime& stage, uint64_t waves);
+	static void        NoteKnownFormedView() noexcept;
+	static void        NoteFormedFallback() noexcept;
+	void               LogFormedSummary();
 	void FindBuffers(std::span<PreparedBindings* const> stages, bool find_buffers = true);
 	void                           RebindBuffers(PreparedBindings& bindings, uint64_t invocations_x = 0);
 	void                           RebindImages(PreparedBindings& bindings);
@@ -598,6 +605,18 @@ private:
 	DrawTargets                           m_targets;
 	DrawTargets*                          m_draw_targets = &m_targets;
 	PreparedBindings                     m_compute_bindings;
+	struct FormedRead {
+		uint32_t                                resource = 0;
+		uint64_t                                address  = 0;
+		std::array<uint32_t, 4>                 words {};
+		ShaderRecompiler::IR::FormedView        view;
+	};
+	void BindFormedView(const FormedRead& read, const ShaderRecompiler::IR::BufferResource& resource);
+	[[nodiscard]] ViewLogSegment ReserveViewLog(uint64_t program, std::vector<ViewLogEntry> views);
+	std::vector<FormedRead>  m_formed_reads;
+	uint64_t                 m_formed_waves = 0;
+	std::shared_ptr<Buffer>  m_view_log_buffer;
+	std::shared_ptr<ViewLog> m_view_log;
 	std::shared_ptr<RayTracingCheck>     m_rt_check;
 	std::shared_ptr<WaveSplitCheck>      m_split_check;
 	std::vector<ImageId>                  m_bound_images;

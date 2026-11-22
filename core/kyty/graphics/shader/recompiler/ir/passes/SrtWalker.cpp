@@ -15,6 +15,7 @@
 #include <deque>
 #include <map>
 #include <unordered_set>
+#include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -255,6 +256,29 @@ bool DefersFlatLoad(uint32_t slot) {
 	return slot != NoFlatSlot && slot != ZeroTestSlot && !IsDescriptorSlot(slot);
 }
 
+thread_local bool                         t_walker_form     = false;
+thread_local bool                         t_walker_form_all = false;
+thread_local std::vector<uint64_t>        t_formed_deferred;
+thread_local std::vector<SrtFormedSource> t_formed_sources;
+
+uint64_t KYTY_SYSV_ABI ProbeFormGuestLoad(uint64_t address, WalkerCachedPage* cache) {
+	if (!t_walker_form) return ProbeGuestLoad(address, cache);
+	if (t_walker_form_all) {
+		t_formed_deferred.push_back(address);
+		return uint64_t {1} << 32u;
+	}
+	const bool before = t_walker_faulted;
+	t_walker_faulted  = false;
+	const auto result = ProbeGuestLoad(address, cache);
+	if (t_walker_faulted) {
+		t_formed_deferred.push_back(address);
+		t_walker_faulted = before;
+		return uint64_t {1} << 32u;
+	}
+	t_walker_faulted = before;
+	return result;
+}
+
 uint64_t KYTY_SYSV_ABI ProbeFlatGuestLoad(uint64_t address, WalkerCachedPage* cache) {
 	const bool before = t_walker_faulted;
 	t_walker_faulted  = false;
@@ -269,7 +293,8 @@ uint64_t KYTY_SYSV_ABI ProbeFlatGuestLoad(uint64_t address, WalkerCachedPage* ca
 }
 #endif
 
-void LoadGuest(Xbyak::CodeGenerator& code, size_t cache, [[maybe_unused]] uint32_t slot) {
+void LoadGuest(Xbyak::CodeGenerator& code, size_t cache, [[maybe_unused]] uint32_t slot,
+               [[maybe_unused]] bool form = false) {
 	Xbyak::Label direct, done, slow;
 	code.mov(code.rax, code.r10);
 	code.shr(code.rax, 12);
@@ -295,7 +320,9 @@ void LoadGuest(Xbyak::CodeGenerator& code, size_t cache, [[maybe_unused]] uint32
 	code.mov(code.rdi, code.r10);
 	code.lea(code.rsi, code.ptr[code.rdx + cache]);
 #if defined(ANYPS5_KYTY)
-	code.mov(code.rax, reinterpret_cast<uint64_t>(DefersFlatLoad(slot) ? &ProbeFlatGuestLoad : &ProbeGuestLoad));
+	code.mov(code.rax, reinterpret_cast<uint64_t>(form                   ? &ProbeFormGuestLoad
+	                                              : DefersFlatLoad(slot) ? &ProbeFlatGuestLoad
+	                                                                     : &ProbeGuestLoad));
 #else
 	code.mov(code.rax, reinterpret_cast<uint64_t>(&ProbeGuestLoad));
 #endif
@@ -622,6 +649,7 @@ private:
 	std::vector<uint32_t> m_flat_slots;
 	std::vector<bool>     m_zero_tested;
 	std::vector<uint32_t> m_gpu_control;
+	std::vector<uint32_t> m_form_slots;
 };
 
 void WalkerCompiler::AddOutput(Value value, uint32_t gate) {
@@ -691,11 +719,14 @@ void WalkerCompiler::FindFlatOnlyNodes(std::span<const Operand> conditions,
 	std::vector<uint32_t> word_slot(m_nodes.size(), NoFlatSlot);
 	std::vector<uint32_t> flat_reads(m_nodes.size(), 0);
 	std::vector<uint32_t> flat_of(m_nodes.size(), NoFlatSlot);
+	std::vector<bool>     plain_use(m_nodes.size(), false);
+	std::vector<uint32_t> form_word(m_nodes.size(), NoFlatSlot);
 	m_plan.descriptor_word_flat.assign(descriptors.size() * 8u, NoFlatSlot);
 	const auto use = [&](const Operand& operand) {
 		if (operand.kind == Kind::Node && operand.value < used.size()) {
 			used[operand.value]      = true;
 			other_use[operand.value] = true;
+			plain_use[operand.value] = true;
 		}
 	};
 	for (const auto& node: m_nodes) {
@@ -710,6 +741,7 @@ void WalkerCompiler::FindFlatOnlyNodes(std::span<const Operand> conditions,
 			if (operand.kind != Kind::Node || operand.value >= used.size()) continue;
 			used[operand.value] = true;
 			word_uses[operand.value]++;
+			form_word[operand.value] = DescriptorSlot(source, word);
 			if (DescriptorRefreshMask(kind, word) != 0) {
 				word_slot[operand.value] = DescriptorSlot(source, word);
 			} else {
@@ -860,6 +892,43 @@ void WalkerCompiler::FindFlatOnlyNodes(std::span<const Operand> conditions,
 			m_gpu_control[index] = flat_of[index];
 		}
 	}
+#if defined(ANYPS5_KYTY)
+	m_form_slots.assign(m_nodes.size(), NoFlatSlot);
+	const auto& sources = m_plan.descriptor_sources;
+	m_plan.gpu_formable_sources.assign(sources.size(), 0u);
+	const auto form_load = [&](const Operand& operand, uint32_t source, uint32_t word) {
+		if (operand.kind != Kind::Node || operand.value >= m_nodes.size()) return false;
+		const auto  index = static_cast<size_t>(operand.value);
+		const auto& node  = m_nodes[index];
+		return is_load(index) && !node.referenced && !masks.contains(node.inst) && word_uses[index] == 1 &&
+		       !plain_use[index] && flat_reads[index] <= 1 && !m_zero_tested[index] &&
+		       m_gpu_control[index] == NoFlatSlot && form_word[index] == DescriptorSlot(source, word);
+	};
+	for (uint32_t source = 0; source < descriptors.size() && source < sources.size(); ++source) {
+		if (descriptors[source].size() != 4u || sources[source].dword_count != 4u ||
+		    sources[source].indirect_descriptor.has_value()) {
+			continue;
+		}
+		bool formable = false;
+		for (uint32_t buffer = 0; buffer < m_plan.info.buffers.size(); ++buffer) {
+			if (m_plan.info.buffers[buffer].source != source) continue;
+			formable = GpuFormableBuffer(m_plan, buffer);
+			if (!formable) break;
+		}
+		for (const auto& image: m_plan.info.images) formable = formable && image.source != source;
+		for (const auto& sampler: m_plan.info.samplers) formable = formable && sampler.source != source;
+		for (uint32_t word = 0; formable && word < 4u; ++word) {
+			formable = form_load(descriptors[source][word], source, word);
+		}
+		if (!formable) continue;
+		m_plan.gpu_formable_sources[source] = 1u;
+		for (uint32_t word = 0; word < 4u; ++word) {
+			const auto index    = static_cast<size_t>(descriptors[source][word].value);
+			m_form_slots[index] = DescriptorSlot(source, word);
+			if (flat_reads[index] == 1) m_plan.descriptor_word_flat[source * 8u + word] = flat_of[index];
+		}
+	}
+#endif
 }
 
 WalkerCompiler::Ref WalkerCompiler::Evaluate(Value value, uint32_t context) {
@@ -1298,7 +1367,10 @@ void WalkerCompiler::EmitRead(const Node& node, uint32_t index) {
 	const bool vector = op == ValueOpcode::LoadBufferU32;
 	auto args = std::span(node.args);
 	Xbyak::Label zero;
-	const auto   flat_slot = index < m_flat_slots.size() ? m_flat_slots[index] : NoFlatSlot;
+	const auto   form_slot = index < m_form_slots.size() ? m_form_slots[index] : NoFlatSlot;
+	const auto   flat_slot = form_slot != NoFlatSlot          ? form_slot
+	                         : index < m_flat_slots.size() ? m_flat_slots[index]
+	                                                       : NoFlatSlot;
 	if (vector) {
 		Fetch(args[0], m_ret);
 		c.test(c.rax, c.rax);
@@ -1362,7 +1434,7 @@ void WalkerCompiler::EmitRead(const Node& node, uint32_t index) {
 		if (index < m_gpu_control.size() && m_gpu_control[index] != NoFlatSlot) {
 			SkipGpuControlLoad(c.r10, m_gpu_control[index], node.state);
 		}
-		LoadGuest(c, static_cast<size_t>(m_page_cache) - m_bias, flat_slot);
+		LoadGuest(c, static_cast<size_t>(m_page_cache) - m_bias, flat_slot, form_slot != NoFlatSlot);
 		++m_captures;
 		c.mov(c.qword[c.r8], c.r10);
 		c.mov(c.dword[c.r8 + 8], c.eax);
@@ -1881,8 +1953,13 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	t_gpu_produced   = runtime.gpu_produced;
 	t_pending_write  = runtime.pending_write;
 #if defined(ANYPS5_KYTY)
-	t_walker_defer  = t_walker_ahead && runtime.defer_flat_loads;
-	t_walker_around = t_walker_ahead && runtime.note_around_loads;
+	t_walker_defer    = t_walker_ahead && runtime.defer_flat_loads;
+	t_walker_around   = t_walker_ahead && runtime.note_around_loads;
+	t_walker_form     = runtime.defer_formed && std::ranges::any_of(plan.gpu_formable_sources,
+	                                                                [](uint8_t formable) { return formable != 0u; });
+	t_walker_form_all = t_walker_form && FormsAllVsharps();
+	t_formed_deferred.clear();
+	t_formed_sources.clear();
 #endif
 	++t_walk;
 	const auto* end = plan.srt_code->getCode<Walker>()(runtime.user_data.data(), flat.data(),
@@ -1892,11 +1969,36 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	t_gpu_produced   = nullptr;
 	t_pending_write  = nullptr;
 #if defined(ANYPS5_KYTY)
-	t_walker_defer  = false;
-	t_walker_around = false;
+	t_walker_defer    = false;
+	t_walker_around   = false;
+	const bool formed = std::exchange(t_walker_form, false) && !t_formed_deferred.empty();
+	t_walker_form_all = false;
 #endif
 	if (end == nullptr || t_walker_faulted) return false;
 	const auto* first = scratch.data() + plan.srt_captures / 8u;
+#if defined(ANYPS5_KYTY)
+	if (formed) {
+		std::ranges::sort(t_formed_deferred);
+		for (const auto* read = first; read != end; read += 2) {
+			const auto slot = static_cast<uint32_t>(read[1] >> 32u);
+			if (!IsDescriptorSlot(slot)) continue;
+			const auto source = DescriptorSlotSource(slot);
+			const auto word   = DescriptorSlotWord(slot);
+			if (source >= plan.gpu_formable_sources.size() || plan.gpu_formable_sources[source] == 0u || word >= 4u) {
+				continue;
+			}
+			auto found = std::ranges::find(t_formed_sources, source, &SrtFormedSource::source);
+			if (found == t_formed_sources.end()) {
+				found = t_formed_sources.insert(t_formed_sources.end(), SrtFormedSource {.source = source});
+			}
+			found->words[word] = read[0];
+			found->seen        = static_cast<uint8_t>(found->seen | (1u << word));
+			if (std::ranges::binary_search(t_formed_deferred, read[0])) {
+				found->deferred = static_cast<uint8_t>(found->deferred | (1u << word));
+			}
+		}
+	}
+#endif
 	if (reads != nullptr) {
 		for (auto* read = first; read != end; read += 2) reads->emplace_back(*read, sizeof(uint32_t));
 	}
@@ -1969,6 +2071,10 @@ std::vector<uint64_t>& SrtDeferredLoadsOfThread() {
 
 std::vector<uint64_t>& SrtAroundLoadsOfThread() {
 	return t_around_loads;
+}
+
+std::vector<SrtFormedSource>& SrtFormedSourcesOfThread() {
+	return t_formed_sources;
 }
 #endif
 

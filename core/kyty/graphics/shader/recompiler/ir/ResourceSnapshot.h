@@ -49,6 +49,12 @@ struct GpuFlatLoad {
 	uint32_t count   = 0;
 };
 
+struct GpuFormedView {
+	uint32_t resource = 0;
+	uint32_t element  = 0;
+	uint64_t address  = 0;
+};
+
 struct ResourceSnapshot {
 	std::vector<DescriptorValue> buffers;
 	std::vector<DescriptorValue> images;
@@ -59,6 +65,7 @@ struct ResourceSnapshot {
 	std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
 	UniformFill                 uniform_fill;
 	mutable std::vector<GpuFlatLoad> gpu_flat_loads;
+	std::vector<GpuFormedView>       gpu_formed;
 };
 
 }

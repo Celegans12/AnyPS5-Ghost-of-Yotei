@@ -55,7 +55,7 @@ std::string Refused(const char* ab, const char* start = "", const char* settle =
 
 void Refusals() {
 	const std::string listed =
-	    "settings KYTY_AB can change: KYTY_GENERIC_COMPUTE_VARIANT, KYTY_E2_VSHARP_MIRROR";
+	    "settings KYTY_AB can change: KYTY_GENERIC_COMPUTE_VARIANT, KYTY_E2_VSHARP_MIRROR, KYTY_E2_GPU_FORMED";
 	Check(Contains(Refused("KYTY_GENERIC_COMPUTE_VARIANT"), "expected <seconds>:<setting>"),
 	      "a value without a phase length is refused");
 	Check(Contains(Refused("0.5:KYTY_GENERIC_COMPUTE_VARIANT"), "at least 1 s"), "a phase under 1 s is refused");
@@ -178,6 +178,7 @@ void EnvironmentArms() {
 }
 
 void MirrorArms() {
+	IR::SetMirrorSize(uint64_t {1} << 40u);
 	SetVariable("KYTY_E2_VSHARP_MIRROR", nullptr);
 	Switches::Reload();
 	Check(!Switches::On(Switch::E2VsharpMirror) && !IR::MirrorsVsharpBuffers(),
@@ -197,7 +198,35 @@ void MirrorArms() {
 	SetVariable("KYTY_E2_VSHARP_MIRROR", "1");
 	Switches::Reload();
 	Check(IR::MirrorsVsharpBuffers(), "KYTY_E2_VSHARP_MIRROR=1 turns the mirror on");
+	IR::SetMirrorSize(0);
+	Check(!IR::MirrorsVsharpBuffers(), "without a mirror nothing is read by mirror address");
 	SetVariable("KYTY_E2_VSHARP_MIRROR", nullptr);
+	Switches::Reload();
+}
+
+void FormedArms() {
+	IR::SetMirrorSize(uint64_t {1} << 40u);
+	SetVariable("KYTY_E2_GPU_FORMED", nullptr);
+	Switches::Reload();
+	Check(!Switches::On(Switch::E2GpuFormed) && !IR::FormsVsharpBuffers(), "KYTY_E2_GPU_FORMED is off without the variable");
+	Check(Switches::Find("KYTY_E2_GPU_FORMED") == Switch::E2GpuFormed, "KYTY_E2_GPU_FORMED is a runtime switch");
+	Ab::Config config;
+	Check(Ab::Parse("1:KYTY_E2_GPU_FORMED", "", "0", config).empty(), "an A/B of GPU-formed views parses");
+	Ab::Run run(config);
+	const auto first = run.AtPresent(1, 0.0, 0.0);
+	Check(AnyContains(first, "A: KYTY_E2_GPU_FORMED=0; B: KYTY_E2_GPU_FORMED=1"),
+	      "without the variable arm A resolves GPU-written V# words on the CPU and arm B in the shader");
+	Check(!IR::FormsVsharpBuffers(), "phase A keeps GPU-formed views off");
+	static_cast<void>(run.AtPresent(2, 1.0, 1.0));
+	Check(IR::FormsVsharpBuffers(), "phase B turns GPU-formed views on");
+	static_cast<void>(run.AtPresent(3, 2.0, 2.0));
+	Check(!IR::FormsVsharpBuffers(), "phase A turns them off again");
+	SetVariable("KYTY_E2_GPU_FORMED", "1");
+	Switches::Reload();
+	Check(IR::FormsVsharpBuffers(), "KYTY_E2_GPU_FORMED=1 turns GPU-formed views on");
+	IR::SetMirrorSize(0);
+	Check(!IR::FormsVsharpBuffers(), "without a mirror no view is formed in the shader");
+	SetVariable("KYTY_E2_GPU_FORMED", nullptr);
 	Switches::Reload();
 }
 
@@ -235,6 +264,7 @@ int main() {
 	Phases();
 	EnvironmentArms();
 	MirrorArms();
+	FormedArms();
 	if (g_failures != 0) {
 		std::fprintf(stderr, "%d failure(s)\n", g_failures);
 		return 1;

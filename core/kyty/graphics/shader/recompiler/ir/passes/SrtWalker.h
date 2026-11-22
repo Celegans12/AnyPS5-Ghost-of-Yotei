@@ -81,6 +81,7 @@ struct SrtRuntime {
 #if defined(ANYPS5_KYTY)
 	bool defer_flat_loads = false;
 	bool note_around_loads = false;
+	bool defer_formed = false;
 #endif
 };
 
@@ -118,6 +119,15 @@ void SetSrtWalkerGuestMemory(const SrtWalkerGuestMemory& memory);
 #if defined(ANYPS5_KYTY)
 [[nodiscard]] std::vector<uint64_t>& SrtDeferredLoadsOfThread();
 [[nodiscard]] std::vector<uint64_t>& SrtAroundLoadsOfThread();
+struct SrtFormedSource {
+	uint32_t                source   = 0;
+	std::array<uint64_t, 4> words    = {};
+	uint8_t                 seen     = 0;
+	uint8_t                 deferred = 0;
+};
+[[nodiscard]] std::vector<SrtFormedSource>& SrtFormedSourcesOfThread();
+[[nodiscard]] bool GpuFormableBuffer(const ResourcePlan& program, uint32_t index);
+[[nodiscard]] bool FormsAllVsharps();
 #endif
 uint32_t SrtWalkerLoadLength(uint64_t rip);
 uint32_t SrtWalkerAheadLoadLength(uint64_t rip, uint64_t address);

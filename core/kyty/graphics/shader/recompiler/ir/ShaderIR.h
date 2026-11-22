@@ -157,6 +157,10 @@ inline constexpr uint32_t MirrorBufferBit = 1u << 25u;
 [[nodiscard]] constexpr bool IsMirrorBuffer(uint32_t packed_stride) {
 	return (packed_stride & MirrorBufferBit) != 0u;
 }
+inline constexpr uint32_t GpuFormedBufferBit = 1u << 26u;
+[[nodiscard]] constexpr bool IsGpuFormedBuffer(uint32_t packed_stride) {
+	return (packed_stride & GpuFormedBufferBit) != 0u;
+}
 
 struct BufferWriteSpan {
 	uint32_t offset         = 0;
@@ -614,9 +618,13 @@ struct Bindings {
 	bool     flattened_srt_uniform = false;
 	uint32_t flattened_srt_uniform_index = UINT32_MAX;
 	uint32_t mirror_count = 0;
+	uint32_t formed_count = 0;
 
 	static constexpr uint32_t MirrorDwords       = 4;
 	static constexpr uint32_t MirrorHeaderDwords = 4;
+	static constexpr uint32_t FormedDwords       = 3;
+	static constexpr uint32_t ViewLogDwords      = 4;
+	static constexpr uint32_t FormedFlag         = 1u;
 
 	[[nodiscard]] uint32_t MemorySizeDword() const {
 		return memory_offset_dword +
@@ -629,10 +637,16 @@ struct Bindings {
 	[[nodiscard]] uint32_t StrideDword() const { return MipStatsDword() + mip_stats_count; }
 	[[nodiscard]] uint32_t TableBlockDword() const { return StrideDword() + stride_count; }
 	[[nodiscard]] uint32_t MirrorHeaderDword() const { return TableBlockDword() + table_block_dwords; }
-	[[nodiscard]] uint32_t MirrorDword() const {
+	[[nodiscard]] uint32_t ViewLogDword() const {
 		return MirrorHeaderDword() + (mirror_count != 0 ? MirrorHeaderDwords : 0u);
 	}
-	[[nodiscard]] uint32_t ShaderDataDwords() const { return MirrorDword() + MirrorDwords * mirror_count; }
+	[[nodiscard]] uint32_t MirrorDword() const {
+		return ViewLogDword() + (formed_count != 0 ? ViewLogDwords : 0u);
+	}
+	[[nodiscard]] uint32_t MirrorSlotDwords() const {
+		return MirrorDwords + (formed_count != 0 ? FormedDwords : 0u);
+	}
+	[[nodiscard]] uint32_t ShaderDataDwords() const { return MirrorDword() + MirrorSlotDwords() * mirror_count; }
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;
 	}
@@ -941,6 +955,8 @@ struct ResourcePlan {
 	UniformFillPlan                     uniform_fill;
 	std::vector<DescriptorRefresh>      descriptor_refresh;
 	std::vector<uint32_t>               descriptor_word_flat;
+	std::vector<uint8_t>                gpu_formable_sources;
+	mutable uint64_t                    gpu_formed_buffers = 0;
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;
 	uint32_t                              srt_user_data = 0;
 	uint32_t                              srt_captures  = 0;

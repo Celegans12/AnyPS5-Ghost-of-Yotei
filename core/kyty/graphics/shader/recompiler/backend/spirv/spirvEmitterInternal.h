@@ -153,6 +153,10 @@ struct EmitterState {
 	std::vector<uint32_t>                           mirror_bases;
 	std::vector<uint32_t>                           mirror_ranges;
 	std::vector<uint32_t>                           mirror_words;
+	std::vector<uint32_t>                           formed_flags;
+	std::vector<uint32_t>                           formed_bases;
+	std::vector<uint32_t>                           formed_bytes;
+	std::vector<uint32_t>                           formed_misses;
 	std::vector<uint32_t>                           memory_byte_sizes;
 	std::vector<uint32_t>                           memory_strides;
 	uint32_t                                         bda_pagetable_variable  = 0;
@@ -520,6 +524,7 @@ Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::
 uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resource);
 
 void EmitMemoryBindings(EmitterState& state);
+void EmitViewLog(EmitterState& state);
 
 uint32_t LdsDwordCount(const EmitterState& state);
 void EnsureLdsStorage(EmitterState& state);

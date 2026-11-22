@@ -698,6 +698,7 @@ void RenderExecutor::LogResolveSummary() {
 	}
 	if (now - last < 10'000'000'000ull) return;
 	g_resolve_line.store(now, std::memory_order_relaxed);
+	LogFormedSummary();
 	const auto frame_now = m_context.FrameNumber();
 	const auto frames    = frame_now - m_resolve_frames;
 	m_resolve_frames     = frame_now;

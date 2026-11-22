@@ -1,5 +1,6 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
@@ -208,26 +209,208 @@ static uint32_t EmitMirrorDeviceAddress(EmitterState& state, uint32_t address) {
 	return Binary(state, spv::OpIAdd, TypeU64(state), state.mirror_base, address);
 }
 
+static uint32_t EmitPhysicalWordLoad(EmitterState& state, uint32_t address) {
+	const auto value = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value,
+	                          Unary(state, spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), address),
+	                          static_cast<uint32_t>(spv::MemoryAccessAlignedMask), 4u);
+	return value;
+}
+
+static void EmitPhysicalWordStore(EmitterState& state, uint32_t address, uint32_t value) {
+	state.builder.AddFunction(spv::OpStore, Unary(state, spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), address),
+	                          value, static_cast<uint32_t>(spv::MemoryAccessAlignedMask), 4u);
+}
+
+static uint32_t EmitAddressPlus(EmitterState& state, uint32_t address, uint64_t bytes) {
+	return bytes == 0u ? address : Binary(state, spv::OpIAdd, TypeU64(state), address, ConstantU64(state, bytes));
+}
+
+struct FormedSlot {
+	uint32_t view  = 0;
+	uint32_t range = 0;
+	uint32_t word  = 0;
+};
+
+static FormedSlot EmitFormedView(EmitterState& state, const IR::BufferResource& buffer, uint32_t slot, uint32_t size,
+                                 uint32_t formed) {
+	const auto u32     = TypeU32(state);
+	const auto u64     = TypeU64(state);
+	const auto boolean = TypeBool(state);
+	const auto zero    = ConstantU32(state, 0u);
+	const auto dword   = state.program.bindings.MirrorDword() + state.program.bindings.MirrorSlotDwords() * slot;
+	const auto address = EmitMirrorDeviceAddress(
+	    state, PackU64(state, EmitShaderDataDwordLoad(state, dword + IR::Bindings::MirrorDwords),
+	                   EmitShaderDataDwordLoad(state, dword + IR::Bindings::MirrorDwords + 1u)));
+	std::array<uint32_t, 4> words {};
+	for (uint32_t word = 0; word < words.size(); ++word) {
+		words[word] = EmitValueOrZeroIfCondition(state, formed, [&]() {
+			return EmitPhysicalWordLoad(state, EmitAddressPlus(state, address, word * 4u));
+		});
+	}
+	const auto bits = [&](uint32_t value, uint32_t shift, uint32_t mask) {
+		return Binary(state, spv::OpBitwiseAnd, u32, Binary(state, spv::OpShiftRightLogical, u32, value, ConstantU32(state, shift)),
+		              ConstantU32(state, mask));
+	};
+	const auto is = [&](uint32_t value, uint32_t constant) {
+		return Binary(state, spv::OpIEqual, boolean, value, ConstantU32(state, constant));
+	};
+	const auto either = [&](uint32_t a, uint32_t b) { return Binary(state, spv::OpLogicalOr, boolean, a, b); };
+	const auto typed   = Binary(state, spv::OpINotEqual, boolean, bits(words[3], 30u, 3u), zero);
+	const auto stride  = bits(words[1], 16u, IR::BufferStrideMask);
+	const auto records = words[2];
+	const auto oob     = bits(words[3], 28u, 3u);
+	const auto strided = Binary(state, spv::OpINotEqual, boolean, stride, zero);
+	auto       base    = PackU64(state, words[0], Binary(state, spv::OpBitwiseAnd, u32, words[1], ConstantU32(state, 0xffffu)));
+	base               = Select(state, u64, typed, ConstantU64(state, 0u), base);
+	const auto records64 = Unary(state, spv::OpUConvert, u64, records);
+	auto bytes = Select(state, u64, strided, Binary(state, spv::OpIMul, u64, records64, Unary(state, spv::OpUConvert, u64, stride)),
+	                    records64);
+	if (!buffer.scalar && buffer.max_byte_extent != 0u) {
+		const auto widen = Binary(state, spv::OpLogicalAnd, boolean,
+		                          Binary(state, spv::OpLogicalAnd, boolean,
+		                                 Binary(state, spv::OpINotEqual, boolean, bytes, ConstantU64(state, 0u)),
+		                                 is(stride, 0u)),
+		                          is(oob, 2u));
+		const auto extent = ConstantU64(state, buffer.max_byte_extent);
+		bytes = Select(state, u64, widen,
+		               Select(state, u64, Binary(state, spv::OpULessThan, boolean, bytes, extent), extent, bytes), bytes);
+	}
+	bytes             = Select(state, u64, typed, ConstantU64(state, 0u), bytes);
+	const auto empty  = either(Binary(state, spv::OpIEqual, boolean, base, ConstantU64(state, 0u)),
+	                           Binary(state, spv::OpIEqual, boolean, bytes, ConstantU64(state, 0u)));
+	const auto element = std::max(
+	    1u, IR::FormedElementBytes(state.program, static_cast<uint32_t>(&buffer - state.program.info.buffers.data())));
+	const auto low_bits = [&](uint32_t value64, uint64_t mask) {
+		return Binary(state, spv::OpINotEqual, boolean, Binary(state, spv::OpBitwiseAnd, u64, value64, ConstantU64(state, mask)),
+		              ConstantU64(state, 0u));
+	};
+	const auto end = Binary(state, spv::OpIAdd, u64, base, bytes);
+	auto miss = either(is(records, UINT32_MAX),
+	                   Binary(state, spv::OpLogicalAnd, boolean, strided, is(bits(words[1], 31u, 1u), 1u)));
+	miss      = either(miss, is(bits(words[3], 23u, 1u), 1u));
+	miss      = either(miss, low_bits(base, element - 1u));
+	miss      = either(miss, low_bits(bytes, 0xffffffff00000000ull));
+	if (buffer.written) miss = either(miss, low_bits(bytes, 3u));
+	miss      = either(miss, Binary(state, spv::OpUGreaterThan, boolean, end, size));
+	miss      = Binary(state, spv::OpLogicalAnd, boolean, miss, Unary(state, spv::OpLogicalNot, boolean, empty));
+	const auto none = Binary(state, spv::OpLogicalAnd, boolean, is(oob, 0u), Unary(state, spv::OpLogicalNot, boolean, strided));
+	state.formed_flags[slot]  = formed;
+	state.formed_bases[slot]  = base;
+	state.formed_bytes[slot]  = bytes;
+	state.formed_misses[slot] = miss;
+	return {.view  = base,
+	        .range = Select(state, u32, either(empty, miss), zero, Unary(state, spv::OpUConvert, u32, bytes)),
+	        .word  = Binary(state, spv::OpBitwiseOr, u32, Binary(state, spv::OpShiftLeftLogical, u32, stride, ConstantU32(state, 8u)),
+	                        Select(state, u32, none, ConstantU32(state, 1u << 31u), zero))};
+}
+
 static void EmitMirrorBindings(EmitterState& state) {
 	const auto count = state.program.bindings.mirror_count;
 	state.mirror_bases.assign(count, 0u);
 	state.mirror_ranges.assign(count, 0u);
 	state.mirror_words.assign(count, 0u);
+	state.formed_flags.assign(count, 0u);
+	state.formed_bases.assign(count, 0u);
+	state.formed_bytes.assign(count, 0u);
+	state.formed_misses.assign(count, 0u);
 	if (count == 0) return;
 	const auto u64    = TypeU64(state);
 	const auto header = state.program.bindings.MirrorHeaderDword();
 	state.mirror_base = PackU64(state, EmitShaderDataDwordLoad(state, header), EmitShaderDataDwordLoad(state, header + 1u));
 	const auto size   = PackU64(state, EmitShaderDataDwordLoad(state, header + 2u), EmitShaderDataDwordLoad(state, header + 3u));
-	for (uint32_t slot = 0; slot < count; ++slot) {
-		const auto dword = state.program.bindings.MirrorDword() + IR::Bindings::MirrorDwords * slot;
+	for (const auto& buffer: state.program.info.buffers) {
+		if (buffer.mirror_index >= count) continue;
+		const auto slot  = buffer.mirror_index;
+		const auto dword = state.program.bindings.MirrorDword() + state.program.bindings.MirrorSlotDwords() * slot;
 		const auto view  = PackU64(state, EmitShaderDataDwordLoad(state, dword), EmitShaderDataDwordLoad(state, dword + 1u));
 		const auto range = EmitShaderDataDwordLoad(state, dword + 2u);
 		const auto end   = Binary(state, spv::OpIAdd, u64, view, Unary(state, spv::OpUConvert, u64, range));
 		const auto inside = Binary(state, spv::OpULessThanEqual, TypeBool(state), end, size);
-		state.mirror_bases[slot]  = EmitMirrorDeviceAddress(state, view);
-		state.mirror_ranges[slot] = Select(state, TypeU32(state), inside, range, ConstantU32(state, 0u));
-		state.mirror_words[slot]  = EmitShaderDataDwordLoad(state, dword + 3u);
+		auto device = EmitMirrorDeviceAddress(state, view);
+		auto bytes  = Select(state, TypeU32(state), inside, range, ConstantU32(state, 0u));
+		auto word   = EmitShaderDataDwordLoad(state, dword + 3u);
+		if (IR::IsGpuFormedBuffer(buffer.packed_stride)) {
+			const auto formed = Binary(
+			    state, spv::OpINotEqual, TypeBool(state),
+			    Binary(state, spv::OpBitwiseAnd, TypeU32(state),
+			           EmitShaderDataDwordLoad(state, dword + IR::Bindings::MirrorDwords + 2u),
+			           ConstantU32(state, IR::Bindings::FormedFlag)),
+			    ConstantU32(state, 0u));
+			const auto own = EmitFormedView(state, buffer, slot, size, formed);
+			device = Select(state, u64, formed, EmitMirrorDeviceAddress(state, own.view), device);
+			bytes  = Select(state, TypeU32(state), formed, own.range, bytes);
+			word   = Select(state, TypeU32(state), formed, own.word, word);
+		}
+		state.mirror_bases[slot]  = device;
+		state.mirror_ranges[slot] = bytes;
+		state.mirror_words[slot]  = word;
 	}
+}
+
+void EmitViewLog(EmitterState& state) {
+	const auto& bindings = state.program.bindings;
+	if (state.program.table_mode || bindings.formed_count == 0 || bindings.mirror_count == 0) return;
+	state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
+	const auto u32     = TypeU32(state);
+	const auto u64     = TypeU64(state);
+	const auto boolean = TypeBool(state);
+	const auto header  = bindings.ViewLogDword();
+	const auto ring    = PackU64(state, EmitShaderDataDwordLoad(state, header), EmitShaderDataDwordLoad(state, header + 1u));
+	const auto first   = EmitShaderDataDwordLoad(state, header + 2u);
+	const auto capacity = EmitShaderDataDwordLoad(state, header + 3u);
+	const auto one      = ConstantU32(state, 1u);
+	const auto zero     = ConstantU32(state, 0u);
+	std::vector<uint32_t> before(bindings.mirror_count, zero);
+	auto                  total = zero;
+	for (uint32_t slot = 0; slot < bindings.mirror_count; ++slot) {
+		before[slot] = total;
+		if (state.formed_flags[slot] == 0u) continue;
+		total = Binary(state, spv::OpIAdd, u32, total, Select(state, u32, state.formed_flags[slot], one, zero));
+	}
+	const auto elected = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformElect, boolean, elected, ConstantU32(state, spv::ScopeSubgroup));
+	const auto any = Binary(state, spv::OpLogicalAnd, boolean, elected, Binary(state, spv::OpINotEqual, boolean, total, zero));
+	EmitIfCondition(state, any, [&]() {
+		const auto segment = Binary(state, spv::OpIAdd, u64, ring,
+		                            Binary(state, spv::OpShiftLeftLogical, u64, Unary(state, spv::OpUConvert, u64, first),
+		                                   ConstantU64(state, 4u)));
+		const auto index = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAtomicIAdd, u32, index,
+		                          Unary(state, spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), segment),
+		                          ConstantU32(state, spv::ScopeDevice), ConstantU32(state, spv::MemorySemanticsMaskNone),
+		                          total);
+		for (const auto& buffer: state.program.info.buffers) {
+			const auto slot = buffer.mirror_index;
+			if (slot >= bindings.mirror_count || state.formed_flags[slot] == 0u) continue;
+			EmitIfCondition(state, state.formed_flags[slot], [&]() {
+				const auto position = Binary(state, spv::OpIAdd, u32, index, before[slot]);
+				EmitIfCondition(state, Binary(state, spv::OpULessThan, boolean, position, capacity), [&]() {
+					const auto entry = Binary(
+					    state, spv::OpIAdd, u64, segment,
+					    Binary(state, spv::OpShiftLeftLogical, u64,
+					           Unary(state, spv::OpUConvert, u64, Binary(state, spv::OpIAdd, u32, position, one)),
+					           ConstantU64(state, 4u)));
+					const uint32_t flags = (buffer.read ? 1u : 0u) | (buffer.written ? 2u : 0u) | (slot << 8u);
+					const auto     tag   = Binary(state, spv::OpBitwiseOr, u32, ConstantU32(state, flags),
+					                              Select(state, u32, state.formed_misses[slot], ConstantU32(state, 4u), zero));
+					const auto base      = state.formed_bases[slot];
+					const auto bytes     = state.formed_bytes[slot];
+					const auto low       = [&](uint32_t value) { return Unary(state, spv::OpUConvert, u32, value); };
+					const auto high      = [&](uint32_t value) {
+                        return low(Binary(state, spv::OpShiftRightLogical, u64, value, ConstantU64(state, 32u)));
+					};
+					EmitPhysicalWordStore(state, entry, low(base));
+					EmitPhysicalWordStore(state, EmitAddressPlus(state, entry, 4u),
+					                      Binary(state, spv::OpBitwiseOr, u32,
+					                             Binary(state, spv::OpBitwiseAnd, u32, high(base), ConstantU32(state, 0xffffu)),
+					                             Binary(state, spv::OpShiftLeftLogical, u32, tag, ConstantU32(state, 16u))));
+					EmitPhysicalWordStore(state, EmitAddressPlus(state, entry, 8u), low(bytes));
+					EmitPhysicalWordStore(state, EmitAddressPlus(state, entry, 12u), high(bytes));
+				});
+			});
+		}
+	});
 }
 
 uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resource) {

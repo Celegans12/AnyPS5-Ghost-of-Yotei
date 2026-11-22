@@ -102,6 +102,22 @@ bool MirrorsVsharpBuffers();
 uint32_t MirrorElementBytes(const ResourcePlan& program, uint32_t index);
 void MirrorBuffers(const ResourcePlan& program, const ResourceSnapshot& snapshot,
                    ResourceSpecialization& specialization);
+struct FormedView {
+	uint64_t base   = 0;
+	uint64_t bytes  = 0;
+	uint32_t stride = 0;
+	bool     none   = false;
+	bool     serves = false;
+};
+bool       FormsVsharpBuffers();
+void       BlockFormedViews(bool blocked);
+bool       FormedViewsBlocked();
+uint64_t   MirrorSize();
+uint32_t   FormedElementBytes(const ResourcePlan& program, uint32_t index);
+FormedView FormView(const BufferResource& buffer, uint32_t element, std::span<const uint32_t, 4> words,
+                    uint64_t limit);
+void       FormBuffers(const ResourcePlan& program, const ResourceSnapshot& snapshot,
+                       ResourceSpecialization& specialization, uint64_t formed_now);
 bool AlignResources(const ResourcePlan& program, const ResourceSnapshot& snapshot,
                     const ResourceSpecialization& specialization, const ResourceSpecialization& target,
                     ResourceSnapshot* aligned);

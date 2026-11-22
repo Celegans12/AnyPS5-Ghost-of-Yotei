@@ -568,6 +568,28 @@ add_test(NAME kyty_shim_vsharp_mirror_replay COMMAND kyty_shim_vsharp_mirror_rep
 set_tests_properties(kyty_shim_vsharp_mirror_replay PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
         PASS_REGULAR_EXPRESSION "kyty_shim_vsharp_mirror_replay: ok")
 
+add_test_executable(kyty_shim_gpu_formed_replay_tests ${CMAKE_CURRENT_SOURCE_DIR}/GpuFormedReplay.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../Execution/src/FrameCapture.cpp)
+target_include_directories(kyty_shim_gpu_formed_replay_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/3rdparty/zstd/lib)
+target_link_libraries(kyty_shim_gpu_formed_replay_tests PRIVATE libzstd_static)
+set_target_properties(kyty_shim_gpu_formed_replay_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_host_test_executable(kyty_shim_gpu_formed_replay_tests)
+add_dependencies(kyty_shim_gpu_formed_replay_tests agc_frame_replay)
+add_test(NAME kyty_shim_gpu_formed_replay COMMAND kyty_shim_gpu_formed_replay_tests $<TARGET_FILE:agc_frame_replay>)
+set_tests_properties(kyty_shim_gpu_formed_replay PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "kyty_shim_gpu_formed_replay: ok")
+
+add_test_executable(kyty_shim_view_log_tests ${CMAKE_CURRENT_SOURCE_DIR}/ViewLogSegments.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+target_include_directories(kyty_shim_view_log_tests PRIVATE ${LIBS_INCLUDE_DIR})
+configure_host_test_executable(kyty_shim_view_log_tests)
+if(MINGW)
+    target_link_libraries(kyty_shim_view_log_tests PRIVATE stdc++ gcc_eh)
+endif()
+target_link_libraries(kyty_shim_view_log_tests PRIVATE Kyty::gpu libkernel libc)
+add_test(NAME kyty_shim_view_log COMMAND kyty_shim_view_log_tests)
+set_tests_properties(kyty_shim_view_log PROPERTIES TIMEOUT 20
+        PASS_REGULAR_EXPRESSION "kyty_shim_view_log: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+
 add_test_executable(kyty_shim_generic_compute_variants_tests ${CMAKE_CURRENT_SOURCE_DIR}/GenericComputeVariants.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
 target_include_directories(kyty_shim_generic_compute_variants_tests PRIVATE ${LIBS_INCLUDE_DIR})
 configure_host_test_executable(kyty_shim_generic_compute_variants_tests)
@@ -715,7 +737,7 @@ set_tests_properties(kyty_shim_cross_queue_recycled_label_own_tick PROPERTIES TI
         PASS_REGULAR_EXPRESSION "kyty_shim_cross_queue_recycled_label: order broken: ")
 if(WIN32)
     set_property(TEST kyty_shim_buffer_null_range kyty_shim_uniform_scalar_replay kyty_shim_empty_buffer_replay
-            kyty_shim_empty_buffer_replay_off kyty_shim_vsharp_mirror_replay
+            kyty_shim_empty_buffer_replay_off kyty_shim_vsharp_mirror_replay kyty_shim_gpu_formed_replay
             kyty_shim_generic_compute_replay kyty_shim_generic_compute_replay_wide kyty_shim_bda_submission_sync
             kyty_shim_cross_queue_compute_waits_graphics_data kyty_shim_cross_queue_graphics_waits_compute_data
             kyty_shim_cross_queue_dma_wait kyty_shim_cross_queue_compute_waits_graphics_clock

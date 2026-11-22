@@ -185,12 +185,13 @@ void LogShaderVariantBuild(const char* stage, uint64_t shader_hash, uint32_t use
 	PipelineCacheLog(
 	    "[kyty-variant] build stage={} shader={:016x} module={:016x} user_data_count={} "
 	    "static={:016x} push_start={} push_cursor={} buffers={:016x} images={:016x} "
-	    "samplers={:016x} linked_code={:016x} table={} mirrored={} spirv_words={}{} @{}",
+	    "samplers={:016x} linked_code={:016x} table={} mirrored={} formed={} spirv_words={}{} @{}",
 	    stage, shader_hash, module.id, user_data_count, fingerprint(static_state),
 	    module.info.bindings.push_data_start_dword, push_data_cursor,
 	    fingerprint(specialization.buffers), fingerprint(specialization.images),
 	    fingerprint(specialization.samplers), XXH3_64bits(functions.data(), functions.size() * sizeof(uint32_t)),
-	    module.info.table_mode, module.info.bindings.mirror_count, module.spirv_words, plain_fields,
+	    module.info.table_mode, module.info.bindings.mirror_count, module.info.bindings.formed_count, module.spirv_words,
+	    plain_fields,
 	    std::chrono::steady_clock::now().time_since_epoch().count());
 }
 #endif
@@ -821,6 +822,50 @@ void GuestReadLog::NoteDeferredLoads(std::span<uint64_t> addresses) {
 		load.deferred = true;
 		m_deferred_words += load.count;
 	}
+}
+
+void GuestReadLog::AddDeferredFlatLoad(uint64_t address, uint32_t slot) {
+	m_flat_loads.push_back({.address = address, .stage = m_stage, .slot = slot, .count = 1, .deferred = true});
+	m_deferred_words++;
+}
+
+void GuestReadLog::ForgetLoads(std::span<uint64_t> addresses) {
+	if (addresses.empty()) return;
+	std::ranges::sort(addresses);
+	std::vector<Entry> kept;
+	kept.reserve(m_entries.size() + addresses.size());
+	for (const auto& entry: m_entries) {
+		const auto first = std::ranges::lower_bound(addresses, entry.address);
+		if (entry.strict || entry.zero_test || first == addresses.end() || *first - entry.address >= entry.size) {
+			kept.push_back(entry);
+			continue;
+		}
+		uint32_t done = 0;
+		while (done < entry.size) {
+			uint32_t end = done;
+			while (end < entry.size && !std::ranges::binary_search(addresses, entry.address + end)) {
+				end += sizeof(uint32_t);
+			}
+			end = std::min(end, entry.size);
+			if (end > done) {
+				Entry piece      = entry;
+				piece.address    = entry.address + done;
+				piece.offset     = entry.offset + done;
+				piece.size       = end - done;
+				piece.words_begin = entry.words_begin;
+				while (piece.words_begin < entry.words_end && m_words[piece.words_begin].offset < piece.offset) {
+					piece.words_begin++;
+				}
+				piece.words_end = piece.words_begin;
+				while (piece.words_end < entry.words_end && m_words[piece.words_end].offset < piece.offset + piece.size) {
+					piece.words_end++;
+				}
+				kept.push_back(piece);
+			}
+			done = end + sizeof(uint32_t);
+		}
+	}
+	m_entries = std::move(kept);
 }
 
 void GuestReadLog::NoteAroundLoads(std::span<uint64_t> addresses) {
@@ -1705,6 +1750,10 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		runtime.workgroup_counts   = input_info.workgroup_counts;
 		runtime.indirect_args_address = input_info.indirect_args_address;
 		runtime.runtime_stride        = RuntimeStride(params.hash);
+#if defined(ANYPS5_KYTY)
+		runtime.defer_formed = ShaderRecompiler::IR::FormsAllVsharps() && ShaderRecompiler::IR::FormsVsharpBuffers() &&
+		                       input_info.indirect_args_address == 0 && !input_info.dispatch_indirect_threads;
+#endif
 	}
 	m_lookup_key.stage           = options.stage;
 	m_lookup_key.hash            = params.hash;
@@ -2798,6 +2847,10 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 		runtime.workgroup_counts      = input_info.workgroup_counts;
 		runtime.indirect_args_address = input_info.indirect_args_address;
 		runtime.runtime_stride        = RuntimeStride(params.hash);
+#if defined(ANYPS5_KYTY)
+		runtime.defer_formed = ShaderRecompiler::IR::FormsVsharpBuffers() && input_info.indirect_args_address == 0 &&
+		                       !input_info.dispatch_indirect_threads;
+#endif
 	}
 	t_ahead_unread_load = false;
 #if defined(ANYPS5_KYTY)
@@ -2816,6 +2869,23 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 		ahead.reads.NoteDeferredLoads(ShaderRecompiler::IR::SrtDeferredLoadsOfThread());
 	}
 	ahead.reads.NoteAroundLoads(ShaderRecompiler::IR::SrtAroundLoadsOfThread());
+	if (!resources.gpu_formed.empty()) {
+		thread_local std::vector<uint64_t> forgotten;
+		forgotten.clear();
+		const auto& plan = program->resource_plan;
+		for (const auto& formed: ShaderRecompiler::IR::SrtFormedSourcesOfThread()) {
+			for (uint32_t word = 0; word < formed.words.size(); ++word) {
+				if (((formed.deferred >> word) & 1u) == 0u) continue;
+				forgotten.push_back(formed.words[word]);
+				const auto flat = formed.source * 8u + word;
+				if (flat < plan.descriptor_word_flat.size() &&
+				    plan.descriptor_word_flat[flat] < resources.flattened_srt.size()) {
+					ahead.reads.AddDeferredFlatLoad(formed.words[word], plan.descriptor_word_flat[flat]);
+				}
+			}
+		}
+		ahead.reads.ForgetLoads(forgotten);
+	}
 #endif
 	NoteAheadWrites(program->resource_plan, resources);
 	const auto matches = [&](const ShaderModule& candidate) {
@@ -2847,7 +2917,8 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 			return nullptr;
 		}
 #endif
-		const bool queued = t_ahead_unread_load || !ahead.reads.MayHaveReadGpuWrites();
+		const bool queued =
+		    t_ahead_unread_load || !ahead.reads.MayHaveReadGpuWrites() || !resources.gpu_formed.empty();
 		if (queued) {
 #if defined(ANYPS5_KYTY)
 			auto promoted = specialization;
