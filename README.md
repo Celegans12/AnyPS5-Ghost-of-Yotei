@@ -123,7 +123,7 @@ No setting is needed: the defaults are the fastest and most stable choices measu
 
 ## Join us
 
-There is work at every size, and most of it needs no knowledge of the code base yet.
+**Goal #1: finish [architecture v2](https://github.com/simnJS/AnyPS5/issues/168), properly.** Every step removes old machinery, until Ghost of Yōtei runs close to its GPU wall; the [roadmap](https://github.com/simnJS/AnyPS5/issues?q=is%3Aissue+is%3Aopen+in%3Atitle+%22Start+here%22) says what comes first. There is work at every size around it, and most of it needs no knowledge of the code base yet.
 
 | You have | You can |
 |---|---|
