@@ -154,7 +154,7 @@ void Fallback() {
 	          Contains(mirror.Description(), "works without it"),
 	      "the fallback says why: " + mirror.Description());
 	mirror.NoteRange(0x10000, 0x10000);
-	mirror.Submit();
+	mirror.Flush();
 	mirror.WaitIdle();
 	Check(mirror.Totals().calls == 0 && !mirror.IsBound(0x10000), "the fallback binds nothing");
 }
@@ -263,23 +263,32 @@ int Sparse() {
 	const uint64_t first = size / 2 + 3 * block + 0x1230;
 	mirror.NoteRange(first, 0x100);
 	Check(mirror.Totals().calls == 0, "nothing is bound before the submission");
-	mirror.Submit();
+	mirror.Flush();
 	mirror.WaitIdle();
 	auto totals = mirror.Totals();
 	Check(totals.bound_blocks == 1 && totals.calls == 1 && totals.chunks == 1, "one block bound in one call");
+	mirror.NoteRange(first + 2 * block, 0x40);
+	mirror.Submit();
+	mirror.WaitIdle();
+	Check(mirror.Totals().calls == 1 && mirror.IsBound(first + 2 * block),
+	      "a submission within a second of the last binding keeps its block for later");
+	mirror.Flush();
+	mirror.WaitIdle();
+	totals = mirror.Totals();
+	Check(totals.calls == 2 && totals.bound_blocks == 2, "a flush binds what the submissions kept");
 	Check(mirror.IsBound(first) && !mirror.IsBound(first + block), "the residency map holds the block");
 	Check(RoundTrip(graphics, mirror.Handle(), first & ~(block - 1), block, 1), "the bound block keeps what is written to it");
 
 	mirror.NoteRange(first + 0x40, 0x40);
-	mirror.Submit();
+	mirror.Flush();
 	mirror.WaitIdle();
-	Check(mirror.Totals().calls == 1, "a block already bound is not bound again");
+	Check(mirror.Totals().calls == 2, "a block already bound is not bound again");
 
 	mirror.NoteRange((first & ~(block - 1)) + block - 0x10, 0x20);
-	mirror.Submit();
+	mirror.Flush();
 	mirror.WaitIdle();
 	totals = mirror.Totals();
-	Check(totals.bound_blocks == 2 && totals.calls == 2, "a range across two blocks binds the missing one");
+	Check(totals.bound_blocks == 3 && totals.calls == 3, "a range across two blocks binds the missing one");
 	Check(RoundTrip(graphics, mirror.Handle(), first & ~(block - 1), 2 * block, 2), "two neighbouring blocks hold data");
 
 	mirror.NoteRange(size + block, block);
@@ -287,10 +296,10 @@ int Sparse() {
 
 	const auto run_base = size - 64 * (uint64_t {1} << 20u);
 	for (uint64_t index = 0; index < 300; index++) mirror.NoteRange(run_base + index * 2 * block, 1);
-	mirror.Submit();
+	mirror.Flush();
 	mirror.WaitIdle();
 	totals = mirror.Totals();
-	Check(totals.bound_blocks == 302 && totals.calls == 4,
+	Check(totals.bound_blocks == 303 && totals.calls == 5,
 	      "300 scattered blocks go in calls of 256 ranges at most (calls " + std::to_string(totals.calls) + ")");
 	Check(RoundTrip(graphics, mirror.Handle(), run_base + 299 * 2 * block, block, 3), "the last scattered block holds data");
 
@@ -298,13 +307,13 @@ int Sparse() {
 	mirror.Trim(live);
 	mirror.WaitIdle();
 	totals = mirror.Totals();
-	Check(totals.bound_blocks == 1 && totals.unbound_blocks == 301, "a trim unbinds the blocks no live range covers");
+	Check(totals.bound_blocks == 1 && totals.unbound_blocks == 302, "a trim unbinds the blocks no live range covers");
 	Check(mirror.IsBound(first) && !mirror.IsBound(run_base), "the trim keeps the covered block");
 	Check(totals.chunks == 1, "a trim keeps the chunk that still holds a bound block");
 	Check(RoundTrip(graphics, mirror.Handle(), first & ~(block - 1), block, 4), "the kept block still holds data");
 
 	mirror.NoteRange(run_base, 1);
-	mirror.Submit();
+	mirror.Flush();
 	mirror.WaitIdle();
 	Check(mirror.Totals().bound_blocks == 2, "a trimmed block is bound again when a buffer comes back");
 
@@ -314,7 +323,7 @@ int Sparse() {
 	Check(totals.bound_blocks == 0 && totals.chunks == 0 && !mirror.IsBound(first) && !mirror.IsBound(run_base),
 	      "a trim without live buffers unbinds everything and frees every chunk");
 	mirror.NoteRange(first, 0x100);
-	mirror.Submit();
+	mirror.Flush();
 	mirror.WaitIdle();
 	totals = mirror.Totals();
 	Check(totals.bound_blocks == 1 && totals.chunks == 1, "a block is bound again in a new chunk");
@@ -346,7 +355,7 @@ int DefaultSizes() {
 	const uint64_t     address = std::min(highest, mirror.Size() - block) & ~(block - 1);
 	mirror.NoteRange(address, block);
 	mirror.NoteRange(0x228'0000, 0x2'BE50);
-	mirror.Submit();
+	mirror.Flush();
 	mirror.WaitIdle();
 	Check(mirror.IsBound(address) && mirror.IsBound(0x228'0000), "blocks bind at both ends of the mirror");
 	Check(RoundTrip(gpu.graphics, mirror.Handle(), address, block, 6), "the highest block holds data");

@@ -318,6 +318,7 @@ void GuestMirror::NoteRange(uint64_t vaddr, uint64_t size) {
 		const auto bit  = uint64_t {1} << (block % 64);
 		if ((word & bit) != 0) continue;
 		word |= bit;
+		m_pending_blocks++;
 		if (!m_pending.empty() && m_pending.back().first + m_pending.back().count == block) {
 			m_pending.back().count++;
 		} else {
@@ -341,13 +342,21 @@ void GuestMirror::Post(Kind kind, std::vector<Run>&& runs) {
 
 void GuestMirror::Submit() {
 	if (m_pending.empty()) return;
+	if (m_pending_blocks < FlushBlocks && Now() - m_last_post < FlushNs) return;
+	Flush();
+}
+
+void GuestMirror::Flush() {
+	if (m_pending.empty()) return;
+	m_last_post      = Now();
+	m_pending_blocks = 0;
 	Post(Kind::Bind, std::move(m_pending));
 	m_pending.clear();
 }
 
 void GuestMirror::Trim(std::span<const std::pair<uint64_t, uint64_t>> live) {
 	if (m_size == 0) return;
-	Submit();
+	Flush();
 	std::vector<uint64_t> covered(m_bound.size(), 0);
 	const uint64_t        blocks = m_size >> m_block_bits;
 	for (const auto& [vaddr, size]: live) {
