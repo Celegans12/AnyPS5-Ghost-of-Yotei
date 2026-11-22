@@ -487,6 +487,9 @@ if(BUILD_TESTING)
         set_tests_properties(tools_audit_strict_partial PROPERTIES TIMEOUT 20)
         add_test(NAME import_audit COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_import_audit.py)
+        add_test(NAME emutls_imports COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_emutls_imports.py)
+        set_tests_properties(emutls_imports PROPERTIES TIMEOUT 20)
         add_test(NAME guest_pointer_audit COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_guest_pointer_audit.py)
         if(Python3_VERSION VERSION_GREATER_EQUAL 3.11)

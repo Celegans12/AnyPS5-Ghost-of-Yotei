@@ -468,6 +468,10 @@ jobs:
           mapfile -t tests < <(ninja -C build -t targets all | grep -oE '^kyty_shim_[A-Za-z0-9_]+_tests:' | tr -d ':' | sort -u)
           echo "Shim test targets: ${tests[*]}"
           cmake --build build --target kyty_gpu libs relinker kyty_rt_probe agc_frame_replay agc_frame_replay_inspection_tests "${tests[@]}" --parallel "$NUMBER_OF_PROCESSORS"
+      - name: Check the GCC emulated TLS imports of the modules
+        run: |
+          python3 tools/tests/test_check_emutls_imports.py
+          python3 tools/check_emutls_imports.py build/core/libs/libs
       - name: Run the shim tests
         run: ctest --test-dir build -R '^kyty_shim_.*$' --output-on-failure --timeout 300 --no-tests=error
       - name: Run the replay tool tests
