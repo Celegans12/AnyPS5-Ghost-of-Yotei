@@ -1049,6 +1049,12 @@ void CommandProcessor::WriteData(uint64_t address, const uint32_t* src, uint32_t
 		case 4:
 		case 5:
 		case 6: break;
+		case 10:
+		case 11:
+			if ((write_control >> 30u) > 1u) {
+				EXIT("unsupported writeData engine 0x%02" PRIx32 "\n", write_control >> 30u);
+			}
+			break;
 		default: EXIT("unsupported writeData destination selector 0x%02" PRIx32 "\n", dst_sel);
 	}
 	if (dw_num == 0) {
