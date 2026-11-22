@@ -1,0 +1,85 @@
+name: AnyKyty performance report
+description: A slow scene or a change in speed on AnyKyty, measured with the in-run A/B or the flip telemetry.
+title: "perf: <title name> <title ID> <version>"
+labels: [perf]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Run with the default settings unless a field asks for an override. Use the in-run A/B (`KYTY_AB`, read by `tools/kyty_ab_report.py`) or the flip telemetry (`APS5_VIDEOOUT_TELEMETRY_DIR`, `APS5_VIDEOOUT_FLIP_TIMING`, read by `tools/videoout_flip_compare.py`); both are described under [Measure](https://github.com/simnJS/AnyPS5/blob/AnyKyty/docs/dev/START_HERE.md#measure).
+
+        - Run the scene once and restart the title, so the shader and pipeline caches are warm, unless this report is about a cold first run.
+        - Use the same scene, window, resolution and settings for every number you compare.
+        - Attach logs, hashes and screenshots. Never attach game files, save data or memory dumps.
+  - type: input
+    id: title
+    attributes:
+      label: Title ID and version
+      description: From `sce_sys/param.json` of the dump, for example PPSA12345 02.002.000.
+    validations:
+      required: true
+  - type: input
+    id: commit
+    attributes:
+      label: AnyKyty commit
+      description: The `AnyKyty` commit you built (`git rev-parse --short HEAD`), and any pull request on top.
+    validations:
+      required: true
+  - type: textarea
+    id: host
+    attributes:
+      label: Host report
+      description: The block printed once at start (OS, CPU, RAM, GPU, driver).
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: scene
+    attributes:
+      label: Scene
+      description: Where the game is, what the window covers, and the game's graphics mode.
+      placeholder: Novigrad, main square, standing still; performance mode
+    validations:
+      required: true
+  - type: input
+    id: settings
+    attributes:
+      label: Settings
+      description: The settings set, or "defaults" when no `KYTY_*` or `APS5_*` override was used.
+      placeholder: defaults
+    validations:
+      required: true
+  - type: dropdown
+    id: cache
+    attributes:
+      label: Cache state
+      description: Whether the numbers come from the first run after converting (cold shader store) or a later one.
+      options:
+        - Warm
+        - Cold first run
+    validations:
+      required: true
+  - type: textarea
+    id: measurement
+    attributes:
+      label: Measurement
+      description: Paste the output of `python3 tools/kyty_ab_report.py` or of `python3 tools/videoout_flip_compare.py` for this scene.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Anything else that helps interpret the numbers, such as other work running on the machine.
+  - type: checkboxes
+    id: protocol
+    attributes:
+      label: Checks
+      options:
+        - label: The caches were warm, unless this report is about a cold first run
+          required: true
+        - label: Every number compared comes from the same scene and settings
+          required: true
+        - label: No game files, save data or memory dumps are attached
+          required: true

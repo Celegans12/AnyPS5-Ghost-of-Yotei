@@ -5,6 +5,8 @@ body:
   - type: markdown
     attributes:
       value: |
+        **This form is for AnyPS5's own GPU driver, which AnyKyty removed. On AnyKyty use the [AnyKyty performance report](?template=anykyty_performance.yml).**
+
         Capture the scene with `APS5_TRACE_FRAMES=<start>:<count>` (presents; `APS5_TRACE_SECONDS=<start>:<length>` also works), as described under [Performance trace](https://github.com/boykopovar/AnyPS5/blob/main/docs/dev/BUILD.md#performance-trace). It writes `aps5-trace-<commit>-<pid>.json.gz` and appends one line to `aps5-summary.jsonl`.
 
         - Run the scene once and restart the title, so the shader and pipeline caches are warm.
