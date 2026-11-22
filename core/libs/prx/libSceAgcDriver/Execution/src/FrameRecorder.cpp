@@ -19,6 +19,7 @@
 #include <windows.h>
 #elif defined(__linux__)
 #include "prx/libc/include/specifics/linux/HostMapping.hpp"
+#include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #endif
 
 namespace AgcDriver {
@@ -489,6 +490,15 @@ void FrameRecorder::collectRanges() {
     std::size_t arenaBytes = 0;
     GuestArena::GuestArenaRange_nid_postfix(&arenaBase, &arenaBytes);
     if (arenaBytes == 0) throw std::runtime_error("the guest arena is not reserved");
+#ifdef __linux__
+    int guestFile = -1;
+    int directFile = -1;
+    struct stat guestFileInfo{};
+    const bool guestFileKnown = DirectMemoryViewFiles_nid_no_patch(&guestFile, &directFile);
+    if (guestFileKnown && (guestFile < 0 || fstat(guestFile, &guestFileInfo) != 0 || guestFileInfo.st_ino == 0)) {
+        throw std::runtime_error("frame capture: cannot identify the guest memory file");
+    }
+#endif
     for (const auto& allocation : GuestAllocations::GuestAllocationsAcquireAll_nid_postfix()) {
         if (IsFrameCaptureDriverMemory(allocation->address, allocation->bytes)) continue;
         if (!allocation->readable) {
@@ -524,10 +534,13 @@ void FrameRecorder::collectRanges() {
         HostMapping::Walk(first, end, "frame capture", [&](const HostMapping::Mapping& mapping) {
             const auto begin = std::max<std::uint64_t>(first, mapping.start);
             const auto stop = std::min<std::uint64_t>(end, mapping.end);
-            if (!host && mapping.shared) CheckSharedRange(begin, stop);
+            const bool guestFileMapping = !host && guestFileKnown && mapping.offset == mapping.start &&
+                HostMapping::MapsFile(mapping, guestFileInfo);
+            if (!host && mapping.shared && !guestFileMapping) CheckSharedRange(begin, stop);
             const auto protection = mapping.executable ? (mapping.writable ? 0x40u : 0x20u) :
                 (mapping.writable ? 0x04u : 0x02u);
-            add(begin, stop, protection, mapping.shared || mapping.inode != 0 ? FrameRangeKind::Section : FrameRangeKind::Unwatched);
+            add(begin, stop, protection, guestFileMapping ? FrameRangeKind::Unwatched :
+                mapping.shared || mapping.inode != 0 ? FrameRangeKind::Section : FrameRangeKind::Unwatched);
         });
 #else
         throw std::runtime_error("frame capture requires Windows or Linux");

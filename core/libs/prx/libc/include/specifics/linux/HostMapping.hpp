@@ -12,6 +12,8 @@
 #include <stdexcept>
 #include <string>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 #if __has_include(<linux/fs.h>)
 #include <linux/fs.h>
@@ -56,7 +58,16 @@ struct Mapping {
     bool executable = false;
     bool shared = false;
     std::uint64_t inode = 0;
+    std::uint32_t deviceMajor = 0;
+    std::uint32_t deviceMinor = 0;
+    std::uint64_t offset = 0;
 };
+
+inline bool MapsFile(const Mapping& mapping, const struct stat& file) {
+    return mapping.shared && mapping.inode != 0 && mapping.inode == static_cast<std::uint64_t>(file.st_ino) &&
+        mapping.deviceMajor == static_cast<std::uint32_t>(major(file.st_dev)) &&
+        mapping.deviceMinor == static_cast<std::uint32_t>(minor(file.st_dev));
+}
 
 inline int QueryFd() {
     static const int fd = [] {
@@ -91,7 +102,7 @@ inline std::optional<Mapping> ParseMapsLine(const std::string& line) {
         const std::size_t begin = line.find_first_not_of(" \t", static_cast<std::size_t>(prefix));
         if (begin != std::string::npos) path = line.substr(begin, 4095);
     }
-    return Mapping{start, end, path, perms[0] == 'r', perms[1] == 'w', perms[2] == 'x', perms[3] == 's', inode};
+    return Mapping{start, end, path, perms[0] == 'r', perms[1] == 'w', perms[2] == 'x', perms[3] == 's', inode, devMajor, devMinor, offset};
 }
 
 inline std::optional<Mapping> ScanMaps(std::uint64_t address, const char* caller) {
@@ -109,7 +120,7 @@ inline std::optional<Mapping> ScanMaps(std::uint64_t address, const char* caller
 inline Mapping FromQuery(const procmap_query& query, const char* name) {
     return Mapping{query.vma_start, query.vma_end, query.vma_name_size != 0 ? name : "", (query.vma_flags & PROCMAP_QUERY_VMA_READABLE) != 0,
         (query.vma_flags & PROCMAP_QUERY_VMA_WRITABLE) != 0, (query.vma_flags & PROCMAP_QUERY_VMA_EXECUTABLE) != 0,
-        (query.vma_flags & PROCMAP_QUERY_VMA_SHARED) != 0, query.inode};
+        (query.vma_flags & PROCMAP_QUERY_VMA_SHARED) != 0, query.inode, query.dev_major, query.dev_minor, query.vma_offset};
 }
 
 inline std::optional<Mapping> Find(std::uint64_t address, const char* caller) {
