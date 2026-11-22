@@ -10,6 +10,7 @@
 [![GPUs: NVIDIA, AMD](https://img.shields.io/badge/GPUs-NVIDIA%20%7C%20AMD-555555)](#status)
 [![Good first issues](https://img.shields.io/github/issues/simnJS/AnyPS5/good%20first%20issue?label=good%20first%20issues&color=7057ff)](https://github.com/simnJS/AnyPS5/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)
 [![Discussions](https://img.shields.io/github/discussions/simnJS/AnyPS5?label=discussions)](https://github.com/simnJS/AnyPS5/discussions)
+[![Managed with HangarAI](https://img.shields.io/badge/managed%20with-HangarAI-7aa2f7?labelColor=14151d&logo=data:image/svg%2bxml;base64,77u/PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxMDI0IDEwMjQiIHdpZHRoPSIxMDI0IiBoZWlnaHQ9IjEwMjQiIHJvbGU9ImltZyIgYXJpYS1sYWJlbD0iSGFuZ2FyQUkiPgogIDxkZWZzPgogICAgPGxpbmVhckdyYWRpZW50IGlkPSJ0aWxlIiB4MT0iMCIgeTE9IjAiIHgyPSIwLjQyIiB5Mj0iMSI+CiAgICAgIDxzdG9wIG9mZnNldD0iMCIgc3RvcC1jb2xvcj0iIzI0MjczOSIgLz4KICAgICAgPHN0b3Agb2Zmc2V0PSIxIiBzdG9wLWNvbG9yPSIjMTQxNTFkIiAvPgogICAgPC9saW5lYXJHcmFkaWVudD4KICA8L2RlZnM+CiAgPHJlY3Qgd2lkdGg9IjEwMjQiIGhlaWdodD0iMTAyNCIgZmlsbD0idXJsKCN0aWxlKSIgLz4KICA8cmVjdCB4PSIyMDAiIHk9IjIwMCIgd2lkdGg9IjI2MCIgaGVpZ2h0PSI2MjQiIGZpbGw9IiM3YWEyZjciIC8+CiAgPHJlY3QgeD0iNTM4IiB5PSIyMDAiIHdpZHRoPSIyODYiIGhlaWdodD0iMjYwIiBmaWxsPSIjYzBjYWY1IiAvPgogIDxyZWN0IHg9IjUzOCIgeT0iNTM4IiB3aWR0aD0iMjg2IiBoZWlnaHQ9IjI4NiIgZmlsbD0iI2MwY2FmNSIgLz4KPC9zdmc+Cg==)](https://hangarai.dev)
 
 **[Start here](docs/dev/START_HERE.md)** · **[Roadmap](https://github.com/simnJS/AnyPS5/issues?q=is%3Aissue+is%3Aopen+in%3Atitle+%22Start+here%22)** · **[Test a game](https://github.com/simnJS/AnyPS5/issues/141)** · **[Architecture v2](https://github.com/simnJS/AnyPS5/issues/168)**
 
@@ -134,7 +135,37 @@ No setting is needed: the defaults are the fastest and most stable choices measu
 
 Read [Start here](docs/dev/START_HERE.md) before your first pull request: building, testing, measuring, the rules, and how a pull request gets in. Questions go to [Discussions](https://github.com/simnJS/AnyPS5/discussions).
 
+## Contributors
+
+Everyone below has code in AnyKyty, most active first. Thank you!
+
+<p>
+<a href="https://github.com/simnJS"><img src="https://github.com/simnJS.png?size=96" width="48" height="48" alt="simnJS" title="simnJS"></a>
+<a href="https://github.com/mjnhbg3"><img src="https://github.com/mjnhbg3.png?size=96" width="48" height="48" alt="mjnhbg3" title="mjnhbg3"></a>
+<a href="https://github.com/Celegans12"><img src="https://github.com/Celegans12.png?size=96" width="48" height="48" alt="Celegans12" title="Celegans12"></a>
+<a href="https://github.com/XatiX"><img src="https://github.com/XatiX.png?size=96" width="48" height="48" alt="XatiX" title="XatiX"></a>
+<a href="https://github.com/Raghav314"><img src="https://github.com/Raghav314.png?size=96" width="48" height="48" alt="Raghav314" title="Raghav314"></a>
+<a href="https://github.com/trvxoo-glitch"><img src="https://github.com/trvxoo-glitch.png?size=96" width="48" height="48" alt="trvxoo-glitch" title="trvxoo-glitch"></a>
+<a href="https://github.com/SleglJan"><img src="https://github.com/SleglJan.png?size=96" width="48" height="48" alt="SleglJan" title="SleglJan"></a>
+<a href="https://github.com/vgpastor"><img src="https://github.com/vgpastor.png?size=96" width="48" height="48" alt="vgpastor" title="vgpastor"></a>
+<a href="https://github.com/adam25136"><img src="https://github.com/adam25136.png?size=96" width="48" height="48" alt="adam25136" title="adam25136"></a>
+<a href="https://github.com/relativespace2K"><img src="https://github.com/relativespace2K.png?size=96" width="48" height="48" alt="relativespace2K" title="relativespace2K"></a>
+<a href="https://github.com/Nawid3333"><img src="https://github.com/Nawid3333.png?size=96" width="48" height="48" alt="Nawid3333" title="Nawid3333"></a>
+<a href="https://github.com/yinx080"><img src="https://github.com/yinx080.png?size=96" width="48" height="48" alt="yinx080" title="yinx080"></a>
+<a href="https://github.com/Kikoarl"><img src="https://github.com/Kikoarl.png?size=96" width="48" height="48" alt="Kikoarl" title="Kikoarl"></a>
+<a href="https://github.com/QRMOE"><img src="https://github.com/QRMOE.png?size=96" width="48" height="48" alt="QRMOE" title="QRMOE"></a>
+<a href="https://github.com/ThiagoShade"><img src="https://github.com/ThiagoShade.png?size=96" width="48" height="48" alt="ThiagoShade" title="ThiagoShade"></a>
+<a href="https://github.com/DealPotato"><img src="https://github.com/DealPotato.png?size=96" width="48" height="48" alt="DealPotato" title="DealPotato"></a>
+<a href="https://github.com/mrfelek"><img src="https://github.com/mrfelek.png?size=96" width="48" height="48" alt="mrfelek" title="mrfelek"></a>
+<a href="https://github.com/yasaiiko"><img src="https://github.com/yasaiiko.png?size=96" width="48" height="48" alt="yasaiiko" title="yasaiiko"></a>
+<a href="https://github.com/Scramblrrrr"><img src="https://github.com/Scramblrrrr.png?size=96" width="48" height="48" alt="Scramblrrrr" title="Scramblrrrr"></a>
+</p>
+
+And thanks to everyone who tested a game or reported a bug in the [game test issues](https://github.com/simnJS/AnyPS5/issues?q=is%3Aissue+label%3A%22game+test%22). AnyKyty also stands on the work of every [AnyPS5 contributor](https://github.com/boykopovar/AnyPS5/graphs/contributors) and of [KytyPS5](https://github.com/KytyPS5/KytyPS5/graphs/contributors). Your first merged pull request adds you here.
+
 ## Credits and licence
+
+<p><a href="https://hangarai.dev"><img src="https://hangarai.dev/logo.svg" alt="HangarAI" height="20" align="absmiddle"></a> AnyKyty is managed, and partly built, with <a href="https://hangarai.dev">HangarAI</a> — a team of Claude Code and Codex agents that plans, codes in parallel and lands checked work together. The maintainers use it to triage issues, review pull requests, measure and integrate; much of the code comes from the contributors in the history.</p>
 
 AnyKyty is built on two projects. **[AnyPS5](https://github.com/boykopovar/AnyPS5)** by boykopovar and its contributors gives the relinker and every system library; its own README is [upstream](https://github.com/boykopovar/AnyPS5#readme). **[KytyPS5](https://github.com/KytyPS5/KytyPS5)**, built on Kyty by InoriRus, gives the graphics core, which is maintained in this repository under `core/kyty`.
 
