@@ -32,7 +32,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
-      contents: read
+      contents: write
       pull-requests: write
       issues: write
       actions: write
@@ -53,8 +53,10 @@ jobs:
             sleep $((attempt * 20))
           done
           if [ -z "$ahead" ]; then echo "::error::could not compare $BASE with upstream $UPSTREAM_BRANCH"; exit 1; fi
-          pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls?state=open&base=$BASE&head=${UPSTREAM%%/*}:$UPSTREAM_BRANCH&per_page=100" \
-            --jq "[.[] | select(.title | (startswith(\"$PR_TITLE \") or startswith(\"$LEGACY_PR_TITLE \")))][0].number // empty")
+          pr=""
+          pr_head=""
+          read -r pr pr_head < <(gh api "repos/$GITHUB_REPOSITORY/pulls?state=open&base=$BASE&per_page=100" \
+            --jq "[.[] | select(.title | (startswith(\"$PR_TITLE \") or startswith(\"$LEGACY_PR_TITLE \")))][0] | if . then \"\(.number) \(.head.label)\" else empty end") || true
           issue=$(gh api "repos/$GITHUB_REPOSITORY/issues?state=open&creator=github-actions%5Bbot%5D&per_page=100" \
             --jq "[.[] | select(.pull_request == null and (.title | startswith(\"$ISSUE_TITLE\")))][0].number // empty")
           echo "Upstream $UPSTREAM_BRANCH ${upstream:0:10}: $ahead commits not in $BASE (threshold $THRESHOLD); open pull request: ${pr:-none}; open issue: ${issue:-none}" | tee -a "$GITHUB_STEP_SUMMARY"
@@ -62,6 +64,7 @@ jobs:
             echo "upstream=$upstream"
             echo "ahead=$ahead"
             echo "pr=$pr"
+            echo "pr_head=$pr_head"
             echo "issue=$issue"
           } >> "$GITHUB_OUTPUT"
           if [ "$ahead" -ge "$THRESHOLD" ]; then echo "check=true" >> "$GITHUB_OUTPUT"; exit 0; fi
@@ -79,7 +82,9 @@ jobs:
         env:
           UPSTREAM_SHA: ${{ steps.state.outputs.upstream }}
           PR: ${{ steps.state.outputs.pr }}
+          PR_HEAD: ${{ steps.state.outputs.pr_head }}
           ISSUE: ${{ steps.state.outputs.issue }}
+          PUSH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
         run: |
           git fetch --no-tags "https://github.com/$UPSTREAM.git" "$UPSTREAM_SHA"
           base=$(git rev-parse HEAD)
@@ -88,12 +93,63 @@ jobs:
           rc=0
           result=$(git merge-tree --write-tree --name-only --no-messages HEAD "$UPSTREAM_SHA") || rc=$?
           if [ "$rc" -gt 1 ]; then echo "::error::git merge-tree failed with code $rc"; exit "$rc"; fi
+          head_ref="${UPSTREAM%%/*}:$UPSTREAM_BRANCH"
+          resolved=false
+          if [ "$rc" -eq 1 ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            merge_rc=0
+            git merge --no-commit --no-ff "$UPSTREAM_SHA" > /dev/null || merge_rc=$?
+            resolve_rc=0
+            python3 -I tools/sync_resolve_removed.py --prune-fragments > resolve.log || resolve_rc=$?
+            cat resolve.log
+            if [ "$resolve_rc" -eq 0 ]; then
+              subject="chore(sync): merge upstream $UPSTREAM_BRANCH $short"
+              date=$(git show -s --format=%cI "$UPSTREAM_SHA")
+              GIT_AUTHOR_DATE=$date GIT_COMMITTER_DATE=$date git commit -q -m "$subject" -m "Merges $UPSTREAM $UPSTREAM_BRANCH at $UPSTREAM_SHA. Paths the AnyKyty branch removed stay deleted: tools/sync_resolve_removed.py."
+              if git push --force "https://x-access-token:$PUSH_TOKEN@github.com/$GITHUB_REPOSITORY.git" "HEAD:refs/heads/sync/upstream" 2> push.log; then
+                rc=0
+                resolved=true
+                head_ref="sync/upstream"
+                { grep -v '^conflict: ' resolve.log || true; } | sed 's/^/- /' > sync-resolved.md
+              else
+                cat push.log
+                {
+                  echo "Merging \`$UPSTREAM\` \`$UPSTREAM_BRANCH\` at $UPSTREAM_SHA ($count commits) into \`$BASE\` at $base conflicts only on paths this branch removed, which tools/sync_resolve_removed.py resolves, but the resolved merge could not be pushed to \`sync/upstream\`:"
+                  echo
+                  echo '```'
+                  sed 's/x-access-token:[^@]*@//' push.log
+                  echo '```'
+                  echo
+                  echo "A push that changes workflow files needs a token with the \`workflow\` scope: set it as the \`SYNC_TOKEN\` secret of this repository. Meanwhile, merge by hand: \`git merge --no-commit $UPSTREAM_SHA && python3 tools/sync_resolve_removed.py --prune-fragments\` ($RUN_URL)."
+                } > body.md
+                title="$ISSUE_TITLE $short"
+                if [ -n "$ISSUE" ]; then gh issue edit "$ISSUE" --title "$title" --body-file body.md; else gh issue create --title "$title" --body-file body.md > /dev/null; fi
+                if [ -n "$PR" ]; then gh pr close "$PR" --comment "Upstream $UPSTREAM_BRANCH $short cannot be pushed resolved: see the sync issue."; fi
+                echo "Resolved merge not pushed: issue opened" | tee -a "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
+            else
+              files=$(grep '^conflict: ' resolve.log | sed 's/^conflict: //' | sort -u)
+              git merge --abort 2> /dev/null || true
+            fi
+          fi
           if [ "$rc" -eq 0 ]; then
             title="$PR_TITLE $short ($count commits)"
             {
-              echo "\`$UPSTREAM\` \`$UPSTREAM_BRANCH\` is $count commits ahead of \`$BASE\` ($base) and merges into it without conflicts (checked at $UPSTREAM_SHA)."
-              echo
-              echo "This pull request follows upstream \`$UPSTREAM_BRANCH\`: its head moves with every upstream merge, and the AnyKyty workflow builds each new head. Merge by hand the commit that was built and checked, for example \`git merge --no-ff $UPSTREAM_SHA\`. Kept up to date by the Sync upstream workflow ($RUN_URL)."
+              if [ "$resolved" = true ]; then
+                echo "\`$UPSTREAM\` \`$UPSTREAM_BRANCH\` is $count commits ahead of \`$BASE\` ($base). It merges into it once the paths this branch removed stay deleted (checked at $UPSTREAM_SHA); \`sync/upstream\` holds that merge."
+                echo
+                echo "This pull request follows upstream \`$UPSTREAM_BRANCH\`: \`sync/upstream\` is rebuilt with every upstream merge, and the AnyKyty workflow builds each new head. Merge the commit that was built and checked, for example \`git merge --ff-only $(git rev-parse HEAD)\`. Kept up to date by the Sync upstream workflow ($RUN_URL)."
+                echo
+                echo "Resolved by tools/sync_resolve_removed.py:"
+                echo
+                cat sync-resolved.md
+              else
+                echo "\`$UPSTREAM\` \`$UPSTREAM_BRANCH\` is $count commits ahead of \`$BASE\` ($base) and merges into it without conflicts (checked at $UPSTREAM_SHA)."
+                echo
+                echo "This pull request follows upstream \`$UPSTREAM_BRANCH\`: its head moves with every upstream merge, and the AnyKyty workflow builds each new head. Merge by hand the commit that was built and checked, for example \`git merge --no-ff $UPSTREAM_SHA\`. Kept up to date by the Sync upstream workflow ($RUN_URL)."
+              fi
               workflows=$(git diff --name-status "$base...$UPSTREAM_SHA" -- .github/workflows)
               if [ -n "$workflows" ]; then
                 echo
@@ -102,7 +158,7 @@ jobs:
                 echo "$workflows" | sed 's/^/- /'
               fi
             } > sync-what.md
-            printf '\n%s\n' 'The Git merge-tree check completed without conflicts. Build and test results are reported by the AnyKyty workflow.' > sync-tested.md
+            printf '\n%s\n' 'The Git merge check completed without conflicts. Build and test results are reported by the AnyKyty workflow.' > sync-tested.md
             sed -E \
               -e '/^### What$/r sync-what.md' \
               -e '/^### Tested$/r sync-tested.md' \
@@ -112,23 +168,30 @@ jobs:
               -e 's/^(.*AI-assisted: )<!--/\1no <!--/' \
               .github/pull_request_template.md > body.md
             pr=$PR
+            if [ -n "$pr" ] && [ "$PR_HEAD" != "${UPSTREAM%%/*}:$UPSTREAM_BRANCH" ] && [ "$resolved" != true ]; then
+              gh pr close "$pr" --comment "Upstream $UPSTREAM_BRANCH $short merges cleanly now: a new pull request follows ($RUN_URL)."
+              pr=""
+            elif [ -n "$pr" ] && [ "$resolved" = true ] && [ "$PR_HEAD" != "${GITHUB_REPOSITORY%%/*}:sync/upstream" ]; then
+              gh pr close "$pr" --comment "Upstream $UPSTREAM_BRANCH $short needs its removed paths resolved: a new pull request from sync/upstream follows ($RUN_URL)."
+              pr=""
+            fi
             if [ -n "$pr" ]; then
               gh pr edit "$pr" --title "$title" --body-file body.md
             else
-              pr=$(gh pr create --base "$BASE" --head "${UPSTREAM%%/*}:$UPSTREAM_BRANCH" --no-maintainer-edit --title "$title" --body-file body.md | grep -oE '[0-9]+$')
+              pr=$(gh pr create --base "$BASE" --head "$head_ref" --no-maintainer-edit --title "$title" --body-file body.md | grep -oE '[0-9]+$')
               gh workflow run anykyty.yml --ref "$BASE" -f pr="$pr" || echo "::warning::Could not start the AnyKyty workflow on pull request #$pr"
             fi
             echo "Pull request #$pr: $title" | tee -a "$GITHUB_STEP_SUMMARY"
             if [ -n "$ISSUE" ]; then gh issue close "$ISSUE" --comment "Upstream $UPSTREAM_BRANCH $short merges cleanly into $BASE now: #$pr."; fi
           else
-            files=$(printf '%s\n' "$result" | tail -n +2 | sed '/^$/d' | sort -u)
+            if [ -z "${files:-}" ]; then files=$(printf '%s\n' "$result" | tail -n +2 | sed '/^$/d' | sort -u); fi
             title="$ISSUE_TITLE $short"
             {
               echo "Merging \`$UPSTREAM\` \`$UPSTREAM_BRANCH\` at $UPSTREAM_SHA ($count commits) into \`$BASE\` at $base conflicts in:"
               echo
               echo "$files" | sed 's/^/- /'
               echo
-              echo "Resolve it by merging $UPSTREAM_SHA into \`$BASE\` by hand. The Sync upstream workflow ($RUN_URL) updates this issue on each run and closes it once upstream merges cleanly."
+              echo "Paths this branch removed (the historical driver) are resolved by tools/sync_resolve_removed.py; the files above are real conflicts. Resolve it by merging $UPSTREAM_SHA into \`$BASE\` by hand, then run \`python3 tools/sync_resolve_removed.py --prune-fragments\` for the rest. The Sync upstream workflow ($RUN_URL) updates this issue on each run and closes it once upstream merges cleanly."
             } > body.md
             issue=$ISSUE
             if [ -n "$issue" ]; then

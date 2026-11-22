@@ -1,0 +1,3 @@
+# Files whose conflicting hunks, in a merge of upstream, only concern the removed driver: tools/sync_resolve_removed.py resolves them to our side and keeps the merged rest.
+docs/dev/ENVIRONMENT.md
+docs/dev/debt/libSceAgcDriver.md
