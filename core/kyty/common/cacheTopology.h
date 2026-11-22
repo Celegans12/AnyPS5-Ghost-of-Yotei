@@ -113,6 +113,75 @@ inline std::vector<int> LargestCacheCpus(const std::filesystem::path& cpu_root) 
 	return chosen == nullptr ? std::vector<int> {} : chosen->cpus;
 }
 
+struct CacheRecord {
+	uint32_t         level = 0;
+	uint64_t         size  = 0;
+	std::vector<int> cpus;
+};
+
+inline std::vector<int> LargestCacheCpus(const std::vector<CacheRecord>& caches) {
+	uint32_t top_level = 0;
+	for (const auto& cache: caches) {
+		if (cache.size != 0 && !cache.cpus.empty()) {
+			top_level = std::max(top_level, cache.level);
+		}
+	}
+	const CacheRecord* chosen = nullptr;
+	for (const auto& cache: caches) {
+		if (cache.level != top_level || cache.size == 0 || cache.cpus.empty()) {
+			continue;
+		}
+		if (chosen == nullptr || cache.size > chosen->size ||
+		    (cache.size == chosen->size && cache.cpus.front() < chosen->cpus.front())) {
+			chosen = &cache;
+		}
+	}
+	return chosen == nullptr ? std::vector<int> {} : chosen->cpus;
+}
+
+struct CoreRecord {
+	uint32_t         efficiency = 0;
+	std::vector<int> cpus;
+};
+
+inline std::vector<int> OneCpuPerCore(const std::vector<CoreRecord>& cores, const std::vector<int>& allowed,
+                                      size_t count) {
+	struct Pick {
+		uint32_t efficiency = 0;
+		bool     holds_cpu0 = false;
+		int      cpu        = -1;
+	};
+	std::vector<Pick> picks;
+	for (const auto& core: cores) {
+		Pick pick {core.efficiency, std::find(core.cpus.begin(), core.cpus.end(), 0) != core.cpus.end(), -1};
+		for (const int cpu: core.cpus) {
+			if (std::find(allowed.begin(), allowed.end(), cpu) != allowed.end() && (pick.cpu < 0 || cpu < pick.cpu)) {
+				pick.cpu = cpu;
+			}
+		}
+		if (pick.cpu >= 0 && std::none_of(picks.begin(), picks.end(), [&](const Pick& other) { return other.cpu == pick.cpu; })) {
+			picks.push_back(pick);
+		}
+	}
+	if (count == 0 || picks.size() < count) {
+		return {};
+	}
+	std::stable_sort(picks.begin(), picks.end(), [](const Pick& left, const Pick& right) {
+		if (left.efficiency != right.efficiency) {
+			return left.efficiency > right.efficiency;
+		}
+		if (left.holds_cpu0 != right.holds_cpu0) {
+			return !left.holds_cpu0;
+		}
+		return left.cpu < right.cpu;
+	});
+	std::vector<int> result;
+	for (size_t index = 0; index < count; index++) {
+		result.push_back(picks[index].cpu);
+	}
+	return result;
+}
+
 }
 
 #endif

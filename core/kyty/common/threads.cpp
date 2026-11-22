@@ -5,14 +5,17 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cstddef>
 #include <ctime>
 #include <memory>
 #include <thread>
 #include <vector>
 
-#if defined(ANYPS5_KYTY) && KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+#if defined(ANYPS5_KYTY)
 #include "common/cacheTopology.h"
+#endif
 
+#if defined(ANYPS5_KYTY) && KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 #include <pthread.h>
 #include <sched.h>
 #endif
@@ -159,6 +162,128 @@ void Thread::KeepCurrentOnLargestCache() {
 	}
 	if (CPU_COUNT(&set) != 0 && !CPU_EQUAL(&set, &allowed)) {
 		(void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+	}
+}
+#endif
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+bool Thread::LogicalCpuExists(int logical_cpu) {
+	DWORD_PTR process_mask = 0;
+	DWORD_PTR system_mask  = 0;
+	if (logical_cpu < 0 || logical_cpu >= 64 ||
+	    !::GetProcessAffinityMask(::GetCurrentProcess(), &process_mask, &system_mask)) {
+		return false;
+	}
+	return ((system_mask >> static_cast<uint32_t>(logical_cpu)) & 1u) != 0;
+}
+#endif
+
+#if defined(ANYPS5_KYTY) && KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+template <typename Func>
+static void ForEachProcessorInfo(LOGICAL_PROCESSOR_RELATIONSHIP relation, Func&& func) {
+	DWORD length = 0;
+	(void)::GetLogicalProcessorInformationEx(relation, nullptr, &length);
+	if (length == 0) {
+		return;
+	}
+	std::vector<uint8_t> buffer(length);
+	if (!::GetLogicalProcessorInformationEx(
+	        relation, reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data()), &length)) {
+		return;
+	}
+	constexpr size_t HeaderSize = offsetof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Processor);
+	for (DWORD offset = 0; offset + HeaderSize <= length;) {
+		const auto* info = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data() + offset);
+		if (info->Size == 0 || offset + info->Size > length) {
+			break;
+		}
+		if (info->Relationship == relation) {
+			func(*info);
+		}
+		offset += info->Size;
+	}
+}
+
+static std::vector<int> GroupMaskCpus(const GROUP_AFFINITY* masks, WORD count) {
+	std::vector<int> cpus;
+	for (WORD index = 0; index < count; index++) {
+		for (uint32_t bit = 0; bit < 64; bit++) {
+			if (((masks[index].Mask >> bit) & 1u) != 0) {
+				cpus.push_back(static_cast<int>(masks[index].Group * 64u + bit));
+			}
+		}
+	}
+	std::ranges::sort(cpus);
+	return cpus;
+}
+
+static std::vector<CacheRecord> WindowsCaches() {
+	constexpr size_t MasksOffset =
+	    offsetof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Cache) + offsetof(CACHE_RELATIONSHIP, GroupMasks);
+	std::vector<CacheRecord> caches;
+	ForEachProcessorInfo(RelationCache, [&](const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX& info) {
+		const auto& cache = info.Cache;
+		const auto  masks = std::max<WORD>(cache.GroupCount, 1);
+		if (cache.Type != CacheInstruction && MasksOffset + masks * sizeof(GROUP_AFFINITY) <= info.Size) {
+			caches.push_back({cache.Level, cache.CacheSize, GroupMaskCpus(cache.GroupMasks, masks)});
+		}
+	});
+	return caches;
+}
+
+static std::vector<CoreRecord> WindowsCores() {
+	constexpr size_t MasksOffset =
+	    offsetof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Processor) + offsetof(PROCESSOR_RELATIONSHIP, GroupMask);
+	std::vector<CoreRecord> cores;
+	ForEachProcessorInfo(RelationProcessorCore, [&](const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX& info) {
+		const auto& core  = info.Processor;
+		const auto  masks = std::max<WORD>(core.GroupCount, 1);
+		if (MasksOffset + masks * sizeof(GROUP_AFFINITY) <= info.Size) {
+			cores.push_back({core.EfficiencyClass, GroupMaskCpus(core.GroupMask, masks)});
+		}
+	});
+	return cores;
+}
+
+bool Thread::PinCurrentToOwnCore(uint32_t index, uint32_t count) {
+	static const std::vector<int> cpus = [count] {
+		GROUP_AFFINITY current {};
+		if (!::GetThreadGroupAffinity(::GetCurrentThread(), &current)) {
+			return std::vector<int> {};
+		}
+		std::vector<int> allowed;
+		for (const int cpu: LargestCacheCpus(WindowsCaches())) {
+			if (cpu / 64 == current.Group && ((current.Mask >> static_cast<uint32_t>(cpu % 64)) & 1u) != 0) {
+				allowed.push_back(cpu);
+			}
+		}
+		return OneCpuPerCore(WindowsCores(), allowed, count);
+	}();
+	if (index >= cpus.size()) {
+		return false;
+	}
+	PinCurrent(cpus[index] % 64);
+	return true;
+}
+
+void Thread::KeepCurrentOnLargestCache() {
+	static const std::vector<int> cache_cpus = LargestCacheCpus(WindowsCaches());
+	GROUP_AFFINITY                current {};
+	if (cache_cpus.empty() || !::GetThreadGroupAffinity(::GetCurrentThread(), &current)) {
+		return;
+	}
+	KAFFINITY mask = 0;
+	for (const int cpu: cache_cpus) {
+		if (cpu / 64 == current.Group) {
+			mask |= KAFFINITY {1} << static_cast<uint32_t>(cpu % 64);
+		}
+	}
+	mask &= current.Mask;
+	if (mask != 0 && mask != current.Mask) {
+		GROUP_AFFINITY wanted {};
+		wanted.Group = current.Group;
+		wanted.Mask  = mask;
+		(void)::SetThreadGroupAffinity(::GetCurrentThread(), &wanted, nullptr);
 	}
 }
 #endif
