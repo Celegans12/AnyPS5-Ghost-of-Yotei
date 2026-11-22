@@ -1426,6 +1426,16 @@ void frameSegment(
                 }
                 while (stub.End - stub.Begin < kJumpBytes && stub.First > p) {
                     const auto j = stub.First - 1;
+                    if (!stubs.empty() && stubs.back().Last == stub.First && stubs.back().End == stub.Begin) {
+                        auto joined = std::move(stubs.back());
+                        stubs.pop_back();
+                        joined.Body.Append(stub.Body);
+                        joined.Operands += stub.Operands;
+                        joined.Last = stub.Last;
+                        joined.End = stub.End;
+                        stub = std::move(joined);
+                        break;
+                    }
                     const auto& prior = body[j];
                     if (prior.Offset + prior.Length != stub.Begin || prior.Info.FlowKind != ControlFlowKind::Sequential || frees.contains(j)) break;
                     const auto copied = copy(j);

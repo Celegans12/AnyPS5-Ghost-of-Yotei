@@ -311,6 +311,17 @@ std::vector<Leaf> backwardStubbedLeaves() {
     };
 }
 
+std::vector<Leaf> joinedStubLeaves() {
+    return {
+        {"leaf adding at rsp before a je right after a load at 0x60 that has its own stub", {
+            0x55, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x70,
+            0x48, 0x89, 0x7c, 0x24, 0xe0, 0x48, 0x89, 0x14, 0x24, 0x48, 0x89, 0x74, 0x24, 0x60,
+            0x48, 0x8b, 0x44, 0x24, 0x60, 0x48, 0x03, 0x04, 0x24, 0x74, 0x03, 0x48, 0x01, 0xf8, 0x48, 0x03, 0x44, 0x24, 0xe0,
+            0x48, 0x83, 0xc4, 0x70, 0x5b, 0x41, 0x5c, 0x41, 0x5d, 0x41, 0x5e, 0x41, 0x5f, 0x5d, 0xc3,
+        }, 2 * kA + kB + kC},
+    };
+}
+
 std::vector<Leaf> widenedLeaves() {
     return {
         {"leaf without pushes spilling 0x10 below rsp and adding a spill before its ret", {
@@ -682,6 +693,8 @@ int main() {
         require(stubbed.OperandStubs == 3 && stubbed.StubbedOperands == 5, "the leaves were framed with " + std::to_string(stubbed.OperandStubs) + " operand stubs carrying " + std::to_string(stubbed.StubbedOperands) + " rsp operands, not 3 carrying 5");
         const auto backward = runLeaves(backwardStubbedLeaves());
         require(backward.OperandStubs == 2 && backward.StubbedOperands == 3 && backward.MovedOperands == 5, "the leaves comparing at rsp before a branch were framed with " + std::to_string(backward.OperandStubs) + " operand stubs carrying " + std::to_string(backward.StubbedOperands) + " rsp operands and " + std::to_string(backward.MovedOperands) + " moved in place, not 2 carrying 3 and 5");
+        const auto joined = runLeaves(joinedStubLeaves());
+        require(joined.OperandStubs == 2 && joined.StubbedOperands == 4 && joined.MovedOperands == 2 && joined.Relocated == 0, "the leaf adding at rsp before a je was framed with " + std::to_string(joined.OperandStubs) + " operand stubs carrying " + std::to_string(joined.StubbedOperands) + " rsp operands, " + std::to_string(joined.MovedOperands) + " moved in place and " + std::to_string(joined.Relocated) + " relocated, not 2 carrying 4, 2 and 0");
         const auto widened = runLeaves(widenedLeaves());
         require(widened.WidenedPrologues == 9 && widened.WidenedExits == 8 && widened.LeaveExits == 2 && widened.WidenedOperands == 13, "the leaves with short prologues and exits were framed with " + std::to_string(widened.WidenedPrologues) + " widened prologues, " + std::to_string(widened.WidenedExits) + " widened exits, " + std::to_string(widened.LeaveExits) + " leave exits and " + std::to_string(widened.WidenedOperands) + " rsp operands in them, not 9, 8, 2 and 13");
         const auto thunked = runLeaves(thunkLeaves());
