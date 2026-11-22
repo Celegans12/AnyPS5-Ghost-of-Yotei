@@ -660,6 +660,36 @@ static void CheckUnlockedHostWrites(bool resident) {
     mappings.UnmapAlias(alias);
 }
 
+static void CheckUnlockedHostWriteCollected(bool resident) {
+    const bool unlocked = std::getenv("APS5_NO_UNLOCKED_HOST_WRITES") == nullptr;
+    Memory memory(4 * blockBytes, resident);
+    auto& mappings = memory.mappings;
+    auto* const block = memory.base + blockBytes;
+    auto* const page = block + 4096;
+    const auto target = reinterpret_cast<std::uintptr_t>(page) + 7;
+    auto token = mappings.OpenHostWrite(target, 4);
+    Require(token > 1);
+    mappings.CloseHostWrite(target, 4, token);
+    memory.Collect(true);
+    Require(memory.Collect(true).empty());
+    token = mappings.OpenHostWrite(target, 4);
+    Require(token != 0 && (token == 1) == unlocked);
+    const auto open = memory.Collect(true);
+    bool found = false;
+    for (std::size_t index = 0; index < open.size(); ++index) {
+        auto* const reported = static_cast<unsigned char*>(open[index]);
+        Require(reported >= block && reported < block + blockBytes);
+        Require(index == 0 || open[index - 1] < open[index]);
+        found = found || reported == page;
+    }
+    Require(found);
+    page[7] = 41;
+    mappings.CloseHostWrite(target, 4, token);
+    const auto written = memory.Collect(true);
+    Require(written.size() == 1 && written[0] == page);
+    Require(memory.Collect(true).empty());
+}
+
 static void CheckHostWriteTokens() {
     Memory memory;
     auto& mappings = memory.mappings;
@@ -796,6 +826,8 @@ int main() {
         CheckRangedHostWrites();
         CheckUnlockedHostWrites(true);
         CheckUnlockedHostWrites(false);
+        CheckUnlockedHostWriteCollected(true);
+        CheckUnlockedHostWriteCollected(false);
         CheckHostWriteTokens();
         CheckUnlockedHostWriteRaces();
 #endif
