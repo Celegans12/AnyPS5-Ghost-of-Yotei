@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <bit>
 #include <iterator>
+#include <type_traits>
 #include <xxhash.h>
 
 namespace Libs::Graphics {
@@ -103,6 +104,7 @@ ImageHeap::ImageHeap(RenderContext& context, PageManager& page_manager)
 	EXIT_IF(graphics.device.allocateDescriptorSets(&allocate, &m_set) != vk::Result::eSuccess);
 	graphics.image_heap_layout = m_layout;
 	m_elements.emplace_back();
+	m_uses.emplace_back();
 	m_writes.push_back({0u, {nullptr, nullptr, vk::ImageLayout::eShaderReadOnlyOptimal}});
 	WriteDescriptors();
 }
@@ -183,6 +185,7 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 		                                                  .limit   = limit,
 		                                                  .profile = profile});
 		created->slots.resize(bytes / 4u + 1u);
+		created->uses.resize(created->slots.size());
 		created->buffer = SlotBuffer(m_context, bytes);
 		UpdateProbes(*created, 0u, bytes);
 		created->dirty_begin = 0;
@@ -245,6 +248,7 @@ bool ImageHeap::AcquireList(const IR::ImageHeapList& list, IR::ImageHeapView& re
 	for (auto slot = slots - 1u; slot < held.slots.size(); ++slot) Assign(held, slot, 0u);
 	const auto previous = held.slots.size();
 	held.slots.resize(slots, 0u);
+	held.uses.resize(slots);
 	if (previous < slots) Widen(held.dirty_begin, held.dirty_end, previous, slots);
 	held.dirty_end   = std::min(held.dirty_end, slots);
 	held.dirty_begin = std::min(held.dirty_begin, held.dirty_end);
@@ -377,14 +381,49 @@ void ImageHeap::UpdateProbe(View& view, uint64_t probe) {
 
 void ImageHeap::Assign(View& view, size_t slot, uint32_t entry) {
 	const auto previous = std::exchange(view.slots[slot], entry);
+	if (previous != entry) {
+		Unlink(view, slot, previous);
+		Link(view, slot, entry);
+	}
 	Release(previous);
 	if (previous != entry) Widen(view.dirty_begin, view.dirty_end, slot, slot + 1u);
 }
 
 void ImageHeap::Assign(List& list, size_t slot, uint32_t entry) {
 	const auto previous = std::exchange(list.slots[slot], entry);
+	if (previous != entry) {
+		Unlink(list, slot, previous);
+		Link(list, slot, entry);
+	}
 	Release(previous);
 	if (previous != entry) Widen(list.dirty_begin, list.dirty_end, slot, slot + 1u);
+}
+
+template <typename Owner>
+void ImageHeap::Link(Owner& owner, size_t slot, uint32_t entry) {
+	const auto index = entry & ElementMask;
+	if (index == 0u) return;
+	auto& element_uses = m_uses[index];
+	owner.uses[slot]   = static_cast<uint32_t>(element_uses.size());
+	Use use {.slot = static_cast<uint32_t>(slot)};
+	if constexpr (std::is_same_v<Owner, View>) {
+		use.view = &owner;
+	} else {
+		use.list = &owner;
+	}
+	element_uses.push_back(use);
+}
+
+template <typename Owner>
+void ImageHeap::Unlink(Owner& owner, size_t slot, uint32_t entry) {
+	const auto index = entry & ElementMask;
+	if (index == 0u) return;
+	auto&      element_uses = m_uses[index];
+	const auto position     = owner.uses[slot];
+	const auto moved        = element_uses.back();
+	element_uses[position]  = moved;
+	(moved.view != nullptr ? moved.view->uses : moved.list->uses)[moved.slot] = position;
+	element_uses.pop_back();
 }
 
 void ImageHeap::Upload(CommandBuffer& buffer, const std::vector<uint32_t>& slots, Buffer& device,
@@ -453,6 +492,7 @@ void ImageHeap::Retire() {
 void ImageHeap::Mark(uint32_t index, State state) {
 	auto& element = m_elements[index];
 	element.state = state;
+	if (!m_uses[index].empty()) m_marked.push_back(index);
 	if (const auto found = m_index.find(element.key);
 	    found != m_index.end() && found->second == index) {
 		m_index.erase(found);
@@ -474,31 +514,44 @@ bool ImageHeap::ForEachChanged(Fn&& fn) {
 }
 
 void ImageHeap::Repoint() {
-	for (const auto& memory: m_memories) {
-		for (const auto& view: memory->views) {
-			for (uint64_t probe = 0; probe < view->count; ++probe) {
-				const auto  slot    = (view->first + probe * view->step) / 4u;
-				const auto& element = m_elements[view->slots[slot] & ElementMask];
-				if (element.state == State::Buried) {
-					memory->dead[slot] = Hash(element.key.value);
-					Assign(*view, slot, 0u);
-				} else if (element.state == State::Stale) {
-					const auto key = element.key;
-					Assign(*view, slot, Intern(*view, element.kind, key));
-				}
-			}
-		}
+	std::ranges::sort(m_marked);
+	m_marked.erase(std::ranges::unique(m_marked).begin(), m_marked.end());
+	m_visits.clear();
+	for (const auto index: m_marked) {
+		if (m_elements[index].state == State::Live) continue;
+		m_visits.insert(m_visits.end(), m_uses[index].begin(), m_uses[index].end());
 	}
-	for (auto& [owner, list]: m_lists) {
-		for (size_t slot = 1; slot + 1u < list.slots.size(); ++slot) {
-			const auto& element = m_elements[list.slots[slot] & ElementMask];
+	m_marked.clear();
+	if (m_visits.empty()) return;
+	size_t order = 0;
+	for (const auto& memory: m_memories) {
+		for (const auto& view: memory->views) view->order = order++;
+	}
+	for (auto& [owner, list]: m_lists) list.order = order++;
+	std::ranges::sort(m_visits, {}, [](const Use& use) {
+		return std::pair {use.view != nullptr ? use.view->order : use.list->order, use.slot};
+	});
+	for (const auto& use: m_visits) {
+		if (use.list != nullptr) {
+			auto&       list    = *use.list;
+			const auto& element = m_elements[list.slots[use.slot] & ElementMask];
 			if (element.state == State::Buried) {
-				Assign(list, slot, 0u);
+				Assign(list, use.slot, 0u);
 			} else if (element.state == State::Stale) {
 				const auto key  = element.key;
 				const auto kind = element.kind;
-				Assign(list, slot, Intern(*list.view, kind, key));
+				Assign(list, use.slot, Intern(*list.view, kind, key));
 			}
+			continue;
+		}
+		auto&       view    = *use.view;
+		const auto& element = m_elements[view.slots[use.slot] & ElementMask];
+		if (element.state == State::Buried) {
+			view.memory.dead[use.slot] = Hash(element.key.value);
+			Assign(view, use.slot, 0u);
+		} else if (element.state == State::Stale) {
+			const auto key = element.key;
+			Assign(view, use.slot, Intern(view, element.kind, key));
 		}
 	}
 }
@@ -537,6 +590,7 @@ uint32_t ImageHeap::Allocate(bool may_fail) {
 			EXIT("image heaps exceed %u resident images\n", IR::ImageHeapCapacity);
 		}
 		m_elements.emplace_back();
+		m_uses.emplace_back();
 		return static_cast<uint32_t>(m_elements.size() - 1u);
 	}
 	const auto index = m_free.back();
@@ -567,6 +621,7 @@ void ImageHeap::Resize(Memory& memory, uint64_t base, uint64_t size) {
 		view->count       = count;
 		const auto slots  = view->slots.size();
 		view->slots.resize(size / 4u + 1u);
+		view->uses.resize(view->slots.size());
 		view->dirty_end   = std::min(view->dirty_end, view->slots.size());
 		view->dirty_begin = std::min(view->dirty_begin, view->dirty_end);
 		if (view->slots.size() * sizeof(uint32_t) > view->buffer->Size()) {
@@ -756,7 +811,9 @@ void ImageHeap::Drop(Memory& memory) {
 	for (auto& view: memory.views) {
 		std::erase(m_active, view.get());
 		for (uint64_t probe = 0; probe < view->count; ++probe) {
-			Release(view->slots[(view->first + probe * view->step) / 4u]);
+			const auto slot = (view->first + probe * view->step) / 4u;
+			Unlink(*view, slot, view->slots[slot]);
+			Release(view->slots[slot]);
 		}
 		if (scheduler.Active()) {
 			scheduler.DeferOperation([buffer = std::move(view->buffer)] {});
