@@ -95,6 +95,14 @@ class CheckKytySettingsTests(unittest.TestCase):
         self.assertEqual(status, 0, text)
         self.assertIn("4 KYTY_* setting(s)", text)
 
+    def test_prefix_check_argument_built_from_a_prefix_fails(self):
+        for argument in ('"KYTY_" + suffix', '"KYTY_" "ALPHA"'):
+            with self.subTest(argument=argument):
+                code = CODE + f'bool allowed = name.starts_with({argument});\n'
+                status, text = self.run_check(self.tree({"a.cpp": code}))
+                self.assertEqual(status, 1, text)
+                self.assertIn("builds an environment name from the literal 'KYTY_'", text)
+
     def test_tests_and_third_party_directories_are_skipped(self):
         files = {"a.cpp": CODE, "libs/tests/t.cpp": 'x("KYTY_ONLY_IN_TESTS");\n', "3rdparty/z.cpp": 'x("KYTY_THIRD");\n',
                  "libs/UnitTests.cpp": 'x("KYTY_UNIT");\n', "libs/Table.inc": 'x("KYTY_DELTA");\n'}

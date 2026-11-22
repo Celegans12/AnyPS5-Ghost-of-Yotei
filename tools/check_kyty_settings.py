@@ -32,7 +32,7 @@ def literals(text):
         if match.group("string") is not None:
             literal = LITERAL.fullmatch(match.group("string"))
             if literal is not None:
-                yield match.start(), literal.group("text")
+                yield match.start(), match.end(), literal.group("text")
 
 
 def reads(root):
@@ -45,12 +45,13 @@ def reads(root):
             raise ValueError(f"cannot read {path.as_posix()}: {error}") from error
         if "KYTY_" not in text:
             continue
-        for start, value in literals(text):
+        for start, end, value in literals(text):
             if NAME.fullmatch(value) is None:
                 continue
             site = f"{path.as_posix()}:{text.count(chr(10), 0, start) + 1}"
             if value.endswith("_"):
-                if re.search(r'\.\s*starts_with\s*\(\s*$', text[:start]) is None:
+                if (re.search(r'\.\s*starts_with\s*\(\s*$', text[:start]) is None or
+                        re.match(r'\s*\)', text[end:]) is None):
                     prefixes.setdefault(value, []).append(site)
             else:
                 found.setdefault(value, []).append(site)
