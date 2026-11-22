@@ -127,18 +127,14 @@ option(APS5_ENABLE_TIMING_LOG "Write frame timings asynchronously to frame-timin
 option(APS5_ENABLE_TRACY "Build the Tracy profiler client and report performance timer scopes as Tracy zones" OFF)
 option(ANYPS5_LIBRESSL_ORACLE "Build guest_libressl_oracle, which compares libSceLibreSsl with LibreSSL 2.5.4 downloaded from ftp.openbsd.org" OFF)
 option(ANYPS5_USE_SYSTEM_DEPS "Resolve SDL2, freetype, Vulkan-Headers, SPIRV-Headers, glslang and SPIRV-Tools from the system instead of the bundled submodules" OFF)
-set(ANYPS5_GPU_BACKEND "anyps5" CACHE STRING "GPU driver: anyps5, or kyty to also build the Kyty core in core/kyty (docs/dev/THIRD_PARTY_KYTY.md)")
-set_property(CACHE ANYPS5_GPU_BACKEND PROPERTY STRINGS anyps5 kyty)
-if(NOT ANYPS5_GPU_BACKEND MATCHES "^(anyps5|kyty)$")
-    message(FATAL_ERROR "ANYPS5_GPU_BACKEND must be anyps5 or kyty, not ${ANYPS5_GPU_BACKEND}")
+if(DEFINED ANYPS5_GPU_BACKEND AND NOT ANYPS5_GPU_BACKEND STREQUAL "kyty")
+    message(FATAL_ERROR "ANYPS5_GPU_BACKEND=${ANYPS5_GPU_BACKEND} is no longer supported: the historical AnyPS5 GPU driver was removed and Kyty is the only GPU driver. Drop the option (-DANYPS5_GPU_BACKEND=kyty is still accepted and does nothing).")
 endif()
-option(ANYPS5_KYTY_DLL "With ANYPS5_GPU_BACKEND=kyty on Windows: build the Kyty core and the AgcDriver shim as kyty_gpu.prx with llvm-mingw clang and libc++, behind KytyDll.h" OFF)
-if(ANYPS5_KYTY_DLL AND NOT (WIN32 AND ANYPS5_GPU_BACKEND STREQUAL "kyty"))
-    message(FATAL_ERROR "ANYPS5_KYTY_DLL needs ANYPS5_GPU_BACKEND=kyty on Windows")
+option(ANYPS5_KYTY_DLL "On Windows: build the Kyty core and the AgcDriver shim as kyty_gpu.prx with llvm-mingw clang and libc++, behind KytyDll.h" OFF)
+if(ANYPS5_KYTY_DLL AND NOT WIN32)
+    message(FATAL_ERROR "ANYPS5_KYTY_DLL is for Windows only")
 endif()
-if(ANYPS5_GPU_BACKEND STREQUAL "kyty")
-    add_compile_definitions(ANYPS5_KYTY=1)
-endif()
+add_compile_definitions(ANYPS5_KYTY=1)
 add_compile_definitions(APS5_ENABLE_TIMING_LOG=$<BOOL:${APS5_ENABLE_TIMING_LOG}>)
 include(cmake/SystemDeps.cmake)
 
@@ -227,9 +223,6 @@ endif()
 option(ANYPS5_BUILD_FUZZERS "Build the relinker libFuzzer targets with AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 option(ANYPS5_KYTY_FUZZERS "Build the Kyty libFuzzer targets (shader recompiler, PM4 command processor) with libFuzzer coverage, AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 if(ANYPS5_KYTY_FUZZERS)
-    if(NOT ANYPS5_GPU_BACKEND STREQUAL "kyty")
-        message(FATAL_ERROR "ANYPS5_KYTY_FUZZERS requires ANYPS5_GPU_BACKEND=kyty")
-    endif()
     if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
         message(FATAL_ERROR "ANYPS5_KYTY_FUZZERS requires GCC on Linux, like the Kyty backend; the fuzzer driver comes from the Clang runtime that builds Kyty")
     endif()
@@ -331,52 +324,6 @@ if(MINGW)
 endif()
 
 if(BUILD_TESTING)
-    add_test_executable(shader_cache_file_read_tests
-        ${CMAKE_CURRENT_SOURCE_DIR}/core/shader/recompiler/tests/CacheFileReadTests.cpp)
-    target_include_directories(shader_cache_file_read_tests PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/core/shader/recompiler)
-    add_test(NAME shader_cache_file_read COMMAND shader_cache_file_read_tests)
-    set_tests_properties(shader_cache_file_read PROPERTIES TIMEOUT 20)
-    add_test_executable(request_serializer_tests
-        ${CMAKE_CURRENT_SOURCE_DIR}/core/shader/recompiler/tests/RequestSerializerTests.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/core/shader/recompiler/ControlFlow/src/RequestSerializer.cpp)
-    target_include_directories(request_serializer_tests PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/core/libs
-        ${CMAKE_CURRENT_SOURCE_DIR}/core/shader/recompiler
-        ${CMAKE_CURRENT_SOURCE_DIR}/core/shader/recompiler/ControlFlow/include)
-    add_test(NAME request_serializer COMMAND request_serializer_tests)
-    set_tests_properties(request_serializer PROPERTIES TIMEOUT 20)
-    find_package(Python3 QUIET COMPONENTS Interpreter)
-    add_test_executable(shader_ir_use_rewrite_tests
-        core/shader/recompiler/IntermediateRepresentation/tests/UseRewrite.cpp
-        core/shader/recompiler/IntermediateRepresentation/tests/UseRewriteAllocation.cpp
-        core/shader/recompiler/IntermediateRepresentation/src/IrValue.cpp
-        core/shader/recompiler/IntermediateRepresentation/src/IrBlock.cpp
-        core/shader/recompiler/IntermediateRepresentation/src/IrOpcode.cpp
-        core/shader/recompiler/IntermediateRepresentation/src/GuestRegister.cpp)
-    target_include_directories(shader_ir_use_rewrite_tests PRIVATE
-        core/shader/recompiler/IntermediateRepresentation/include)
-    add_test(NAME shader_ir_use_rewrite COMMAND shader_ir_use_rewrite_tests)
-    set_tests_properties(shader_ir_use_rewrite PROPERTIES TIMEOUT 20)
-    add_test_executable(shader_ssa_pass_reads_tests
-        core/shader/recompiler/tests/SsaPassReads.cpp
-        core/shader/recompiler/Optimization/src/SsaBuilder/SsaPass.cpp
-        core/shader/recompiler/Optimization/src/SsaBuilder/SsaDefTable.cpp
-        core/shader/recompiler/Optimization/src/SsaBuilder/SsaVariable.cpp
-        core/shader/recompiler/IntermediateRepresentation/src/IrProgram.cpp
-        core/shader/recompiler/IntermediateRepresentation/src/IrValue.cpp
-        core/shader/recompiler/IntermediateRepresentation/src/IrBlock.cpp
-        core/shader/recompiler/IntermediateRepresentation/src/IrOpcode.cpp
-        core/shader/recompiler/IntermediateRepresentation/src/IrType.cpp
-        core/shader/recompiler/IntermediateRepresentation/src/GuestRegister.cpp)
-    target_include_directories(shader_ssa_pass_reads_tests PRIVATE
-        core/shader/recompiler
-        core/shader/recompiler/IntermediateRepresentation/include
-        core/shader/recompiler/Optimization/include
-        core/shader/recompiler/RdnaDecoder/include
-        core/shader/recompiler/ControlFlow/include)
-    add_test(NAME shader_ssa_pass_reads COMMAND shader_ssa_pass_reads_tests)
-    set_tests_properties(shader_ssa_pass_reads PROPERTIES TIMEOUT 20)
     add_test_executable(pad_command_file_tests core/libs/prx/libScePad/tests/InputCommandFile.cpp)
     target_include_directories(pad_command_file_tests PRIVATE core/libs)
     add_test(NAME pad_command_file COMMAND pad_command_file_tests)
@@ -391,7 +338,7 @@ if(BUILD_TESTING)
     set_tests_properties(pad_input_script PROPERTIES TIMEOUT 20)
     set(anyps5HostTestTemp ${CMAKE_BINARY_DIR}/test-temp)
     file(MAKE_DIRECTORY ${anyps5HostTestTemp})
-    set_property(TEST shader_cache_file_read pad_command_file pad_recording pad_input_script APPEND PROPERTY
+    set_property(TEST pad_command_file pad_recording pad_input_script APPEND PROPERTY
         ENVIRONMENT_MODIFICATION
         "TMPDIR=set:${anyps5HostTestTemp};TEMP=set:${anyps5HostTestTemp};TMP=set:${anyps5HostTestTemp}")
     if(Python3_Interpreter_FOUND)
@@ -405,21 +352,6 @@ if(BUILD_TESTING)
         add_test(NAME build_changed_guest_tests COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_build_changed_guest_tests.py)
         set_tests_properties(build_changed_guest_tests PROPERTIES TIMEOUT 30)
-        add_test(NAME shader_cache_native_paths COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/core/shader/recompiler/tests/test_shader_cache_native_paths.py
-            ${CMAKE_CURRENT_SOURCE_DIR}/core/shader/recompiler/ShaderCacheVersion.cmake ${CMAKE_COMMAND})
-        set_tests_properties(shader_cache_native_paths PROPERTIES TIMEOUT 20)
-        foreach(shard RANGE 0 6)
-            if(shard EQUAL 0)
-                set(shader_cache_sources_test_name shader_cache_runtime_sources)
-            else()
-                set(shader_cache_sources_test_name shader_cache_runtime_sources_shard_${shard})
-            endif()
-            add_test(NAME ${shader_cache_sources_test_name} COMMAND ${Python3_EXECUTABLE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_shader_cache_runtime_sources.py
-                ${CMAKE_CURRENT_SOURCE_DIR}/core/shader/recompiler ${CMAKE_COMMAND} --shard ${shard}/7)
-            set_tests_properties(${shader_cache_sources_test_name} PROPERTIES TIMEOUT 180)
-        endforeach()
         add_test(NAME tools_nid_name_audit COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/tests/test_audit_nid_names.py)
         add_test(NAME run_report_summary COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_run_report_summary.py)
@@ -789,8 +721,6 @@ if(BUILD_TESTING)
         endforeach()
         add_test(NAME debt_report COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_debt_report.py)
-        add_test(NAME agc_test_split COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_agc_test_split.py)
         add_test(NAME debt_fold COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_debt_fold.py)
         add_test(NAME stubgen_stdout_newlines COMMAND ${Python3_EXECUTABLE}
@@ -1229,13 +1159,10 @@ if(WIN32 OR APPLE OR (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANYPS5_ENABLE_A
     endif()
 endif()
 
-add_subdirectory(core/shader/recompiler)
 add_subdirectory(core/Decoder/Jpeg)
 add_subdirectory(core/Decoder/Png)
 add_subdirectory(core/libs)
-if(ANYPS5_GPU_BACKEND STREQUAL "kyty")
-    include(core/kyty/cmake/KytyBackend.cmake)
-endif()
+include(core/kyty/cmake/KytyBackend.cmake)
 add_subdirectory(core/relinker)
 add_subdirectory(tools/library-oracle)
 if(ANYPS5_LTO AND ANYPS5_LTO_EXCLUDE)

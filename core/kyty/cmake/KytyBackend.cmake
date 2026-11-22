@@ -1,10 +1,10 @@
 include(ExternalProject)
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT MINGW)
-    message(FATAL_ERROR "ANYPS5_GPU_BACKEND=kyty is built on Linux and on Windows with MinGW-w64 GCC only")
+    message(FATAL_ERROR "The Kyty GPU driver is built on Linux and on Windows with MinGW-w64 GCC only")
 endif()
 if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    message(FATAL_ERROR "ANYPS5_GPU_BACKEND=kyty links Clang-built Kyty code against GCC's libstdc++; build AnyPS5 with GCC")
+    message(FATAL_ERROR "the Kyty GPU driver links Clang-built Kyty code against GCC's libstdc++; build AnyPS5 with GCC")
 endif()
 if(ANYPS5_KYTY_DLL)
     include(core/kyty/cmake/KytyDll.cmake)

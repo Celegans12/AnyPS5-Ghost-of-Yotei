@@ -36,7 +36,6 @@ add_library(libSceAgc SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/Misc/src/Platform.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Misc/src/RegisterDefaults.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Misc/src/Semaphore.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Misc/src/ShaderFusion.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Misc/src/StaticBuffer.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Misc/src/Suspend.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Patch/src/CondExec.cpp
@@ -50,31 +49,16 @@ add_library(libSceAgc SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/Patch/src/Branch.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Predication/src/Predication.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Shader/src/CreateShader.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Shader/src/GsOversubscription.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Shader/src/GsPrimPayload.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Shader/src/InterpolantMapping.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Shader/src/LinkShaders.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Shader/src/PrimState.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Shader/src/ShaderUtils.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Kyty/src/GsOversubscription.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Kyty/src/InterpolantMapping.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Kyty/src/PrimState.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Kyty/src/RegisterDefaults.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Kyty/src/ShaderFusion.cpp
 )
-
-if(ANYPS5_GPU_BACKEND STREQUAL "kyty")
-    get_target_property(libSceAgcSources libSceAgc SOURCES)
-    list(REMOVE_ITEM libSceAgcSources
-            ${CMAKE_CURRENT_SOURCE_DIR}/Misc/src/ShaderFusion.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/Shader/src/GsOversubscription.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/Shader/src/PrimState.cpp
-    )
-    set_target_properties(libSceAgc PROPERTIES SOURCES "${libSceAgcSources}")
-    target_sources(libSceAgc PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/Kyty/src/GsOversubscription.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/Kyty/src/InterpolantMapping.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/Kyty/src/PrimState.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/Kyty/src/RegisterDefaults.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/Kyty/src/ShaderFusion.cpp
-    )
-    target_compile_definitions(libSceAgc PRIVATE ANYPS5_KYTY=1)
-endif()
 
 target_include_directories(libSceAgc PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(libSceAgc PRIVATE libSceAgcDriver libkernel libc)
@@ -205,11 +189,6 @@ endif()
 add_test_executable(agc_semaphore_tests EXCLUDE_FROM_ALL tests/Semaphore.cpp)
 target_include_directories(agc_semaphore_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(agc_semaphore_tests PRIVATE libSceAgc libc)
-if(ANYPS5_GPU_BACKEND STREQUAL "kyty")
-    target_compile_definitions(agc_semaphore_tests PRIVATE ANYPS5_KYTY=1)
-else()
-    target_link_libraries(agc_semaphore_tests PRIVATE libSceAgcDriver)
-endif()
 configure_windows_unwind(agc_semaphore_tests)
 if(BUILD_TESTING)
     set_target_properties(agc_semaphore_tests PROPERTIES EXCLUDE_FROM_ALL FALSE)
@@ -375,22 +354,6 @@ if(BUILD_TESTING)
     endif()
 endif()
 
-add_test_executable(agc_shader_fusion_tests EXCLUDE_FROM_ALL tests/ShaderFusion.cpp)
-target_include_directories(agc_shader_fusion_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR} ${ANYPS5_SPIRV_HEADERS_INCLUDE_DIR})
-target_link_libraries(agc_shader_fusion_tests PRIVATE libSceAgc libSceAgcDriver libc)
-set_target_properties(agc_shader_fusion_tests PROPERTIES CXX_EXTENSIONS OFF)
-configure_windows_unwind(agc_shader_fusion_tests)
-
-if(BUILD_TESTING AND NOT ANYPS5_GPU_BACKEND STREQUAL "kyty")
-    set_target_properties(agc_shader_fusion_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
-    add_test(NAME agc_shader_fusion COMMAND agc_shader_fusion_tests)
-    set_tests_properties(agc_shader_fusion PROPERTIES SKIP_RETURN_CODE 77)
-    if(WIN32)
-        set_tests_properties(agc_shader_fusion PROPERTIES ENVIRONMENT_MODIFICATION
-            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
-    endif()
-endif()
-
 add_test_executable(agc_instrumentation_query_size_tests EXCLUDE_FROM_ALL tests/InstrumentationQuerySize.cpp)
 target_include_directories(agc_instrumentation_query_size_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(agc_instrumentation_query_size_tests PRIVATE libSceAgc libc)
@@ -439,59 +402,6 @@ if(BUILD_TESTING)
     add_test(NAME agc_lod_stats COMMAND agc_lod_stats_tests)
     if(WIN32)
         set_tests_properties(agc_lod_stats PROPERTIES ENVIRONMENT_MODIFICATION
-            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
-    endif()
-endif()
-
-add_test_executable(agc_interpolant_mapping_tests EXCLUDE_FROM_ALL
-        tests/InterpolantMapping.cpp
-        Shader/src/InterpolantMapping.cpp
-        Shader/src/ShaderUtils.cpp
-)
-target_include_directories(agc_interpolant_mapping_tests PRIVATE ${LIBS_INCLUDE_DIR})
-target_link_libraries(agc_interpolant_mapping_tests PRIVATE libSceAgcDriver libc)
-set_target_properties(agc_interpolant_mapping_tests PROPERTIES CXX_EXTENSIONS OFF)
-configure_windows_unwind(agc_interpolant_mapping_tests)
-
-if(BUILD_TESTING)
-    set_target_properties(agc_interpolant_mapping_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
-    add_test(NAME agc_interpolant_mapping COMMAND agc_interpolant_mapping_tests)
-    if(WIN32)
-        set_tests_properties(agc_interpolant_mapping PROPERTIES ENVIRONMENT_MODIFICATION
-            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
-    endif()
-endif()
-
-if(BUILD_TESTING)
-    add_test_executable(guest_shader_link_tests
-            ${LIBS_INCLUDE_DIR}/tests/GuestShaderLink.cpp
-            Shader/src/LinkShaders.cpp
-            Shader/src/PrimState.cpp
-            Shader/src/InterpolantMapping.cpp
-            Shader/src/ShaderUtils.cpp
-    )
-    target_include_directories(guest_shader_link_tests PRIVATE ${LIBS_INCLUDE_DIR})
-    target_link_libraries(guest_shader_link_tests PRIVATE libSceAgc libSceAgcDriver libc)
-    configure_windows_unwind(guest_shader_link_tests)
-    add_test(NAME guest_shader_link COMMAND guest_shader_link_tests)
-    if(WIN32)
-        set_tests_properties(guest_shader_link PROPERTIES ENVIRONMENT_MODIFICATION
-            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
-    endif()
-endif()
-
-add_test_executable(agc_gs_oversubscription_tests EXCLUDE_FROM_ALL
-        tests/GsOversubscription.cpp
-        Shader/src/GsOversubscription.cpp
-)
-target_include_directories(agc_gs_oversubscription_tests PRIVATE ${LIBS_INCLUDE_DIR})
-target_link_libraries(agc_gs_oversubscription_tests PRIVATE libc)
-configure_windows_unwind(agc_gs_oversubscription_tests)
-if(BUILD_TESTING)
-    set_target_properties(agc_gs_oversubscription_tests PROPERTIES EXCLUDE_FROM_ALL FALSE)
-    add_test(NAME agc_gs_oversubscription_tests COMMAND agc_gs_oversubscription_tests)
-    if(WIN32)
-        set_tests_properties(agc_gs_oversubscription_tests PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
@@ -589,26 +499,6 @@ if(BUILD_TESTING)
     add_test(NAME agc_cond_exec_patch_tests COMMAND agc_cond_exec_patch_tests)
     if(WIN32)
         set_tests_properties(agc_cond_exec_patch_tests PROPERTIES ENVIRONMENT_MODIFICATION
-            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
-    endif()
-endif()
-
-add_test_executable(agc_shader_helpers_tests EXCLUDE_FROM_ALL
-        tests/ShaderHelpers.cpp
-        Shader/src/LinkShaders.cpp
-        Shader/src/PrimState.cpp
-        Shader/src/InterpolantMapping.cpp
-        Shader/src/ShaderUtils.cpp
-)
-target_include_directories(agc_shader_helpers_tests PRIVATE ${LIBS_INCLUDE_DIR})
-target_link_libraries(agc_shader_helpers_tests PRIVATE libc libSceAgcDriver)
-configure_windows_unwind(agc_shader_helpers_tests)
-if(BUILD_TESTING)
-    set_target_properties(agc_shader_helpers_tests PROPERTIES EXCLUDE_FROM_ALL FALSE)
-    add_test(NAME agc_shader_helpers COMMAND agc_shader_helpers_tests)
-    set_tests_properties(agc_shader_helpers PROPERTIES TIMEOUT 30)
-    if(WIN32)
-        set_tests_properties(agc_shader_helpers PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()

@@ -4,21 +4,6 @@ target_link_libraries(libSceJobManager PRIVATE libSceAgc libSceAgcDriver libSceR
 configure_windows_unwind(libSceJobManager)
 
 if(BUILD_TESTING)
-    add_test_executable(guest_job_manager_profiler_tests ${LIBS_INCLUDE_DIR}/tests/JobManagerProfiler.cpp Export.cpp)
-    target_include_directories(guest_job_manager_profiler_tests PRIVATE ${LIBS_INCLUDE_DIR}
-        ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR} ${ANYPS5_SPIRV_HEADERS_INCLUDE_DIR}
-        $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>)
-    target_compile_options(guest_job_manager_profiler_tests PRIVATE -msse4.2)
-    target_link_libraries(guest_job_manager_profiler_tests PRIVATE libSceAgc libSceAgcDriver libkernel libc ulobjmgr)
-    configure_windows_unwind(guest_job_manager_profiler_tests)
-    add_test(NAME guest_job_manager_profiler COMMAND guest_job_manager_profiler_tests)
-    add_test(NAME guest_job_manager_profiler_gpu COMMAND guest_job_manager_profiler_tests gpu)
-    set_tests_properties(guest_job_manager_profiler guest_job_manager_profiler_gpu PROPERTIES TIMEOUT 20)
-    set_tests_properties(guest_job_manager_profiler_gpu PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1")
-    if(WIN32)
-        set_tests_properties(guest_job_manager_profiler guest_job_manager_profiler_gpu PROPERTIES ENVIRONMENT_MODIFICATION
-            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAgc>")
-    endif()
     add_test_executable(job_manager_compute_progress_tests ${LIBS_INCLUDE_DIR}/tests/JobManagerComputeProgress.cpp)
     target_include_directories(job_manager_compute_progress_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(job_manager_compute_progress_tests PRIVATE libc)

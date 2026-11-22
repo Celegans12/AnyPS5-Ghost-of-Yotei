@@ -2729,7 +2729,7 @@ add_test_executable(guest_thermal_sensors_tests ${LIBS_INCLUDE_DIR}/tests/GuestT
     endif()
     add_test(NAME guest_memory COMMAND guest_memory_tests)
     add_test(NAME guest_mmap_fixed_anonymous COMMAND guest_memory_tests fixed-anonymous)
-    if(ANYPS5_GPU_BACKEND STREQUAL "kyty" AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         foreach(pages private populate demand)
             add_test(NAME guest_direct_memory_pages_${pages} COMMAND guest_memory_tests direct-pages)
             set_tests_properties(guest_direct_memory_pages_${pages} PROPERTIES ENVIRONMENT "KYTY_DIRECT_MEMORY_PAGES=${pages}" SKIP_RETURN_CODE 77)
