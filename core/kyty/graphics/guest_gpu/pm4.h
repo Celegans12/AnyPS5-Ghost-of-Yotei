@@ -671,6 +671,7 @@ constexpr uint32_t SPI_SHADER_PGM_RSRC2_PS_SHARED_VGPR_CNT_SHIFT        = 28;
 constexpr uint32_t SPI_SHADER_PGM_RSRC2_PS_SHARED_VGPR_CNT_MASK         = 0xF;
 
 constexpr uint32_t SPI_SHADER_USER_DATA_PS_0  = 0xC;
+constexpr uint32_t SPI_SHADER_REQ_CTRL_PS = 0x30;
 constexpr uint32_t SPI_SHADER_USER_ACCUM_PS_0 = 0x32;
 
 constexpr uint32_t SPI_SHADER_PACE_ID_GS = 0x80;

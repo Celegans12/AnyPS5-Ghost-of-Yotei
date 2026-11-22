@@ -2257,7 +2257,8 @@ static constexpr auto MakeShaderIndirectTable() {
 	for (const auto cmd_offset: {Pm4::SPI_SHADER_PGM_RSRC4_HS, Pm4::SPI_SHADER_PGM_CHKSUM_HS,
 	                             Pm4::SPI_GRAPHICS_SHADER_CONTROL_HS, Pm4::SPI_SHADER_PGM_RSRC4_GS,
 	                             Pm4::SPI_SHADER_PACE_ID_GS, Pm4::SPI_GRAPHICS_SHADER_CONTROL_GS,
-	                             Pm4::SPI_SHADER_PACE_ID_PS, Pm4::SPI_GRAPHICS_SHADER_CONTROL_PS}) {
+	                             Pm4::SPI_SHADER_PACE_ID_PS, Pm4::SPI_GRAPHICS_SHADER_CONTROL_PS,
+	                             Pm4::SPI_SHADER_REQ_CTRL_PS}) {
 		table[cmd_offset] = IgnoreRegister;
 	}
 	table[0x0ca] = IgnoreRegister;
