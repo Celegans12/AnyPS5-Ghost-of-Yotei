@@ -90,6 +90,11 @@ class CheckKytySettingsTests(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertIn("builds an environment name from the literal 'KYTY_'", text)
 
+    def test_prefix_checks_do_not_read_or_build_a_setting(self):
+        status, text = self.run_check(self.tree({"a.cpp": CODE + 'bool allowed = name.starts_with("KYTY_");\n'}))
+        self.assertEqual(status, 0, text)
+        self.assertIn("4 KYTY_* setting(s)", text)
+
     def test_tests_and_third_party_directories_are_skipped(self):
         files = {"a.cpp": CODE, "libs/tests/t.cpp": 'x("KYTY_ONLY_IN_TESTS");\n', "3rdparty/z.cpp": 'x("KYTY_THIRD");\n',
                  "libs/UnitTests.cpp": 'x("KYTY_UNIT");\n', "libs/Table.inc": 'x("KYTY_DELTA");\n'}

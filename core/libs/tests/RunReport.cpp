@@ -1306,14 +1306,19 @@ void RecipeRedactionTest() {
 
 void RecipeEnvironmentTest() {
     Require(RunReport::RecipeVariableAllowed("ANYPS5_GPU"), "an ANYPS5 variable is kept");
+    Require(RunReport::RecipeVariableAllowed("KYTY_NATIVE_RT"), "a KYTY variable is kept");
     Require(!RunReport::RecipeVariableAllowed("PATH"), "a variable outside ANYPS5_ is not recorded");
     Require(!RunReport::RecipeVariableAllowed("anyps5_gpu"), "the prefix is case sensitive");
     for (const char* name : {"ANYPS5_API_TOKEN", "ANYPS5_KEYFILE", "ANYPS5_DB_PASSWORD", "ANYPS5_client_secret", "ANYPS5_secret", "ANYPS5_PSN_PASSCODE", "ANYPS5_NP_AUTH", "ANYPS5_SESSION_COOKIE"}) {
         Require(!RunReport::RecipeVariableAllowed(name), std::string("a secret-named variable was allowed: ") + name);
     }
-    const RunReport::EnvironmentVariables all{{"ANYPS5_ZETA", "1"}, {"ANYPS5_API_TOKEN", "x"}, {"HOME", "/root"}, {"ANYPS5_ALPHA", "0"}};
+    Require(!RunReport::RecipeVariableAllowed("kyty_native_rt"), "the KYTY prefix is case sensitive");
+    for (const char* name : {"KYTY_API_TOKEN", "KYTY_KEYFILE", "KYTY_DB_PASSWORD", "KYTY_client_secret", "KYTY_PSN_PASSCODE", "KYTY_NP_AUTH", "KYTY_SESSION_COOKIE", "KYTY_CREDENTIAL", "KYTY_LOGIN"}) {
+        Require(!RunReport::RecipeVariableAllowed(name), std::string("a secret-named KYTY variable was allowed: ") + name);
+    }
+    const RunReport::EnvironmentVariables all{{"ANYPS5_ZETA", "1"}, {"ANYPS5_API_TOKEN", "x"}, {"HOME", "/root"}, {"ANYPS5_ALPHA", "0"}, {"KYTY_NATIVE_RT", "0"}, {"KYTY_ASYNC_PIPELINES", "2"}, {"KYTY_API_TOKEN", "hidden"}};
     const auto kept = RunReport::RecipeEnvironment(all);
-    Require(kept == RunReport::EnvironmentVariables({{"ANYPS5_ALPHA", "0"}, {"ANYPS5_ZETA", "1"}}), "the recipe keeps sorted ANYPS5 variables only");
+    Require(kept == RunReport::EnvironmentVariables({{"ANYPS5_ALPHA", "0"}, {"ANYPS5_ZETA", "1"}, {"KYTY_ASYNC_PIPELINES", "2"}, {"KYTY_NATIVE_RT", "0"}}), "the recipe keeps sorted non-secret runtime variables only");
     for (const auto& [name, value] : RunReport::ProcessEnvironment()) {
         Require(RunReport::RecipeVariableAllowed(name), "the captured environment holds a name the recipe may not record: " + name);
     }
@@ -1331,15 +1336,16 @@ void RecipeSerializeTest() {
     recipe.runId = std::string(32u, 'a');
     recipe.build.commit = std::string(40u, 'b');
     recipe.arguments = {"/home/alice/prx/game.elf", "--aps5-report=on"};
-    recipe.environment = {{"ANYPS5_GPU", "AMD Radeon"}, {"ANYPS5_INPUT_CONFIG", "/home/alice/pad.json"}};
+    recipe.environment = {{"ANYPS5_GPU", "AMD Radeon"}, {"ANYPS5_INPUT_CONFIG", "/home/alice/pad.json"}, {"KYTY_NATIVE_RT", "0"}, {"KYTY_SESSION_LOG", "/home/alice/session.log"}};
     recipe.configFiles = {"pad.json"};
     const auto text = RunReport::SerializeRecipe(recipe, host);
     Require(Contains(text, "\"format\": \"anyps5-recipe\"") && Contains(text, "\"version\": 1"), "the recipe lacks its format header: " + text);
     Require(Contains(text, "\"argv\": [\n    \"[redacted]\",\n    \"--aps5-report=on\"\n  ]"), "argv is redacted per value: " + text);
     Require(Contains(text, "\"ANYPS5_GPU\": \"AMD Radeon\"") && Contains(text, "\"ANYPS5_INPUT_CONFIG\": \"[redacted]\""), "environment values are redacted per value: " + text);
+    Require(Contains(text, "\"KYTY_NATIVE_RT\": \"0\"") && !Contains(text, "KYTY_SESSION_LOG"), "KYTY settings are recorded without secret-named variables: " + text);
     Require(Contains(text, "\"configFiles\": [\n    \"pad.json\"\n  ]") && Contains(text, "\"commit\": \"" + std::string(40u, 'b') + "\""), "config names or the build commit are missing: " + text);
     Require(!Contains(text, "alice"), "a user name reached the recipe: " + text);
-    recipe.environment = {{"ANYPS5_API_TOKEN", "hidden"}};
+    recipe.environment = {{"ANYPS5_API_TOKEN", "hidden"}, {"KYTY_API_TOKEN", "hidden"}};
     Require(!Contains(RunReport::SerializeRecipe(recipe, host), "hidden"), "a secret variable value reached the recipe");
 }
 
@@ -1347,7 +1353,7 @@ void RecipeFileTest() {
     Directory executable, user;
     auto settings = Covered(executable.path, user.path, IdA);
     settings.arguments = {"/home/alice/game.elf", "--aps5-report=on"};
-    settings.environment = {{"ANYPS5_GPU", "AMD"}, {"ANYPS5_API_KEY", "hidden"}};
+    settings.environment = {{"ANYPS5_GPU", "AMD"}, {"ANYPS5_API_KEY", "hidden"}, {"KYTY_NATIVE_RT", "0"}, {"KYTY_API_KEY", "hidden"}};
     settings.configFiles = {"pad.json"};
     RunReport::Collector collector(settings);
     Require(collector.Start(), "the collector did not start");
@@ -1356,7 +1362,8 @@ void RecipeFileTest() {
     Require(fs::exists(recipePath), "the recipe was not written next to the report");
     const auto text = Read(recipePath);
     Require(Contains(text, "\"ANYPS5_GPU\": \"AMD\"") && Contains(text, "\"pad.json\"") && Contains(text, "[redacted]"), "the recipe lacks its captured fields: " + text);
-    Require(!Contains(text, "hidden") && !Contains(text, "ANYPS5_API_KEY"), "a secret reached the recipe file");
+    Require(Contains(text, "\"KYTY_NATIVE_RT\": \"0\""), "the recipe file lacks its KYTY setting: " + text);
+    Require(!Contains(text, "hidden") && !Contains(text, "ANYPS5_API_KEY") && !Contains(text, "KYTY_API_KEY"), "a secret reached the recipe file");
 }
 
 void Dump(const fs::path& directory) {

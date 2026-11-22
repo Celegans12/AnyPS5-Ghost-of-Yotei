@@ -595,7 +595,7 @@ std::vector<std::string> CommandLineArguments() {
 }
 
 bool RecipeVariableAllowed(std::string_view name) {
-    if (!name.starts_with("ANYPS5_")) return false;
+    if (!name.starts_with("ANYPS5_") && !name.starts_with("KYTY_")) return false;
     const auto upper = [&](std::string_view text) {
         std::string result(text);
         for (auto& character : result) character = static_cast<char>(std::toupper(static_cast<unsigned char>(character)));

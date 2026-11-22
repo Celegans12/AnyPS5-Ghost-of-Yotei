@@ -50,7 +50,8 @@ def reads(root):
                 continue
             site = f"{path.as_posix()}:{text.count(chr(10), 0, start) + 1}"
             if value.endswith("_"):
-                prefixes.setdefault(value, []).append(site)
+                if re.search(r'\.\s*starts_with\s*\(\s*$', text[:start]) is None:
+                    prefixes.setdefault(value, []).append(site)
             else:
                 found.setdefault(value, []).append(site)
     return found, prefixes
