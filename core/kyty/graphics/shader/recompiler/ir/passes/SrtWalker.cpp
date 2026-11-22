@@ -2,7 +2,6 @@
 
 #include "common/abi.h"
 #include "common/assert.h"
-#include "common/runtimeSwitches.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <xbyak/xbyak.h>
@@ -270,10 +269,8 @@ uint64_t KYTY_SYSV_ABI ProbeFlatGuestLoad(uint64_t address, WalkerCachedPage* ca
 }
 #endif
 
-void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address, size_t cache,
-               [[maybe_unused]] uint32_t slot, bool formed = false) {
+void LoadGuest(Xbyak::CodeGenerator& code, size_t cache, [[maybe_unused]] uint32_t slot) {
 	Xbyak::Label direct, done, slow;
-	if (!formed) code.lea(code.r10, code.ptr[address]);
 	code.mov(code.rax, code.r10);
 	code.shr(code.rax, 12);
 	code.mov(code.r11d, code.eax);
@@ -536,8 +533,7 @@ private:
 
 class WalkerCompiler {
 public:
-	WalkerCompiler(ResourcePlan& plan, Xbyak::CodeGenerator& code, bool short_form)
-	    : m_plan(plan), m_code(code), m_short(short_form) {}
+	WalkerCompiler(ResourcePlan& plan, Xbyak::CodeGenerator& code): m_plan(plan), m_code(code) {}
 
 	void Compile(std::span<const Value> values);
 
@@ -622,7 +618,7 @@ private:
 	Xbyak::Label                                      m_ret;
 	uint32_t m_shader_base = 0, m_page_cache = 0, m_reach = 0, m_states = 0, m_states_end = 0, m_bias = 0;
 	uint32_t m_user_data = 0, m_captures = 0;
-	bool     m_short = false, m_body = true;
+	bool     m_body = true;
 	std::vector<uint32_t> m_flat_slots;
 	std::vector<bool>     m_zero_tested;
 	std::vector<uint32_t> m_gpu_control;
@@ -1046,7 +1042,6 @@ void WalkerCompiler::Layout() {
 		auto& node = m_nodes[index];
 		node.slot  = offset;
 		offset += 8u;
-		if (!m_short) continue;
 		const auto   op   = node.inst->GetOpcode();
 		const size_t skip = op == ValueOpcode::LoadBufferU32 ? 1u : 0u;
 		const bool read = op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer ||
@@ -1057,7 +1052,7 @@ void WalkerCompiler::Layout() {
 		}
 	}
 	m_reach = offset;
-	if (m_short) m_bias = m_reach + 128u;
+	m_bias  = m_reach + 128u;
 	offset += static_cast<uint32_t>(m_plan.control_flow.size());
 	m_states = offset;
 	for (uint32_t index = 0; index < m_nodes.size(); ++index) {
@@ -1107,7 +1102,7 @@ void WalkerCompiler::Branch(const Operand& operand, const Xbyak::Label& unknown)
 		c.jmp(unknown, Near);
 	} else if (operand.kind == Kind::Node) {
 		auto& node = m_nodes[operand.value];
-		if (m_short && m_body && node.called) {
+		if (m_body && node.called) {
 			auto& stub   = m_stubs.emplace_back();
 			stub.operand = operand;
 			stub.unknown = &unknown;
@@ -1317,11 +1312,10 @@ void WalkerCompiler::EmitRead(const Node& node, uint32_t index) {
 		    static_cast<int64_t>(static_cast<int32_t>(m_plan.memory_info[inst.Flags<MemoryFlags>().index].offset)) &
 		    ~int64_t {3};
 		const auto constant = int64_t {static_cast<uint32_t>(args[2].value) & ~3u} + immediate;
-		const bool folded   = m_short && args[2].kind == Kind::Constant && constant + 4 <= INT32_MAX;
+		const bool folded   = args[2].kind == Kind::Constant && constant + 4 <= INT32_MAX;
 		const auto offset   = folded ? Xbyak::RegExp(static_cast<size_t>(constant))
 		                             : c.r9 + static_cast<size_t>(immediate);
-		const auto cache    = static_cast<size_t>(m_page_cache) - m_bias;
-		if (m_short && args[0].kind == Kind::UserData && args[1].kind == Kind::UserData) {
+		if (args[0].kind == Kind::UserData && args[1].kind == Kind::UserData) {
 			c.mov(c.rax, c.qword[At(m_bases.at({args[0].value, args[1].value}))]);
 		} else {
 			Base(args[0], args[1]);
@@ -1330,24 +1324,12 @@ void WalkerCompiler::EmitRead(const Node& node, uint32_t index) {
 			Load(c.r9, args[2]);
 			c.and_(c.r9d, ~3u);
 		}
+		c.lea(c.r10, c.ptr[c.rax + offset]);
 		if (op == ValueOpcode::LoadAddressU32) {
-			if (m_short) {
-				c.lea(c.r10, c.ptr[c.rax + offset]);
-				c.mov(c.rcx, c.r10);
-			} else {
-				c.lea(c.rax, c.ptr[c.rax + offset]);
-				c.mov(c.rcx, c.rax);
-			}
+			c.mov(c.rcx, c.r10);
 			c.shr(c.rcx, 48);
 			c.jnz(m_ret, Near);
-			const auto address = m_short ? Xbyak::RegExp(c.r10) : Xbyak::RegExp(c.rax);
-			if (index < m_zero_tested.size() && m_zero_tested[index]) SkipZeroTestedLoad(c, address, m_ret);
-			if (index < m_gpu_control.size() && m_gpu_control[index] != NoFlatSlot) {
-				SkipGpuControlLoad(address, m_gpu_control[index], node.state);
-			}
-			LoadGuest(c, address, cache, flat_slot, m_short);
 		} else {
-			if (m_short) c.lea(c.r10, c.ptr[c.rax + offset]);
 			Load(c.r11, args[1]);
 			c.shr(c.r11d, 16);
 			if (vector) {
@@ -1375,15 +1357,12 @@ void WalkerCompiler::EmitRead(const Node& node, uint32_t index) {
 			c.lea(c.r11, c.ptr[offset + 4u]);
 			c.cmp(c.r11, c.rcx);
 			c.ja(zero, Near);
-			const auto address = m_short ? Xbyak::RegExp(c.r10) : c.rax + offset;
-			if (index < m_zero_tested.size() && m_zero_tested[index]) {
-				SkipZeroTestedLoad(c, address, m_ret);
-			}
-			if (index < m_gpu_control.size() && m_gpu_control[index] != NoFlatSlot) {
-				SkipGpuControlLoad(address, m_gpu_control[index], node.state);
-			}
-			LoadGuest(c, address, cache, flat_slot, m_short);
 		}
+		if (index < m_zero_tested.size() && m_zero_tested[index]) SkipZeroTestedLoad(c, c.r10, m_ret);
+		if (index < m_gpu_control.size() && m_gpu_control[index] != NoFlatSlot) {
+			SkipGpuControlLoad(c.r10, m_gpu_control[index], node.state);
+		}
+		LoadGuest(c, static_cast<size_t>(m_page_cache) - m_bias, flat_slot);
 		++m_captures;
 		c.mov(c.qword[c.r8], c.r10);
 		c.mov(c.dword[c.r8 + 8], c.eax);
@@ -1391,7 +1370,7 @@ void WalkerCompiler::EmitRead(const Node& node, uint32_t index) {
 		c.add(c.r8, 16);
 		Store(node);
 	}
-	if (m_short && op == ValueOpcode::LoadAddressU32) return;
+	if (op == ValueOpcode::LoadAddressU32) return;
 	c.L(zero);
 	c.xor_(c.eax, c.eax);
 	Store(node);
@@ -1638,7 +1617,7 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 
 	Xbyak::Label pass, fail, reset;
 	std::deque<Xbyak::Label> exits;
-	if (m_bias != 0) c.add(c.rdx, m_bias);
+	c.add(c.rdx, m_bias);
 	c.mov(c.qword[At(m_shader_base)], c.rcx);
 	for (const auto& [pair, slot]: m_bases) {
 		Base({Kind::UserData, pair.first}, {Kind::UserData, pair.second});
@@ -1665,7 +1644,7 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 		for (uint32_t block = 0; block < blocks.size(); ++block) {
 			Xbyak::Label next;
 			const auto mark = [&](uint32_t target) {
-				if (m_short && target > block && rechecks[target].empty()) {
+				if (target > block && rechecks[target].empty()) {
 					c.mov(c.byte[At(m_reach + target)], 1);
 					return;
 				}
@@ -1862,15 +1841,8 @@ static void FindRefreshableSources(ResourcePlan& plan) {
 
 void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values) {
 	if (values.empty()) FindRefreshableSources(plan);
-	plan.srt_long_code = std::make_unique<Xbyak::CodeGenerator>(4096, Xbyak::AutoGrow);
-	WalkerCompiler(plan, *plan.srt_long_code, false).Compile(values);
-	plan.srt_long_captures = plan.srt_captures;
-	const auto long_words  = plan.srt_scratch.size();
-	const auto user_data   = plan.srt_user_data;
 	plan.srt_code = std::make_unique<Xbyak::CodeGenerator>(4096, Xbyak::AutoGrow);
-	WalkerCompiler(plan, *plan.srt_code, true).Compile(values);
-	if (plan.srt_scratch.size() < long_words) plan.srt_scratch.assign(long_words, 0u);
-	plan.srt_user_data = std::max(plan.srt_user_data, user_data);
+	WalkerCompiler(plan, *plan.srt_code).Compile(values);
 }
 
 thread_local uint32_t t_plan_scratch_slot = UINT32_MAX;
@@ -1899,16 +1871,11 @@ PlanScratchRef PlanScratch(const ResourcePlan& plan) {
 
 bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
              std::vector<std::pair<uint64_t, uint64_t>>* reads) {
-	const bool  short_form =
-	    plan.srt_long_code == nullptr ||
-	    Common::RuntimeSwitches::On(Common::RuntimeSwitches::Switch::ShortSrtWalkers);
-	const auto& code     = short_form ? plan.srt_code : plan.srt_long_code;
-	const auto  captures = short_form ? plan.srt_captures : plan.srt_long_captures;
-	if (code == nullptr || runtime.user_data.size() < plan.srt_user_data) return false;
+	if (plan.srt_code == nullptr || runtime.user_data.size() < plan.srt_user_data) return false;
 	auto& scratch = PlanScratch(plan).srt_scratch;
 	flat.assign(plan.srt_reads.size(), 0u);
 	using Walker = const uint64_t* KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*, uint64_t*, uint64_t);
-	t_running_walker = code.get();
+	t_running_walker = plan.srt_code.get();
 	t_walker_ahead   = runtime.record_load != nullptr;
 	t_walker_faulted = false;
 	t_gpu_produced   = runtime.gpu_produced;
@@ -1918,8 +1885,8 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	t_walker_around = t_walker_ahead && runtime.note_around_loads;
 #endif
 	++t_walk;
-	const auto* end = code->getCode<Walker>()(runtime.user_data.data(), flat.data(), scratch.data(),
-	                                          runtime.shader_base);
+	const auto* end = plan.srt_code->getCode<Walker>()(runtime.user_data.data(), flat.data(),
+	                                                     scratch.data(), runtime.shader_base);
 	t_running_walker = nullptr;
 	t_walker_ahead   = false;
 	t_gpu_produced   = nullptr;
@@ -1929,7 +1896,7 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	t_walker_around = false;
 #endif
 	if (end == nullptr || t_walker_faulted) return false;
-	const auto* first = scratch.data() + captures / 8u;
+	const auto* first = scratch.data() + plan.srt_captures / 8u;
 	if (reads != nullptr) {
 		for (auto* read = first; read != end; read += 2) reads->emplace_back(*read, sizeof(uint32_t));
 	}

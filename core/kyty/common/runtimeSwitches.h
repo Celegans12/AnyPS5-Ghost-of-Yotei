@@ -13,7 +13,6 @@ namespace Common::RuntimeSwitches {
 
 enum class Switch : uint32_t {
 	GenericComputeVariant,
-	ShortSrtWalkers,
 	Count
 };
 
