@@ -29,6 +29,7 @@ inline constexpr std::size_t SerialQueues = 1 + 7 * 8;
 void NoteSubmission(Libs::Graphics::GuestGpu& gpu, std::uint32_t queue);
 void RequireNotHeld(const char* what);
 bool Tracking();
+bool Replaying();
 
 }
 

@@ -172,6 +172,10 @@ bool Tracking() {
     return state().tracking.load(std::memory_order_acquire);
 }
 
+bool Replaying() {
+    return (state().tracking.load(std::memory_order_acquire) & TrackReplaySerials) != 0;
+}
+
 void RequireNotHeld(const char* what) {
     if (state().held.load(std::memory_order_acquire)) throw std::runtime_error(std::string("kyty replay: ") + what + " waits for the GPU while the replay holds it settled (AgcDriverReleaseSettled first)");
 }

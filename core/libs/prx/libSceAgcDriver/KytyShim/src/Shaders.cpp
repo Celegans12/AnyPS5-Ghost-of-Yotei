@@ -45,7 +45,7 @@ const ShaderMap shaderMap;
 }
 
 extern "C" void AgcDriverRegisterShader_nid_postfix(const Shader* shader) {
-    const bool replay = KytyShim::Replay::Tracking();
+    const bool replay = KytyShim::Replay::Replaying();
     if (replay) KytyShim::Entry::CheckGuestRange(shader, sizeof(Shader), alignof(Shader));
     if (shader->code == nullptr || shader->shader_size == 0 || shader->shader_size % sizeof(std::uint32_t) != 0) {
         char text[160];
