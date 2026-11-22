@@ -152,7 +152,7 @@ from [KytyPS5](https://github.com/KytyPS5/KytyPS5) carry a `Ported-from: KytyPS5
 
 ## Settings of the kyty build
 
-A build reads its settings from environment variables, once per process. The tables below list every `KYTY_*` name the code under `core/` reads, one row each, and `tools/check_kyty_settings.py` fails when a name read in `core/` has no row here or a row names something the code no longer reads. Three kinds of reader exist:
+A build reads its settings from environment variables, once per process. The tables below list every `KYTY_*` name the code under `core/` reads, one row each, and `tools/check_kyty_settings.py` fails when a name read in `core/` has no row here or a row names something the code no longer reads. The same names make up the list in `core/libs/prx/libSceAgcDriver/KytyShim/src/Settings.cpp`, and the check also fails when that list and the names read in `core/` differ. At start, after the host report, a session prints `[kyty] <name> is set but not read by this build` once for each other `KYTY_*` variable set in its environment, a removed switch or a misspelt name for example. Three kinds of reader exist:
 
 - `KytyShim::StartRuntime()` (`core/libs/prx/libSceAgcDriver/KytyShim/src/Config.cpp`) loads KytyPS5's `ConfigOptions` at their defaults, then reads the variables named after KytyPS5's command-line options. An empty value counts as unset; an invalid value stops the emulator with a message naming the variable. Rows of this kind say "stops" in their values.
 - Code of `core/kyty/`, imported or ours, reads `KYTY_*` names with `std::getenv` or with a small helper that takes the name as a string literal. Each is read once; most accept anything and fall back to the default, as their values column says.
@@ -683,4 +683,4 @@ lies wholly inside a kept settled part, as `A|B`. `--json` writes the same in a 
 
 ### Adding a setting
 
-A pull request that makes the code under `core/` read a new `KYTY_*` name adds its row to the tables above, with its default taken from the code, and one that stops reading a name removes the row. `python3 tools/check_kyty_settings.py` lists what is missing or stale; the `conventions` job of [the AnyKyty workflow](../../.github/workflows/anykyty.yml) runs it. A new `ANYPS5_*` or `APS5_*` name also needs its row in [ENVIRONMENT](ENVIRONMENT.md).
+A pull request that makes the code under `core/` read a new `KYTY_*` name adds its row to the tables above, with its default taken from the code, and its name to the list in `core/libs/prx/libSceAgcDriver/KytyShim/src/Settings.cpp`; one that stops reading a name removes both. `python3 tools/check_kyty_settings.py` lists what is missing or stale; the `conventions` job of [the AnyKyty workflow](../../.github/workflows/anykyty.yml) runs it. A new `ANYPS5_*` or `APS5_*` name also needs its row in [ENVIRONMENT](ENVIRONMENT.md).
