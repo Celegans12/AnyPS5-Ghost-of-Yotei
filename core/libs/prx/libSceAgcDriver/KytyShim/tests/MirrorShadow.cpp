@@ -308,22 +308,16 @@ int Sparse() {
 	mirror.WaitIdle();
 	Check(mirror.Totals().bound_blocks == 2, "a trimmed block is bound again when a buffer comes back");
 
-	mirror.Deactivate();
+	mirror.Trim({});
 	mirror.WaitIdle();
 	totals = mirror.Totals();
-	Check(!mirror.Active() && totals.bound_blocks == 0 && totals.chunks == 0 && totals.releases == 1,
-	      "switching the shadow off unbinds everything and frees its memory");
-	mirror.NoteRange(first, 0x100);
-	mirror.Submit();
-	mirror.WaitIdle();
-	Check(mirror.Totals().bound_blocks == 0 && !mirror.IsBound(first), "an inactive shadow binds nothing");
-
-	mirror.Activate();
+	Check(totals.bound_blocks == 0 && totals.chunks == 0 && !mirror.IsBound(first) && !mirror.IsBound(run_base),
+	      "a trim without live buffers unbinds everything and frees every chunk");
 	mirror.NoteRange(first, 0x100);
 	mirror.Submit();
 	mirror.WaitIdle();
 	totals = mirror.Totals();
-	Check(mirror.Active() && totals.bound_blocks == 1 && totals.chunks == 1, "switching it on again binds again");
+	Check(totals.bound_blocks == 1 && totals.chunks == 1, "a block is bound again in a new chunk");
 	Check(RoundTrip(graphics, mirror.Handle(), first & ~(block - 1), block, 5), "the block bound again holds data");
 
 	const auto stats = mirror.TakeStats();
