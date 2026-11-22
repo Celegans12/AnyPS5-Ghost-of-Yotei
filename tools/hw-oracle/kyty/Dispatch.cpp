@@ -12,7 +12,9 @@
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <optional>
+#include <utility>
 
 namespace KytyOracle {
 namespace {
@@ -166,6 +168,28 @@ struct HostBuffer {
     std::uint64_t bytes = 0;
 };
 
+class Cleanup {
+public:
+    Cleanup() = default;
+    Cleanup(const Cleanup&) = delete;
+    Cleanup& operator=(const Cleanup&) = delete;
+
+    ~Cleanup() {
+        for (auto step = steps.rbegin(); step != steps.rend(); ++step) (*step)();
+    }
+
+    void Add(std::function<void()> step) {
+        steps.push_back(std::move(step));
+    }
+
+private:
+    std::vector<std::function<void()>> steps;
+};
+
+std::uint32_t LdsDwords(const Kernel& kernel) {
+    return static_cast<std::uint32_t>((std::uint64_t {kernel.lds_bytes} + 3u) / 4u);
+}
+
 }
 
 struct Device::State {
@@ -178,17 +202,26 @@ struct Device::State {
     std::uint32_t min_subgroup = 0;
     std::uint32_t max_subgroup = 0;
     std::uint32_t max_shared_bytes = 0;
+    std::uint32_t max_workgroup_threads = 0;
+    std::uint32_t max_workgroup_subgroups = 0;
     bool subgroup_control = false;
     std::string name;
     Recompiler::Spirv::Profile profile;
 
-    HostBuffer CreateHostBuffer(std::uint64_t bytes) const {
+    void Open(std::string_view selector, Choice choice);
+
+    bool Enforces(std::uint32_t host_subgroup) const {
+        return subgroup_control && host_subgroup >= min_subgroup && host_subgroup <= max_subgroup;
+    }
+
+    HostBuffer CreateHostBuffer(std::uint64_t bytes, Cleanup& cleanup) const {
         HostBuffer result;
         vk::BufferCreateInfo info;
         result.bytes = std::max<std::uint64_t>((bytes + 15u) & ~std::uint64_t {15u}, 16u);
         info.size = result.bytes;
         info.usage = vk::BufferUsageFlagBits::eStorageBuffer;
         result.buffer = Checked(device.createBuffer(info), "buffer creation");
+        cleanup.Add([this, buffer = result.buffer] { device.destroyBuffer(buffer); });
         const auto needs = device.getBufferMemoryRequirements(result.buffer);
         const auto flags = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent;
         for (std::uint32_t type = 0; type < memory.memoryTypeCount && !result.memory; type++) {
@@ -197,18 +230,14 @@ struct Device::State {
             allocate.allocationSize = needs.size;
             allocate.memoryTypeIndex = type;
             result.memory = Checked(device.allocateMemory(allocate), "memory allocation");
+            cleanup.Add([this, memory = result.memory] { device.freeMemory(memory); });
         }
         Require(static_cast<bool>(result.memory), "the device has no host-visible memory for a buffer");
         Checked(device.bindBufferMemory(result.buffer, result.memory, 0), "buffer binding");
         result.mapped = Checked(device.mapMemory(result.memory, 0, VK_WHOLE_SIZE), "buffer mapping");
+        cleanup.Add([this, memory = result.memory] { device.unmapMemory(memory); });
         std::memset(result.mapped, 0, result.bytes);
         return result;
-    }
-
-    void DestroyHostBuffer(HostBuffer& buffer) const {
-        device.unmapMemory(buffer.memory);
-        device.destroyBuffer(buffer.buffer);
-        device.freeMemory(buffer.memory);
     }
 };
 
@@ -226,7 +255,7 @@ Module Compile(const Kernel& kernel, const Program& program, std::uint32_t threa
     compute.threads_num[0] = threads;
     compute.threads_num[1] = 1u;
     compute.threads_num[2] = 1u;
-    compute.lds_size_dwords = kernel.lds_bytes / 4u;
+    compute.lds_size_dwords = LdsDwords(kernel);
     compute.host_subgroup_size = host_subgroup;
     compute.wave_size = kernel.wave_size;
     compute.float_mode = static_cast<std::uint8_t>(kernel.float_mode);
@@ -272,24 +301,22 @@ std::string DescribeModes(const Kernel& kernel) {
 std::vector<std::string> Device::List() {
     const auto instance = CreateInstance();
     std::vector<std::string> names;
-    for (const auto& candidate : Candidates(instance)) names.push_back(candidate.name);
+    try {
+        for (const auto& candidate : Candidates(instance)) names.push_back(candidate.name);
+    } catch (...) {
+        instance.destroy();
+        throw;
+    }
     instance.destroy();
     return names;
 }
 
-Device::Device(std::string_view selector, Choice choice) : state(std::make_unique<State>()) {
-    auto& s = *state;
-    s.instance = CreateInstance();
-    try {
-        const auto candidates = Candidates(s.instance);
-        const auto& chosen = Choose(candidates, selector, choice);
-        s.physical = chosen.physical;
-        s.family = chosen.family;
-        s.name = chosen.name;
-    } catch (...) {
-        s.instance.destroy();
-        throw;
-    }
+void Device::State::Open(std::string_view selector, Choice choice) {
+    const auto candidates = Candidates(instance);
+    const auto& chosen = Choose(candidates, selector, choice);
+    physical = chosen.physical;
+    family = chosen.family;
+    name = chosen.name;
 
     vk::PhysicalDeviceVulkan13Features features13;
     vk::PhysicalDeviceVulkan12Features features12;
@@ -298,35 +325,50 @@ Device::Device(std::string_view selector, Choice choice) : state(std::make_uniqu
     features12.pNext = &features13;
     features11.pNext = &features12;
     features.pNext = &features11;
-    s.physical.getFeatures2(&features);
+    physical.getFeatures2(&features);
     features13.robustImageAccess = VK_FALSE;
     features.features.robustBufferAccess = VK_FALSE;
 
     const float priority = 1.0f;
     vk::DeviceQueueCreateInfo queue_info;
-    queue_info.queueFamilyIndex = s.family;
+    queue_info.queueFamilyIndex = family;
     queue_info.queueCount = 1;
     queue_info.pQueuePriorities = &priority;
     vk::DeviceCreateInfo device_info;
     device_info.pNext = &features;
     device_info.queueCreateInfoCount = 1;
     device_info.pQueueCreateInfos = &queue_info;
-    s.device = Checked(s.physical.createDevice(device_info), "device creation");
-    VULKAN_HPP_DEFAULT_DISPATCHER.init(s.device);
-    s.queue = s.device.getQueue(s.family, 0);
-    s.memory = s.physical.getMemoryProperties();
+    device = Checked(physical.createDevice(device_info), "device creation");
+    VULKAN_HPP_DEFAULT_DISPATCHER.init(device);
+    queue = device.getQueue(family, 0);
+    memory = physical.getMemoryProperties();
 
     vk::PhysicalDeviceVulkan13Properties properties13;
     vk::PhysicalDeviceProperties2 properties;
     properties.pNext = &properties13;
-    s.physical.getProperties2(&properties);
-    s.min_subgroup = properties13.minSubgroupSize;
-    s.max_subgroup = properties13.maxSubgroupSize;
-    s.max_shared_bytes = properties.properties.limits.maxComputeSharedMemorySize;
-    s.subgroup_control = features13.subgroupSizeControl == VK_TRUE &&
-                         (properties13.requiredSubgroupSizeStages & vk::ShaderStageFlagBits::eCompute);
-    s.profile.native_float_min_max = properties.properties.vendorID == AmdVendor;
-    s.profile.native_float16 = features12.shaderFloat16 == VK_TRUE;
+    physical.getProperties2(&properties);
+    const auto& limits = properties.properties.limits;
+    min_subgroup = properties13.minSubgroupSize;
+    max_subgroup = properties13.maxSubgroupSize;
+    max_shared_bytes = limits.maxComputeSharedMemorySize;
+    max_workgroup_threads = std::min(limits.maxComputeWorkGroupInvocations, limits.maxComputeWorkGroupSize[0]);
+    max_workgroup_subgroups = properties13.maxComputeWorkgroupSubgroups;
+    subgroup_control = features13.subgroupSizeControl == VK_TRUE &&
+                       (properties13.requiredSubgroupSizeStages & vk::ShaderStageFlagBits::eCompute);
+    profile.native_float_min_max = properties.properties.vendorID == AmdVendor;
+    profile.native_float16 = features12.shaderFloat16 == VK_TRUE;
+}
+
+Device::Device(std::string_view selector, Choice choice) : state(std::make_unique<State>()) {
+    auto& s = *state;
+    s.instance = CreateInstance();
+    try {
+        s.Open(selector, choice);
+    } catch (...) {
+        if (s.device) s.device.destroy();
+        s.instance.destroy();
+        throw;
+    }
 }
 
 Device::~Device() {
@@ -344,7 +386,7 @@ const Recompiler::Spirv::Profile& Device::Profile() const {
 
 std::uint32_t Device::HostSubgroup(std::uint32_t wave_size) const {
     const auto& s = *state;
-    if (s.subgroup_control && wave_size >= s.min_subgroup && wave_size <= s.max_subgroup) return wave_size;
+    if (s.Enforces(wave_size)) return wave_size;
     return std::min<std::uint32_t>(wave_size, 32u);
 }
 
@@ -355,17 +397,26 @@ std::vector<std::uint32_t> Device::Run(const Kernel& kernel, const Program& prog
     Require(threads % kernel.wave_size == 0u, "threads must be a multiple of the wave size " + std::to_string(kernel.wave_size));
     Require(input.size() >= std::size_t {threads} * InputDwords, "the input holds fewer than threads * 16 bytes");
     Require(input.size() == std::size_t {threads} * InputDwords, "the input has extra words after the rows; extras need BDA and are not supported yet");
-    Require(kernel.lds_bytes <= s.max_shared_bytes, "the kernel's LDS (" + std::to_string(kernel.lds_bytes) +
-                                                        " bytes) exceeds the device's maxComputeSharedMemorySize");
+    Require(std::uint64_t {LdsDwords(kernel)} * 4u <= s.max_shared_bytes, "the kernel's LDS (" + std::to_string(kernel.lds_bytes) +
+                                                                                " bytes) exceeds the device's maxComputeSharedMemorySize");
+    const auto host_subgroup = HostSubgroup(kernel.wave_size);
+    const bool enforced = s.Enforces(host_subgroup);
+    if (threads > s.max_workgroup_threads || (enforced && threads > s.max_workgroup_subgroups * host_subgroup)) {
+        throw Refusal(std::to_string(threads) + " threads exceed the device's workgroup of " +
+                      std::to_string(enforced ? std::min(s.max_workgroup_threads, s.max_workgroup_subgroups * host_subgroup)
+                                              : s.max_workgroup_threads) +
+                      " invocations; run fewer rows per dispatch");
+    }
 
     std::vector<std::uint32_t> in(input.begin(), input.end());
     std::vector<std::uint32_t> out(std::size_t {threads} * OutputDwords, UnwrittenOutput);
     const auto user_data = UserData(in, out);
-    const auto host_subgroup = HostSubgroup(kernel.wave_size);
     const auto module = Compile(kernel, program, threads, host_subgroup, s.profile, user_data);
-    if (!module.lane_local && s.max_subgroup < host_subgroup) {
-        throw NotLaneLocal("the program is not lane-local and the device's subgroups hold " + std::to_string(s.max_subgroup) +
-                           " lanes, fewer than " + std::to_string(host_subgroup));
+    const bool fixed = s.min_subgroup == host_subgroup && s.max_subgroup == host_subgroup;
+    if (!module.lane_local && !enforced && !fixed) {
+        throw NotLaneLocal("the program is not lane-local and the device cannot run it on " + std::to_string(host_subgroup) +
+                           "-lane subgroups: its subgroups hold " + std::to_string(s.min_subgroup) + " to " +
+                           std::to_string(s.max_subgroup) + " lanes" + (s.subgroup_control ? "" : " and their size cannot be chosen"));
     }
 
     const auto& layout = module.info.bindings;
@@ -376,6 +427,7 @@ std::vector<std::uint32_t> Device::Run(const Kernel& kernel, const Program& prog
                 "descriptor binding kind " + std::to_string(static_cast<std::uint32_t>(kind)) + " is not served by the runner");
     }
 
+    Cleanup cleanup;
     const auto buffer_count = layout.descriptor_counts[static_cast<std::size_t>(BindingKind::Buffers)];
     std::vector<HostBuffer> buffers(buffer_count);
     std::vector<void*> targets(buffer_count, nullptr);
@@ -395,7 +447,7 @@ std::vector<std::uint32_t> Device::Run(const Kernel& kernel, const Program& prog
         std::copy_n(module.snapshot.buffers[i].dwords.begin(), std::size(descriptor.fields), descriptor.fields);
         auto* host = reinterpret_cast<void*>(static_cast<std::uintptr_t>(descriptor.Base48()));
         const auto bytes = descriptor.GetSize();
-        buffers[index] = s.CreateHostBuffer(bytes);
+        buffers[index] = s.CreateHostBuffer(bytes, cleanup);
         targets[index] = host;
         written[index] = resource.written;
         sizes[index] = bytes;
@@ -426,6 +478,7 @@ std::vector<std::uint32_t> Device::Run(const Kernel& kernel, const Program& prog
     set_layout_info.bindingCount = static_cast<std::uint32_t>(set_bindings.size());
     set_layout_info.pBindings = set_bindings.data();
     const auto set_layout = Checked(s.device.createDescriptorSetLayout(set_layout_info), "set layout creation");
+    cleanup.Add([&s, set_layout] { s.device.destroyDescriptorSetLayout(set_layout); });
     const vk::PushConstantRange push_range {vk::ShaderStageFlagBits::eCompute, 0u, Recompiler::IR::NativePushConstantSize};
     vk::PipelineLayoutCreateInfo pipeline_layout_info;
     pipeline_layout_info.setLayoutCount = 1;
@@ -433,22 +486,25 @@ std::vector<std::uint32_t> Device::Run(const Kernel& kernel, const Program& prog
     pipeline_layout_info.pushConstantRangeCount = 1;
     pipeline_layout_info.pPushConstantRanges = &push_range;
     const auto pipeline_layout = Checked(s.device.createPipelineLayout(pipeline_layout_info), "pipeline layout creation");
+    cleanup.Add([&s, pipeline_layout] { s.device.destroyPipelineLayout(pipeline_layout); });
     vk::ShaderModuleCreateInfo module_info;
     module_info.codeSize = module.spirv.size() * sizeof(std::uint32_t);
     module_info.pCode = module.spirv.data();
     const auto shader = Checked(s.device.createShaderModule(module_info), "module creation");
+    cleanup.Add([&s, shader] { s.device.destroyShaderModule(shader); });
     vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup;
     vk::ComputePipelineCreateInfo pipeline_info;
     pipeline_info.stage.stage = vk::ShaderStageFlagBits::eCompute;
     pipeline_info.stage.module = shader;
     pipeline_info.stage.pName = "main";
-    if (s.subgroup_control && host_subgroup >= s.min_subgroup && host_subgroup <= s.max_subgroup) {
+    if (enforced) {
         subgroup.requiredSubgroupSize = host_subgroup;
         pipeline_info.stage.pNext = &subgroup;
     }
     pipeline_info.layout = pipeline_layout;
     vk::Pipeline pipeline;
     Checked(s.device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &pipeline), "pipeline creation");
+    cleanup.Add([&s, pipeline] { s.device.destroyPipeline(pipeline); });
 
     const vk::DescriptorPoolSize pool_size {vk::DescriptorType::eStorageBuffer, std::max(buffer_count, 1u)};
     vk::DescriptorPoolCreateInfo pool_info;
@@ -456,6 +512,7 @@ std::vector<std::uint32_t> Device::Run(const Kernel& kernel, const Program& prog
     pool_info.poolSizeCount = 1;
     pool_info.pPoolSizes = &pool_size;
     const auto pool = Checked(s.device.createDescriptorPool(pool_info), "descriptor pool creation");
+    cleanup.Add([&s, pool] { s.device.destroyDescriptorPool(pool); });
     vk::DescriptorSetAllocateInfo set_info;
     set_info.descriptorPool = pool;
     set_info.descriptorSetCount = 1;
@@ -477,6 +534,7 @@ std::vector<std::uint32_t> Device::Run(const Kernel& kernel, const Program& prog
     vk::CommandPoolCreateInfo command_pool_info;
     command_pool_info.queueFamilyIndex = s.family;
     const auto command_pool = Checked(s.device.createCommandPool(command_pool_info), "command pool creation");
+    cleanup.Add([&s, command_pool] { s.device.destroyCommandPool(command_pool); });
     vk::CommandBufferAllocateInfo command_info;
     command_info.commandPool = command_pool;
     command_info.level = vk::CommandBufferLevel::ePrimary;
@@ -504,14 +562,7 @@ std::vector<std::uint32_t> Device::Run(const Kernel& kernel, const Program& prog
 
     for (std::uint32_t index = 0; index < buffer_count; index++) {
         if (written[index]) std::memcpy(targets[index], buffers[index].mapped, sizes[index]);
-        s.DestroyHostBuffer(buffers[index]);
     }
-    s.device.destroyCommandPool(command_pool);
-    s.device.destroyDescriptorPool(pool);
-    s.device.destroyPipeline(pipeline);
-    s.device.destroyShaderModule(shader);
-    s.device.destroyPipelineLayout(pipeline_layout);
-    s.device.destroyDescriptorSetLayout(set_layout);
     return out;
 }
 

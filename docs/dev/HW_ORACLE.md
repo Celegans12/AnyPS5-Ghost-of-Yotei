@@ -183,10 +183,12 @@ The report's `runtime` field says which side produced it.
 
 - Compute only.
 - Whole waves: Python pads the rows with zeros to the wave size, so cross-lane instructions see the padded lanes.
-- At most 1024 lanes per dispatch (512 with `--wave64`).
+- At most 1024 lanes per dispatch (512 with `--wave64`), and no more than the device's compute workgroup holds.
 - No `coarse`, and no extra input words: extras need buffer device addresses.
-- A body that is not lane-local needs subgroups as wide as its wave, and the recompiler marks only wave64 programs
-  lane-local, so on lavapipe (8 lanes) only lane-local `--wave64` bodies run. Elsewhere the runner refuses with exit status 2.
+- A body that is not lane-local needs subgroups of the width the recompiler compiled it for (32 lanes, or 64 for a wave64
+  program where the device can be asked for 64), either requested through subgroup size control or the only width the
+  device has. The recompiler marks only wave64 programs lane-local, so on lavapipe (8 lanes) only lane-local `--wave64`
+  bodies run. The runner refuses with exit status 2 where a body or dispatch does not fit the device.
 - The kernel descriptor's `FLOAT_MODE` goes to the recompiler as the compute float mode, but the recompiler models only part
   of it: FP32 compare inputs are flushed when the FP32 input-denormal bit is clear, and f64 code needs `0xc0`. Round modes,
   FP32 denormal outputs, IEEE, DX10 clamp and FP16 overflow are not modelled, so rows that depend on them are expected to differ.

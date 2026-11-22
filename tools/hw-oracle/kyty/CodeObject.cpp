@@ -136,6 +136,7 @@ Kernel ParseCodeObject(std::span<const std::byte> bytes) {
         std::uint64_t size;
         std::uint32_t link;
     };
+    (void)reader.Range(sectionOffset, std::uint64_t {sectionCount} * SectionHeaderBytes, "section header table");
     std::vector<RawSection> raw;
     for (std::uint16_t index = 0; index < sectionCount; ++index) {
         const auto base = sectionOffset + static_cast<std::uint64_t>(index) * SectionHeaderBytes;
@@ -159,6 +160,7 @@ Kernel ParseCodeObject(std::span<const std::byte> bytes) {
             "code object .symtab does not link to .strtab");
     Require(symbolSection.size % SymbolBytes == 0, "code object .symtab size is not a multiple of 24");
     const auto strings = reader.Range(sections[symbolSection.link].offset, sections[symbolSection.link].size, ".strtab");
+    (void)reader.Range(symbolSection.offset, symbolSection.size, ".symtab");
     std::vector<Symbol> symbols;
     for (std::uint64_t at = 0; at < symbolSection.size; at += SymbolBytes) {
         const auto base = symbolSection.offset + at;
@@ -178,9 +180,11 @@ Kernel ParseCodeObject(std::span<const std::byte> bytes) {
     Require(descriptor.size == DescriptorBytes, "symbol probe.kd size is not 64");
     const auto& textSection = SectionOf(sections, probe, ".text");
     const auto& rodataSection = SectionOf(sections, descriptor, ".rodata");
-    const auto textBytes = reader.Range(textSection.offset + (probe.value - textSection.address), probe.size, "probe");
+    const auto textBytes = reader.Range(textSection.offset, textSection.size, ".text")
+                               .subspan(static_cast<std::size_t>(probe.value - textSection.address), static_cast<std::size_t>(probe.size));
     const auto descriptorBytes =
-        reader.Range(rodataSection.offset + (descriptor.value - rodataSection.address), descriptor.size, "probe.kd");
+        reader.Range(rodataSection.offset, rodataSection.size, ".rodata")
+            .subspan(static_cast<std::size_t>(descriptor.value - rodataSection.address), static_cast<std::size_t>(descriptor.size));
 
     const auto field = [&](std::size_t offset, std::size_t size) {
         std::uint64_t value = 0;
@@ -190,14 +194,14 @@ Kernel ParseCodeObject(std::span<const std::byte> bytes) {
     const auto group = static_cast<std::uint32_t>(field(0, 4));
     const auto privateBytes = static_cast<std::uint32_t>(field(4, 4));
     const auto kernargBytes = static_cast<std::uint32_t>(field(8, 4));
-    const auto entry = static_cast<std::int64_t>(field(16, 8));
+    const auto entry = field(16, 8);
     const auto rsrc1 = static_cast<std::uint32_t>(field(48, 4));
     const auto rsrc2 = static_cast<std::uint32_t>(field(52, 4));
     const auto properties = static_cast<std::uint32_t>(field(56, 2));
     Require(group <= MaxGroupBytes, "kernel descriptor group_segment_fixed_size exceeds 65536");
     Require(privateBytes == 0, "kernel descriptor private_segment_fixed_size is not 0");
     Require(kernargBytes == 16, "kernel descriptor kernarg_size is not 16");
-    Require(entry == static_cast<std::int64_t>(probe.value) - static_cast<std::int64_t>(descriptor.value),
+    Require(entry == probe.value - descriptor.value,
             "kernel descriptor kernel_code_entry_byte_offset does not point at probe");
     Require((rsrc2 & 1u) == 0, "kernel descriptor compute_pgm_rsrc2 ENABLE_PRIVATE_SEGMENT is set");
     Require(((rsrc2 >> 1) & 0x1fu) == 2, "kernel descriptor compute_pgm_rsrc2 USER_SGPR_COUNT is not 2");

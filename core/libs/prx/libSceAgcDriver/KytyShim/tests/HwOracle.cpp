@@ -60,6 +60,12 @@ constexpr std::array<uint32_t, 2> FmaBody {0xd54b000au, 0x041a0b04u};
 constexpr std::array<uint32_t, 1> MoveFromS4Body {0x7e140204u};
 constexpr std::array<uint32_t, 1> MoveFromS12Body {0x7e14020cu};
 constexpr std::array<uint32_t, 2> LoadThroughS4Body {0xe0301000u, 0x80010a01u};
+constexpr std::array<uint32_t, 1> WriteS4Body {0xbe840380u};
+constexpr std::array<uint32_t, 2> ReadLaneToS4Body {0xd7600004u, 0x00010104u};
+constexpr std::array<uint32_t, 2> CarryToS4Body {0xd70f040au, 0x00020b04u};
+constexpr std::array<uint32_t, 1> WriteS10PairBody {0xbe8a0480u};
+constexpr std::array<uint32_t, 1> WriteS12PairBody {0xbe8c0480u};
+constexpr std::array<uint32_t, 2> CarryToS12Body {0xd70f0c0au, 0x00020b04u};
 
 struct Row {
 	const char*             name;
@@ -318,12 +324,33 @@ KytyOracle::Module CompileBody(std::span<const uint32_t> body, uint32_t float_mo
 }
 
 void GuardTests() {
-	Refuses("body reading s4", [] { (void)CompileBody(MoveFromS4Body, Ps5FloatMode, false, true); }, "the body names s4");
-	Refuses("body loading through s[4:7]", [] { (void)CompileBody(LoadThroughS4Body, Ps5FloatMode, false, true); }, "the body names s4");
-	try {
-		(void)CompileBody(MoveFromS12Body, Ps5FloatMode, false, true);
-	} catch (const std::exception& error) {
-		Check(false, std::string("a body reading s12 was refused: ") + error.what());
+	struct GuardCase {
+		const char*               what;
+		std::span<const uint32_t> body;
+		const char*               refusal;
+	};
+	const std::array<GuardCase, 9> cases {{
+	    {"body reading s4", MoveFromS4Body, "the body names s4"},
+	    {"body loading through s[4:7]", LoadThroughS4Body, "the body names s4"},
+	    {"body writing s4", WriteS4Body, "the body names s4"},
+	    {"body reading a lane into s4", ReadLaneToS4Body, "the body names s4"},
+	    {"body writing a carry to s4", CarryToS4Body, "the body names s4"},
+	    {"body writing s[10:11]", WriteS10PairBody, "the body names s10"},
+	    {"body reading s12", MoveFromS12Body, nullptr},
+	    {"body writing s[12:13]", WriteS12PairBody, nullptr},
+	    {"body writing a carry to s12", CarryToS12Body, nullptr},
+	}};
+	for (const auto& test: cases) {
+		const auto compile = [&test] { (void)CompileBody(test.body, Ps5FloatMode, false, true); };
+		if (test.refusal != nullptr) {
+			Refuses(test.what, compile, test.refusal);
+			continue;
+		}
+		try {
+			compile();
+		} catch (const std::exception& error) {
+			Check(false, std::string(test.what) + " was refused: " + error.what());
+		}
 	}
 }
 
