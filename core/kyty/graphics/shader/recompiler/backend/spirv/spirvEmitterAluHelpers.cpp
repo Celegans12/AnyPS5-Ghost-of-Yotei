@@ -1,4 +1,4 @@
-#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
+#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
@@ -278,6 +278,9 @@ uint32_t EmitTrigCycleF32(EmitterState& state, uint32_t src, bool preserve_signe
 }
 
 uint32_t EmitConvertF32F16Lane(EmitterState& state, uint32_t bits, IR::Value lane) {
+	if (!state.profile.native_float16) {
+		return EmitConvertF32F16(state, EmitExtractF16Lane(state, bits, lane));
+	}
 	const auto unpacked = state.builder.AllocateId();
 	const auto ret      = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpExtInst, TypeF32Vector(state, 2), unpacked, GlslStd450(state),

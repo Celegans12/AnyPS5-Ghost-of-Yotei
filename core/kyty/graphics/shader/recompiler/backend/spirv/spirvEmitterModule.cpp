@@ -73,10 +73,12 @@ uint32_t TypeF32(EmitterState& state) {
 }
 
 uint32_t TypeF16(EmitterState& state) {
+	if (!state.profile.native_float16) return TypeU32(state);
 	return state.builder.Type(spv::OpTypeFloat, 16);
 }
 
 uint32_t TypeF16x2(EmitterState& state) {
+	if (!state.profile.native_float16) return TypeU32Vector(state, 2);
 	return state.builder.Type(spv::OpTypeVector, TypeF16(state), 2);
 }
 
@@ -1097,7 +1099,7 @@ void DefineModule(EmitterState& state) {
 	                             spv::MemoryModelGLSL450);
 	state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,
 	                               32u);
-	if (state.program.info.float16) {
+	if (state.program.info.float16 && state.profile.native_float16) {
 		state.builder.RequireCapability(spv::CapabilityFloat16);
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,
 		                               16u);

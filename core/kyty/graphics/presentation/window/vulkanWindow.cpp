@@ -65,7 +65,6 @@ vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noe
 	return {.samplerMirrorClampToEdge                     = VK_TRUE,
 	        .storageBuffer8BitAccess                      = VK_TRUE,
 	        .shaderBufferInt64Atomics                     = VK_TRUE,
-	        .shaderFloat16                                = VK_TRUE,
 	        .shaderSampledImageArrayNonUniformIndexing    = VK_TRUE,
 	        .shaderStorageBufferArrayNonUniformIndexing   = VK_TRUE,
 	        .shaderStorageImageArrayNonUniformIndexing    = VK_TRUE,
@@ -279,7 +278,6 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		              "descriptorBindingUpdateUnusedWhilePending");
 		check_feature(features12.descriptorBindingPartiallyBound,
 		              "descriptorBindingPartiallyBound");
-		check_feature(features12.shaderFloat16, "shaderFloat16");
 		check_feature(features12.uniformBufferStandardLayout, "uniformBufferStandardLayout");
 		check_feature(features13.robustImageAccess, "robustImageAccess");
 		check_feature(robustness2.nullDescriptor, "nullDescriptor");
@@ -568,6 +566,9 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	graphics.sampler_filter_minmax_enabled      = supported12.samplerFilterMinmax;
 
 	auto features12                     = WindowContext::RequiredVulkan12Features();
+	features12.shaderFloat16           = supported12.shaderFloat16;
+	graphics.shader_float16_enabled    = supported12.shaderFloat16 != VK_FALSE;
+	LOGF("Vulkan half precision: %s\n", graphics.shader_float16_enabled ? "native" : "software");
 	features12.shaderSharedInt64Atomics = supported12.shaderSharedInt64Atomics;
 	features12.samplerFilterMinmax      = supported12.samplerFilterMinmax;
 	if (!features12.shaderSharedInt64Atomics || !workgroup_layout.workgroupMemoryExplicitLayout) {
