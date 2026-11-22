@@ -677,6 +677,31 @@ void stubsShortOperandsAtRspBeforeABranchWithTheInstructionsBeforeThem() {
     }
 }
 
+void joinsAShortOperandAtRspBeforeABranchToTheStubBeforeIt() {
+    const std::vector<std::uint8_t> body{
+        0x48, 0x89, 0x7c, 0x24, 0xe0,
+        0x0f, 0xb6, 0x4c, 0x24, 0x70,
+        0x20, 0x4c, 0x24, 0x78,
+        0x75, 0x02,
+        0x31, 0xc0,
+        0x48, 0x8b, 0x44, 0x24, 0xe0,
+    };
+    const auto input = image({framelessLeaf(InflatePrologue, body, inflateExit())});
+    Codegen::RedZoneFrameReport report;
+    std::vector<Codegen::RedZoneDisplacement> displacements;
+    const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
+    require(report.Framed == 1 && report.Relocated == 0 && report.OperandStubs == 1 && report.StubbedOperands == 2 && report.MovedOperands == 2 && sites.size() == 3 && report.Skipped.empty() && report.Unframed.empty(), "a 4-byte operand at rsp before a branch, after a 5-byte operand at rsp that needs its own stub, was not framed in one stub with it");
+    require(sites[2].Address == input.functions[0].Begin + InflatePrologue.size() + 5 && sites[2].Length == 9, "the joined stub does not cover both operands at rsp");
+    require(sites[2].Body == stubBody({0x0f, 0xb6, 0x8c, 0x24, 0x90, 0x00, 0x00, 0x00, 0x20, 0x8c, 0x24, 0x98, 0x00, 0x00, 0x00}), "the joined stub does not run both operands in order, moved by the shift");
+    std::vector<std::uint8_t> loop = body;
+    loop[15] = 0xfa;
+    const auto looped = image({framelessLeaf(InflatePrologue, loop, inflateExit())});
+    Codegen::RedZoneFrameReport loopedReport;
+    std::vector<Codegen::RedZoneDisplacement> loopedDisplacements;
+    Codegen::FrameRedZoneFunctions(looped.bytes, looped.segments, looped.functions, {}, loopedReport, loopedDisplacements);
+    require(loopedReport.OperandStubs == 0 && loopedReport.Relocated == 1, "a stub was joined over a branch target between its operands at rsp");
+}
+
 void skipsShortOperandsAtRspWhoseWidenedStubCoversABranchTarget() {
     std::vector<std::uint8_t> body{
         0x48, 0x89, 0x7c, 0x24, 0xe0,
@@ -1205,6 +1230,7 @@ int main() {
         stubsOperandsAtRspOverARipRelativeInstruction();
         stubsOperandsAtRspBetweenRipRelativeInstructions();
         stubsShortOperandsAtRspBeforeABranchWithTheInstructionsBeforeThem();
+        joinsAShortOperandAtRspBeforeABranchToTheStubBeforeIt();
         skipsShortOperandsAtRspWhoseWidenedStubCoversABranchTarget();
         skipsLeavesWithOperandsThatCannotMove();
         widensShortProloguesAndExits();
