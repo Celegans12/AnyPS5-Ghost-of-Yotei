@@ -222,6 +222,7 @@ GuestMirror::GuestMirror(GraphicContext& graphics, std::span<const uint64_t> siz
 	}
 	m_shared_queue = graphics.sparse_queue == graphics.queue;
 	m_bound.assign(((m_size >> m_block_bits) + 63) / 64, 0);
+	m_resident = std::vector<std::atomic<uint64_t>>(m_bound.size());
 	vk::PhysicalDeviceVulkan13Properties properties13 {};
 	vk::PhysicalDeviceProperties2        properties {.pNext = &properties13};
 	graphics.physical_device.getProperties2(&properties);
@@ -323,6 +324,19 @@ void GuestMirror::NoteRange(uint64_t vaddr, uint64_t size) {
 			m_pending.back().count++;
 		} else {
 			m_pending.push_back({block, 1});
+		}
+	}
+}
+
+void GuestMirror::MakeResident(uint64_t vaddr, uint64_t size) {
+	NoteRange(vaddr, size);
+	if (m_size == 0 || size == 0 || UINT64_MAX - vaddr < size) return;
+	const uint64_t last = std::min((vaddr + size - 1) >> m_block_bits, (m_size >> m_block_bits) - 1);
+	for (auto block = vaddr >> m_block_bits; block <= last; block++) {
+		if ((m_resident[block / 64].load(std::memory_order_acquire) & (uint64_t {1} << (block % 64))) == 0) {
+			Flush();
+			WaitIdle();
+			return;
 		}
 	}
 }
@@ -469,6 +483,11 @@ void GuestMirror::Bind(const std::vector<Run>& runs) {
 		}
 	}
 	Execute(m_binds, "bind");
+	for (const auto& run: runs) {
+		for (auto block = run.first; block < run.first + run.count; block++) {
+			m_resident[block / 64].fetch_or(uint64_t {1} << (block % 64), std::memory_order_release);
+		}
+	}
 	m_blocks.fetch_add(blocks, std::memory_order_relaxed);
 	m_bound_blocks.fetch_add(blocks, std::memory_order_relaxed);
 }
@@ -478,6 +497,9 @@ void GuestMirror::Unbind(const std::vector<Run>& runs) {
 	uint64_t blocks = 0;
 	for (const auto& run: runs) {
 		m_binds.push_back({.resourceOffset = run.first << m_block_bits, .size = run.count << m_block_bits});
+		for (auto block = run.first; block < run.first + run.count; block++) {
+			m_resident[block / 64].fetch_and(~(uint64_t {1} << (block % 64)), std::memory_order_release);
+		}
 	}
 	Execute(m_binds, "unbind");
 	for (const auto& run: runs) {

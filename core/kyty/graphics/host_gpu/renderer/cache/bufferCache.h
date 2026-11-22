@@ -144,6 +144,7 @@ public:
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
 	                                                        BufferId id              = {});
+	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainMirroredBuffer(uint64_t vaddr, uint64_t size, BufferId id);
 	[[nodiscard]] std::pair<Buffer*, uint64_t>
 	ObtainBufferWithProvenWrites(uint64_t vaddr, uint64_t size, std::span<const GuestRange> writes,
 	                           BufferId id);
@@ -294,7 +295,8 @@ private:
 	friend class TextureCache;
 
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainSynchronizedBuffer(
-	    uint64_t vaddr, uint64_t size, bool is_written, bool is_texel_buffer, BufferId id = {});
+	    uint64_t vaddr, uint64_t size, bool is_written, bool is_texel_buffer, BufferId id = {},
+	    bool streamed = true);
 
 	bool IsBufferInvalid(BufferId id) const { return !id || m_slot_buffers[id].is_deleted; }
 	WriteFaultOwner InvalidateGuestWriteFault(uint64_t vaddr);

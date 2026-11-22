@@ -153,6 +153,10 @@ inline constexpr uint32_t RuntimeBufferStride = BufferStrideMask;
 [[nodiscard]] constexpr bool HasRuntimeStride(uint32_t packed_stride) {
 	return (packed_stride & BufferStrideMask) == RuntimeBufferStride;
 }
+inline constexpr uint32_t MirrorBufferBit = 1u << 25u;
+[[nodiscard]] constexpr bool IsMirrorBuffer(uint32_t packed_stride) {
+	return (packed_stride & MirrorBufferBit) != 0u;
+}
 
 struct BufferWriteSpan {
 	uint32_t offset         = 0;
@@ -186,6 +190,7 @@ struct BufferResource {
 	bool                   indirect_write_table  = false;
 	uint32_t               indirect_table_offset = 0;
 	std::vector<BufferWriteSpan> proven_writes;
+	uint32_t               mirror_index          = UINT32_MAX;
 
 	bool operator==(const BufferResource& other) const = default;
 };
@@ -608,6 +613,10 @@ struct Bindings {
 	uint32_t stride_count = 0;
 	bool     flattened_srt_uniform = false;
 	uint32_t flattened_srt_uniform_index = UINT32_MAX;
+	uint32_t mirror_count = 0;
+
+	static constexpr uint32_t MirrorDwords       = 4;
+	static constexpr uint32_t MirrorHeaderDwords = 4;
 
 	[[nodiscard]] uint32_t MemorySizeDword() const {
 		return memory_offset_dword +
@@ -619,7 +628,11 @@ struct Bindings {
 	}
 	[[nodiscard]] uint32_t StrideDword() const { return MipStatsDword() + mip_stats_count; }
 	[[nodiscard]] uint32_t TableBlockDword() const { return StrideDword() + stride_count; }
-	[[nodiscard]] uint32_t ShaderDataDwords() const { return TableBlockDword() + table_block_dwords; }
+	[[nodiscard]] uint32_t MirrorHeaderDword() const { return TableBlockDword() + table_block_dwords; }
+	[[nodiscard]] uint32_t MirrorDword() const {
+		return MirrorHeaderDword() + (mirror_count != 0 ? MirrorHeaderDwords : 0u);
+	}
+	[[nodiscard]] uint32_t ShaderDataDwords() const { return MirrorDword() + MirrorDwords * mirror_count; }
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;
 	}

@@ -69,6 +69,7 @@ public:
 	[[nodiscard]] uint64_t           OutsideBlocks() const noexcept { return m_outside_blocks; }
 
 	void NoteRange(uint64_t vaddr, uint64_t size);
+	void MakeResident(uint64_t vaddr, uint64_t size);
 	void Submit();
 	void Flush();
 	void Trim(std::span<const std::pair<uint64_t, uint64_t>> live);
@@ -120,7 +121,8 @@ private:
 	std::string     m_description;
 	bool            m_shared_queue = false;
 
-	std::vector<uint64_t> m_bound;
+	std::vector<uint64_t>              m_bound;
+	std::vector<std::atomic<uint64_t>> m_resident;
 	std::vector<Run>      m_pending;
 	uint64_t              m_pending_blocks = 0;
 	uint64_t              m_last_post      = 0;

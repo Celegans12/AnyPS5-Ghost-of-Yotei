@@ -54,7 +54,8 @@ std::string Refused(const char* ab, const char* start = "", const char* settle =
 }
 
 void Refusals() {
-	const std::string listed = "settings KYTY_AB can change: KYTY_GENERIC_COMPUTE_VARIANT";
+	const std::string listed =
+	    "settings KYTY_AB can change: KYTY_GENERIC_COMPUTE_VARIANT, KYTY_E2_VSHARP_MIRROR";
 	Check(Contains(Refused("KYTY_GENERIC_COMPUTE_VARIANT"), "expected <seconds>:<setting>"),
 	      "a value without a phase length is refused");
 	Check(Contains(Refused("0.5:KYTY_GENERIC_COMPUTE_VARIANT"), "at least 1 s"), "a phase under 1 s is refused");
@@ -176,6 +177,30 @@ void EnvironmentArms() {
 	Switches::Reload();
 }
 
+void MirrorArms() {
+	SetVariable("KYTY_E2_VSHARP_MIRROR", nullptr);
+	Switches::Reload();
+	Check(!Switches::On(Switch::E2VsharpMirror) && !IR::MirrorsVsharpBuffers(),
+	      "KYTY_E2_VSHARP_MIRROR is off without the variable");
+	Check(Switches::Find("KYTY_E2_VSHARP_MIRROR") == Switch::E2VsharpMirror, "KYTY_E2_VSHARP_MIRROR is a runtime switch");
+	Ab::Config config;
+	Check(Ab::Parse("1:KYTY_E2_VSHARP_MIRROR", "", "0", config).empty(), "an A/B of the mirror parses");
+	Ab::Run run(config);
+	const auto first = run.AtPresent(1, 0.0, 0.0);
+	Check(AnyContains(first, "A: KYTY_E2_VSHARP_MIRROR=0; B: KYTY_E2_VSHARP_MIRROR=1"),
+	      "without the variable arm A reads buffers bound and arm B by mirror address");
+	Check(!IR::MirrorsVsharpBuffers(), "phase A keeps the mirror off");
+	static_cast<void>(run.AtPresent(2, 1.0, 1.0));
+	Check(IR::MirrorsVsharpBuffers(), "phase B turns the mirror on");
+	static_cast<void>(run.AtPresent(3, 2.0, 2.0));
+	Check(!IR::MirrorsVsharpBuffers(), "phase A turns it off again");
+	SetVariable("KYTY_E2_VSHARP_MIRROR", "1");
+	Switches::Reload();
+	Check(IR::MirrorsVsharpBuffers(), "KYTY_E2_VSHARP_MIRROR=1 turns the mirror on");
+	SetVariable("KYTY_E2_VSHARP_MIRROR", nullptr);
+	Switches::Reload();
+}
+
 int Flips() {
 	Ab::Start();
 	Check(Ab::Configured() && Ab::Listed(Switch::GenericComputeVariant), "KYTY_AB lists KYTY_GENERIC_COMPUTE_VARIANT");
@@ -209,6 +234,7 @@ int main() {
 	Refusals();
 	Phases();
 	EnvironmentArms();
+	MirrorArms();
 	if (g_failures != 0) {
 		std::fprintf(stderr, "%d failure(s)\n", g_failures);
 		return 1;

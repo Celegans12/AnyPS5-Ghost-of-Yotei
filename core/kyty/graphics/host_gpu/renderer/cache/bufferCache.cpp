@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/execHelpers.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -396,6 +397,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 			                     m_guest_mirror->Size());
 		}
 	}
+	ShaderRecompiler::IR::SetMirrorSize(m_guest_mirror ? m_guest_mirror->Size() : 0);
 	m_scheduler.SetSubmitHook(
 	    [](void* self, CommandBuffer& command) {
 		    auto* cache = static_cast<BufferCache*>(self);
@@ -419,6 +421,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 
 BufferCache::~BufferCache() {
 	m_scheduler.SetSubmitHook(nullptr, nullptr);
+	ShaderRecompiler::IR::SetMirrorSize(0);
 	m_guest_mirror.reset();
 	if (m_scatter_pipeline) {
 		m_graphics.device.destroyPipeline(m_scatter_pipeline);
@@ -1821,8 +1824,13 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	return ObtainSynchronizedBuffer(vaddr, size, is_written, is_texel_buffer, id);
 }
 
+std::pair<Buffer*, uint64_t> BufferCache::ObtainMirroredBuffer(uint64_t vaddr, uint64_t size, BufferId id) {
+	EXIT_IF(!(GuestRange {vaddr, size}.Valid()));
+	return ObtainSynchronizedBuffer(vaddr, size, false, false, id, false);
+}
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainSynchronizedBuffer(
-    uint64_t vaddr, uint64_t size, bool is_written, bool is_texel_buffer, BufferId id) {
+    uint64_t vaddr, uint64_t size, bool is_written, bool is_texel_buffer, BufferId id, bool streamed) {
 	if (m_in_place && !is_texel_buffer) {
 		const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
 		if (owner != nullptr && *owner && m_slot_buffers[*owner].InPlace() &&
@@ -1837,7 +1845,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainSynchronizedBuffer(
 		}
 	}
 
-	const bool  small_read = !is_written && size <= CACHING_PAGESIZE;
+	const bool  small_read = streamed && !is_written && size <= CACHING_PAGESIZE;
 	StreamMemo* stream     = nullptr;
 	uint64_t    window     = 0;
 	if (small_read && !m_memory_tracker.IsRegionGpuModified(vaddr, size)) {

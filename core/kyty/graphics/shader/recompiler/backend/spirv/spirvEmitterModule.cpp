@@ -328,8 +328,11 @@ void DefineDescriptors(EmitterState& state) {
 	auto& counts = bindings.descriptor_counts;
 	auto& buffer_count = counts[static_cast<size_t>(Kind::Buffers)];
 	const bool table = state.program.table_mode;
+	bindings.mirror_count = 0;
 	for (auto& buffer: info.buffers) {
-		buffer.descriptor_index = buffer.live && !table ? buffer_count++ : UINT32_MAX;
+		const bool mirror       = !table && IR::IsMirrorBuffer(buffer.packed_stride);
+		buffer.descriptor_index = buffer.live && !table && !mirror ? buffer_count++ : UINT32_MAX;
+		buffer.mirror_index     = buffer.live && mirror ? bindings.mirror_count++ : UINT32_MAX;
 	}
 	auto& uniform_count = counts[static_cast<size_t>(Kind::UniformBuffers)];
 	const auto scalar_reads = BuffersReadOnlyByScalarLoads(state.program);
@@ -1014,7 +1017,10 @@ void DefineModule(EmitterState& state) {
 	const bool physical_addresses =
 	    state.program.info.uses_dma || state.program.info.uses_image_heap ||
 	    state.program.info.uses_device_address || state.program.info.ray_query_mirror ||
-	    state.program.table_mode;
+	    state.program.table_mode ||
+	    std::ranges::any_of(state.program.info.buffers, [](const IR::BufferResource& buffer) {
+		    return buffer.live && IR::IsMirrorBuffer(buffer.packed_stride);
+	    });
 	if (physical_addresses) {
 		state.builder.RequireCapability(spv::CapabilityInt64);
 		state.builder.RequireCapability(spv::CapabilityPhysicalStorageBufferAddresses);

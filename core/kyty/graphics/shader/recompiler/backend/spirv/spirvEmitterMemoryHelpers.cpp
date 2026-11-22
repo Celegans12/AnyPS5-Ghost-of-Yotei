@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
@@ -177,6 +178,58 @@ Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::
 	return state.program.info.buffers[mem.resource].descriptor_format;
 }
 
+bool MirroredBuffer(const EmitterState& state, uint32_t resource) {
+	return resource < state.program.info.buffers.size() &&
+	       state.program.info.buffers[resource].mirror_index != UINT32_MAX;
+}
+
+static uint32_t MirrorSlot(const EmitterState& state, uint32_t resource) {
+	const auto slot = state.program.info.buffers.at(resource).mirror_index;
+	if (slot >= state.mirror_bases.size()) {
+		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, resource,
+		                             "mirrored buffer has no mirror slot");
+	}
+	return slot;
+}
+
+uint32_t EmitMirrorByteOffset(EmitterState& state, uint32_t resource) {
+	return Binary(state, spv::OpBitwiseAnd, TypeU32(state), state.mirror_words[MirrorSlot(state, resource)],
+	              ConstantU32(state, 0xffu));
+}
+
+uint32_t EmitMirrorStride(EmitterState& state, uint32_t resource) {
+	return Binary(state, spv::OpBitwiseAnd, TypeU32(state),
+	              Binary(state, spv::OpShiftRightLogical, TypeU32(state), state.mirror_words[MirrorSlot(state, resource)],
+	                     ConstantU32(state, 8u)),
+	              ConstantU32(state, IR::BufferStrideMask));
+}
+
+static uint32_t EmitMirrorDeviceAddress(EmitterState& state, uint32_t address) {
+	return Binary(state, spv::OpIAdd, TypeU64(state), state.mirror_base, address);
+}
+
+static void EmitMirrorBindings(EmitterState& state) {
+	const auto count = state.program.bindings.mirror_count;
+	state.mirror_bases.assign(count, 0u);
+	state.mirror_ranges.assign(count, 0u);
+	state.mirror_words.assign(count, 0u);
+	if (count == 0) return;
+	const auto u64    = TypeU64(state);
+	const auto header = state.program.bindings.MirrorHeaderDword();
+	state.mirror_base = PackU64(state, EmitShaderDataDwordLoad(state, header), EmitShaderDataDwordLoad(state, header + 1u));
+	const auto size   = PackU64(state, EmitShaderDataDwordLoad(state, header + 2u), EmitShaderDataDwordLoad(state, header + 3u));
+	for (uint32_t slot = 0; slot < count; ++slot) {
+		const auto dword = state.program.bindings.MirrorDword() + IR::Bindings::MirrorDwords * slot;
+		const auto view  = PackU64(state, EmitShaderDataDwordLoad(state, dword), EmitShaderDataDwordLoad(state, dword + 1u));
+		const auto range = EmitShaderDataDwordLoad(state, dword + 2u);
+		const auto end   = Binary(state, spv::OpIAdd, u64, view, Unary(state, spv::OpUConvert, u64, range));
+		const auto inside = Binary(state, spv::OpULessThanEqual, TypeBool(state), end, size);
+		state.mirror_bases[slot]  = EmitMirrorDeviceAddress(state, view);
+		state.mirror_ranges[slot] = Select(state, TypeU32(state), inside, range, ConstantU32(state, 0u));
+		state.mirror_words[slot]  = EmitShaderDataDwordLoad(state, dword + 3u);
+	}
+}
+
 uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resource) {
 	const auto& buffers = state.program.info.buffers;
 	const auto& root = buffers[resource];
@@ -203,6 +256,7 @@ uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resour
 
 void EmitMemoryBindings(EmitterState& state) {
 	if (state.program.table_mode) return;
+	EmitMirrorBindings(state);
 	const auto count = state.program.bindings.descriptor_counts[static_cast<size_t>(IR::DescriptorBindingKind::Buffers)];
 	state.memory_byte_offsets.resize(count);
 	state.memory_byte_sizes.resize(count);
@@ -311,6 +365,35 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 		access.byte_offset = ConstantU32(state, 0);
 		return access;
 	}
+	if (MirroredBuffer(state, mem.resource)) {
+		if (array_index != 0u) {
+			ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
+			                             "mirrored buffer cannot be indexed");
+		}
+		const auto slot = MirrorSlot(state, mem.resource);
+		const auto     alias = static_cast<uint32_t>(&buffer - state.storage_buffers.data());
+		const uint32_t bits  = alias == 0u ? 8u : alias == 1u ? 16u : alias == 3u ? 64u : 32u;
+		(void)TypePhysicalStorageBufferPointer(state, bits);
+		MemoryResourceAccess access {
+		    .kind          = mem.kind,
+		    .memory_access = mem.coherent ? spv::MemoryAccessVolatileMask : spv::MemoryAccessMaskNone,
+		    .physical      = true};
+		auto range = state.mirror_ranges[slot];
+		if (mem.kind == IR::ResourceKind::Buffer) {
+			const auto none = Binary(state, spv::OpINotEqual, TypeBool(state),
+			                         Binary(state, spv::OpShiftRightLogical, TypeU32(state), state.mirror_words[slot],
+			                                ConstantU32(state, 31u)),
+			                         ConstantU32(state, 0u));
+			range = Select(state, TypeU32(state), none, ConstantU32(state, 0u), range);
+		}
+		access.device_base    = state.mirror_bases[slot];
+		access.range_bytes    = range;
+		access.object_pointer = access.device_base;
+		access.element_bits   = bits;
+		access.length = Binary(state, spv::OpShiftRightLogical, TypeU32(state), range, ConstantU32(state, alias));
+		access.byte_offset    = EmitMirrorByteOffset(state, mem.resource);
+		return access;
+	}
 	if (buffer.variable == 0) {
 		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
 		                             "storage buffer descriptor array was not emitted");
@@ -414,8 +497,40 @@ uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAcce
 	return in_bounds;
 }
 
+static bool MirrorBytewise(const EmitterState& state, const MemoryResourceAccess& access) {
+	return access.device_base != 0u && state.profile.robust_buffer_access && access.element_bits > 8u;
+}
+
+uint32_t EmitMirrorPartialLoad(EmitterState& state, const MemoryResourceAccess& access, uint32_t index,
+                               uint32_t value) {
+	if (!MirrorBytewise(state, access)) return value;
+	const auto u32   = TypeU32(state);
+	const auto bytes = access.element_bits / 8u;
+	const auto start = Binary(state, spv::OpShiftLeftLogical, u32, index, ConstantU32(state, std::countr_zero(bytes)));
+	const auto left  = Binary(state, spv::OpISub, u32, access.range_bytes, start);
+	const auto whole = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), left, ConstantU32(state, bytes));
+	const auto shift = Binary(state, spv::OpShiftLeftLogical, u32, EmitUMin32(state, left, ConstantU32(state, bytes - 1u)),
+	                          ConstantU32(state, 3u));
+	const auto mask  = Binary(state, spv::OpISub, u32, Binary(state, spv::OpShiftLeftLogical, u32, ConstantU32(state, 1u), shift),
+	                          ConstantU32(state, 1u));
+	return Select(state, TypeU32(state), whole, value, Binary(state, spv::OpBitwiseAnd, TypeU32(state), value, mask));
+}
+
 uint32_t EmitStorageElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
                                     uint32_t index) {
+	if (MirrorBytewise(state, access)) {
+		const auto shift  = static_cast<uint32_t>(std::countr_zero(access.element_bits / 8u));
+		const auto mask   = (access.element_bits / 8u) - 1u;
+		const auto whole  = Binary(state, spv::OpShiftRightLogical, TypeU32(state), access.range_bytes,
+		                           ConstantU32(state, shift));
+		const auto tail   = Binary(state, spv::OpINotEqual, TypeBool(state),
+		                           Binary(state, spv::OpBitwiseAnd, TypeU32(state), access.range_bytes,
+		                                  ConstantU32(state, mask)),
+		                           ConstantU32(state, 0u));
+		const auto length = Binary(state, spv::OpIAdd, TypeU32(state), whole,
+		                           Select(state, TypeU32(state), tail, ConstantU32(state, 1u), ConstantU32(state, 0u)));
+		return Binary(state, spv::OpULessThan, TypeBool(state), index, length);
+	}
 	if (state.profile.robust_buffer_access && !access.physical &&
 	    (access.kind == IR::ResourceKind::Buffer || access.kind == IR::ResourceKind::ScalarBuffer)) {
 		return ConstantBool(state, true);
@@ -456,6 +571,13 @@ uint32_t EmitStorageBufferElementPointer(EmitterState& state,
 		                     : access.element_bits == 64u ? state.storage_buffers[3].element_type
 		                                                  : TypeU32(state);
 		pointer_type = TypePointer(state, spv::StorageClassPhysicalStorageBuffer, element);
+		if (access.device_base != 0u) {
+			const auto bytes = Binary(state, spv::OpShiftLeftLogical, TypeU64(state),
+			                          Unary(state, spv::OpUConvert, TypeU64(state), index),
+			                          ConstantU64(state, std::countr_zero(access.element_bits / 8u)));
+			return Unary(state, spv::OpConvertUToPtr, pointer_type,
+			             Binary(state, spv::OpIAdd, TypeU64(state), access.device_base, bytes));
+		}
 	}
 	const auto pointer = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, pointer_type, pointer, access.object_pointer,

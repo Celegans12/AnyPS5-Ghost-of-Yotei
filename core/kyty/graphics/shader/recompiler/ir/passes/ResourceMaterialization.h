@@ -97,6 +97,11 @@ bool EmptyBuffersServe(const ResourcePlan& program, const ResourceSnapshot& snap
 bool SameModuleCode(const ResourcePlan& program, const ResourceSpecialization& requested,
                     const ResourceSpecialization& candidate);
 bool GenericComputeVariants();
+void SetMirrorSize(uint64_t size);
+bool MirrorsVsharpBuffers();
+uint32_t MirrorElementBytes(const ResourcePlan& program, uint32_t index);
+void MirrorBuffers(const ResourcePlan& program, const ResourceSnapshot& snapshot,
+                   ResourceSpecialization& specialization);
 bool AlignResources(const ResourcePlan& program, const ResourceSnapshot& snapshot,
                     const ResourceSpecialization& specialization, const ResourceSpecialization& target,
                     ResourceSnapshot* aligned);

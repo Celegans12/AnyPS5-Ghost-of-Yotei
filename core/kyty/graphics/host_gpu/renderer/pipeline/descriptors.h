@@ -72,6 +72,7 @@ struct PreparedBindings {
 
 	const ShaderStageRuntime* runtime = nullptr;
 	std::vector<BufferSource>             buffer_sources;
+	std::vector<BufferSource>             mirror_sources;
 	std::vector<vk::DescriptorBufferInfo> buffers;
 	std::vector<vk::DescriptorBufferInfo> uniform_buffers;
 	std::vector<TextureBinding>           images;

@@ -149,6 +149,10 @@ struct EmitterState {
 	uint32_t                                         lane_half               = 0;
 	std::array<BufferDefinition, 4>                  storage_buffers {};
 	std::vector<uint32_t>                           memory_byte_offsets;
+	uint32_t                                         mirror_base             = 0;
+	std::vector<uint32_t>                           mirror_bases;
+	std::vector<uint32_t>                           mirror_ranges;
+	std::vector<uint32_t>                           mirror_words;
 	std::vector<uint32_t>                           memory_byte_sizes;
 	std::vector<uint32_t>                           memory_strides;
 	uint32_t                                         bda_pagetable_variable  = 0;
@@ -507,6 +511,9 @@ uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index);
 uint32_t EmitPushDataLoad(EmitterState& state, uint32_t index);
 
 uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryInfo& mem);
+bool     MirroredBuffer(const EmitterState& state, uint32_t resource);
+uint32_t EmitMirrorByteOffset(EmitterState& state, uint32_t resource);
+uint32_t EmitMirrorStride(EmitterState& state, uint32_t resource);
 
 Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem);
 
@@ -527,6 +534,8 @@ struct MemoryResourceAccess {
 	bool                  non_uniform      = false;
 	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;
 	bool                  physical         = false;
+	uint32_t              device_base      = 0;
+	uint32_t              range_bytes      = 0;
 };
 
 uint32_t EmitAccessLoad(EmitterState& state, uint32_t type, uint32_t pointer, const MemoryResourceAccess& access);
@@ -552,6 +561,8 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState&         st
 
 uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
                                    uint32_t index);
+uint32_t EmitMirrorPartialLoad(EmitterState& state, const MemoryResourceAccess& access, uint32_t index,
+                               uint32_t value);
 uint32_t EmitStorageElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
                                     uint32_t index);
 
