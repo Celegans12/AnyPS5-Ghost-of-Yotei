@@ -737,7 +737,9 @@ set_tests_properties(kyty_shim_wave_split_codegen PROPERTIES TIMEOUT 60
         PASS_REGULAR_EXPRESSION "kyty_shim_wave_split_codegen: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
 
 if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
-    add_test_executable(kyty_shim_pm4_write_data_tests ${CMAKE_CURRENT_SOURCE_DIR}/Pm4WriteData.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+    if(WIN32)
+    add_test_executable(kyty_shim_pm4_write_data_tests ${CMAKE_CURRENT_SOURCE_DIR}/Pm4WriteData.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/Pm4WriteDataMain.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
     target_include_directories(kyty_shim_pm4_write_data_tests PRIVATE ${LIBS_INCLUDE_DIR})
     configure_host_test_executable(kyty_shim_pm4_write_data_tests)
     if(MINGW)
@@ -746,6 +748,11 @@ if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
     target_link_libraries(kyty_shim_pm4_write_data_tests PRIVATE
             "$<TARGET_GENEX_EVAL:kyty_shim_pm4_write_data_tests,$<TARGET_PROPERTY:Kyty::gpu,INTERFACE_LINK_LIBRARIES>>"
             Kyty::gpu libSceAgcDriver libkernel libc)
+    else()
+        target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/Pm4WriteData.cpp)
+        add_test_executable(kyty_shim_pm4_write_data_tests ${CMAKE_CURRENT_SOURCE_DIR}/Pm4WriteDataMain.cpp)
+        target_link_libraries(kyty_shim_pm4_write_data_tests PRIVATE libSceAgcDriver libkernel libc)
+    endif()
     add_test(NAME kyty_shim_pm4_write_data COMMAND kyty_shim_pm4_write_data_tests)
     set_tests_properties(kyty_shim_pm4_write_data PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77
             ENVIRONMENT "KYTY_GPU_PIPELINE=0;KYTY_FALLBACKS=0"

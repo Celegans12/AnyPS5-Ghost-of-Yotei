@@ -107,7 +107,7 @@ void CheckGds(CommandProcessor& cp, RenderContext& renderer, GraphicContext& gra
 
 }
 
-int main() {
+extern "C" int RunKytyPm4WriteDataTest() {
 	Common::InitializeThreads();
 	Config::Initialize();
 	Config::Load(Config::ConfigOptions {});
