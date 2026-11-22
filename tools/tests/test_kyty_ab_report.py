@@ -177,6 +177,72 @@ class KytyAbReportTests(unittest.TestCase):
             self.assertEqual(kyty_ab_report.main([str(empty)]), 2)
         self.assertIn("has no [kyty-ab] phase: was KYTY_AB set?", errors.getvalue())
 
+    def test_markdown_summary_and_counters(self):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = kyty_ab_report.main([str(self.folder), "--markdown"])
+        self.assertEqual(code, 0)
+        text = output.getvalue()
+        self.assertIn("| A | 2 | 51.00 (sd 1.41) | 51.00 (sd 1.41) | 3000 (sd 0) | 30.0 | 0 |", text)
+        self.assertIn("| B | 2 | 55.50 (sd 0.71) | 55.50 (sd 0.71) | 3030 (sd 0) | 30.0 | 0 |", text)
+        self.assertIn("| B - A | - | +4.50 (+8.8 %) |", text)
+        self.assertIn("| Drift-cancelled B - A | 1 | +5.00 (standard error -) |", text)
+        self.assertLess(text.index("| B - A |"), text.index("| Drift-cancelled B - A |"))
+        self.assertIn(SETTING["A"], text)
+        self.assertIn(SETTING["B"], text)
+        self.assertIn("Phases kept: 4; set aside: 3.", text)
+        self.assertIn("draws per image B/A = 1.010 (same scene)", text)
+        self.assertIn("| kyty-write-blocks | 2 | 2 | summary of the last 10 s: 400\\|300 guest write faults", text)
+        rows = [line for line in text.splitlines() if line.startswith("|")]
+        for row in rows:
+            self.assertNotIn("400|300", row)
+
+    def test_markdown_keeps_json_unchanged(self):
+        targets = [Path(self.temporary.name) / name for name in ("text.json", "markdown.json")]
+        for options, target in zip(([], ["--markdown"]), targets):
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(kyty_ab_report.main([str(self.folder), *options, "--json", str(target)]), 0)
+        self.assertEqual(targets[0].read_bytes(), targets[1].read_bytes())
+
+    def test_markdown_drift_standard_error(self):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = kyty_ab_report.main([str(self.folder), "--markdown", "--from", "all", "--wait-max", "100"])
+        self.assertEqual(code, 0)
+        self.assertIn("| Drift-cancelled B - A | 2 | +7.50 (standard error 2.50) |", output.getvalue())
+
+    def test_markdown_plain_log_and_missing_arm(self):
+        log = Path(self.temporary.name) / "plain.log"
+        log.write_text("\n".join(session_lines()) + "\n", encoding="utf-8")
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(kyty_ab_report.main([str(log), "--markdown"]), 0)
+        self.assertIn("| A | 3 | 47.33 (sd 6.43) | - (sd -) | - (sd -) | 30.0 | 0 |", output.getvalue())
+        self.assertIn("Phases kept: 6; set aside: 1.", output.getvalue())
+        log.write_text("\n".join(session_lines()[:6]) + "\n", encoding="utf-8")
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(kyty_ab_report.main([str(log), "--markdown"]), 2)
+        self.assertIn("| B | 0 | - (sd -) |", output.getvalue())
+        self.assertIn("| Drift-cancelled B - A | 0 | - |", output.getvalue())
+
+    def test_markdown_escapes_table_cells(self):
+        result = self.analyse()
+        result["per_arm"]["A"]["settings"] = "a|b\n<setting>"
+        output = io.StringIO()
+        kyty_ab_report.render_markdown(result, output)
+        self.assertIn("| A | a\\|b<br>&lt;setting&gt; |", output.getvalue())
+
+    def test_help_describes_session_contents(self):
+        output = io.StringIO()
+        with redirect_stdout(output), self.assertRaises(SystemExit) as exited:
+            kyty_ab_report.main(["--help"])
+        self.assertEqual(exited.exception.code, 0)
+        text = " ".join(output.getvalue().split())
+        self.assertNotIn("planb/runs", text)
+        for name in ("stderr.log", "vkcount.log", "threads.jsonl", "phases.jsonl", "plain log file", "--markdown"):
+            self.assertIn(name, text)
+
 
 if __name__ == "__main__":
     unittest.main()

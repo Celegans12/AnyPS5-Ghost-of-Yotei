@@ -1,4 +1,5 @@
 import argparse
+import html
 import json
 import math
 import re
@@ -10,9 +11,10 @@ DESCRIPTION = """Per-arm summary of an in-run A/B of the Kyty backend (KYTY_AB).
 begins at present <n> (t <s> s, wall <w>)" when a phase starts, "[kyty-ab] phase A|B <k> settled at present <n> (...)"
 KYTY_AB_SETTLE seconds later, and "[kyty-ab] phase A|B <k> settled for <s> s: <n> presents, <f> img/s, ..." when the
 phase ends, for the part after its settle. Only phases with that last line count, so the phase the session stopped in is
-left out. A session folder of planb/runs/ also gives vkcount.log (img/s and draws per image of each window, placed in
-time by start.json), threads.jsonl (the wait field: time the threads spent runnable but not running) and phases.jsonl
-(the session's steps). A phase is kept when its settled part starts after the step --from, and is set aside as disturbed
+left out. Input is a plain log file or a session folder containing stderr.log. The folder may also contain vkcount.log
+(img/s and draws per image of each window, placed in time by start.json), threads.jsonl (the wait field: time the threads
+spent runnable but not running) and phases.jsonl (the session's steps). A phase is kept when its settled part starts
+after the step --from, and is set aside as disturbed
 when one threads.jsonl window inside it has a CPU-weighted wait above --wait-max percent. --skip seconds after each
 settled line are also left out of the vkcount and threads windows. A periodic "[kyty-*] summary of the last <s> s" line
 counts for phase k only when the previous line of the same kind came after phase k's settled line and the line came
@@ -281,18 +283,73 @@ def render(result, out):
             out.write(f"  [{counter['kind']}] ({lines['A']}|{lines['B']} lines) {fill(counter['template'], counter['A'], counter['B'])}\n")
 
 
+def markdown_text(value):
+    return html.escape(str(value), quote=False).replace("\\", "\\\\").replace("|", "\\|").replace("\n", "<br>")
+
+
+def render_markdown(result, out):
+    out.write(f"kyty_ab_report: {markdown_text(result['log'])}\n\n")
+    out.write("| Arm / difference | Phases | img/s | vk img/s | Draws/img | Longest ms | >=50 ms |\n")
+    out.write("| --- | ---: | ---: | ---: | ---: | ---: | ---: |\n")
+    a, b = (result["per_arm"][arm] for arm in "AB")
+    for arm in "AB":
+        data = result["per_arm"][arm]
+        out.write(f"| {arm} | {data['phases']} | {optional(data['fps'])} (sd {optional(data['fps_sd'])}) | "
+                  f"{optional(data['vk_fps'])} (sd {optional(data['vk_fps_sd'])}) | "
+                  f"{optional(data['draws_per_image'], 0)} (sd {optional(data['draws_sd'], 0)}) | "
+                  f"{optional(data['longest_ms'], 1)} | {data['long_frames']} |\n")
+    difference = "-"
+    if a["fps"] is not None and b["fps"] is not None:
+        difference = f"{b['fps'] - a['fps']:+.2f} ({(b['fps'] / a['fps'] - 1) * 100:+.1f} %)"
+    out.write(f"| B - A | - | {difference} | - | - | - | - |\n")
+    drift = result["drift_cancelled"]
+    difference = f"{drift['mean']:+.2f} (standard error {optional(drift['standard_error'])})" if drift else "-"
+    out.write(f"| Drift-cancelled B - A | {drift['count'] if drift else 0} | {difference} | - | - | - | - |\n\n")
+    out.write("| Arm | Settings |\n| --- | --- |\n")
+    for arm in "AB":
+        out.write(f"| {arm} | {markdown_text(result['per_arm'][arm]['settings'] or '-')} |\n")
+    kept = sum(phase["kept"] for phase in result["phases"])
+    out.write(f"\nPhases kept: {kept}; set aside: {len(result['phases']) - kept}.\n\n")
+    arms = result["arms"]
+    if arms:
+        out.write(f"Phases of {arms['phase_seconds']:g} s from {markdown_text(arms['from'])}, settle {arms['settle_seconds']:g} s.\n\n")
+    origin = "every phase" if result["from_wall"] is None else f"phases settled after the {result['from_step']} step"
+    sources = [name for name, present in (("vkcount.log", result["vkcount"]), ("threads.jsonl", result["threads"])) if present]
+    out.write(f"Kept: {markdown_text(origin)}; extra skip {result['skip']:g} s; disturbed above {result['wait_max']:g} % wait; "
+              f"windows from {', '.join(sources) if sources else 'the log only'}.\n\n")
+    out.write("| Phase | Arm | Settled s | img/s | vk img/s | Draws/img | Wait % | Longest ms | >=50 ms | Kept |\n")
+    out.write("| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n")
+    for phase in result["phases"]:
+        out.write(f"| {phase['phase']} | {phase['arm']} | {optional(phase.get('settled_seconds'), 1)} | "
+                  f"{optional(phase.get('fps'))} | {optional(phase.get('vk_fps'))} | {optional(phase.get('draws_per_image'), 0)} | "
+                  f"{optional(phase.get('wait_max'), 1)} | {optional(phase.get('longest_ms'), 1)} | "
+                  f"{phase.get('long_frames', '-')} | {markdown_text('yes' if phase['kept'] else 'no: ' + phase['why'])} |\n")
+    if a["draws_per_image"] and b["draws_per_image"]:
+        ratio = b["draws_per_image"] / a["draws_per_image"]
+        verdict = "same scene" if abs(ratio - 1) <= 0.10 else "scenes differ by more than 10 %: the arms do not compare"
+        out.write(f"\nScene: draws per image B/A = {ratio:.3f} ({verdict}).\n")
+    if result["counters"]:
+        out.write("\nCounters: mean of each [kyty-*] summary wholly inside the kept settled parts, A|B where they differ.\n\n")
+        out.write("| Counter | A lines | B lines | Mean (A\\|B) |\n| --- | ---: | ---: | --- |\n")
+        for counter in result["counters"]:
+            lines = counter["lines"]
+            text = fill(counter["template"], counter["A"], counter["B"])
+            out.write(f"| {markdown_text(counter['kind'])} | {lines['A']} | {lines['B']} | {markdown_text(text)} |\n")
+
+
 def main(argv=None):
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="backslashreplace")
     parser = argparse.ArgumentParser(description=DESCRIPTION)
-    parser.add_argument("session", help="session folder (planb/runs/<name>, its stderr.log is read) or a log file")
+    parser.add_argument("session", help="session folder containing stderr.log or a plain log file")
     parser.add_argument("--log", help="log file inside the session folder (default stderr.log)")
     parser.add_argument("--from", dest="start_step", default="measure",
                         help="session step after which a settled part must start: measure (falls back to game), game, or all")
     parser.add_argument("--skip", type=float, default=0.0, help="extra seconds after each settled line left out of the windows")
     parser.add_argument("--wait-max", type=float, default=10.0, help="CPU-weighted wait percent above which a window is disturbed")
     parser.add_argument("--json", help="also write the result to this JSON file")
+    parser.add_argument("--markdown", action="store_true", help="print the report as Markdown tables")
     args = parser.parse_args(argv)
     path = Path(args.session)
     folder, log = (path, path / (args.log or "stderr.log")) if path.is_dir() else (path.parent, path)
@@ -307,7 +364,7 @@ def main(argv=None):
     if not result["phases"]:
         print(f"error: {log} has no [kyty-ab] phase: was KYTY_AB set?", file=sys.stderr)
         return 2
-    render(result, sys.stdout)
+    (render_markdown if args.markdown else render)(result, sys.stdout)
     if args.json:
         Path(args.json).write_text(json.dumps(result, indent=1) + "\n", encoding="utf-8")
     return 0 if result["per_arm"]["A"]["phases"] and result["per_arm"]["B"]["phases"] else 2
