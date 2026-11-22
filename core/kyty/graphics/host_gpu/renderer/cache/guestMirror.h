@@ -51,7 +51,6 @@ public:
 		uint64_t call_ns        = 0;
 		uint64_t done_ns        = 0;
 		uint64_t longest_ns     = 0;
-		uint64_t releases       = 0;
 	};
 
 	GuestMirror(GraphicContext& graphics, std::span<const uint64_t> sizes = DefaultSizes);
@@ -59,7 +58,6 @@ public:
 	KYTY_CLASS_NO_COPY(GuestMirror);
 
 	[[nodiscard]] bool               Available() const noexcept { return m_size != 0; }
-	[[nodiscard]] bool               Active() const noexcept { return m_active; }
 	[[nodiscard]] uint64_t           Size() const noexcept { return m_size; }
 	[[nodiscard]] uint64_t           BlockSize() const noexcept { return uint64_t {1} << m_block_bits; }
 	[[nodiscard]] uint64_t           DeviceAddress() const noexcept { return m_device_address; }
@@ -70,8 +68,6 @@ public:
 
 	void NoteRange(uint64_t vaddr, uint64_t size);
 	void Submit();
-	void Activate();
-	void Deactivate();
 	void Trim(std::span<const std::pair<uint64_t, uint64_t>> live);
 	void WaitIdle();
 	[[nodiscard]] Stats TakeStats();
@@ -82,7 +78,7 @@ private:
 		uint64_t first = 0;
 		uint64_t count = 0;
 	};
-	enum class Kind : uint8_t { Bind, Unbind, Release };
+	enum class Kind : uint8_t { Bind, Unbind };
 	struct Command {
 		Kind             kind = Kind::Bind;
 		std::vector<Run> runs;
@@ -107,7 +103,6 @@ private:
 	void               BinderThread(std::stop_token stop);
 	void               Bind(const std::vector<Run>& runs);
 	void               Unbind(const std::vector<Run>& runs);
-	void               Release();
 	void               Execute(std::vector<vk::SparseMemoryBind>& binds, const char* what);
 	[[nodiscard]] Grant Allocate(uint64_t wanted);
 	void               Free(Slot slot);
@@ -122,7 +117,6 @@ private:
 	std::string     m_description;
 	bool            m_shared_queue = false;
 
-	bool                  m_active = true;
 	std::vector<uint64_t> m_bound;
 	std::vector<Run>      m_pending;
 	uint64_t              m_outside_blocks = 0;
@@ -149,7 +143,6 @@ private:
 	std::atomic<uint64_t> m_call_ns {0};
 	std::atomic<uint64_t> m_done_ns {0};
 	std::atomic<uint64_t> m_longest_ns {0};
-	std::atomic<uint64_t> m_releases {0};
 	Stats                 m_taken;
 
 	std::jthread m_binder;

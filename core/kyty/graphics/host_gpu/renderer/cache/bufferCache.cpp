@@ -7,7 +7,6 @@
 #include "common/hackNotice.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
-#include "common/runtimeSwitches.h"
 #include "common/spscQueue.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/scout.h"
@@ -395,9 +394,6 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 		} else {
 			SetVulkanObjectNameF(m_graphics.device, m_guest_mirror->Handle(), "Kyty.GuestMirror[size=0x{:x}]",
 			                     m_guest_mirror->Size());
-		}
-		if (m_guest_mirror && !Common::RuntimeSwitches::On(Common::RuntimeSwitches::Switch::MirrorShadow)) {
-			m_guest_mirror->Deactivate();
 		}
 	}
 	m_scheduler.SetSubmitHook(
@@ -3267,20 +3263,7 @@ uint64_t BufferCache::DropFreedRange(uint64_t vaddr, uint64_t size, FreeBlocksQu
 }
 
 void BufferCache::SubmitGuestMirror() {
-	if (!m_guest_mirror) return;
-	const bool on = Common::RuntimeSwitches::On(Common::RuntimeSwitches::Switch::MirrorShadow);
-	if (on != m_guest_mirror->Active()) {
-		if (on) {
-			m_guest_mirror->Activate();
-			for (const auto& [vaddr, id]: m_buffers) {
-				const auto& buffer = m_slot_buffers[id];
-				if (!buffer.InPlace()) m_guest_mirror->NoteRange(buffer.CpuAddress(), buffer.Size());
-			}
-		} else {
-			m_guest_mirror->Deactivate();
-		}
-	}
-	m_guest_mirror->Submit();
+	if (m_guest_mirror) m_guest_mirror->Submit();
 }
 
 void BufferCache::TickGuestMirror() {
@@ -3288,6 +3271,11 @@ void BufferCache::TickGuestMirror() {
 	static constexpr uint64_t PressureMargin = 256 * MiB;
 	auto&                     mirror         = *m_guest_mirror;
 	m_guest_mirror_frames++;
+	const auto now     = static_cast<uint64_t>(SteadyNs());
+	const bool summary = m_guest_mirror_line != 0 && now - m_guest_mirror_line >= 10'000'000'000;
+	const bool check   = m_gc_tick - m_guest_mirror_trim >= TrimPeriod;
+	if (m_guest_mirror_line == 0) m_guest_mirror_line = now;
+	if (!summary && !check) return;
 	uint64_t used = 0, budget = 0;
 	if (m_graphics.CanReportMemoryUsage()) {
 		std::array<GraphicContext::HeapUsage, VK_MAX_MEMORY_HEAPS> heaps {};
@@ -3298,43 +3286,38 @@ void BufferCache::TickGuestMirror() {
 			budget += heaps[heap].budget;
 		}
 	}
-	if (mirror.Active() && budget != 0 && used + PressureMargin >= budget &&
-	    m_gc_tick - m_guest_mirror_trim >= TrimPeriod) {
+	if (check) {
 		m_guest_mirror_trim = m_gc_tick;
-		m_guest_mirror_trims++;
-		std::vector<std::pair<uint64_t, uint64_t>> live;
-		live.reserve(m_buffers.size());
-		for (const auto& [vaddr, id]: m_buffers) {
-			const auto& buffer = m_slot_buffers[id];
-			if (!buffer.InPlace()) live.emplace_back(buffer.CpuAddress(), buffer.Size());
+		if (budget != 0 && used + PressureMargin >= budget) {
+			m_guest_mirror_trims++;
+			std::vector<std::pair<uint64_t, uint64_t>> live;
+			live.reserve(m_buffers.size());
+			for (const auto& [vaddr, id]: m_buffers) {
+				const auto& buffer = m_slot_buffers[id];
+				if (!buffer.InPlace()) live.emplace_back(buffer.CpuAddress(), buffer.Size());
+			}
+			mirror.Trim(live);
 		}
-		mirror.Trim(live);
 	}
-	const auto now = SteadyNs();
-	if (m_guest_mirror_line == 0) {
-		m_guest_mirror_line = static_cast<uint64_t>(now);
-		return;
-	}
-	if (static_cast<uint64_t>(now) - m_guest_mirror_line < 10'000'000'000) return;
-	const auto seconds  = static_cast<double>(static_cast<uint64_t>(now) - m_guest_mirror_line) / 1e9;
+	if (!summary) return;
+	const auto seconds  = static_cast<double>(now - m_guest_mirror_line) / 1e9;
 	const auto frames   = std::exchange(m_guest_mirror_frames, 0);
 	const auto trims    = std::exchange(m_guest_mirror_trims, 0);
 	const auto stats    = mirror.TakeStats();
 	const auto per      = [frames](uint64_t value) { return frames != 0 ? static_cast<double>(value) / static_cast<double>(frames) : 0.0; };
 	const auto block    = mirror.BlockSize();
-	m_guest_mirror_line = static_cast<uint64_t>(now);
+	m_guest_mirror_line = now;
 	::Log::WriteToConsoleAndLog(fmt::format(
-	    "[kyty-mirror] summary of the last {:.0f} s: {} frames, shadow {}; {} blocks of {} KiB bound ({:.1f} MiB, {} chunks of "
-	    "{} MiB) in a mirror of {} GiB; {} blocks bound in {} vkQueueBindSparse calls ({:.3f} calls and {:.2f} blocks per "
-	    "frame), {:.2f} ms in the calls, {:.1f} ms until they were done (longest {:.2f} ms); {} blocks unbound ({} trims under "
-	    "memory pressure, {} releases); {} blocks noted outside the mirror; device-local memory {} MiB used of a {} MiB "
-	    "budget\n",
-	    seconds, frames, mirror.Active() ? "on" : "off", stats.bound_blocks, block >> 10u,
+	    "[kyty-mirror] summary of the last {:.0f} s: {} frames; {} blocks of {} KiB bound ({:.1f} MiB, {} chunks of {} MiB) in a "
+	    "mirror of {} GiB; {} blocks bound in {} vkQueueBindSparse calls ({:.3f} calls and {:.2f} blocks per frame), {:.2f} ms in "
+	    "the calls, {:.1f} ms until they were done (longest {:.2f} ms); {} blocks unbound in {} trims under memory pressure; {} "
+	    "blocks noted outside the mirror; device-local memory {} MiB used of a {} MiB budget\n",
+	    seconds, frames, stats.bound_blocks, block >> 10u,
 	    static_cast<double>(stats.bound_blocks * block) / static_cast<double>(MiB), stats.chunks,
 	    std::max(GuestMirror::ChunkBytes, block) / MiB, mirror.Size() / GuestMirror::GiB, stats.blocks, stats.calls,
 	    per(stats.calls), per(stats.blocks), static_cast<double>(stats.call_ns) / 1e6, static_cast<double>(stats.done_ns) / 1e6,
-	    static_cast<double>(stats.longest_ns) / 1e6, stats.unbound_blocks, trims, stats.releases, mirror.OutsideBlocks(),
-	    used / MiB, budget / MiB));
+	    static_cast<double>(stats.longest_ns) / 1e6, stats.unbound_blocks, trims, mirror.OutsideBlocks(), used / MiB,
+	    budget / MiB));
 }
 
 void BufferCache::RunGarbageCollector() {

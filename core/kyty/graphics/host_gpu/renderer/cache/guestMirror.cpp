@@ -301,7 +301,7 @@ void GuestMirror::SetBound(uint64_t first, uint64_t count, bool bound) noexcept 
 }
 
 void GuestMirror::NoteRange(uint64_t vaddr, uint64_t size) {
-	if (!m_active || m_size == 0 || size == 0 || UINT64_MAX - vaddr < size) return;
+	if (m_size == 0 || size == 0 || UINT64_MAX - vaddr < size) return;
 	const uint64_t blocks = m_size >> m_block_bits;
 	const uint64_t first  = vaddr >> m_block_bits;
 	uint64_t       last   = (vaddr + size - 1) >> m_block_bits;
@@ -343,30 +343,6 @@ void GuestMirror::Submit() {
 	if (m_pending.empty()) return;
 	Post(Kind::Bind, std::move(m_pending));
 	m_pending.clear();
-}
-
-void GuestMirror::Activate() {
-	m_active = m_size != 0;
-}
-
-void GuestMirror::Deactivate() {
-	if (!m_active) return;
-	for (const auto& run: m_pending) SetBound(run.first, run.count, false);
-	m_pending.clear();
-	std::vector<Run> runs;
-	for (uint64_t word = 0; word < m_bound.size(); word++) {
-		for (auto bits = m_bound[word]; bits != 0; bits &= bits - 1) {
-			const auto block = word * 64 + static_cast<uint64_t>(std::countr_zero(bits));
-			if (!runs.empty() && runs.back().first + runs.back().count == block) {
-				runs.back().count++;
-			} else {
-				runs.push_back({block, 1});
-			}
-		}
-	}
-	std::fill(m_bound.begin(), m_bound.end(), 0);
-	m_active = false;
-	Post(Kind::Release, std::move(runs));
 }
 
 void GuestMirror::Trim(std::span<const std::pair<uint64_t, uint64_t>> live) {
@@ -419,10 +395,6 @@ void GuestMirror::BinderThread(std::stop_token stop) {
 		switch (command.kind) {
 			case Kind::Bind: Bind(command.runs); break;
 			case Kind::Unbind: Unbind(command.runs); break;
-			case Kind::Release:
-				Unbind(command.runs);
-				Release();
-				break;
 		}
 		{
 			Common::ScopedLock lock(m_mutex);
@@ -530,21 +502,6 @@ void GuestMirror::Free(Slot slot) {
 	m_free_slots.push_back(slot);
 }
 
-void GuestMirror::Release() {
-	EXIT_IF(!m_block_slots.empty());
-	for (auto& chunk: m_chunks) {
-		if (chunk.memory) {
-			m_graphics.device.freeMemory(chunk.memory);
-			m_chunk_count.fetch_sub(1, std::memory_order_relaxed);
-		}
-	}
-	m_chunks.clear();
-	m_current_chunk = UINT32_MAX;
-	m_free_chunks.clear();
-	m_free_slots.clear();
-	m_releases.fetch_add(1, std::memory_order_relaxed);
-}
-
 void GuestMirror::Execute(std::vector<vk::SparseMemoryBind>& binds, const char* what) {
 	const auto device = m_graphics.device;
 	for (size_t begin = 0; begin < binds.size(); begin += MaxBindsPerCall) {
@@ -588,8 +545,7 @@ GuestMirror::Stats GuestMirror::Totals() const {
 	        .unbound_blocks = m_unbound_blocks.load(std::memory_order_relaxed),
 	        .call_ns        = m_call_ns.load(std::memory_order_relaxed),
 	        .done_ns        = m_done_ns.load(std::memory_order_relaxed),
-	        .longest_ns     = m_longest_ns.load(std::memory_order_relaxed),
-	        .releases       = m_releases.load(std::memory_order_relaxed)};
+	        .longest_ns     = m_longest_ns.load(std::memory_order_relaxed)};
 }
 
 GuestMirror::Stats GuestMirror::TakeStats() {
@@ -600,7 +556,6 @@ GuestMirror::Stats GuestMirror::TakeStats() {
 	delta.unbound_blocks = totals.unbound_blocks - m_taken.unbound_blocks;
 	delta.call_ns        = totals.call_ns - m_taken.call_ns;
 	delta.done_ns        = totals.done_ns - m_taken.done_ns;
-	delta.releases       = totals.releases - m_taken.releases;
 	m_taken              = totals;
 	delta.longest_ns     = m_longest_ns.exchange(0, std::memory_order_relaxed);
 	return delta;

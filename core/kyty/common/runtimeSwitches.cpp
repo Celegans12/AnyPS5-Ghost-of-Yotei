@@ -25,7 +25,6 @@ struct Entry {
 
 constexpr Entry Entries[] = {
     {"KYTY_GENERIC_COMPUTE_VARIANT", "0", "1"},
-    {"KYTY_MIRROR_SHADOW", "0", "1"},
 };
 
 static_assert(std::size(Entries) == SwitchCount);
