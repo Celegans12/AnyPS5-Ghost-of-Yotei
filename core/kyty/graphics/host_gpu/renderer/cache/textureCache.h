@@ -91,7 +91,7 @@ public:
 	[[nodiscard]] bool CopyToImage(uint64_t address, uint64_t source, uint64_t size);
 	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
 	[[nodiscard]] bool HasGpuWrittenImages(uint64_t address, uint64_t size);
-	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
+	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size, bool include_depth_aliases = false);
 	[[nodiscard]] bool MayHoldImages(uint64_t address, uint64_t size) const noexcept;
 
 	[[nodiscard]] bool IsMeta(uint64_t address);

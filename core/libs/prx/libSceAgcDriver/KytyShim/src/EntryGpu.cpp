@@ -3,6 +3,9 @@
 #include "prx/libSceAgcDriver/KytyShim/src/Replay.hpp"
 #include "prx/libSceAgcDriver/KytyShim/src/Settings.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#if !defined(ANYPS5_KYTY_DLL)
+#include "prx/libSceAgcDriver/Execution/include/FrameRecorder.hpp"
+#endif
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
@@ -357,7 +360,7 @@ void RequireOutput(std::uint32_t handle, const char* reason) {
     require(s.outputs.contains(handle), reason);
 }
 
-void Submit(std::span<const std::uint32_t> commands, std::uint32_t queue) {
+bool Submit(std::span<const std::uint32_t> commands, std::uint32_t queue) {
     auto& s = state();
     std::shared_lock gate(s.gate);
     CheckStopping();
@@ -393,8 +396,10 @@ void Submit(std::span<const std::uint32_t> commands, std::uint32_t queue) {
         begin = points[i].end;
     }
     SubmitWords(gpu, commands.subspan(begin), queue);
-    if (queue == 0 && (!points.empty() || HasFlipPacket(commands))) gpu.NoteFrameSubmitted();
+    const bool boundary = queue == 0 && (!points.empty() || HasFlipPacket(commands));
+    if (boundary) gpu.NoteFrameSubmitted();
     KytyShim::Replay::NoteSubmission(gpu, queue);
+    return boundary;
 }
 
 }
@@ -524,7 +529,14 @@ void SubmitDescriptor(const Packet& descriptor, std::uint32_t queue) {
     if (descriptor.dw_num == 0) return;
     if (descriptor.addr == nullptr) throw std::runtime_error("null command buffer");
     CheckGuestRange(descriptor.addr, std::size_t{descriptor.dw_num} * sizeof(std::uint32_t), alignof(std::uint32_t));
-    Submit(std::span<const std::uint32_t>(descriptor.addr, descriptor.dw_num), queue);
+    const auto commands = std::span<const std::uint32_t>(descriptor.addr, descriptor.dw_num);
+#if !defined(ANYPS5_KYTY_DLL)
+    if (auto* recorder = AgcDriver::FrameRecorder::Active()) {
+        recorder->Submit(descriptor, queue, [&] { return Submit(commands, queue); });
+        return;
+    }
+#endif
+    Submit(commands, queue);
 }
 
 }
@@ -532,6 +544,24 @@ void SubmitDescriptor(const Packet& descriptor, std::uint32_t queue) {
 }
 
 namespace AgcDriver {
+
+#if !defined(ANYPS5_KYTY_DLL)
+bool IsFrameCaptureDriverMemory(std::uint64_t address, std::uint64_t bytes) {
+    using namespace KytyShim::Entry;
+    if (address < DriverMemoryAddress) return false;
+    const auto offset = address - DriverMemoryAddress;
+    return offset < DriverMemoryBytes && bytes <= DriverMemoryBytes - offset;
+}
+
+std::vector<std::uint32_t> FrameCapturePendingEopTokens() {
+    auto& s = KytyShim::Entry::state();
+    std::lock_guard lock(s.eopMutex);
+    std::vector<std::uint32_t> tokens;
+    tokens.reserve(s.eopFlips.size());
+    for (const auto& flip : s.eopFlips) tokens.push_back(flip.token);
+    return tokens;
+}
+#endif
 
 void Submit(const Packet* packet, std::uint32_t queue) try {
     KernelNoteGpuSubmit_nid_no_patch();
@@ -551,12 +581,21 @@ extern "C" void AgcDriverSubmitGraphics_nid_postfix(std::uint32_t* commands, std
 }
 
 extern "C" void AgcDriverSuspendPoint_nid_postfix() try {
-    auto& s = KytyShim::Entry::state();
-    std::shared_lock gate(s.gate);
-    KytyShim::Entry::CheckStopping();
-    auto& gpu = KytyShim::Entry::Gpu();
-    gpu.SuspendPoint();
-    KytyShim::Replay::NoteSubmission(gpu, 0);
+    const auto accept = [] {
+        auto& s = KytyShim::Entry::state();
+        std::shared_lock gate(s.gate);
+        KytyShim::Entry::CheckStopping();
+        auto& gpu = KytyShim::Entry::Gpu();
+        gpu.SuspendPoint();
+        KytyShim::Replay::NoteSubmission(gpu, 0);
+    };
+#if !defined(ANYPS5_KYTY_DLL)
+    if (auto* recorder = AgcDriver::FrameRecorder::Active()) {
+        recorder->Suspend(accept);
+        return;
+    }
+#endif
+    accept();
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
 }
@@ -589,13 +628,22 @@ extern "C" void AgcDriverShutdown_nid_postfix() {
 }
 
 extern "C" void AgcDriverSubmitFlip_nid_postfix(const AgcDriver::FlipInfo& info) try {
-    auto& s = KytyShim::Entry::state();
-    std::shared_lock gate(s.gate);
-    KytyShim::Entry::CheckStopping();
-    KytyShim::Entry::RequireOutput(info.handle, "flip references an unregistered video output");
-    auto& gpu = KytyShim::Entry::Gpu();
-    KytyShim::Present::SubmitCpuFlip(gpu, info);
-    KytyShim::Replay::NoteSubmission(gpu, 0);
+    const auto accept = [&] {
+        auto& s = KytyShim::Entry::state();
+        std::shared_lock gate(s.gate);
+        KytyShim::Entry::CheckStopping();
+        KytyShim::Entry::RequireOutput(info.handle, "flip references an unregistered video output");
+        auto& gpu = KytyShim::Entry::Gpu();
+        KytyShim::Present::SubmitCpuFlip(gpu, info);
+        KytyShim::Replay::NoteSubmission(gpu, 0);
+    };
+#if !defined(ANYPS5_KYTY_DLL)
+    if (auto* recorder = AgcDriver::FrameRecorder::Active()) {
+        recorder->Flip(info, accept);
+        return;
+    }
+#endif
+    accept();
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
 }
@@ -604,12 +652,18 @@ extern "C" std::uint32_t AgcDriverReserveEopFlip_nid_postfix(const AgcDriver::Fl
     auto& s = KytyShim::Entry::state();
     KytyShim::Entry::CheckStopping();
     KytyShim::Entry::RequireOutput(info.handle, "EOP flip references an unregistered video output");
-    std::lock_guard lock(s.eopMutex);
-    if (s.eopFlips.size() >= KytyShim::Entry::PendingEopFlipLimit) return 0;
-    KytyShim::Entry::require(s.nextEopToken <= AgcDriver::EopFlipTokenLimit, "EOP flip token space exhausted");
-    const auto token = s.nextEopToken++;
-    s.eopFlips.push_back({token, info});
-    return token;
+    const auto reserve = [&]() -> std::uint32_t {
+        std::lock_guard lock(s.eopMutex);
+        if (s.eopFlips.size() >= KytyShim::Entry::PendingEopFlipLimit) return 0;
+        KytyShim::Entry::require(s.nextEopToken <= AgcDriver::EopFlipTokenLimit, "EOP flip token space exhausted");
+        const auto token = s.nextEopToken++;
+        s.eopFlips.push_back({token, info});
+        return token;
+    };
+#if !defined(ANYPS5_KYTY_DLL)
+    if (auto* recorder = AgcDriver::FrameRecorder::Active()) return recorder->ReserveEopFlip(info, reserve);
+#endif
+    return reserve();
 }
 
 extern "C" std::uint32_t AgcDriverReserveEopFlipAt_nid_postfix(const AgcDriver::FlipInfo& info, std::uint32_t token) {
@@ -617,37 +671,61 @@ extern "C" std::uint32_t AgcDriverReserveEopFlipAt_nid_postfix(const AgcDriver::
     KytyShim::Entry::CheckStopping();
     KytyShim::Entry::require(token >= AgcDriver::EopFlipTokenBase && token <= AgcDriver::EopFlipTokenLimit, "EOP flip token is out of range");
     KytyShim::Entry::RequireOutput(info.handle, "EOP flip references an unregistered video output");
-    std::lock_guard lock(s.eopMutex);
-    const auto found = std::find_if(s.eopFlips.begin(), s.eopFlips.end(), [token](const KytyShim::Entry::PendingEopFlip& flip) { return flip.token == token; });
-    if (found != s.eopFlips.end()) {
-        const auto& reserved = found->info;
-        KytyShim::Entry::require(reserved.handle == info.handle && reserved.index == info.index && reserved.mode == info.mode && reserved.argument == info.argument, "EOP flip token is reserved for a different flip");
-        throw AgcDriver::EopFlipAlreadyReserved{};
-    }
-    if (s.eopFlips.size() >= KytyShim::Entry::PendingEopFlipLimit) return 0;
-    s.eopFlips.push_back({token, info});
-    s.nextEopToken = std::max(s.nextEopToken, token + 1);
-    return token;
+    const auto reserve = [&]() -> std::uint32_t {
+        std::lock_guard lock(s.eopMutex);
+        const auto found = std::find_if(s.eopFlips.begin(), s.eopFlips.end(), [token](const KytyShim::Entry::PendingEopFlip& flip) { return flip.token == token; });
+        if (found != s.eopFlips.end()) {
+            const auto& reserved = found->info;
+            KytyShim::Entry::require(reserved.handle == info.handle && reserved.index == info.index && reserved.mode == info.mode && reserved.argument == info.argument, "EOP flip token is reserved for a different flip");
+            throw AgcDriver::EopFlipAlreadyReserved{};
+        }
+        if (s.eopFlips.size() >= KytyShim::Entry::PendingEopFlipLimit) return 0;
+        s.eopFlips.push_back({token, info});
+        s.nextEopToken = std::max(s.nextEopToken, token + 1);
+        return token;
+    };
+#if !defined(ANYPS5_KYTY_DLL)
+    if (auto* recorder = AgcDriver::FrameRecorder::Active()) return recorder->ReserveEopFlip(info, reserve);
+#endif
+    return reserve();
 }
 
 extern "C" void AgcDriverRegisterVideoOutput_nid_postfix(std::uint32_t handle, const std::shared_ptr<AgcDriver::IVideoOutput>& output) {
     KytyShim::Entry::require(output != nullptr, "null video output");
     KytyShim::Entry::CheckStopping();
     auto& s = KytyShim::Entry::state();
-    std::lock_guard lock(s.outputsMutex);
-    KytyShim::Entry::require(s.outputs.emplace(handle, output).second, "video output already registered");
+    const auto accept = [&] {
+        std::lock_guard lock(s.outputsMutex);
+        KytyShim::Entry::require(s.outputs.emplace(handle, output).second, "video output already registered");
+    };
+#if !defined(ANYPS5_KYTY_DLL)
+    if (auto* recorder = AgcDriver::FrameRecorder::Active()) {
+        recorder->RegisterVideoOutput(handle, accept);
+        return;
+    }
+#endif
+    accept();
 }
 
 extern "C" void AgcDriverUnregisterVideoOutput_nid_postfix(std::uint32_t handle, const std::shared_ptr<AgcDriver::IVideoOutput>& output) {
     auto& s = KytyShim::Entry::state();
-    {
-        std::lock_guard lock(s.outputsMutex);
-        const auto found = s.outputs.find(handle);
-        KytyShim::Entry::require(found != s.outputs.end() && found->second == output, "video output registration mismatch");
-        s.outputs.erase(found);
+    const auto accept = [&] {
+        {
+            std::lock_guard lock(s.outputsMutex);
+            const auto found = s.outputs.find(handle);
+            KytyShim::Entry::require(found != s.outputs.end() && found->second == output, "video output registration mismatch");
+            s.outputs.erase(found);
+        }
+        std::lock_guard lock(s.eopMutex);
+        std::erase_if(s.eopFlips, [handle](const KytyShim::Entry::PendingEopFlip& flip) { return flip.info.handle == handle; });
+    };
+#if !defined(ANYPS5_KYTY_DLL)
+    if (auto* recorder = AgcDriver::FrameRecorder::Active()) {
+        recorder->UnregisterVideoOutput(handle, accept);
+        return;
     }
-    std::lock_guard lock(s.eopMutex);
-    std::erase_if(s.eopFlips, [handle](const KytyShim::Entry::PendingEopFlip& flip) { return flip.info.handle == handle; });
+#endif
+    accept();
 }
 
 extern "C" void* AgcDriverStaticTable_nid_postfix() {

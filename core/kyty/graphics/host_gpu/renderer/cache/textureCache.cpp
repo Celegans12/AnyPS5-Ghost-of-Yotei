@@ -3579,14 +3579,15 @@ bool TextureCache::CopyToImage(uint64_t address, uint64_t source, uint64_t size)
 	return true;
 }
 
-bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
+bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size, bool include_depth_aliases) {
 	if (!GuestRange {address, size}.Valid()) {
 		return false;
 	}
 	Common::ScopedLock lock {m_lock};
 	bool             modified = false;
 	ForEachImageInRegion(address, size, [&](ImageId, Image& image) {
-		modified = !image.depth_id && image.IsGpuModified() && !image.IsDefinitelyCpuDirty();
+		const bool aliases_modified_depth = include_depth_aliases && image.depth_id && m_slot_images[image.depth_id].IsGpuModified();
+		modified = !image.IsDefinitelyCpuDirty() && (image.depth_id ? aliases_modified_depth : image.IsGpuModified());
 		return modified;
 	});
 	return modified;

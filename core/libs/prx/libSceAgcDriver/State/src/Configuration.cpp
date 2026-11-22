@@ -1,5 +1,8 @@
 #include "prx/libSceAgcDriver/State/include/Configuration.hpp"
 #include "prx/libSceAgcDriver/include/AgcDriver.hpp"
+#if defined(ANYPS5_KYTY_FRAME_CAPTURE)
+#include "prx/libSceAgcDriver/Execution/include/FrameRecorder.hpp"
+#endif
 
 #include <cstdint>
 #include <cstddef>
@@ -52,8 +55,18 @@ int APS5_VABI sceAgcDriverGetHsOffchipParam(uint16_t* granularity, uint16_t* buf
 
 int APS5_VABI sceAgcDriverSetTFRing(const volatile void* base, uint32_t size) {
  if (base == nullptr || size == 0) throw std::invalid_argument("sceAgcDriverSetTFRing: empty ring");
- std::lock_guard lock(tessellationFactorRingMutex);
- tessellationFactorRing = {reinterpret_cast<uintptr_t>(base), size};
+ const auto address = reinterpret_cast<uintptr_t>(base);
+ const auto publish = [address, size] {
+  std::lock_guard lock(tessellationFactorRingMutex);
+  tessellationFactorRing = {address, size};
+ };
+#if defined(ANYPS5_KYTY_FRAME_CAPTURE)
+ if (auto* recorder = AgcDriver::FrameRecorder::Active()) {
+  recorder->SetTessellationFactorRing(address, size, publish);
+  return 0;
+ }
+#endif
+ publish();
  return 0;
 }
 

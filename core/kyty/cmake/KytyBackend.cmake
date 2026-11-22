@@ -64,13 +64,14 @@ set(ANYPS5_KYTY_BINARY_DIR "${CMAKE_BINARY_DIR}/core/kyty")
 if(ANYPS5_KYTY_THIN_LTO)
     set(ANYPS5_KYTY_ARCHIVES "${ANYPS5_KYTY_BINARY_DIR}/libkyty_gpu.a")
 else()
+    set(ANYPS5_KYTY_ZSTD_ARCHIVE "${ANYPS5_KYTY_BINARY_DIR}/3rdparty/zstd/lib/libzstd.a")
     set(ANYPS5_KYTY_ARCHIVES
         "${ANYPS5_KYTY_BINARY_DIR}/libkyty_gpu.a"
         "${ANYPS5_KYTY_BINARY_DIR}/libzarchive.a"
         "${ANYPS5_KYTY_BINARY_DIR}/3rdparty/fmt/libfmt.a"
         "${ANYPS5_KYTY_BINARY_DIR}/3rdparty/xxHash/libxxhash.a"
         "${ANYPS5_KYTY_BINARY_DIR}/3rdparty/tracy/libTracyClient.a"
-        "${ANYPS5_KYTY_BINARY_DIR}/3rdparty/zstd/lib/libzstd.a"
+        "${ANYPS5_KYTY_ZSTD_ARCHIVE}"
         "${ANYPS5_KYTY_BINARY_DIR}/3rdparty/SPIRV-Tools/source/opt/libSPIRV-Tools-opt.a"
         "${ANYPS5_KYTY_BINARY_DIR}/3rdparty/SPIRV-Tools/source/libSPIRV-Tools.a"
     )
@@ -133,6 +134,7 @@ target_compile_definitions(anyps5_kyty_gpu
         TRACY_MANUAL_LIFETIME
 )
 if(WIN32)
+    set_property(TARGET anyps5_kyty_gpu PROPERTY ANYPS5_KYTY_ZSTD_ARCHIVE "${ANYPS5_KYTY_ZSTD_ARCHIVE}")
     target_link_libraries(anyps5_kyty_gpu INTERFACE ${ANYPS5_KYTY_ARCHIVES} $<TARGET_PROPERTY:ANYPS5_KYTY_HOST_RUNTIME> $<TARGET_LINKER_FILE:libkernel> $<TARGET_LINKER_FILE:libc> pthread psapi dbghelp ws2_32 synchronization secur32)
     if(MINGW AND ANYPS5_MINGW_DWARF_EXCEPTIONS)
         target_sources(anyps5_kyty_gpu INTERFACE $<TARGET_OBJECTS:windows_seh_personalities>)

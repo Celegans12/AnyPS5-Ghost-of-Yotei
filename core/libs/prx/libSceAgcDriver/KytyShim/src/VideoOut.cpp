@@ -17,6 +17,9 @@
 #include "libs/errno.h"
 
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#if !defined(ANYPS5_KYTY_DLL)
+#include "prx/libSceAgcDriver/Execution/include/FrameRecorder.hpp"
+#endif
 #include "prx/libSceAgcDriver/Execution/include/KeyboardOverlay.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Presentation.hpp"
@@ -347,6 +350,9 @@ void PrepareSource(PendingFlip& flip, Libs::Graphics::Presenter& presenter, Libs
     if (!flip.source.has_value()) return;
     const auto info = DisplayImageInfo(*flip.source);
     flip.frame = &presenter.PrepareFrame(buffer, info, flip.source->pixelFormat, false);
+#if !defined(ANYPS5_KYTY_DLL)
+    if (auto* recorder = AgcDriver::FrameRecorder::Active()) recorder->PresentBuffer(*flip.source);
+#endif
 }
 
 std::uint64_t DropFlip(std::uint32_t handle, int index) {
@@ -796,6 +802,9 @@ extern "C" void AgcDriverPresentBuffer_nid_postfix(const AgcDriver::Presentation
     if (flip.has_value() && flip->frame != nullptr) presenter.Discard(*flip->frame);
     const auto prepared = KytyShim::Present::PrepareGuestFrames(renderer, presenter, KytyShim::Present::DescribeGuestImage(&buffer), overlayImage);
     KytyShim::Present::PresentGuestLayers(host, presenter, *prepared->main, prepared->overlay);
+#if !defined(ANYPS5_KYTY_DLL)
+    if (auto* recorder = AgcDriver::FrameRecorder::Active()) recorder->PresentBuffer(buffer);
+#endif
     gpuReady(context);
 }
 

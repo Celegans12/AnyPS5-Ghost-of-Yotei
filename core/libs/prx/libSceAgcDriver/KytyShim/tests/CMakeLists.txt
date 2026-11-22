@@ -586,6 +586,26 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64
             PASS_REGULAR_EXPRESSION "kyty_shim_hot_write_watch: ok")
 endif()
 
+if(NOT ANYPS5_KYTY_DLL)
+    add_test_executable(kyty_shim_frame_capture_round_trip_tests
+            ${CMAKE_CURRENT_SOURCE_DIR}/FrameCaptureRoundTrip.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../Execution/src/FrameCapture.cpp)
+    target_include_directories(kyty_shim_frame_capture_round_trip_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(kyty_shim_frame_capture_round_trip_tests PRIVATE libSceAgc libSceAgcDriver libkernel libc libzstd_static)
+    set_target_properties(kyty_shim_frame_capture_round_trip_tests PROPERTIES CXX_EXTENSIONS OFF)
+    configure_windows_unwind(kyty_shim_frame_capture_round_trip_tests)
+    add_dependencies(kyty_shim_frame_capture_round_trip_tests agc_frame_replay)
+    add_test(NAME kyty_shim_frame_capture_round_trip
+            COMMAND kyty_shim_frame_capture_round_trip_tests $<TARGET_FILE:agc_frame_replay>)
+    set_tests_properties(kyty_shim_frame_capture_round_trip PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_FRAME_CAPTURE=${CMAKE_CURRENT_BINARY_DIR}/frame capture round trip;APS5_FRAME_CAPTURE_AT_FLIP=1;APS5_FRAME_CAPTURE_FRAMES=2")
+    if(WIN32)
+        set_property(TARGET kyty_shim_frame_capture_round_trip_tests APPEND PROPERTY LINK_DEPENDS "$<TARGET_FILE:libSceAgcDriver>")
+        set_property(TEST kyty_shim_frame_capture_round_trip APPEND PROPERTY ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAgcDriver>")
+    endif()
+endif()
+
 add_test_executable(kyty_shim_depth_target_alias_tests ${CMAKE_CURRENT_SOURCE_DIR}/DepthTargetAlias.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../../Execution/src/FrameCapture.cpp)
 target_include_directories(kyty_shim_depth_target_alias_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/3rdparty/zstd/lib)

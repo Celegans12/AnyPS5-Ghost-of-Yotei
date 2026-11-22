@@ -2,6 +2,16 @@
 #include "prx/libSceAgcDriver/KytyShim/src/EntryApi.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#if !defined(ANYPS5_KYTY_DLL)
+#include "prx/libSceAgcDriver/Execution/include/FrameRecorder.hpp"
+#include "kernel/memory.h"
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <sys/uio.h>
+#include <unistd.h>
+#endif
+#endif
 
 #include "common/debugCounters.h"
 #include "common/threads.h"
@@ -41,6 +51,8 @@ constexpr std::uint32_t LabelData64 = 2u << 29u;
 constexpr std::uint64_t ParsedMargin = 64;
 constexpr std::size_t WaitCapacity = 64;
 constexpr std::int64_t HoldGraceMs = 1000;
+constexpr unsigned TrackReplaySerials = 1;
+constexpr unsigned TrackCaptureSerials = 2;
 
 struct LabelPacket {
     std::uint64_t serial = 0;
@@ -55,7 +67,7 @@ struct Queue {
 };
 
 struct State {
-    std::atomic<bool> tracking{false};
+    std::atomic<unsigned> tracking{0};
     std::array<Queue, SerialQueues> queues;
     std::mutex holdMutex;
     std::atomic<bool> held{false};
@@ -187,6 +199,65 @@ void NoteSubmission(Libs::Graphics::GuestGpu& gpu, std::uint32_t queue) {
 
 namespace AgcDriver {
 
+#if !defined(ANYPS5_KYTY_DLL)
+void StartFrameCaptureSerials() {
+    static_cast<void>(KytyShim::Entry::SerialLabels());
+    KytyShim::Replay::state().tracking.fetch_or(KytyShim::Replay::TrackCaptureSerials, std::memory_order_release);
+}
+
+void StopFrameCaptureSerials() noexcept {
+    KytyShim::Replay::state().tracking.fetch_and(~KytyShim::Replay::TrackCaptureSerials, std::memory_order_release);
+}
+
+bool ReadFrameCaptureMemory(std::uint64_t address, std::span<std::byte> destination) {
+    namespace Memory = Libs::LibKernel::Memory;
+    if (destination.empty()) return true;
+    if (address > std::numeric_limits<std::uintptr_t>::max() - destination.size()) return false;
+    if (KytyShim::Entry::GpuStarted() && Libs::Graphics::GuestRange{address, destination.size()}.Valid()) {
+        auto& renderer = KytyShim::Entry::Renderer();
+        auto& buffers = renderer.GetBufferCache();
+        bool read = false;
+        bool needsGpu = true;
+        try {
+            renderer.GetGpu().SendCommandSync([&] {
+                try {
+                    const auto size = destination.size();
+                    if (renderer.GetTextureCache().IsRegionGpuModified(address, size, true) ||
+                        buffers.DeferredLabelPending(address, size)) return;
+                    if (!buffers.HasGpuDirtyBytes(address, size)) {
+                        needsGpu = false;
+                        return;
+                    }
+                    if (buffers.TryReadMirroredGpuWrites(address, destination.data(), size)) {
+                        read = true;
+                        return;
+                    }
+                    buffers.ReadMemory(address, size);
+                    if (!buffers.HasGpuDirtyBytes(address, size)) {
+                        read = Memory::TryReadBacking(address, destination.data(), size);
+                    }
+                } catch (const std::exception&) {
+                    read = false;
+                }
+            });
+        } catch (const std::exception&) {
+            return false;
+        }
+        if (needsGpu) return read;
+    }
+    if (Memory::TryReadBacking(address, destination.data(), destination.size())) return true;
+    const auto* source = reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address));
+#if defined(_WIN32)
+    SIZE_T received = 0;
+    return ReadProcessMemory(GetCurrentProcess(), source, destination.data(), destination.size(), &received) != 0 && received == destination.size();
+#else
+    const iovec local{destination.data(), destination.size()};
+    const iovec remote{const_cast<void*>(source), destination.size()};
+    return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == static_cast<ssize_t>(destination.size());
+#endif
+}
+#endif
+
 std::vector<std::byte> ReadDisplayBuffer(const DisplayBuffer& buffer) {
     KytyShim::Replay::RequireNotHeld("ReadDisplayBuffer");
     AgcDriverWaitIdle_nid_postfix();
@@ -244,7 +315,7 @@ std::vector<std::byte> ReadDisplayBuffer(const DisplayBuffer& buffer) {
 
 extern "C" void AgcDriverTrackSerials_nid_postfix() {
     static_cast<void>(KytyShim::Entry::SerialLabels());
-    KytyShim::Replay::state().tracking.store(true, std::memory_order_release);
+    KytyShim::Replay::state().tracking.fetch_or(KytyShim::Replay::TrackReplaySerials, std::memory_order_release);
 }
 
 extern "C" void AgcDriverSerialProgress_nid_postfix(std::uint64_t* accepted, std::uint64_t* completed) {

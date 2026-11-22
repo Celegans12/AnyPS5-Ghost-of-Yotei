@@ -1,4 +1,5 @@
 kyty_shim_depth_target_alias	replays a capture through the Kyty renderer, whose device selection requires VK_EXT_image_view_min_lod and subgroups of 32 or 64: llvmpipe has no such extension and a subgroup size of 8
+kyty_shim_frame_capture_round_trip	same device requirement as kyty_shim_depth_target_alias
 kyty_shim_buffer_null_range	same device requirement as kyty_shim_depth_target_alias
 kyty_shim_uniform_scalar_replay	same device requirement as kyty_shim_depth_target_alias
 kyty_shim_empty_buffer_replay	same device requirement as kyty_shim_depth_target_alias

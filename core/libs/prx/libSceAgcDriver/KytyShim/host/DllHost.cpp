@@ -347,6 +347,9 @@ KytyDllHost MakeHost() {
 
 const KytyDllApi& Api() {
     static const KytyDllApi* api = [] {
+        if (const char* capture = std::getenv("APS5_FRAME_CAPTURE"); capture != nullptr && *capture != '\0') {
+            std::fputs("[frame-capture] kyty_gpu.prx does not support recording. Use the linked Kyty build.\n", stderr);
+        }
         static const KytyDllHost host = MakeHost();
         HMODULE self = nullptr;
         if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(&MakeHost), &self)) throw std::runtime_error("libSceAgcDriver: its own module is not known");

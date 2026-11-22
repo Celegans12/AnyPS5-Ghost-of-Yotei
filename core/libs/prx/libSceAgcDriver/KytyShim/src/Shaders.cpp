@@ -7,6 +7,9 @@
 #include "prx/libSceAgcDriver/KytyShim/src/EntryApi.hpp"
 #include "prx/libSceAgcDriver/KytyShim/src/Replay.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#if !defined(ANYPS5_KYTY_DLL)
+#include "prx/libSceAgcDriver/Execution/include/FrameRecorder.hpp"
+#endif
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparationScope.hpp"
 
 #include "graphics/shader/shader.h"
@@ -58,14 +61,35 @@ extern "C" void AgcDriverRegisterShader_nid_postfix(const Shader* shader) {
     map.num_input_semantics = shader->num_input_semantics;
     map.code_size_bytes = shader->shader_size;
     map.scratch_size_dwords = shader->scratch_size_dw_per_thread;
-    Kyty::ShaderMapUserData(reinterpret_cast<std::uint64_t>(shader->code), map);
+    const auto accept = [&] { Kyty::ShaderMapUserData(reinterpret_cast<std::uint64_t>(shader->code), map); };
+#if !defined(ANYPS5_KYTY_DLL)
+    if (auto* recorder = AgcDriver::FrameRecorder::Active()) {
+        recorder->RegisterShader(shader, accept);
+        return;
+    }
+#endif
+    accept();
 }
 
+#if defined(ANYPS5_KYTY_DLL)
 extern "C" void AgcDriverResolveShaderAbi_nid_postfix(const Shader*, std::span<const ShaderRegister>, std::span<const ShaderRegister>) {}
 
 extern "C" void AgcDriverResolveGraphicsStagesAbi_nid_postfix(std::span<const Shader* const>, std::span<const ShaderRegister>, std::span<const ShaderRegister>) {}
 
 extern "C" void AgcDriverResolveGraphicsAbi_nid_postfix(const Shader*, const Shader*, std::uint32_t) {}
+#else
+extern "C" void AgcDriverResolveShaderAbi_nid_postfix(const Shader* shader, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) {
+    if (auto* recorder = AgcDriver::FrameRecorder::Active()) recorder->ResolveShaderAbi(shader, context, primitive);
+}
+
+extern "C" void AgcDriverResolveGraphicsStagesAbi_nid_postfix(std::span<const Shader* const> stages, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) {
+    if (auto* recorder = AgcDriver::FrameRecorder::Active()) recorder->ResolveGraphicsStagesAbi(stages, context, primitive);
+}
+
+extern "C" void AgcDriverResolveGraphicsAbi_nid_postfix(const Shader* vertex, const Shader* pixel, std::uint32_t primitiveType) {
+    if (auto* recorder = AgcDriver::FrameRecorder::Active()) recorder->ResolveGraphicsAbi(vertex, pixel, primitiveType);
+}
+#endif
 
 extern "C" AgcDriver::DriverDetail::ShaderPreparationTransaction* AgcDriverBeginShaderPreparation_nid_postfix(const Shader* const*, std::size_t) {
     return nullptr;
