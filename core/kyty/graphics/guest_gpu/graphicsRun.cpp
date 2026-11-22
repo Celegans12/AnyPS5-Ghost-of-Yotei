@@ -471,7 +471,6 @@ void GuestGpu::ExecutionThread() {
 #if defined(ANYPS5_KYTY)
 	PipelineCache::BeginExecuteThread();
 #endif
-	BdaDirtyRegions::g_translating = true;
 	constexpr uint32_t NotifyInterval = 16;
 	uint32_t           unnotified     = 0;
 	auto&              operations     = m_resolving ? m_resolved : m_operations;

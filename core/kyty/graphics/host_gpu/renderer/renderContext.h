@@ -1,7 +1,6 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_RENDERCONTEXT_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_RENDERCONTEXT_H_
 
-#include "graphics/host_gpu/bdaDirtyRegions.h"
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
@@ -79,7 +78,6 @@ public:
 		if (submit_id != m_bda_submit || after_wait) {
 			m_bda_submit = submit_id;
 			m_bda_generation++;
-			BdaDirtyRegions::Publish();
 		}
 	}
 	[[nodiscard]] bool WriteAroundGpuWrites(void* destination, const void* data, uint64_t size);

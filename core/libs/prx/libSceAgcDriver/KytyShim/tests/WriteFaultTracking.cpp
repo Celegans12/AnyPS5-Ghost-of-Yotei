@@ -1,4 +1,3 @@
-#include "graphics/host_gpu/bdaDirtyRegions.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionManager.h"
@@ -155,21 +154,17 @@ void ConcurrentFaultsOnOpenPagesTakeNoLock(RegionManager& region) {
 }
 
 void OpenPageFaultStillSignalsTheWrite(PageManager& pages) {
-	namespace Bda = Libs::Graphics::BdaDirtyRegions;
 	MemoryTracker  tracker(pages);
 	const uint64_t vaddr = RegionBase + 64 * TRACKER_REGION_SIZE + 3 * TRACKER_PAGE_SIZE;
 	const uint64_t index = vaddr / TRACKER_REGION_SIZE;
-	const uint64_t bit   = uint64_t {1} << (index % 64);
 	tracker.ConsumeCpuWrites(CpuWriteConsumer::IndirectWriteTables, vaddr, TRACKER_PAGE_SIZE, [](uint64_t, uint64_t) {});
 	Check(tracker.IsRegionCpuModified(vaddr, TRACKER_PAGE_SIZE), "signal: a fresh region is not written by the CPU");
-	Bda::g_pending[index / 64].fetch_and(~bit);
 	const auto region = tracker.RegionCpuDirtyEpoch(index);
 	const auto global = RegionManager::CpuDirtyEpoch();
 	bool       gpu    = true;
 	Check(tracker.WriteFaultFindsOpen(vaddr, Block, false, TRACKER_PAGE_SIZE, &gpu), "signal: the open page took the lock");
 	Check(tracker.RegionCpuDirtyEpoch(index) > region, "signal: the region CPU write epoch did not move");
 	Check(RegionManager::CpuDirtyEpoch() > global, "signal: the global CPU write epoch did not move");
-	Check((Bda::g_pending[index / 64].load() & bit) != 0, "signal: the region was not marked for device address reads");
 
 	size_t     deferred = 0;
 	const auto consumed = [&](CpuWriteConsumer consumer, uint64_t address, uint64_t size) {

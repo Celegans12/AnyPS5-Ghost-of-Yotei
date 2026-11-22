@@ -6,7 +6,6 @@
 #include "common/threadSafety.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
-#include "graphics/host_gpu/bdaDirtyRegions.h"
 
 #include <algorithm>
 #include <array>
@@ -335,7 +334,6 @@ public:
 		NoteGuestWriteFault(offset);
 		m_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
 		s_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
-		BdaDirtyRegions::Mark(m_cpu_addr / TRACKER_REGION_SIZE);
 	}
 
 	[[nodiscard]] static uint64_t TakeOpenedUploadBytes() noexcept {
@@ -372,7 +370,6 @@ public:
 				}
 				m_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
 				s_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
-				BdaDirtyRegions::Mark(m_cpu_addr / TRACKER_REGION_SIZE);
 			}
 			if constexpr (!enable) {
 				NoteOpenedUpload(nullptr, changed);
@@ -593,7 +590,6 @@ public:
 		}
 		m_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
 		s_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
-		BdaDirtyRegions::Mark(m_cpu_addr / TRACKER_REGION_SIZE);
 		m_has_cpu_dirty.store(true, std::memory_order_release);
 		return CountPages(leaving);
 	}

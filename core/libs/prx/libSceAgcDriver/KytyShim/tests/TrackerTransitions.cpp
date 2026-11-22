@@ -1,4 +1,3 @@
-#include "graphics/host_gpu/bdaDirtyRegions.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionManager.h"
@@ -70,7 +69,6 @@ void operator delete[](void* memory, std::size_t, std::align_val_t) noexcept {
 
 namespace {
 
-namespace Bda = Libs::Graphics::BdaDirtyRegions;
 using Libs::Graphics::MemoryTracker;
 using Libs::Graphics::PageManager;
 using Libs::Graphics::RegionManager;
@@ -102,21 +100,11 @@ struct Counting {
 	[[nodiscard]] uint64_t Allocations() const { return g_allocations.load(std::memory_order_relaxed) - before; }
 };
 
-bool Pending(uint64_t index) {
-	return (Bda::g_pending[index / 64].load() & (uint64_t {1} << (index % 64))) != 0;
-}
-
-void Unmark(uint64_t index) {
-	Bda::g_pending[index / 64].fetch_and(~(uint64_t {1} << (index % 64)));
-}
-
 void QuestionsCreateNoRegion(PageManager& pages) {
 	MemoryTracker  tracker(pages);
 	const uint64_t region = RegionBase / TRACKER_REGION_SIZE + 8;
 	const uint64_t start  = region * TRACKER_REGION_SIZE;
 	const uint64_t next   = start + TRACKER_REGION_SIZE;
-	Unmark(region);
-	Unmark(region + 1);
 	const auto global = RegionManager::CpuDirtyEpoch();
 	bool       modified = false;
 	{
@@ -127,7 +115,6 @@ void QuestionsCreateNoRegion(PageManager& pages) {
 	Check(modified, "questions: memory never tracked does not read as written by the CPU, an upload would skip it");
 	Check(tracker.RegionCpuDirtyEpoch(region) == 0, "questions: a question created the region");
 	Check(RegionManager::CpuDirtyEpoch() == global, "questions: a question advanced the global CPU write epoch");
-	Check(!Pending(region), "questions: a question marked the region for device address reads");
 	Check(tracker.CpuModificationEpoch(start, TRACKER_PAGE_SIZE) == 0, "questions: a question gave the region a CPU modification epoch");
 
 	tracker.ForEachUploadRange(next, TRACKER_PAGE_SIZE, false, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});

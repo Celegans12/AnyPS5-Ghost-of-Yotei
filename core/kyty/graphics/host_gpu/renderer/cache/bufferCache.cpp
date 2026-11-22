@@ -16,7 +16,6 @@
 #include "graphics/host_gpu/renderer/execHelpers.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/host_gpu/bdaDirtyRegions.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "kernel/memory.h"
 
@@ -188,7 +187,6 @@ void BufferCache::ChangeRegister(BufferId id) {
 		          last   = (buffer.CpuAddress() + buffer.Size() - 1) / TRACKER_REGION_SIZE;
 		     region <= last && region < TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE; ++region) {
 			m_region_registrations[region].store(epoch, std::memory_order_release);
-			BdaDirtyRegions::Mark(region);
 		}
 		m_registration_epoch.store(epoch, std::memory_order_release);
 	}

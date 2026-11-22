@@ -6,7 +6,6 @@
 #include "common/hackNotice.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/scout.h"
-#include "graphics/host_gpu/bdaDirtyRegions.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/shader/recompiler/frontend/decode/RecordReach.h"
