@@ -9,7 +9,6 @@
 #include "common/uniqueFunction.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
-#include "graphics/host_gpu/renderer/pipeline/pipelineHelpers.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -794,21 +793,6 @@ private:
 	void                  LogStallStats(bool force);
 #endif
 
-	std::unique_ptr<PipelineHelpers> m_helpers;
-	std::unordered_map<uint64_t, const ShaderModule*> m_helper_jobs;
-	std::mutex                                        m_helper_caches_mutex;
-	std::vector<vk::PipelineCache>                    m_helper_caches;
-	vk::PipelineCache                                 m_helper_cache = nullptr;
-	std::atomic<uint64_t> m_helper_found {0}, m_helper_created {0}, m_helper_compiled_here {0},
-	    m_helper_taken_back {0};
-	void StartHelpers();
-	void StopHelpers();
-	bool CreateComputePipelineElsewhere(const ShaderModule& module, const std::vector<uint32_t>& spirv,
-	                                    bool urgent);
-	void OnHelperResult(PipelineHelpers::Result&& result);
-	void PublishComputePipeline(const ShaderModule& module, const Pipeline& pipeline,
-	                            std::chrono::steady_clock::time_point started);
-
 #if defined(ANYPS5_KYTY)
 	std::unique_ptr<PipelineLibraries>     m_libraries;
 	std::vector<vk::Pipeline>              m_retired_pipelines;
@@ -850,7 +834,7 @@ private:
 	bool TakeQueuedAsyncPipeline(Matches&& matches);
 	void AsyncPipelineWorker();
 	void StopAsyncPipelines();
-	void CreateComputePipelineAhead(const ShaderModule& module, const std::vector<uint32_t>& spirv);
+	void CreateComputePipelineAhead(const ShaderModule& module);
 #if defined(ANYPS5_KYTY)
 	void RequestComputePipelineAhead(const ShaderModule& module);
 #endif
@@ -905,8 +889,7 @@ private:
 	void BuildManifestModule(uint32_t index, std::span<const uint32_t> code,
 	                         std::span<const uint32_t> back_code, bool guest_traversal = false);
 	void CreateManifestPipeline(uint32_t index);
-	void CreateManifestComputePipeline(const ShaderModule& module, const std::vector<uint32_t>& spirv,
-	                                   bool from_assets);
+	void CreateManifestComputePipeline(const ShaderModule& module, bool from_assets);
 	void SetHostInput(ManifestModule& module) const;
 	const ShaderModule* FindCompiledModule(
 	    const ProgramKey& key, const ShaderRecompiler::IR::ResourceSpecialization& specialization,
@@ -934,7 +917,8 @@ private:
 	std::unique_ptr<UseOrder, UseOrderDeleter> m_use_order;
 	void OpenUseOrder(const std::filesystem::path& path);
 	void NoteUse(Pipeline& pipeline, std::span<const ShaderModule* const> stages);
-	static constexpr uint32_t MappedRank = PipelineHelpers::NoRank - 1;
+	static constexpr uint32_t NoRank     = UINT32_MAX;
+	static constexpr uint32_t MappedRank = NoRank - 1;
 	[[nodiscard]] uint32_t    UseRank(uint64_t program_hash) const;
 };
 
@@ -963,16 +947,12 @@ struct DriverCreations {
 [[nodiscard]] DriverCreations GetDriverCreations(double slow_seconds);
 void DescribeDriverPipelineCreation(std::string& report);
 
-[[nodiscard]] std::vector<uint8_t> EncodeComputeModule(const ShaderModule&          module,
-                                                       const std::vector<uint32_t>& spirv);
 [[nodiscard]] bool EncodeModuleRecord(ShaderType stage, uint64_t hash, uint32_t user_data_count,
                                       const std::vector<uint32_t>&              static_state,
                                       const ShaderRecompiler::IR::ResourcePlan& plan,
                                       const ShaderModule& module, const std::vector<uint32_t>& spirv,
                                       const std::vector<uint32_t>& plain_spirv,
                                       std::vector<uint8_t>&        record);
-bool DecodeComputeModule(std::span<const uint8_t> bytes, ShaderModule& module,
-                         std::vector<uint32_t>& spirv);
 
 #if defined(ANYPS5_KYTY)
 [[nodiscard]] std::vector<uint8_t> ComputeShaderStoreHeader(const GraphicContext& graphics);

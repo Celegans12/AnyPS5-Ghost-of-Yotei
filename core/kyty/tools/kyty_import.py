@@ -13,7 +13,6 @@ SKIP = {"common/CMakeLists.txt"}
 CONTRACT = (
     "kernel/eventQueue.h",
     "kernel/fileSystem.h",
-    "kernel/guestPause.h",
     "kernel/memory.h",
     "kernel/pthread.h",
     "libs/agc.h",

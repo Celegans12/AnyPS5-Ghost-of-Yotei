@@ -420,22 +420,6 @@ void PipelineCache::StoreLayout(uint64_t key, const ShaderTessellationInputInfo&
 	m_store.Append(std::move(record.bytes));
 }
 
-std::vector<uint8_t> EncodeComputeModule(const ShaderModule& module, const std::vector<uint32_t>& spirv) {
-	Writer record;
-	IoStoreModuleInfo(record, module);
-	IoAll(record, spirv);
-	return std::move(record.bytes);
-}
-
-bool DecodeComputeModule(std::span<const uint8_t> bytes, ShaderModule& module,
-                         std::vector<uint32_t>& spirv) {
-	Reader reader {bytes};
-	IoStoreModuleInfo(reader, module);
-	IoAll(reader, spirv);
-	module.spirv_words = static_cast<uint32_t>(spirv.size());
-	return reader.ok && reader.bytes.empty() && module.info.stage == ShaderType::Compute;
-}
-
 #if defined(ANYPS5_KYTY)
 std::vector<uint8_t> ComputeShaderStoreHeader(const GraphicContext& graphics) {
 	return StoreHeader(graphics);

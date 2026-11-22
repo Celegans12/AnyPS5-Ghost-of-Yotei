@@ -23,7 +23,7 @@ verbatim at their top:
 | `core/kyty/graphics/` | `src/graphics/` | every file |
 | `core/kyty/common/` | `src/common/` | every file except `CMakeLists.txt` |
 | `core/kyty/cmake/` | `src/` | `embed_spirv.cmake`, `cmake_config.h.in`, `kytyGitVersion.h.in` |
-| `core/libs/prx/libSceAgcDriver/KytyShim/include/kernel/` | `src/kernel/` | `eventQueue.h`, `fileSystem.h`, `guestPause.h`, `memory.h`, `pthread.h` |
+| `core/libs/prx/libSceAgcDriver/KytyShim/include/kernel/` | `src/kernel/` | `eventQueue.h`, `fileSystem.h`, `memory.h`, `pthread.h` |
 | `core/libs/prx/libSceAgcDriver/KytyShim/include/libs/` | `src/libs/` | `agc.h`, `controller.h`, `errno.h`, `hmd2.h`, `libs.h` |
 | `core/libs/prx/libSceAgcDriver/KytyShim/include/loader/` | `src/loader/` | `demonsSoulsPageFree.h`, `demonsSoulsTitle.h`, `guestOodle.h`, `systemContent.h`, `timer.h` |
 
@@ -110,9 +110,8 @@ mapped from pagefile-backed sections of 1 GiB, each created and mapped into the 
 its range, and each direct memory backing is mapped at its physical offset after the guest range. A section page cannot
 be given back to the system, so a page that held data is zeroed when it is unmapped and stays committed. Access
 violations reach `KytyShim::HandleHostFault` from libc's vectored exception handler through
-`GuestArenaSetGpuFaultHandler`. KytyPS5's pipeline helper processes are not built (`PipelineHelpers` starts none and
-`PipelineHelperProcesses` returns 0): a helper is the executable started again with `--pipeline-helper`, and here the
-executable is the converted title.
+`GuestArenaSetGpuFaultHandler`. KytyPS5's pipeline helper processes are not imported: a helper is the executable started
+again with `--pipeline-helper`, and here the executable is the converted title.
 
 ## Third-party code
 
@@ -225,7 +224,7 @@ The table draws are GPU-driven draws of a shader pair's table programs.
 
 ### Pipelines and shader store
 
-This build does not read KytyPS5's `KYTY_PIPELINE_PRECOMPILE`: stopping the game while the manifest's pipelines compile needs the helper processes and `GuestPause::Supported()`, and this build has neither, so the game never stops for them.
+This build does not read KytyPS5's `KYTY_PIPELINE_PRECOMPILE`: stopping the game while the manifest's pipelines compile needs the helper processes and a way to stop the guest threads, and this build has neither, so the game never stops for them.
 
 | Variable | Values | Default | Effect | Category | Platform | Origin |
 |---|---|---|---|---|---|---|

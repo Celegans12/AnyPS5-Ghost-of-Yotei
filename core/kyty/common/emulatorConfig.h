@@ -28,8 +28,6 @@ enum class PresentMode { Fifo, Mailbox, Immediate };
 
 enum class PssrUpscaler { Linear, DLSS, FSR };
 
-enum class PipelinePrecompile { Ask, Wait, Play };
-
 using Keymap = std::vector<std::string>;
 using ControllerColor = std::array<uint8_t, 3>;
 
@@ -94,7 +92,6 @@ struct ConfigOptions {
 	bool                   pipeline_manifest_enabled   = true;
 	bool                   pipeline_manifest_record    = false;
 	bool                   pipeline_manifest_strict    = KYTY_STRICT_PIPELINE_MANIFEST_DEFAULT != 0;
-	PipelinePrecompile     pipeline_precompile         = PipelinePrecompile::Ask;
 	LogDirection           shader_log_direction        = LogDirection::Silent;
 	std::filesystem::path  shader_log_folder           = "_Shaders";
 	bool                   command_buffer_dump_enabled = false;
@@ -172,7 +169,6 @@ bool                   ShaderCacheEnabled();
 bool                   PipelineManifestEnabled();
 bool                   PipelineManifestRecord();
 bool                   PipelineManifestStrict();
-PipelinePrecompile     GetPipelinePrecompile();
 LogDirection           GetShaderLogDirection();
 std::filesystem::path  GetShaderLogFolder();
 

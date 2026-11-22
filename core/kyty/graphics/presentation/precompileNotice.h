@@ -5,21 +5,16 @@
 
 #include <cstdint>
 
-union SDL_Event;
-
 namespace Libs::Graphics {
 
 enum class PrecompileNoticeState : uint32_t {
-	Question,
-	Paused,
 	Waiting,
-	Ready,
 	Compiling,
 };
 
 struct PrecompileNotice {
 	bool                  visible = false;
-	PrecompileNoticeState state   = PrecompileNoticeState::Paused;
+	PrecompileNoticeState state   = PrecompileNoticeState::Waiting;
 	uint32_t done     = 0;
 	uint32_t total    = 0;
 	uint32_t shaders  = 0;
@@ -27,16 +22,8 @@ struct PrecompileNotice {
 	uint32_t seconds_waited   = 0;
 };
 
-enum class PrecompileAnswer : uint32_t { None, Wait, Play };
-
 void ShowPrecompileNotice(const PrecompileNotice& notice);
 void HidePrecompileNotice();
-[[nodiscard]] PrecompileAnswer TakePrecompileAnswer() noexcept;
-
-[[nodiscard]] bool     PrecompileNoticeVisible() noexcept;
-[[nodiscard]] uint64_t PrecompileNoticeRevision() noexcept;
-
-bool ProcessPrecompileNoticeInput(const SDL_Event& event);
 
 struct ManifestProgress {
 	uint32_t done      = 0;
@@ -48,8 +35,6 @@ struct ManifestProgress {
 void ShowManifestProgress(const ManifestProgress& progress);
 void HideManifestProgress();
 [[nodiscard]] bool ManifestProgressVisible() noexcept;
-
-void DrawPrecompileNotice(vk::Extent2D extent);
 
 }
 

@@ -668,14 +668,6 @@ void ShowPrecompileNotice(const PrecompileNotice& notice) {
 
 void HidePrecompileNotice() {}
 
-PrecompileAnswer TakePrecompileAnswer() noexcept {
-    return PrecompileAnswer::None;
-}
-
-bool PrecompileNoticeVisible() noexcept {
-    return false;
-}
-
 }
 
 namespace Libs::Vr {

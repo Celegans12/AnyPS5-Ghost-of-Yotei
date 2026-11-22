@@ -377,13 +377,13 @@ void PipelineCache::NoteUse(Pipeline& pipeline, std::span<const ShaderModule* co
 
 uint32_t PipelineCache::UseRank(uint64_t program_hash) const {
 	if (m_use_order == nullptr) {
-		return PipelineHelpers::NoRank;
+		return NoRank;
 	}
 	if (const auto found = m_use_order->rank.find(program_hash); found != m_use_order->rank.end()) {
 		return found->second;
 	}
 	std::scoped_lock lock(m_use_order->mapped_mutex);
-	return m_use_order->mapped.contains(program_hash) ? MappedRank : PipelineHelpers::NoRank;
+	return m_use_order->mapped.contains(program_hash) ? MappedRank : NoRank;
 }
 
 void PipelineCache::DecideRuntimeStrides(std::span<PipelineManifest*> manifests) {
@@ -827,7 +827,7 @@ bool PipelineCache::ProvideCode(uint64_t hash, std::span<const uint32_t> code, b
 		}
 		auto& entry = found->second;
 		const auto mapped_first = [&](uint32_t index) {
-			if (state.module_rank[index] != PipelineHelpers::NoRank) {
+			if (state.module_rank[index] != NoRank) {
 				return false;
 			}
 			state.module_rank[index] = MappedRank;
@@ -2522,8 +2522,7 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 	const auto finish = [&](const ShaderModule* module, bool built) {
 		if (guest_traversal) {
 			if (module != nullptr && module->info.stage == ShaderType::Compute) {
-				CreateManifestComputePipeline(*module, built ? spirv : std::vector<uint32_t> {},
-				                              record.from_assets);
+				CreateManifestComputePipeline(*module, record.from_assets);
 			}
 			return;
 		}
@@ -2568,8 +2567,7 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 		}
 		state.available.notify_all();
 		if (module != nullptr && module->info.stage == ShaderType::Compute) {
-			CreateManifestComputePipeline(*module, built ? spirv : std::vector<uint32_t> {},
-			                              record.from_assets);
+			CreateManifestComputePipeline(*module, record.from_assets);
 		}
 		if (native && record.stage == ShaderType::Compute &&
 		    (module == nullptr || module->info.info.ray_query)) {
@@ -2726,9 +2724,7 @@ void PipelineCache::CreateManifestPipeline(uint32_t index) {
 	}
 }
 
-void PipelineCache::CreateManifestComputePipeline(const ShaderModule&          module,
-                                                  const std::vector<uint32_t>& spirv,
-                                                  bool                         from_assets) {
+void PipelineCache::CreateManifestComputePipeline(const ShaderModule& module, bool from_assets) {
 #if defined(ANYPS5_KYTY)
 	std::atomic_ref<bool>(module.pipeline_requested).store(true, std::memory_order_relaxed);
 #endif
@@ -2738,9 +2734,6 @@ void PipelineCache::CreateManifestComputePipeline(const ShaderModule&          m
 			return;
 		}
 		m_async_pending_compute.insert(module.id);
-	}
-	if (CreateComputePipelineElsewhere(module, spirv, false)) {
-		return;
 	}
 	const auto start = std::chrono::steady_clock::now();
 	Pipeline   pipeline;

@@ -7,14 +7,12 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #endif
 #include "graphics/presentation/precompileNotice.h"
-#include "kernel/guestPause.h"
 
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <fmt/format.h>
-#include <memory>
 #include <mutex>
 #include <optional>
 #include <utility>
@@ -23,16 +21,9 @@ namespace Libs::Graphics {
 
 namespace {
 
-constexpr double AskSeconds  = 30.0;
-constexpr double WaitSeconds = 20.0;
-constexpr auto   GraceTime    = std::chrono::seconds(3);
-constexpr double GraceSeconds = 5.0;
 constexpr double SlowSeconds   = 0.5;
-constexpr auto   NoticeLinger  = GraceTime;
-constexpr double DefaultJobSeconds = 1.0;
-constexpr uint64_t MinLookups = 32;
+constexpr auto   NoticeLinger  = std::chrono::seconds(3);
 constexpr auto     WatchPeriod = std::chrono::milliseconds(100);
-constexpr auto     PausePeriod = std::chrono::milliseconds(50);
 constexpr auto     LogPeriod   = std::chrono::seconds(10);
 constexpr auto     StallShown  = std::chrono::seconds(3);
 constexpr auto     StallGap    = std::chrono::seconds(1);
@@ -49,15 +40,9 @@ void PrecompileLog(fmt::format_string<Args...> format, Args&&... args) {
 struct Estimate {
 	uint32_t pending  = 0;
 	uint64_t finished = 0;
-	uint64_t helpers_done = 0;
 	uint32_t shaders  = 0;
 	uint64_t shaders_finished = 0;
 	uint32_t running  = 0;
-	double   driver_seconds = 0.0;
-	double   seconds_left   = 0.0;
-	bool     drained        = false;
-	uint32_t helpers_slow    = 0;
-	double   helpers_longest = 0.0;
 };
 
 }
@@ -203,74 +188,23 @@ void PipelineCache::StartPrecompile() {
 void PipelineCache::Precompile(const std::stop_token& stop) {
 	KYTY_PROFILER_THREAD("Thread_PipelinePrecompile");
 	using Clock = std::chrono::steady_clock;
-	enum class Phase { Watch, Ask, Wait, Grace, Played };
 
 	const auto estimate = [this] {
-		const auto stats   = m_helpers != nullptr ? m_helpers->GetStats() : PipelineHelpers::Stats {};
 		const auto backlog = GetManifestBacklog();
 		Estimate   e;
-		const uint64_t lookups = stats.queued + m_helper_found.load(std::memory_order_relaxed);
-		const double   misses  = lookups >= MinLookups
-		                             ? static_cast<double>(stats.queued) / static_cast<double>(lookups)
-		                             : 0.0;
-		const uint32_t jobs    = stats.waiting + stats.in_flight;
-		const double   job     = stats.job_seconds > 0.0 ? stats.job_seconds : DefaultJobSeconds;
-		double running = 0.0;
-		double longest = 0.0;
-		for (size_t i = 0; i < stats.running.size(); i++) {
-			const double ran = stats.running[i];
-			e.helpers_slow += ran >= SlowSeconds ? 1u : 0u;
-			e.helpers_longest = std::max(e.helpers_longest, ran);
-			const double left = std::max(std::max(job, stats.running_expected[i]) - ran, ran);
-			running += left;
-			longest = std::max(longest, left);
-		}
-		const double   queued  = std::max(stats.waiting * job, stats.waiting_seconds) +
-		                         backlog.compute_modules * misses * job;
-		const double   helpers = std::max(longest, (running + queued) /
-		                                               static_cast<double>(std::max(stats.processes, 1u)));
-		const double   threads  = static_cast<double>(std::max(backlog.threads, 1u));
-		const double   graphics = backlog.pipelines * backlog.pipeline_seconds / threads;
-		const double   modules  = backlog.modules * backlog.module_seconds / threads;
-		e.pending        = jobs + backlog.pipelines;
-		e.helpers_done   = stats.done + stats.failed + stats.withdrawn;
-		e.finished       = e.helpers_done + backlog.pipelines_done;
-		e.shaders        = backlog.modules;
+		e.pending          = backlog.pipelines;
+		e.finished         = backlog.pipelines_done;
+		e.shaders          = backlog.modules;
 		e.shaders_finished = backlog.modules_done;
-		e.running        = backlog.running;
-		e.driver_seconds = helpers + graphics;
-		e.seconds_left   = std::max(helpers, graphics + modules);
-		e.drained = jobs == 0 && backlog.modules == 0 && backlog.pipelines == 0 && backlog.running == 0 &&
-		            !backlog.scanning;
+		e.running          = backlog.running;
 		return e;
 	};
 
-	const uint32_t helpers_running = m_helpers != nullptr ? m_helpers->GetStats().processes : 0;
-	const uint32_t helpers_alone   = PipelineHelperProcessesAlone(helpers_running);
-	const auto     set_helpers     = [this](uint32_t processes) {
-		if (m_helpers != nullptr) {
-			m_helpers->SetProcesses(processes);
-		}
-	};
-	const bool can_stop = m_helpers != nullptr && m_manifest_warm &&
-	                      Config::GetPipelinePrecompile() != Config::PipelinePrecompile::Play &&
-	                      LibKernel::GuestPause::Supported();
-	bool                                   wait  = Config::GetPipelinePrecompile() == Config::PipelinePrecompile::Wait;
-	auto                                   phase = can_stop ? Phase::Watch : Phase::Played;
-	std::unique_ptr<LibKernel::GuestPause> pause;
-	Clock::time_point                      shown_at;
-	Clock::time_point                      paused_at;
-	Clock::time_point                      logged_at;
-	Clock::time_point                      grace_end;
 	Clock::time_point                      slow_until;
-	uint64_t                               base       = 0;
-	uint64_t                               stop_base  = 0;
-	uint32_t                               stops      = 0;
 	bool                                   stalled    = false;
 	Clock::time_point                      stall_since;
 	Clock::time_point                      stall_logged;
 #if defined(ANYPS5_KYTY)
-	uint64_t                               stall_helpers = 0;
 	uint64_t                               stall_created = 0;
 	uint64_t                               stall_modules = 0;
 	uint64_t                               stall_waits   = 0;
@@ -292,18 +226,11 @@ void PipelineCache::Precompile(const std::stop_token& stop) {
 		std::unique_lock lock(sleep_mutex);
 		sleeper.wait_for(lock, stop, period, [] { return false; });
 	};
-	const auto play = [&] {
-		pause.reset();
-		set_helpers(helpers_running);
-		phase = Phase::Played;
-	};
-
 #if defined(ANYPS5_KYTY)
 	Clock::time_point stats_logged = Clock::now();
 #endif
 	while (!stop.stop_requested()) {
-		const bool paused = phase == Phase::Ask || phase == Phase::Wait;
-		sleep(paused ? Clock::duration(PausePeriod) : Clock::duration(WatchPeriod));
+		sleep(WatchPeriod);
 #if defined(ANYPS5_KYTY)
 		if (m_libraries != nullptr) {
 			m_libraries->Tick();
@@ -319,7 +246,7 @@ void PipelineCache::Precompile(const std::stop_token& stop) {
 		const auto left  = std::max(e.pending, stall.threads);
 		const auto creations = GetDriverCreations(SlowSeconds);
 		const bool waits_slow = stall.threads != 0 && now - stall.since >= std::chrono::duration<double>(SlowSeconds);
-		const uint32_t slow = creations.slow + e.helpers_slow;
+		const uint32_t slow = creations.slow;
 		if (slow != 0 || waits_slow) {
 			slow_until = now + NoticeLinger;
 		}
@@ -328,7 +255,6 @@ void PipelineCache::Precompile(const std::stop_token& stop) {
 			stall_since  = stall.since;
 			stall_logged = now;
 #if defined(ANYPS5_KYTY)
-			stall_helpers = e.helpers_done;
 			stall_created = m_pipelines_created.load(std::memory_order_relaxed);
 			stall_modules = m_chain_compiled.load(std::memory_order_relaxed);
 			{
@@ -344,7 +270,6 @@ void PipelineCache::Precompile(const std::stop_token& stop) {
 		} else if (stalled && stall.threads == 0 && now - stall.ended >= StallGap) {
 			stalled = false;
 #if defined(ANYPS5_KYTY)
-			const uint64_t helpers = e.helpers_done - std::min(stall_helpers, e.helpers_done);
 			const uint64_t created = m_pipelines_created.load(std::memory_order_relaxed) - stall_created;
 			const uint64_t modules = m_chain_compiled.load(std::memory_order_relaxed) - stall_modules;
 			uint64_t       waits   = 0;
@@ -353,10 +278,8 @@ void PipelineCache::Precompile(const std::stop_token& stop) {
 				waits = m_stall_stats.count - stall_waits;
 			}
 			PrecompileLog("Pipeline stall: the game goes on after {:.1f} s ({} compiles finished meanwhile: {} "
-			              "pipelines created by the driver, {} shader modules built by the chains, {} jobs done "
-			              "by the helpers; {} waits ended)",
-			              seconds(stall.ended - stall_since), created + modules + helpers, created, modules,
-			              helpers, waits);
+			              "pipelines created by the driver, {} shader modules built by the chains; {} waits ended)",
+			              seconds(stall.ended - stall_since), created + modules, created, modules, waits);
 #else
 			PrecompileLog("Pipeline stall: the game goes on after {:.1f} s ({} pipelines compiled meanwhile)",
 			              seconds(stall.ended - stall_since), e.finished - stall_base);
@@ -365,78 +288,6 @@ void PipelineCache::Precompile(const std::stop_token& stop) {
 			stall_logged = now;
 			PrecompileLog("Pipeline stall: {} pipelines left at {:.0f} s", left, seconds(now - stall_since));
 		}
-		if (phase == Phase::Watch || phase == Phase::Grace) {
-			const bool grace = phase == Phase::Grace;
-			const double threshold = grace || stalled ? GraceSeconds : wait ? WaitSeconds : AskSeconds;
-			if (grace && (slow != 0 || waits_slow)) {
-				grace_end = std::max(grace_end, slow_until);
-			}
-			if (grace && TakePrecompileAnswer() == PrecompileAnswer::Play) {
-				PrecompileLog("Pipeline precompile: the player plays at once ({} pipelines left, compiled in the "
-				              "background)",
-				              e.pending);
-				play();
-			} else if (e.driver_seconds < threshold || !LibKernel::GuestPause::GuestStarted()) {
-				if (grace && now >= grace_end) {
-					PrecompileLog("Pipeline precompile: notice closed after {:.1f} s: {} pipelines compiled while "
-					              "the game was stopped {} times",
-					              seconds(now - shown_at), e.finished - base, stops);
-					set_helpers(helpers_running);
-					phase = Phase::Watch;
-				}
-			} else {
-				if (!grace) {
-					(void)TakePrecompileAnswer();
-					shown_at = now;
-					base     = e.finished;
-					stops    = 0;
-				}
-				phase     = wait ? Phase::Wait : Phase::Ask;
-				pause     = std::make_unique<LibKernel::GuestPause>();
-				set_helpers(helpers_alone);
-				paused_at = now;
-				logged_at = now;
-				stop_base = e.finished;
-				stops++;
-				PrecompileLog("Pipeline precompile: about {:.0f} s of pipelines for the driver to compile ({} "
-				              "pipelines, {} shaders to translate): the game waits for them{}",
-				              e.driver_seconds, e.pending, e.shaders,
-				              phase == Phase::Ask ? ", or for the player to play at once"
-				              : grace             ? " (the same notice)"
-				                                  : "");
-			}
-		}
-		if (phase == Phase::Ask || phase == Phase::Wait) {
-			pause->Poll();
-			const auto answer = TakePrecompileAnswer();
-			if (answer == PrecompileAnswer::Play) {
-				PrecompileLog("Pipeline precompile: the player plays at once after {:.1f} s ({} pipelines left, "
-				              "compiled in the background)",
-				              seconds(now - shown_at), e.pending);
-				play();
-			} else {
-				if (answer == PrecompileAnswer::Wait && phase == Phase::Ask) {
-					PrecompileLog("Pipeline precompile: the player waits");
-					phase = Phase::Wait;
-					wait  = true;
-				}
-				if (e.drained) {
-					PrecompileLog("Pipeline precompile: {} pipelines compiled in {:.1f} s; the game goes on",
-					              e.finished - stop_base, seconds(now - paused_at));
-					pause.reset();
-					wait      = true;
-					phase     = Phase::Grace;
-					grace_end = now + GraceTime;
-				} else if (now - logged_at >= LogPeriod) {
-					logged_at = now;
-					PrecompileLog("Pipeline precompile: {} of {} pipelines, {} shaders to translate, about {:.0f} s "
-					              "left at {:.0f} s; {} guest threads stopped",
-					              e.finished - base, e.finished - base + e.pending, e.shaders, e.seconds_left,
-					              seconds(now - paused_at), pause->Suspended());
-				}
-			}
-		}
-
 		if (m_manifest_warm) {
 			const uint64_t finished = e.finished + e.shaders_finished;
 			const uint32_t left     = e.pending + e.running + e.shaders;
@@ -459,7 +310,7 @@ void PipelineCache::Precompile(const std::stop_token& stop) {
 				              seconds(now - *bar_work_since), finished - std::min(bar_base, finished));
 				bar_work_since.reset();
 			}
-			if (bar_shown && phase != Phase::Ask && phase != Phase::Wait) {
+			if (bar_shown) {
 				const auto done = static_cast<uint32_t>(finished - std::min(bar_base, finished));
 				ShowManifestProgress({.done      = done,
 				                      .total     = done + left,
@@ -471,14 +322,8 @@ void PipelineCache::Precompile(const std::stop_token& stop) {
 		}
 
 		std::optional<PrecompileNoticeState> state;
-		if (phase == Phase::Ask) {
-			state = PrecompileNoticeState::Question;
-		} else if (phase == Phase::Wait) {
-			state = PrecompileNoticeState::Paused;
-		} else if ((stalled || waits_slow) && (stall.threads != 0 || phase != Phase::Grace)) {
+		if (stalled || waits_slow) {
 			state = PrecompileNoticeState::Waiting;
-		} else if (phase == Phase::Grace) {
-			state = PrecompileNoticeState::Ready;
 		} else if (now < slow_until) {
 			state = PrecompileNoticeState::Compiling;
 		}
@@ -495,11 +340,10 @@ void PipelineCache::Precompile(const std::stop_token& stop) {
 			shown           = true;
 			notice_base     = e.finished;
 			notice_shown_at = now;
-			constexpr const char* Names[] = {"question", "paused", "waiting", "ready", "compiling"};
-			PrecompileLog("Pipeline notice: shown, state {} ({} driver creations for {:.1f} s, {} helper jobs "
-			              "for {:.1f} s, {} game threads waiting)",
-			              Names[static_cast<uint32_t>(*state)], creations.running, creations.longest,
-			              e.pending, e.helpers_longest, stall.threads);
+			PrecompileLog("Pipeline notice: shown, state {} ({} driver creations for {:.1f} s, {} pipelines pending, "
+			              "{} game threads waiting)",
+			              *state == PrecompileNoticeState::Waiting ? "waiting" : "compiling", creations.running,
+			              creations.longest, e.pending, stall.threads);
 		}
 		const auto done = static_cast<uint32_t>(e.finished - notice_base);
 		ShowPrecompileNotice({.visible          = true,
@@ -509,11 +353,9 @@ void PipelineCache::Precompile(const std::stop_token& stop) {
 		                      .shaders          = *state == PrecompileNoticeState::Waiting ? 0u : e.shaders,
 		                      .waited_pipelines = *state == PrecompileNoticeState::Compiling ? slow : stall.threads,
 		                      .seconds_waited   = *state == PrecompileNoticeState::Compiling
-		                                              ? static_cast<uint32_t>(std::max(creations.longest, e.helpers_longest))
+		                                              ? static_cast<uint32_t>(creations.longest)
 		                                              : static_cast<uint32_t>(seconds(now - (stall.threads != 0 ? stall.since : stall_since)))});
 	}
-	pause.reset();
-	set_helpers(helpers_running);
 	HidePrecompileNotice();
 	HideManifestProgress();
 #if defined(ANYPS5_KYTY)
