@@ -31,6 +31,7 @@ class CommandScheduler;
 class CommandRecorder;
 class TextureCache;
 class RenderContext;
+class GuestMirror;
 
 using BufferId = Common::SlotId;
 inline constexpr BufferId NULL_BUFFER_ID {0};
@@ -270,6 +271,7 @@ public:
 	void               RunGarbageCollector();
 	[[nodiscard]] bool CommitWriteTicks();
 	[[nodiscard]] bool TryReadMirroredGpuWrites(uint64_t vaddr, void* data, uint64_t size);
+	[[nodiscard]] GuestMirror* GetGuestMirror() noexcept { return m_guest_mirror.get(); }
 	void RequestFlushForReadbacks() noexcept {
 		if ((m_device_address_hot != 0 &&
 		     m_readback_count - m_device_address_hot < HotReadbackLifetime) ||
@@ -519,6 +521,13 @@ private:
 	static constexpr uint64_t MirrorMaxRead       = 256;
 	static constexpr uint32_t MaxMirrorLines      = 8192;
 	static constexpr uint64_t MirrorFlushLifetime = 4096;
+	void                      SubmitGuestMirror();
+	void                      TickGuestMirror();
+	std::unique_ptr<GuestMirror> m_guest_mirror;
+	uint64_t                     m_guest_mirror_line   = 0;
+	uint64_t                     m_guest_mirror_frames = 0;
+	uint64_t                     m_guest_mirror_trim   = 0;
+	uint64_t                     m_guest_mirror_trims  = 0;
 	void                      MarkMirrorLinesWritten(uint64_t vaddr, uint64_t size, uint64_t tick);
 	void                      AddMirrorLine(uint64_t line);
 	void                      RecordMirrorCopies(CommandBuffer& command);
