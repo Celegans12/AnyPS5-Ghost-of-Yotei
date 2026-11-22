@@ -593,6 +593,7 @@ public:
         disown(address, end);
         forgetZero(address, end);
         ownedHostAccess.emplace(address, end);
+        if (store) ownedHostStores.emplace(address, end);
         track.Hold(address, end);
         if (!store) track.Import(address, end);
         for (auto it = first; it != views.end() && it->first < end; ++it) {
@@ -620,6 +621,7 @@ public:
         const auto end = address + bytes;
         disown(address, end);
         eraseOwnedRange(ownedHostAccess, address, end);
+        if (store) eraseOwnedRange(ownedHostStores, address, end);
         track.Release(address, end);
         for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < end; ++it) {
             if (it->second.born <= serial) {
@@ -992,6 +994,42 @@ public:
 
     bool Collect(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear, Collection collection = Collection::All) {
         const SiteLock lock(mutex, LockSite::Collect, address, address + bytes);
+        const auto capacity = *count;
+        if (!collect(address, bytes, pages, count, clear, collection)) return false;
+        addHostWrites(address, address + bytes, pages, count, capacity);
+        return true;
+    }
+
+private:
+    void addHostWrites(std::uintptr_t address, std::uintptr_t end, void** pages, std::size_t* count, std::size_t capacity) const {
+        const bool stores = !ownedHostStores.empty() && overlapsOwnedRange(ownedHostStores, address, end);
+        const bool writers = unlockedHostWrites() && writersIn(address, end);
+        if (!stores && !writers) return;
+        std::vector<std::uintptr_t> merged;
+        merged.reserve(*count);
+        for (std::size_t index = 0; index < *count; ++index) merged.push_back(reinterpret_cast<std::uintptr_t>(pages[index]));
+        const auto collected = merged.size();
+        const auto add = [&](std::uintptr_t first, std::uintptr_t last) {
+            const auto from = std::max(first, address) & ~std::uintptr_t{4095};
+            const auto to = std::min(last, end);
+            for (auto page = from; page < to; page += 4096) merged.push_back(std::max(page, address));
+        };
+        if (stores) {
+            for (const auto& [first, last] : ownedHostStores) add(first, last);
+        }
+        if (writers) {
+            for (auto block = address & ~(ownedBlockBytes - 1); block < end; block += ownedBlockBytes) {
+                if (writersIn(block, block + ownedBlockBytes)) add(block, block + ownedBlockBytes);
+            }
+        }
+        if (merged.size() == collected) return;
+        std::sort(merged.begin(), merged.end());
+        merged.erase(std::unique(merged.begin(), merged.end()), merged.end());
+        *count = std::min(merged.size(), capacity);
+        for (std::size_t index = 0; index < *count; ++index) pages[index] = reinterpret_cast<void*>(merged[index]);
+    }
+
+    bool collect(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear, Collection collection) {
         const auto capacity = *count;
         *count = 0;
         const auto end = address + bytes;
@@ -2990,6 +3028,7 @@ private:
     std::map<std::uintptr_t, std::uint16_t> ownedPending;
     OwnedRanges ownedPins;
     OwnedRanges ownedHostAccess;
+    OwnedRanges ownedHostStores;
     std::uint64_t nextOwned = 1;
     Ranges cleanRanges;
     Ranges collectableRanges;
