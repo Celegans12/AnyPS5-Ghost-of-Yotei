@@ -704,11 +704,9 @@ GpuOperation CommandProcessor::MakeOperation(GpuOperationKind kind) {
 	operation.clean         = m_draw_observer != nullptr &&
 	                          (kind == GpuOperationKind::DrawIndex || kind == GpuOperationKind::DrawIndirect) &&
 	                          m_draw_observer->LastClean();
-	if (m_scout_packet != nullptr && (kind == GpuOperationKind::DrawIndex || kind == GpuOperationKind::DrawAuto ||
-	                                  kind == GpuOperationKind::DrawIndirect)) {
-		operation.scout_packet   = m_scout_packet;
+	if (m_scout_sequence != 0 && (kind == GpuOperationKind::DrawIndex || kind == GpuOperationKind::DrawAuto ||
+	                              kind == GpuOperationKind::DrawIndirect)) {
 		operation.scout_sequence = m_scout_sequence;
-		operation.scout_ordinal  = m_scout_ordinal;
 	}
 	if (m_pipeline == nullptr) {
 		operation.state = {&m_ctx, &m_ucfg, &m_sh_ctx};
@@ -797,8 +795,7 @@ uint64_t CommandProcessor::EmitCallback(GpuCallback&& callback, const GpuGuestWr
 
 void CommandProcessor::Execute(GpuOperation& operation) {
 	EXIT_IF(operation.processor != this);
-	if (operation.scout_packet != nullptr && Scout::Running())
-		Scout::NoteDrawAt(operation.scout_packet, operation.scout_sequence, operation.scout_ordinal);
+	if (operation.scout_sequence != 0 && Scout::Running()) Scout::EnterSubmission(operation.scout_sequence);
 	BindState(operation.state);
 	m_renderer.GetRenderExecutor().SetTableTicket(operation.table_ticket);
 	m_renderer.NoteOperation(operation.submit_id, operation.after_wait);
@@ -1715,7 +1712,6 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			if (m_draw_observer != nullptr) m_draw_observer->ObservePacket(opcode, view, packet_dw, true);
 			cursor.offset_dw += packet_dw;
 			execution.m_made_progress = true;
-			if (execution.m_scout_sequence != 0 && Scout::IsDraw(opcode)) execution.m_scout_ordinal++;
 			continue;
 		}
 
@@ -1741,16 +1737,13 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 
 		const bool scout_draw = execution.m_scout_sequence != 0 && Scout::IsDraw(opcode);
 		if (scout_draw) {
-			m_scout_packet   = packet;
 			m_scout_sequence = execution.m_scout_sequence;
-			m_scout_ordinal  = execution.m_scout_ordinal;
 		}
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, view + 1, remaining_dw, total_dw) + 1;
 		EXIT_IF(packet_dw > remaining_dw);
 		if (scout_draw) {
-			m_scout_packet = nullptr;
-			if (!execution.m_suspended) ++execution.m_scout_ordinal;
+			m_scout_sequence = 0;
 		}
 		if (execution.m_suspended) {
 			return;

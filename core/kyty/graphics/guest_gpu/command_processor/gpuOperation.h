@@ -93,9 +93,7 @@ struct GpuOperation {
 	bool clean = false;
 	bool stream_in_place = false;
 	const void*     table_ticket   = nullptr;
-	const uint32_t* scout_packet   = nullptr;
 	uint64_t        scout_sequence = 0;
-	uint32_t        scout_ordinal  = 0;
 	union {
 		DrawIndexArgs       draw_index;
 		DrawAutoArgs        draw_auto;

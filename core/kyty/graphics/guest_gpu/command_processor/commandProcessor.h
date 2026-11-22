@@ -55,7 +55,6 @@ private:
 	bool                      m_yield         = false;
 	bool                      m_made_progress = false;
 	uint64_t                  m_scout_sequence = 0;
-	uint32_t                  m_scout_ordinal  = 0;
 
 public:
 	void SetScoutSequence(uint64_t sequence) noexcept { m_scout_sequence = sequence; }
@@ -248,9 +247,7 @@ private:
 	SnapshotRing<HW::Shader>     m_sh_ctx_snapshots;
 
 	uint64_t m_submit_id      = 0;
-	const uint32_t* m_scout_packet   = nullptr;
 	uint64_t        m_scout_sequence = 0;
-	uint32_t        m_scout_ordinal  = 0;
 	bool     m_predicate_skip = false;
 	std::unique_ptr<DrawStateObserver> m_draw_observer;
 	bool     m_occlusion_wait_requested = false;

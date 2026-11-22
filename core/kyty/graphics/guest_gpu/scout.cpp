@@ -45,9 +45,6 @@ std::atomic<uint64_t> g_counts[Count];
 inline void           Add(Id id, uint64_t n = 1) noexcept { g_counts[id].fetch_add(n, std::memory_order_relaxed); }
 }
 
-struct alignas(128) RenderPosition {
-	std::atomic<uint64_t> render {0};
-};
 struct alignas(128) ScoutWritten {
 	std::atomic<uint64_t> quiescent {0};
 };
@@ -56,24 +53,18 @@ struct alignas(128) ReadMostly {
 	std::atomic<uint64_t> retire_clock {0};
 };
 struct alignas(128) RenderOwn {
-	uint64_t        render_sequence = 0;
-	uint32_t        render_count    = 0;
-	const uint32_t* render_packet   = nullptr;
-	uint64_t        version         = 0;
+	uint64_t render_sequence = 0;
+	uint64_t version         = 0;
 };
 struct alignas(128) AnyWriter {
 	std::atomic<uint64_t> write_clock {0};
 };
-RenderPosition g_render_position;
 ScoutWritten   g_scout_written;
 ReadMostly     g_read_mostly;
 RenderOwn      g_render_own;
 AnyWriter      g_any_writer;
 
-constexpr auto& g_render          = g_render_position.render;
 constexpr auto& g_render_sequence = g_render_own.render_sequence;
-constexpr auto& g_render_count    = g_render_own.render_count;
-constexpr auto& g_render_packet   = g_render_own.render_packet;
 
 struct HostWrite {
 	std::atomic<uint64_t>     clock {0};
@@ -317,7 +308,6 @@ Loss Evaluate(State& state, const View& view, Ticket& ticket) {
 	ticket.image_words = static_cast<uint16_t>(state.words.size());
 	ticket.lod_stats   = static_cast<uint16_t>(state.lod_stats.size());
 	ticket.pages       = static_cast<uint16_t>(state.pages.size());
-	ticket.used        = static_cast<uint32_t>(out - ticket.data);
 	return Loss::None;
 }
 
@@ -355,41 +345,16 @@ bool EvaluateAhead(const std::array<uint64_t, 3>& key, uint64_t key_hash, std::s
 		registers.ps_user = {};
 		std::copy_n(gs_user.begin(), std::min<size_t>(gs_user.size(), registers.gs_user.size()), registers.gs_user.begin());
 		std::copy_n(ps_user.begin(), std::min<size_t>(ps_user.size(), registers.ps_user.size()), registers.ps_user.begin());
-		ticket.sequence = 0;
-		ticket.ordinal  = 0;
-		ticket.packet   = 0;
-		made            = Evaluate(*state, *view, ticket) == Loss::None;
+		made = Evaluate(*state, *view, ticket) == Loss::None;
 	}
 	Quiesce();
 	return made;
 }
 
-void BeginSubmission(uint64_t sequence) {
+void EnterSubmission(uint64_t sequence) {
+	if (sequence == g_render_sequence) return;
 	g_render_sequence = sequence;
-	g_render_count    = 0;
-	g_render_packet   = nullptr;
-	g_render.store(sequence << 24u, std::memory_order_release);
 	FreeRetired();
-}
-
-void NoteDraw(const uint32_t* packet) {
-	g_render_packet = packet;
-	g_render.store(g_render_sequence << 24u | ++g_render_count, std::memory_order_release);
-}
-
-void NoteDrawAt(const uint32_t* packet, uint64_t sequence, uint32_t ordinal) {
-	if (sequence != g_render_sequence) {
-		g_render_sequence = sequence;
-		FreeRetired();
-	}
-	g_render_count  = ordinal + 1;
-	g_render_packet = packet;
-	g_render.store(sequence << 24u | g_render_count, std::memory_order_release);
-}
-
-void SkipDraws(uint32_t count) {
-	g_render_count += count;
-	g_render.store(g_render_sequence << 24u | g_render_count, std::memory_order_release);
 }
 
 void NoteWrite(const void* address, uint32_t size) {

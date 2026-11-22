@@ -28,10 +28,7 @@ void Stop();
 	       opcode == Pm4::IT_DRAW_INDIRECT_MULTI || opcode == Pm4::IT_DRAW_INDEX_INDIRECT_MULTI;
 }
 
-void BeginSubmission(uint64_t sequence);
-void NoteDraw(const uint32_t* packet);
-void SkipDraws(uint32_t count);
-void NoteDrawAt(const uint32_t* packet, uint64_t sequence, uint32_t ordinal);
+void EnterSubmission(uint64_t sequence);
 void NoteWrite(const void* address, uint32_t size);
 void NoteHostWrite(uint64_t address, uint64_t size, bool write_back = false);
 inline void NoteHostWriteIfOn(uint64_t address, uint64_t size, bool write_back = false) {
@@ -73,10 +70,6 @@ inline constexpr uint32_t ResolvedEntries = 65536;
 static_assert(std::has_single_bit(ResolvedEntries));
 
 struct alignas(64) Ticket {
-	uint64_t                                sequence = 0;
-	uint32_t                                ordinal  = 0;
-	uint32_t                                used     = 0;
-	uint64_t                                packet   = 0;
 	uint64_t                                version  = 0;
 	std::array<uint64_t, 3>                 key {};
 	uint64_t                                mapping_epoch = 0;
