@@ -616,6 +616,16 @@ bool LdsLaneSyncEnabled() {
 	}();
 	return enabled;
 }
+
+bool F32ProductNoContractionEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_F32_PRODUCT_NO_CONTRACTION");
+		const bool  on    = value == nullptr || std::strcmp(value, "0") != 0;
+		Log::WriteToConsoleAndLog(on ? "f32 product NoContraction: on\n" : "f32 product NoContraction: off\n");
+		return on;
+	}();
+	return enabled;
+}
 }
 
 ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
@@ -628,7 +638,8 @@ ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	        .relaxed_float          = Config::RelaxedShaderFloatEnabled(),
 	        .ray_query              = graphics.ray_query_enabled,
 	        .lds_lane_sync          = LdsLaneSyncEnabled(),
-	        .native_float16         = graphics.shader_float16_enabled};
+	        .native_float16         = graphics.shader_float16_enabled,
+	        .f32_product_no_contraction = F32ProductNoContractionEnabled()};
 }
 
 std::filesystem::path ShaderStorePath() {
