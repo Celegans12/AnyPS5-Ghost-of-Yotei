@@ -29,6 +29,8 @@ public:
 	static constexpr uint32_t MinBlockBits    = 16;
 	static constexpr uint64_t ChunkBytes      = uint64_t {32} << 20u;
 	static constexpr size_t   MaxBindsPerCall = 256;
+	static constexpr uint64_t FlushBlocks     = 4096;
+	static constexpr uint64_t FlushNs         = 1'000'000'000;
 
 	static constexpr std::array<uint64_t, 10> DefaultSizes {864 * GiB, 832 * GiB, 800 * GiB, 768 * GiB, 704 * GiB,
 	                                                        640 * GiB, 512 * GiB, 256 * GiB, 128 * GiB, 64 * GiB};
@@ -68,6 +70,7 @@ public:
 
 	void NoteRange(uint64_t vaddr, uint64_t size);
 	void Submit();
+	void Flush();
 	void Trim(std::span<const std::pair<uint64_t, uint64_t>> live);
 	void WaitIdle();
 	[[nodiscard]] Stats TakeStats();
@@ -119,6 +122,8 @@ private:
 
 	std::vector<uint64_t> m_bound;
 	std::vector<Run>      m_pending;
+	uint64_t              m_pending_blocks = 0;
+	uint64_t              m_last_post      = 0;
 	uint64_t              m_outside_blocks = 0;
 
 	vk::Buffer                      m_buffer = nullptr;
