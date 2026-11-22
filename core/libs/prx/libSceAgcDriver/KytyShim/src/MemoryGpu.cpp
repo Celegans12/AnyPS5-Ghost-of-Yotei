@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
+#include <array>
 #include <atomic>
 #include <cinttypes>
 #include <cstdlib>
@@ -300,6 +301,20 @@ bool WalkerReadOnPage(uint64_t address, uint32_t& value, const uint8_t* backing)
 	return TryReadAroundGpuWritesOnPage(address, &value, sizeof(value), backing);
 }
 
+bool WalkerSettleLine(uint64_t line, bool& page_clean) {
+	constexpr uint64_t PageSize = 4096;
+	constexpr uint64_t LineSize = 64;
+	auto&              buffers  = GetGpuResources().GetBufferCache();
+	if (buffers.HasGpuDirtyBytes(line, LineSize)) {
+		std::array<uint8_t, LineSize> bytes {};
+		if (!buffers.TryReadMirroredGpuWrites(line, bytes.data(), LineSize) || buffers.HasGpuDirtyBytes(line, LineSize)) {
+			return false;
+		}
+	}
+	page_clean = !buffers.HasGpuDirtyBytes(line & ~(PageSize - 1), PageSize);
+	return true;
+}
+
 }
 #endif
 
@@ -311,7 +326,7 @@ void InstallGpuResources(Graphics::RenderContext* resources) noexcept {
 #if defined(ANYPS5_KYTY)
 	if (resources != nullptr) {
 		Graphics::ShaderRecompiler::IR::SetSrtWalkerGuestMemory(
-		    {&WalkerGuestPage, &WalkerGuestRead, &WalkerAroundPage, &WalkerReadOnPage});
+		    {&WalkerGuestPage, &WalkerGuestRead, &WalkerAroundPage, &WalkerReadOnPage, &WalkerSettleLine});
 	}
 #endif
 }

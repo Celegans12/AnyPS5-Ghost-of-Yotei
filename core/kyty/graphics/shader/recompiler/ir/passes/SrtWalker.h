@@ -117,6 +117,7 @@ struct SrtWalkerGuestMemory {
 #if defined(ANYPS5_KYTY)
 	const uint8_t* (*around_page)(uint64_t address, bool& clean) = nullptr;
 	bool (*read_on_page)(uint64_t address, uint32_t& value, const uint8_t* backing) = nullptr;
+	bool (*settle_line)(uint64_t line, bool& page_clean) = nullptr;
 #endif
 };
 void SetSrtWalkerGuestMemory(const SrtWalkerGuestMemory& memory);
@@ -127,7 +128,9 @@ enum class SrtShortWalkers : uint8_t { Off, On, Verify };
 struct SrtWalkerChecks {
 	uint64_t walks      = 0;
 	uint64_t unstable   = 0;
-	uint64_t mismatches = 0;
+	uint64_t mismatches      = 0;
+	uint64_t line_loads      = 0;
+	uint64_t line_mismatches = 0;
 };
 [[nodiscard]] SrtShortWalkers SrtShortWalkersMode();
 [[nodiscard]] SrtWalkerChecks SrtWalkerChecksSoFar();

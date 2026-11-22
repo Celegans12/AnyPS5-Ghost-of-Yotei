@@ -193,6 +193,8 @@ struct WalkerPageAnswer {
 	const uint8_t* around       = nullptr;
 	bool           around_known = false;
 	bool           around_clean = false;
+	uint64_t       lines_held   = 0;
+	uint64_t       lines_kept   = 0;
 #endif
 };
 thread_local std::array<WalkerPageAnswer, 4> t_page_answers;
@@ -208,7 +210,45 @@ struct WalkerCachedPage {
 constexpr uint32_t WalkerPageCacheSlots = 4;
 
 #if defined(ANYPS5_KYTY)
-thread_local bool t_short_probe = false;
+thread_local bool     t_short_probe = false;
+thread_local bool     t_check_lines = false;
+std::atomic<uint64_t> g_line_checks {0};
+std::atomic<uint64_t> g_line_differences {0};
+constexpr uint64_t    WalkerLineSize = 64;
+
+bool ReadOnHeldLine(uint64_t address, uint64_t offset, WalkerPageAnswer& answer, uint32_t& value) {
+	const auto line = address - offset % WalkerLineSize;
+	const auto bit  = uint64_t {1} << (offset / WalkerLineSize);
+	if (g_guest_memory.settle_line == nullptr || offset % WalkerLineSize > WalkerLineSize - sizeof(value) ||
+	    (answer.lines_kept & bit) != 0) {
+		return false;
+	}
+	if ((answer.lines_held & bit) == 0) {
+		bool page_clean = false;
+		if (!g_guest_memory.settle_line(line, page_clean)) {
+			answer.lines_kept |= bit;
+			return false;
+		}
+		answer.lines_held |= bit;
+		answer.around_clean = page_clean;
+	} else if (t_check_lines) {
+		uint32_t per_load = 0;
+		std::memcpy(&value, answer.around + offset, sizeof(value));
+		const bool read   = g_guest_memory.read_on_page(address, per_load, answer.around);
+		g_line_checks.fetch_add(1, std::memory_order_relaxed);
+		if (!read || per_load != value) {
+			const auto report = g_line_differences.fetch_add(1, std::memory_order_relaxed);
+			if (report < 16) {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "[kyty-srt-walkers] line mismatch {}: load {:#018x} from a held GPU-written line read {:#x}, the "
+				    "per-load path {}\n",
+				    report + 1, address, value, read ? fmt::format("{:#x}", per_load) : std::string("refused")));
+			}
+		}
+	}
+	std::memcpy(&value, answer.around + offset, sizeof(value));
+	return true;
+}
 #endif
 
 uint64_t KYTY_SYSV_ABI ProbeGuestLoad(uint64_t address, WalkerCachedPage* cache) {
@@ -262,6 +302,14 @@ uint64_t KYTY_SYSV_ABI ProbeGuestLoad(uint64_t address, WalkerCachedPage* cache)
 			return uint64_t {1} << 32u | value;
 		}
 		if (answer.around != nullptr) {
+			if (ReadOnHeldLine(address, address - page, answer, value)) {
+				if (answer.around_clean && cache != nullptr) {
+					auto& slot   = cache[(page / PageSize) % WalkerPageCacheSlots];
+					slot.page    = page / PageSize;
+					slot.backing = answer.around;
+				}
+				return uint64_t {1} << 32u | value;
+			}
 			return g_guest_memory.read_on_page(address, value, answer.around) ? uint64_t {1} << 32u | value : 0;
 		}
 	}
@@ -1922,7 +1970,7 @@ std::atomic<uint64_t> g_checked_walks {0};
 std::atomic<uint64_t> g_unstable_walks {0};
 std::atomic<uint64_t> g_walk_mismatches {0};
 std::atomic<uint64_t> g_checks_line {0};
-std::atomic<uint64_t> g_checks_logged[3] {};
+std::atomic<uint64_t> g_checks_logged[5] {};
 std::atomic<uint32_t> g_mismatch_reports {0};
 
 struct WalkRecord {
@@ -1975,11 +2023,15 @@ void LogWalkerChecks() {
 	const auto walks      = take(g_checked_walks, g_checks_logged[0]);
 	const auto unstable   = take(g_unstable_walks, g_checks_logged[1]);
 	const auto mismatches = take(g_walk_mismatches, g_checks_logged[2]);
+	const auto lines      = take(g_line_checks, g_checks_logged[3]);
+	const auto line_diffs = take(g_line_differences, g_checks_logged[4]);
 	Log::WriteToConsoleAndLog(fmt::format(
 	    "[kyty-srt-walkers] summary of the last {:.1f} s: {} walks run with both walkers, {} mismatches, {} walks whose "
-	    "guest memory changed between the runs (not compared); since start {} walks, {} mismatches\n",
-	    static_cast<double>(now - last) / 1e9, walks, mismatches, unstable, g_checked_walks.load(std::memory_order_relaxed),
-	    g_walk_mismatches.load(std::memory_order_relaxed)));
+	    "guest memory changed between the runs (not compared), {} loads from held GPU-written lines read again per "
+	    "load, {} differed; since start {} walks, {} mismatches, {} line loads differed\n",
+	    static_cast<double>(now - last) / 1e9, walks, mismatches, unstable, lines, line_diffs,
+	    g_checked_walks.load(std::memory_order_relaxed), g_walk_mismatches.load(std::memory_order_relaxed),
+	    g_line_differences.load(std::memory_order_relaxed)));
 }
 
 void NoteWalkerMismatch(const ResourcePlan& plan, bool ahead, const std::string& difference) {
@@ -2146,8 +2198,12 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	if (verify) RunReference(plan, runtime, t_walk_records[0]);
 #endif
 	const auto* first = scratch.data() + captures / 8u;
-	const auto* end   = RunWalker(*code, short_form, runtime, flat.data(), scratch.data());
 #if defined(ANYPS5_KYTY)
+	t_check_lines = verify;
+#endif
+	const auto* end = RunWalker(*code, short_form, runtime, flat.data(), scratch.data());
+#if defined(ANYPS5_KYTY)
+	t_check_lines = false;
 	if (verify) {
 		auto& [reference, record, again] = t_walk_records;
 		RecordWalk(plan, long_walker->outputs, scratch.data(), first, end, deferred_before, around_before, record);
@@ -2259,7 +2315,9 @@ SrtShortWalkers SrtShortWalkersMode() {
 SrtWalkerChecks SrtWalkerChecksSoFar() {
 	return {.walks      = g_checked_walks.load(std::memory_order_relaxed),
 	        .unstable   = g_unstable_walks.load(std::memory_order_relaxed),
-	        .mismatches = g_walk_mismatches.load(std::memory_order_relaxed)};
+	        .mismatches      = g_walk_mismatches.load(std::memory_order_relaxed),
+	        .line_loads      = g_line_checks.load(std::memory_order_relaxed),
+	        .line_mismatches = g_line_differences.load(std::memory_order_relaxed)};
 }
 #endif
 

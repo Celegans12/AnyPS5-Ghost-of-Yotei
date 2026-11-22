@@ -80,6 +80,82 @@ void Poke(uint64_t address, uint32_t value) {
 	g_guest[(address - GuestRegion) / 4u] = value;
 }
 
+constexpr uint64_t TablePage  = TableAddress & ~uint64_t {0xfff};
+constexpr uint32_t PageWords  = 1024;
+constexpr uint32_t TableWords = 0x110u / 4u;
+
+struct GpuTable {
+	bool                             active = false;
+	std::array<uint32_t, PageWords>  mirror {};
+	std::array<bool, PageWords>      dirty {};
+	uint64_t                         refused_lines = 0;
+	uint64_t                         settles       = 0;
+	uint64_t                         per_load      = 0;
+};
+GpuTable g_gpu;
+
+bool OnGpuPage(uint64_t address) {
+	return g_gpu.active && (address & ~uint64_t {0xfff}) == TablePage;
+}
+
+bool GpuPageDirty() {
+	return std::find(g_gpu.dirty.begin(), g_gpu.dirty.end(), true) != g_gpu.dirty.end();
+}
+
+uint32_t& GuestWord(uint64_t address) {
+	return g_guest[(address - GuestRegion) / 4u];
+}
+
+void SettleWord(uint64_t address) {
+	const auto index = static_cast<uint32_t>((address - TablePage) / 4u);
+	if (!g_gpu.dirty[index]) return;
+	GuestWord(address)  = g_gpu.mirror[index];
+	g_gpu.dirty[index] = false;
+}
+
+IR::SrtWalkerPage GpuPage(uint64_t address, bool ahead, const uint8_t*& backing) {
+	backing = nullptr;
+	return OnGpuPage(address) && !ahead ? IR::SrtWalkerPage::PerLoad : IR::SrtWalkerPage::Direct;
+}
+
+bool GpuRead(uint64_t address, uint32_t& value, bool ahead, const uint8_t*) {
+	if (ahead || !OnGpuPage(address) || address % 4u != 0u) return false;
+	g_gpu.per_load++;
+	SettleWord(address);
+	value = GuestWord(address);
+	return true;
+}
+
+const uint8_t* GpuAroundPage(uint64_t address, bool& clean) {
+	clean = false;
+	if (!OnGpuPage(address)) return nullptr;
+	clean = !GpuPageDirty();
+	return reinterpret_cast<const uint8_t*>(&GuestWord(TablePage));
+}
+
+bool GpuReadOnPage(uint64_t address, uint32_t& value, const uint8_t*) {
+	return GpuRead(address, value, false, nullptr);
+}
+
+bool GpuSettleLine(uint64_t line, bool& page_clean) {
+	if ((g_gpu.refused_lines >> ((line - TablePage) / 64u) & 1u) != 0u) return false;
+	g_gpu.settles++;
+	for (uint64_t address = line; address < line + 64u; address += 4u) SettleWord(address);
+	page_clean = !GpuPageDirty();
+	return true;
+}
+
+void WriteTableOnGpu() {
+	for (uint32_t index = 0; index < PageWords; ++index) {
+		auto& word          = GuestWord(TablePage + index * 4u);
+		g_gpu.mirror[index] = word;
+		g_gpu.dirty[index]  = index < TableWords;
+		if (g_gpu.dirty[index]) word = 0xdead0000u | index;
+	}
+	g_gpu.refused_lines = uint64_t {1} << 1u;
+	g_gpu.active        = true;
+}
+
 bool ReadMemory(void*, uint64_t address, std::span<uint32_t> values) {
 	for (size_t index = 0; index < values.size(); ++index) {
 		const auto at = address + index * 4u;
@@ -151,6 +227,7 @@ Walk Materialize(const IR::ResourcePlan& plan, std::span<const uint32_t, 16> use
 }
 
 std::array<uint32_t, 16> TableUserData(const std::vector<Texture>& table, uint32_t count) {
+	g_gpu.active = false;
 	std::fill_n(g_guest, GuestBytes / 4u, 0u);
 	for (uint32_t entry = 0; entry < table.size(); ++entry) {
 		for (uint32_t word = 0; word < 8u; ++word) Poke(TableAddress + entry * 32u + word * 4u, table[entry][word]);
@@ -169,6 +246,7 @@ std::array<uint32_t, 16> TableUserData(const std::vector<Texture>& table, uint32
 }
 
 std::array<uint32_t, 16> RawUserData(uint32_t records) {
+	g_gpu.active = false;
 	std::fill_n(g_guest, GuestBytes / 4u, 0u);
 	std::array<uint32_t, 16> user_data {};
 	const auto sharp = [&](uint32_t at, uint64_t address) {
@@ -223,6 +301,11 @@ uint32_t Run(bool both) {
 	for (const auto& [name, table]: tables) {
 		for (const uint32_t count: {static_cast<uint32_t>(table.size()), 0u, 1u}) {
 			compare(name + " count " + std::to_string(count), loop.plan, [&] { return TableUserData(table, count); });
+			compare(name + " count " + std::to_string(count) + ", GPU-written table", loop.plan, [&] {
+				const auto user_data = TableUserData(table, count);
+				WriteTableOnGpu();
+				return user_data;
+			});
 		}
 	}
 	for (const uint32_t records: {0u, 128u}) {
@@ -243,11 +326,15 @@ int main() {
 		return 1;
 	}
 	Check(!both || Common::Ab::Listed(Switches::Switch::ShortSrtWalkers), "KYTY_AB lists KYTY_SHORT_SRT_WALKERS");
+	IR::SetSrtWalkerGuestMemory({&GpuPage, &GpuRead, &GpuAroundPage, &GpuReadOnPage, &GpuSettleLine});
 	const auto walks  = Run(both);
 	const auto checks = IR::SrtWalkerChecksSoFar();
+	Check(g_gpu.settles != 0, "the short walker settles GPU-written lines once");
+	Check(g_gpu.per_load != 0, "a refused line keeps the per-load read");
 	if (verify) {
 		Check(checks.walks >= walks, "every walk ran with both walkers");
 		Check(checks.mismatches == 0 && checks.unstable == 0, "the check found no difference");
+		Check(checks.line_loads != 0 && checks.line_mismatches == 0, "loads from settled lines match the per-load read");
 	} else {
 		Check(checks.walks == 0, "no walk is checked without verify");
 	}
