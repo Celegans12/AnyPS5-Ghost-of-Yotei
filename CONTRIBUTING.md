@@ -1,5 +1,7 @@
 # Contributing
 
+On the `AnyKyty` branch, start with [Start here](docs/dev/START_HERE.md): how to build, run, test and measure AnyKyty, which rules of this page apply to pull requests against `AnyKyty`, and how they are integrated.
+
 ## Code
 
 - Follow the [coding conventions](docs/dev/CONVENTIONS.md): naming, no comments except [technical debt](docs/dev/TechnicalDebt.md), Conventional Commits.
