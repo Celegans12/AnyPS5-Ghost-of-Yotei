@@ -1727,8 +1727,8 @@ void TextureCache::InitializeImage(ImageId id) {
 		return;
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
-	if (upload && !image.IsBufferModified() && image.write_count == 0 && IsTargetImage(image) &&
-	    WasDiscardedTarget(image)) {
+	if (upload && !image.IsBufferModified() && image.write_count == 0 && !image.depth_id &&
+	    IsTargetImage(image) && WasDiscardedTarget(image)) {
 		image.RefreshComplete();
 		return;
 	}
