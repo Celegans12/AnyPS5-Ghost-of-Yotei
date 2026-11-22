@@ -31,6 +31,7 @@
 #include <vector>
 
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace Memory = Libs::LibKernel::Memory;
@@ -997,6 +998,24 @@ void ViewFiles(int* guestFile, int* directFile) {
     Require(DirectMemoryViewFiles_nid_no_patch(guestFile, directFile) && *guestFile >= 0 && *directFile >= 0 && *guestFile != *directFile);
 }
 
+long long FileBlocks(int file) {
+    struct stat info {};
+    Require(fstat(file, &info) == 0);
+    return static_cast<long long>(info.st_blocks);
+}
+
+void PrintTransparentHugePagePolicy() {
+    for (const auto* path : {"/sys/kernel/mm/transparent_hugepage/enabled",
+                             "/sys/kernel/mm/transparent_hugepage/shmem_enabled",
+                             "/sys/kernel/mm/transparent_hugepage/defrag"}) {
+        FILE* file = std::fopen(path, "r");
+        if (file == nullptr) continue;
+        char line[256] = {};
+        if (std::fgets(line, sizeof(line), file) != nullptr) std::printf("sparse-state %s: %s", path, line);
+        std::fclose(file);
+    }
+}
+
 void RequireSparseReads(std::uint64_t address, const std::vector<std::uint8_t>& expected, std::size_t offset, std::size_t bytes) {
     std::vector<std::uint8_t> read(bytes, 0xcc);
     Require(Memory::TryReadBacking(address + offset, read.data(), bytes));
@@ -1029,22 +1048,45 @@ void TestSparseReadsGuestFile() {
     Require(sceKernelMapFlexibleMemory(&flexible, bytes, CpuReadWrite, 0) == 0 && flexible != nullptr);
     const auto address = Address(flexible);
     std::vector<std::uint8_t> expected(bytes, 0);
-    Require(ResidentPages(address, bytes) == 0 && FileHole(guestFile, address, bytes));
+    const auto initialResident = ResidentPages(address, bytes);
+    const auto initialHole = FileHole(guestFile, address, bytes);
+    std::printf("sparse-state guest-initial: resident=%zu hole=%d st_blocks=%lld\n", initialResident, initialHole ? 1 : 0,
+        FileBlocks(guestFile));
+    Require(initialResident == 0 && initialHole);
     RequireSparseReads(address, expected, 0, bytes);
     RequireSparseReads(address, expected, 3, bytes - 5);
-    if (sparse) Require(ResidentPages(address, bytes) == 0 && FileHole(guestFile, address, bytes));
+    if (sparse) {
+        const auto afterReadsResident = ResidentPages(address, bytes);
+        const auto afterReadsHole = FileHole(guestFile, address, bytes);
+        std::printf("sparse-state guest-after-reads: resident=%zu hole=%d st_blocks=%lld\n", afterReadsResident,
+            afterReadsHole ? 1 : 0, FileBlocks(guestFile));
+        Require(afterReadsResident == 0 && afterReadsHole);
+    }
 
     auto* guest = static_cast<std::uint8_t*>(flexible);
     Put(guest, expected, 4 * 0x1000 - 1, 2, 0x41);
     Put(guest, expected, 64 * KiB - 100, 200, 0x52);
     Put(guest, expected, 320 * KiB, Page, 0x63);
     Put(guest, expected, 900 * KiB + 7, 3, 0x74);
+    std::printf("sparse-state guest-after-writes: resident=%zu st_blocks=%lld\n", ResidentPages(address, bytes), FileBlocks(guestFile));
     Require(!FileHole(guestFile, address + 320 * KiB, Page) && !FileHole(guestFile, address + 900 * KiB, 0x1000));
     const std::pair<std::size_t, std::size_t> ranges[] = {
         {0, bytes}, {1, bytes - 2}, {4 * 0x1000 - 1, 2}, {4 * 0x1000 - 2, 4}, {60 * KiB, 200 * KiB}, {128 * KiB + 5, 600 * KiB},
         {320 * KiB - 1, Page + 2}, {320 * KiB + 1, Page - 2}, {bytes - 128 * KiB, 128 * KiB}, {400 * KiB, 496 * KiB}};
-    for (const auto& [offset, size] : ranges) RequireSparseReads(address, expected, offset, size);
-    if (sparse) Require(ResidentPages(address + 400 * KiB, 496 * KiB) == 0 && FileHole(guestFile, address + 400 * KiB, 496 * KiB));
+    std::size_t rangeIndex = 0;
+    for (const auto& [offset, size] : ranges) {
+        RequireSparseReads(address, expected, offset, size);
+        const auto pageOffset = offset & ~std::size_t{0xfff};
+        const auto pageSize = (offset - pageOffset) + size;
+        std::printf("sparse-state guest-range-%zu: resident=%zu hole=%d st_blocks=%lld\n", rangeIndex,
+            ResidentPages(address + pageOffset, pageSize), FileHole(guestFile, address + offset, size) ? 1 : 0, FileBlocks(guestFile));
+        ++rangeIndex;
+    }
+    const auto finalResident = ResidentPages(address + 400 * KiB, 496 * KiB);
+    const auto finalHole = FileHole(guestFile, address + 400 * KiB, 496 * KiB);
+    std::printf("sparse-state guest-final: resident=%zu hole=%d st_blocks=%lld\n", finalResident, finalHole ? 1 : 0,
+        FileBlocks(guestFile));
+    if (sparse) Require(finalResident == 0 && finalHole);
     Require(sceKernelMunmap(address, bytes) == 0);
     std::printf("guest memory file 0x%llx: holes read as zeros%s, data at page edges and across 64 KiB steps read back exactly\n", static_cast<unsigned long long>(address),
         sparse ? " without being filled" : " (plain reads)");
@@ -1062,7 +1104,11 @@ void TestSparseReadsDirectFile() {
     int64_t high = -1;
     Require(sceKernelAllocateDirectMemory(top, directSize, half, 0, 0, &low) == 0 && low >= top);
     Require(sceKernelAllocateDirectMemory(top, directSize, half, 0, 0, &high) == 0 && high >= top && high != low);
-    Require(FileHole(directFile, static_cast<std::uint64_t>(low), half) && FileHole(directFile, static_cast<std::uint64_t>(high), half));
+    const auto initialLowHole = FileHole(directFile, static_cast<std::uint64_t>(low), half);
+    const auto initialHighHole = FileHole(directFile, static_cast<std::uint64_t>(high), half);
+    std::printf("sparse-state direct-initial: low_hole=%d high_hole=%d st_blocks=%lld\n", initialLowHole ? 1 : 0,
+        initialHighHole ? 1 : 0, FileBlocks(directFile));
+    Require(initialLowHole && initialHighHole);
     void* place = nullptr;
     Require(sceKernelReserveVirtualRange(&place, 2 * half, 0, 0) == 0 && place != nullptr);
     void* first = place;
@@ -1072,17 +1118,35 @@ void TestSparseReadsDirectFile() {
     const auto address = Address(place);
     Require(Memory::IsBackingReadable(address, 2 * half) && Memory::FindBackingPointer(address, 2 * half) == nullptr);
     std::vector<std::uint8_t> expected(2 * half, 0);
-    Require(ResidentPages(address, 2 * half) == 0);
+    const auto beforeResident = ResidentPages(address, 2 * half);
+    std::printf("sparse-state direct-before-reads: resident=%zu st_blocks=%lld\n", beforeResident, FileBlocks(directFile));
+    Require(beforeResident == 0);
     RequireSparseReads(address, expected, 0, 2 * half);
-    if (sparse) Require(ResidentPages(address, 2 * half) == 0 && FileHole(directFile, static_cast<std::uint64_t>(low), half) && FileHole(directFile, static_cast<std::uint64_t>(high), half));
+    const auto afterResident = ResidentPages(address, 2 * half);
+    const auto afterLowHole = FileHole(directFile, static_cast<std::uint64_t>(low), half);
+    const auto afterHighHole = FileHole(directFile, static_cast<std::uint64_t>(high), half);
+    std::printf("sparse-state direct-after-reads: resident=%zu low_hole=%d high_hole=%d st_blocks=%lld\n", afterResident,
+        afterLowHole ? 1 : 0, afterHighHole ? 1 : 0, FileBlocks(directFile));
+    if (sparse) Require(afterResident == 0 && afterLowHole && afterHighHole);
 
     auto* guest = static_cast<std::uint8_t*>(place);
     Put(guest, expected, half - 1, 2, 0x35);
     Put(guest, expected, half + 100 * KiB, 0x1000, 0x46);
     const std::pair<std::size_t, std::size_t> ranges[] = {
         {0, 2 * half}, {7, 2 * half - 9}, {half - 1, 2}, {half - 70 * KiB, 140 * KiB}, {half + 99 * KiB, 66 * KiB}, {half + 200 * KiB, 56 * KiB}};
-    for (const auto& [offset, size] : ranges) RequireSparseReads(address, expected, offset, size);
-    if (sparse) Require(FileHole(directFile, static_cast<std::uint64_t>(high), half - 64 * KiB) && ResidentPages(address, half - 64 * KiB) == 0);
+    std::size_t rangeIndex = 0;
+    for (const auto& [offset, size] : ranges) {
+        RequireSparseReads(address, expected, offset, size);
+        std::printf("sparse-state direct-range-%zu: resident=%zu low_hole=%d high_hole=%d st_blocks=%lld\n", rangeIndex,
+            ResidentPages(address, 2 * half), FileHole(directFile, static_cast<std::uint64_t>(low), half) ? 1 : 0,
+            FileHole(directFile, static_cast<std::uint64_t>(high), half) ? 1 : 0, FileBlocks(directFile));
+        ++rangeIndex;
+    }
+    const auto finalHole = FileHole(directFile, static_cast<std::uint64_t>(high), half - 64 * KiB);
+    const auto finalResident = ResidentPages(address, half - 64 * KiB);
+    std::printf("sparse-state direct-final: resident=%zu hole=%d st_blocks=%lld\n", finalResident, finalHole ? 1 : 0,
+        FileBlocks(directFile));
+    if (sparse) Require(finalHole && finalResident == 0);
     Require(sceKernelMunmap(address, 2 * half) == 0);
     Require(sceKernelReleaseDirectMemory(low, half) == 0 && sceKernelReleaseDirectMemory(high, half) == 0);
     std::printf("direct memory file 0x%llx (two backings out of order): holes read as zeros%s, data across the backings read back exactly\n", static_cast<unsigned long long>(address),
@@ -1138,6 +1202,7 @@ int main() {
     TestUnreportedPrivateMemory();
     TestGuestCopyOut();
     TestNoCrossWaitWithGpuThread();
+    PrintTransparentHugePagePolicy();
     TestSparseReadsGuestFile();
     TestSparseReadsDirectFile();
     TestSparseReadsSwappedPage();
