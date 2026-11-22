@@ -31,8 +31,16 @@ void PinCurrent(int logical_cpu);
 void ReserveCores(std::span<const int> logical_cpus);
 bool HasReservedCore();
 
-#if defined(ANYPS5_KYTY) && KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+bool LogicalCpuExists(int logical_cpu);
+#endif
+
+#if defined(ANYPS5_KYTY)
 void KeepCurrentOnLargestCache();
+#endif
+
+#if defined(ANYPS5_KYTY) && KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+bool PinCurrentToOwnCore(uint32_t index, uint32_t count);
 #endif
 
 }

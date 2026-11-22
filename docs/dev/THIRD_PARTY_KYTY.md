@@ -186,7 +186,7 @@ AnyPS5 opens the window, so Kyty's window options do nothing; `ANYPS5_FULLSCREEN
 | Variable | Values | Default | Effect | Category | Platform | Origin |
 |---|---|---|---|---|---|---|
 | `KYTY_GPU_PIPELINE` | a number (base 0), else stops: `0` runs the whole GPU inline on one thread, `1` means every stage, other values keep the bits `1` recording, `2` command processor, `4` resolve | every stage (`7`) | Which stages of the emulated GPU run on threads of their own | perf | all | Kyty import |
-| `KYTY_GPU_THREAD_CPUS` | unset, empty, `off`, or up to five logical CPUs separated by commas: command processor, execution, recording, resolve, host copy; else stops | unset | Unset or empty: on Linux each stage keeps to the CPUs of the largest last-level cache, on Windows KytyPS5's `{4, 6, 8, 10, 2}`. `off`: no placement. A list pins the stages; stages past its end keep KytyPS5's value. See [below](#details) | perf | all | Kyty import; Linux default `c06a623c12` |
+| `KYTY_GPU_THREAD_CPUS` | unset, empty, `off`, or up to five logical CPUs separated by commas: command processor, execution, recording, resolve, host copy; else stops; on Windows a CPU the machine does not have also stops | unset | Unset or empty: each stage keeps to the CPUs of the largest last-level cache, on Windows pinned to one core of it each. `off`: no placement. A list pins the stages; stages past its end keep KytyPS5's `{4, 6, 8, 10, 2}`. See [below](#details) | perf | all | Kyty import; Linux default `c06a623c12` |
 | `KYTY_GPU_SPIN_US` | microseconds; text that is not a number reads as `0` | `2000` | How long a pipeline thread spins on an empty or full handoff before it waits in the kernel; `0` never spins | perf | all | Kyty import |
 | `KYTY_FAST_TLS` | `0` turns it off, any other value or unset leaves it on | on | Serves the emulated TLS of `libSceAgcDriver.prx`'s own `thread_local` variables from one native TLS slot instead of libgcc's `__emutls_get_address`, whose `pthread_getspecific` takes a spin lock on every access and whose storage a thread frees before its `thread_local` destructors run, which corrupts the heap when the thread exits (#116); a thread's slot storage is freed after those destructors; variables of other modules keep libgcc's | perf | Windows | AnyKyty |
 | `KYTY_REPLAY_GPU_PAGE_READS` | `0` turns it off, any other value or unset leaves it on | on | A guest read that faults on a GPU-owned page, on bytes no GPU write is near, is replayed on the backing view instead of waiting for a readback; instructions that write memory or read the shifted register are never replayed; `0` waits for the readback as before; on Windows the replay ends on the single step exception of the vectored handler | perf | all | AnyKyty |
@@ -321,14 +321,20 @@ The settings below change how a part of the driver works, so each has its reason
 
 KytyPS5's log (`LOGF`) is silent by default; `KYTY_PRINTF_DIRECTION=Console` sends it to stderr, beside AnyPS5's own lines.
 
-GPU stage threads on Linux: KytyPS5 places them only on Windows (`{4, 6, 8, 10, 2}` counts SMT siblings as adjacent
-logical processors, and its core reservation uses Windows CPU sets). Under `ANYPS5_KYTY` on Linux, with
+GPU stage threads: KytyPS5 places them only on Windows, on logical CPUs `{4, 6, 8, 10, 2}` whatever the CPU (it counts
+SMT siblings as adjacent logical processors, and its core reservation uses Windows CPU sets). Under `ANYPS5_KYTY`, with
 `KYTY_GPU_THREAD_CPUS` unset or empty, each stage thread (command processor, execution, recording, resolve, host copy)
-keeps to the logical CPUs that share the largest last-level cache (`/sys/devices/system/cpu`: on a Ryzen
-9 7950X3D, CPUs 0-7 and 16-23, the 3D V-Cache CCD), intersected with its current affinity. No core is reserved, and the
-threads it creates afterwards inherit that set. Measured on Subnautica: +7 % to +22 % frames per second, 25-35 % less CPU
-time per draw on each stage (`notes/au-dela-p4-placement.md`). `KYTY_GPU_THREAD_CPUS=off` turns it off. An explicit list
-pins each stage to that Linux logical CPU, without core reservation; threads a stage creates afterwards inherit its CPU.
+stays within the logical CPUs that share the largest last-level cache, intersected with its current affinity. On Linux
+(`/sys/devices/system/cpu`; on a Ryzen 9 7950X3D, CPUs 0-7 and 16-23, the 3D V-Cache CCD) it keeps to that whole set. On
+Windows (`GetLogicalProcessorInformationEx`, `RelationCache` and `RelationProcessorCore`, within the thread's processor
+group) each stage is pinned to one logical CPU of its own core in that set: performance cores first (highest
+`EfficiencyClass`), the core holding CPU 0 last, never two stages on SMT siblings of one core. With fewer such cores than
+stages, the threads keep to the whole set instead. No core is reserved, and the threads a stage creates afterwards
+inherit its CPUs. Measured on Subnautica (Linux): +7 % to +22 % frames per second, 25-35 % less CPU time per draw on each
+stage (`notes/au-dela-p4-placement.md`). On an i9-11900H (one L3), leaving the stages free over all CPUs cost 2.4 % in
+Ghost of Yōtei against pinning them to separate cores, hence the per-core pinning on Windows. `KYTY_GPU_THREAD_CPUS=off` turns it off. An explicit list pins each stage to that
+logical CPU: on Linux without core reservation, so threads a stage creates afterwards inherit its CPU; on Windows with
+KytyPS5's core reservation, and a listed CPU the machine does not have stops with a message naming the variable.
 
 Images the game reads after the GPU writes them: KytyPS5 copies a GPU-written linear image back to guest memory at the
 next suspend point. A game that waits for the label of a `RELEASE_MEM` with GL2

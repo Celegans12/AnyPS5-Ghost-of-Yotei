@@ -227,15 +227,28 @@ void ConfigureGpuStageThread(GpuStageThread stage) {
 			}
 			value = *end == ',' ? end + 1 : end;
 		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		for (const int cpu: result) {
+			if (cpu >= 0 && !Common::Thread::LogicalCpuExists(cpu)) {
+				EXIT("invalid KYTY_GPU_THREAD_CPUS: %s (logical CPU %d does not exist)\n",
+				     std::getenv("KYTY_GPU_THREAD_CPUS"), cpu);
+			}
+		}
+#endif
 		return result;
 	}();
 	Common::Thread::RaiseCurrentPriority();
-#if defined(ANYPS5_KYTY) && KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+#if defined(ANYPS5_KYTY)
 	static const bool listed = [] {
 		const char* value = std::getenv("KYTY_GPU_THREAD_CPUS");
 		return value != nullptr && value[0] != '\0';
 	}();
 	if (!listed) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (Common::Thread::PinCurrentToOwnCore(static_cast<uint32_t>(stage), static_cast<uint32_t>(cpus.size()))) {
+			return;
+		}
+#endif
 		Common::Thread::KeepCurrentOnLargestCache();
 		return;
 	}
