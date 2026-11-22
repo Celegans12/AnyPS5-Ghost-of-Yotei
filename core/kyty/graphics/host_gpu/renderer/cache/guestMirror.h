@@ -62,6 +62,7 @@ public:
 	[[nodiscard]] bool               Active() const noexcept { return m_active; }
 	[[nodiscard]] uint64_t           Size() const noexcept { return m_size; }
 	[[nodiscard]] uint64_t           BlockSize() const noexcept { return uint64_t {1} << m_block_bits; }
+	[[nodiscard]] uint64_t           DeviceAddress() const noexcept { return m_device_address; }
 	[[nodiscard]] const std::string& Description() const noexcept { return m_description; }
 	[[nodiscard]] vk::Buffer         Handle();
 	[[nodiscard]] bool               IsBound(uint64_t vaddr) const noexcept;
@@ -117,6 +118,7 @@ private:
 	uint64_t        m_size        = 0;
 	uint32_t        m_block_bits  = MinBlockBits;
 	uint32_t        m_memory_type = 0;
+	uint64_t        m_device_address = 0;
 	std::string     m_description;
 	bool            m_shared_queue = false;
 
