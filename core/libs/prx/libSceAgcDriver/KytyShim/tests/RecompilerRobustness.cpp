@@ -81,6 +81,40 @@ bool FloatModeBits() {
 	return ok;
 }
 
+struct OffsetCase {
+	uint32_t segment;
+	uint32_t offset;
+	uint32_t expected;
+};
+
+const std::vector<OffsetCase> OffsetCases = {
+    {0u, 0x7ffu, 0x000007ffu},
+    {0u, 0x800u, 0x00000000u},
+    {0u, 0xfffu, 0x000007ffu},
+    {1u, 0x7ffu, 0x000007ffu},
+    {1u, 0x800u, 0xfffff800u},
+    {1u, 0xfffu, 0xffffffffu},
+};
+
+bool FlatOffsets() {
+	namespace Decoder = Libs::Graphics::ShaderRecompiler::Decoder;
+	bool ok = true;
+	for (const auto& entry: OffsetCases) {
+		const std::vector<uint32_t> code = {
+		    (0x37u << 26u) | (entry.segment << 14u) | (0x0cu << 18u) | entry.offset,
+		    (0x7fu << 16u),
+		};
+		Decoder::Instruction inst;
+		Decoder::DecodeInstruction(code, 0, inst);
+		if (inst.offset != entry.expected || inst.memory_segment != entry.segment) {
+			std::printf("flat-offsets: FAILED segment %u offset 0x%03x gives 0x%08x/segment %u, expected 0x%08x/segment %u\n",
+			            entry.segment, entry.offset, inst.offset, inst.memory_segment, entry.expected, entry.segment);
+			ok = false;
+		}
+	}
+	return ok;
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -89,6 +123,11 @@ int main(int argc, char** argv) {
 		found = true;
 		if (!FloatModeBits()) return 1;
 		std::printf("float-mode-bits: ok\n");
+	}
+	if (argc < 2 || std::string_view(argv[1]) == "flat-offsets") {
+		found = true;
+		if (!FlatOffsets()) return 1;
+		std::printf("flat-offsets: ok\n");
 	}
 	for (const auto& entry: Cases) {
 		if (argc >= 2 && std::string_view(argv[1]) != entry.name) continue;
