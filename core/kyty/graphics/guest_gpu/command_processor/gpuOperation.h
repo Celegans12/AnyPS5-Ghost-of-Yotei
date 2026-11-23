@@ -90,6 +90,7 @@ struct GpuOperation {
 	RenderExecutor::AheadNote     ahead_note = RenderExecutor::AheadNote::NotAttempted;
 	bool after_wait = false;
 	bool guest_sync = true;
+	bool formed_sync = false;
 	bool clean = false;
 	bool stream_in_place = false;
 	const void*     table_ticket   = nullptr;

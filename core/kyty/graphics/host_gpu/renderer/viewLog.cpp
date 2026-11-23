@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iterator>
 #include <utility>
 
 namespace Libs::Graphics {
@@ -49,25 +50,55 @@ std::optional<ViewLog::Segment> ViewLog::Reserve(uint32_t entries, uint64_t tick
 	return Segment {.device_address = m_device_address, .first = start, .capacity = entries};
 }
 
-void ViewLog::Attach(const Segment& segment, uint64_t program, std::vector<ViewLogEntry> expected) {
+void ViewLog::Attach(const Segment& segment, uint64_t program, std::vector<ViewLogEntry> expected, uint64_t context) {
 	for (auto live = m_live.rbegin(); live != m_live.rend(); ++live) {
 		if (live->first != segment.first) continue;
 		live->program  = program;
+		live->context  = context;
 		live->attached = true;
 		live->expected = std::move(expected);
 		return;
 	}
 }
 
-void ViewLog::Consume(uint64_t completed_tick) {
+void ViewLog::Consume(uint64_t completed_tick, const Sink& sink) {
 	while (!m_live.empty() && m_live.front().tick <= completed_tick) {
-		if (m_live.front().attached && !m_live.front().expected.empty()) Check(m_live.front());
+		const auto live = std::move(m_live.front());
 		m_live.pop_front();
+		if (!live.attached) continue;
+		uint32_t   count  = 0;
+		const auto logged = Collapse(live, count);
+		if (!live.expected.empty()) Check(live, logged, count);
+		if (sink) {
+			sink({.program = live.program, .context = live.context, .tick = live.tick, .count = count, .capacity = live.capacity, .views = logged});
+		}
 	}
 }
 
 uint64_t ViewLog::Pending() const noexcept {
 	return m_live.empty() ? 0 : m_live.front().tick;
+}
+
+uint64_t ViewLog::LastTick() const noexcept {
+	return m_live.empty() ? 0 : m_live.back().tick;
+}
+
+std::vector<ViewLogEntry> ViewLog::Collapse(const Live& live, uint32_t& count) {
+	count            = Count(live.first);
+	const auto used  = std::min(count, live.capacity);
+	if (count > live.capacity) m_stats.overflow++;
+	std::vector<ViewLogEntry> logged(Entries(live.first), Entries(live.first) + used);
+	m_stats.checked++;
+	m_stats.logged += used;
+	for (const auto& entry: logged) {
+		if ((entry.Flags() & ViewLogEntry::FormMiss) != 0u) m_stats.misses++;
+	}
+	std::ranges::sort(logged, [](const ViewLogEntry& a, const ViewLogEntry& b) {
+		return a.tagged_base != b.tagged_base ? a.tagged_base < b.tagged_base : a.bytes < b.bytes;
+	});
+	logged.erase(std::unique(logged.begin(), logged.end()), logged.end());
+	m_stats.distinct += logged.size();
+	return logged;
 }
 
 void ViewLog::Inject(const Segment& segment, std::span<const ViewLogEntry> entries) {
@@ -77,23 +108,20 @@ void ViewLog::Inject(const Segment& segment, std::span<const ViewLogEntry> entri
 	Count(segment.first) = count;
 }
 
-void ViewLog::Check(const Live& live) {
-	const auto count = Count(live.first);
-	const auto used  = std::min(count, live.capacity);
-	if (count > live.capacity) m_stats.overflow++;
-	std::vector<ViewLogEntry> logged(Entries(live.first), Entries(live.first) + used);
-	m_stats.checked++;
-	m_stats.logged += used;
-	for (const auto& entry: logged) {
-		if ((entry.Flags() & ViewLogEntry::FormMiss) != 0u) m_stats.misses++;
-	}
+void ViewLog::Check(const Live& live, const std::vector<ViewLogEntry>& formed, uint32_t count) {
 	const auto order = [](const ViewLogEntry& a, const ViewLogEntry& b) {
 		return a.tagged_base != b.tagged_base ? a.tagged_base < b.tagged_base : a.bytes < b.bytes;
 	};
+	const auto view = [](ViewLogEntry entry) {
+		entry.tagged_base &= ~(uint64_t {ViewLogEntry::FormMiss} << 48u);
+		return entry;
+	};
+	std::vector<ViewLogEntry> logged;
+	std::ranges::transform(formed, std::back_inserter(logged), view);
 	std::ranges::sort(logged, order);
 	logged.erase(std::unique(logged.begin(), logged.end()), logged.end());
-	m_stats.distinct += logged.size();
-	auto expected = live.expected;
+	std::vector<ViewLogEntry> expected;
+	std::ranges::transform(live.expected, std::back_inserter(expected), view);
 	std::ranges::sort(expected, order);
 	expected.erase(std::unique(expected.begin(), expected.end()), expected.end());
 	m_stats.expected += expected.size();
@@ -107,7 +135,7 @@ void ViewLog::Check(const Live& live) {
 	if (m_trace != 0) {
 		m_trace--;
 		std::string views;
-		for (const auto& entry: logged) {
+		for (const auto& entry: formed) {
 			views += fmt::format(" {}:0x{:x}+0x{:x}:0x{:x}", entry.Slot(), entry.Base(), entry.bytes, entry.Flags() & 0xffu);
 		}
 		m_reports.push_back(fmt::format("checked program={:016x} tick={} count={} capacity={} expected={} views{}",

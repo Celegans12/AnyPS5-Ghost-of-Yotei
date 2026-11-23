@@ -10,6 +10,7 @@
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "common/timer.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -28,6 +29,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/occlusionQueries.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/formedViews.h"
 #include "graphics/host_gpu/renderer/viewLog.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -2867,20 +2869,29 @@ struct FormedCounters {
 	std::atomic<uint64_t> dispatches {0};
 	std::atomic<uint64_t> views {0};
 	std::atomic<uint64_t> known {0};
-	std::atomic<uint64_t> clean_reads {0};
-	std::atomic<uint64_t> around_reads {0};
-	std::atomic<uint64_t> fault_reads {0};
 	std::atomic<uint64_t> fallbacks {0};
 	std::atomic<uint64_t> refused_size {0};
-	std::atomic<uint64_t> refused_shape {0};
-	std::atomic<uint64_t> refused_range {0};
-	std::atomic<uint64_t> refused_clamp {0};
 	std::atomic<uint64_t> refused_slot {0};
+	std::atomic<uint64_t> refused_warming {0};
+	std::atomic<uint64_t> refused_queries {0};
 	std::atomic<uint64_t> entries {0};
 	std::atomic<uint64_t> waits {0};
+	std::atomic<uint64_t> history_checks {0};
+	std::atomic<uint64_t> history_binds {0};
+	std::atomic<uint64_t> miss_binds {0};
+	std::atomic<uint64_t> resolve_gates {0};
+	std::atomic<uint64_t> resolve_gate_ns {0};
+	std::atomic<uint64_t> execute_gates {0};
+	std::atomic<uint64_t> execute_gate_ns {0};
+	std::atomic<uint64_t> gpu_waits {0};
+	std::atomic<uint64_t> gpu_wait_ns {0};
+	std::atomic<uint64_t> guest_waits {0};
+	std::atomic<uint64_t> guest_wait_ns {0};
+	std::atomic<uint64_t> consume_ns {0};
 };
 
-FormedCounters g_formed;
+FormedCounters     g_formed;
+FormedConsumeStats g_consumed;
 
 bool VerifiesViewLog() {
 	static const bool verify = [] {
@@ -2890,20 +2901,73 @@ bool VerifiesViewLog() {
 	return verify;
 }
 
+bool FormedMirrorCheck() {
+	static const bool check = [] {
+		const char* value = std::getenv("KYTY_MIRROR_CHECK");
+		return value != nullptr && std::string_view {value} == "1";
+	}();
+	return check;
+}
+
 constexpr uint64_t ViewLogBytes = uint64_t {16} << 20u;
 
 void ReadFormedWords(uint64_t address, std::array<uint32_t, 4>& words) {
-	if (!Libs::LibKernel::Memory::MayFaultOnGpuRead(address, sizeof(words))) {
+	if (!Libs::LibKernel::Memory::MayFaultOnGpuRead(address, sizeof(words)) ||
+	    !Libs::LibKernel::Memory::TryReadAroundGpuWrites(address, words.data(), sizeof(words))) {
 		std::memcpy(words.data(), reinterpret_cast<const void*>(address), sizeof(words));
-		g_formed.clean_reads.fetch_add(1, std::memory_order_relaxed);
-	} else if (Libs::LibKernel::Memory::TryReadAroundGpuWrites(address, words.data(), sizeof(words))) {
-		g_formed.around_reads.fetch_add(1, std::memory_order_relaxed);
-	} else {
-		std::memcpy(words.data(), reinterpret_cast<const void*>(address), sizeof(words));
-		g_formed.fault_reads.fetch_add(1, std::memory_order_relaxed);
 	}
 }
 
+uint64_t MappedFormedBytes(uint64_t base, uint64_t bytes) {
+	if (!GuestRange {base, bytes}.Valid()) return 0;
+	if (bytes < BufferMapCheckFloor(base, bytes)) return bytes;
+	return Libs::LibKernel::Memory::IsFullyMapped(base, 1) ? Libs::LibKernel::Memory::ClampRangeSize(base, bytes) : 0;
+}
+
+class FormedCacheSink final: public FormedSink {
+public:
+	explicit FormedCacheSink(RenderContext& context): m_context(context) {}
+
+	uint64_t Clamp(uint64_t base, uint64_t bytes) override { return MappedFormedBytes(base, bytes); }
+	bool     Windowed(uint64_t base, uint64_t bytes) override { return m_context.GetBufferCache().Windowed(base, bytes); }
+	bool     CpuDirty(uint64_t base, uint64_t bytes) override { return m_context.GetBufferCache().IsRegionCpuDirty(base, bytes); }
+	void Written(uint64_t base, uint64_t bytes, uint64_t tick) override {
+		m_context.GetBufferCache().NoteGpuWrites(base, bytes, tick);
+		m_context.GetTextureCache().InvalidateMemoryFromGPU(base, bytes);
+	}
+private:
+	RenderContext& m_context;
+};
+
+int64_t FormedNow() {
+	return static_cast<int64_t>(Common::SteadyNs());
+}
+
+bool FormedAllowedHook(uint64_t program) {
+	return FormedPrograms::Instance().Allowed(program, FormedNow());
+}
+
+void FormedUseHook(uint64_t program) {
+	FormedPrograms::Instance().NoteUse(program);
+}
+
+void FormedSeedHook(uint64_t program, uint64_t base, uint64_t bytes) {
+	const auto mapped = MappedFormedBytes(base, bytes);
+	if (mapped != 0) FormedPrograms::Instance().Seed(program, base, mapped, FormedNow());
+}
+
+}
+
+struct RenderExecutor::FormedHistory {
+	FormedPrograms::Ranges                     ranges;
+	std::vector<std::pair<uint64_t, uint64_t>> mapped;
+	RangeSet                                   set;
+	BufferCache::SetRegions                    regions;
+	uint64_t                                   register_epoch = UINT64_MAX;
+};
+
+void RenderExecutor::InstallFormedHooks() {
+	ShaderRecompiler::IR::SetFormedHooks({.allowed = &FormedAllowedHook, .seed = &FormedSeedHook, .used = &FormedUseHook});
 }
 
 void RenderExecutor::NoteKnownFormedView() noexcept {
@@ -2914,21 +2978,77 @@ void RenderExecutor::NoteFormedFallback() noexcept {
 	g_formed.fallbacks.fetch_add(1, std::memory_order_relaxed);
 }
 
+void RenderExecutor::NoteFormedGate(bool resolve, uint64_t ns) noexcept {
+	(resolve ? g_formed.resolve_gates : g_formed.execute_gates).fetch_add(1, std::memory_order_relaxed);
+	(resolve ? g_formed.resolve_gate_ns : g_formed.execute_gate_ns).fetch_add(ns, std::memory_order_relaxed);
+}
+
+void RenderExecutor::NoteFormedGuestWait(uint64_t ns) noexcept {
+	g_formed.guest_waits.fetch_add(1, std::memory_order_relaxed);
+	g_formed.guest_wait_ns.fetch_add(ns, std::memory_order_relaxed);
+}
+
+bool RenderExecutor::PrepareFormedHistory(uint64_t program) {
+	auto& history = m_formed_history[program];
+	if (history == nullptr) history = std::make_shared<FormedHistory>();
+	auto&      cache    = m_context.GetBufferCache();
+	auto&      programs = FormedPrograms::Instance();
+	const auto version  = history->ranges.version;
+	programs.CopyRanges(program, history->ranges);
+	m_formed_version = history->ranges.version;
+	if (history->ranges.version != version) {
+		history->mapped.clear();
+		for (const auto& [begin, end]: history->ranges.ranges) {
+			if (Libs::LibKernel::Memory::IsFullyMapped(begin, end - begin)) {
+				history->mapped.emplace_back(begin, end);
+				continue;
+			}
+			for (auto block = begin; block < end; block += FormedPrograms::BlockSize) {
+				const auto bytes = Libs::LibKernel::Memory::ClampRangeSizeOrZero(block, FormedPrograms::BlockSize);
+				if (bytes != 0) history->mapped.emplace_back(block, block + bytes);
+			}
+		}
+		for (const auto& [begin, end]: history->mapped) {
+			cache.AddToSet(history->set, history->regions, begin, end - begin);
+		}
+		history->register_epoch = UINT64_MAX;
+	}
+	if (history->register_epoch != cache.RegisterEpoch()) {
+		g_formed.history_checks.fetch_add(1, std::memory_order_relaxed);
+		for (const auto& [begin, end]: history->mapped) {
+			if (cache.Windowed(begin, end - begin)) continue;
+			g_formed.history_binds.fetch_add(1, std::memory_order_relaxed);
+			const auto [buffer, offset] = cache.ObtainBuffer(begin, end - begin, false, false, {}, ObtainFrom::Mirror);
+			if (!buffer->IsWindow()) return false;
+		}
+		history->register_epoch = cache.RegisterEpoch();
+	}
+	auto& queries = m_context.GetOcclusionQueries();
+	if (queries.HasPendingDumps()) {
+		for (const auto& [begin, end]: history->mapped) {
+			if (queries.MayPrepareRead(begin, end - begin)) return false;
+		}
+	}
+	cache.SynchronizeBuffersInSet(history->set, history->regions);
+	return true;
+}
+
 bool RenderExecutor::PrepareFormedViews(const ShaderStageRuntime& stage, uint64_t waves) {
 	m_formed_reads.clear();
 	m_formed_waves = waves;
 	const auto& snapshot = *stage.resources;
 	if (snapshot.gpu_formed.empty()) return true;
 	const auto& program = stage.module->info;
-	const auto  limit   = ShaderRecompiler::IR::MirrorSize();
-	const auto  range   = m_context.GetGraphics().GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
-	const auto refuse = [](std::atomic<uint64_t>& reason) {
+	const auto  refuse  = [](std::atomic<uint64_t>& reason) {
 		reason.fetch_add(1, std::memory_order_relaxed);
 		return false;
 	};
-	if (waves == 0 || limit == 0 || waves * snapshot.gpu_formed.size() > ViewLogBytes / ViewLog::EntryBytes / 4u) {
+	if (!FormedPrograms::Instance().Allowed(program.shader_hash, FormedNow())) return refuse(g_formed.refused_warming);
+	if (waves == 0 || ShaderRecompiler::IR::MirrorSize() == 0 ||
+	    waves * snapshot.gpu_formed.size() > ViewLogBytes / ViewLog::EntryBytes / 4u) {
 		return refuse(g_formed.refused_size);
 	}
+	const bool verify = VerifiesViewLog();
 	for (const auto& formed: snapshot.gpu_formed) {
 		if (formed.resource >= program.info.buffers.size()) return refuse(g_formed.refused_slot);
 		const auto& resource = program.info.buffers[formed.resource];
@@ -2937,47 +3057,77 @@ bool RenderExecutor::PrepareFormedViews(const ShaderStageRuntime& stage, uint64_
 			return refuse(g_formed.refused_slot);
 		}
 		FormedRead read {.resource = formed.resource, .address = formed.address};
-		ReadFormedWords(formed.address, read.words);
-		read.view = ShaderRecompiler::IR::FormView(resource, formed.element, read.words, limit);
-		if (!read.view.serves) return refuse(g_formed.refused_shape);
-		if (read.view.base != 0 && read.view.bytes != 0) {
-			if (read.view.bytes > range) return refuse(g_formed.refused_range);
-			if (read.view.bytes >= BufferMapCheckFloor(read.view.base, read.view.bytes) &&
-			    (!Libs::LibKernel::Memory::IsFullyMapped(read.view.base, 1) ||
-			     Libs::LibKernel::Memory::ClampRangeSize(read.view.base, read.view.bytes) != read.view.bytes)) {
-				return refuse(g_formed.refused_clamp);
-			}
+		if (verify) {
+			ReadFormedWords(formed.address, read.words);
+			read.view = ShaderRecompiler::IR::FormView(resource, formed.element, read.words,
+			                                           ShaderRecompiler::IR::MirrorSize());
 		}
 		m_formed_reads.push_back(read);
+	}
+	if (m_formed_reads.empty()) return true;
+	if (!PrepareFormedHistory(program.shader_hash)) {
+		m_formed_reads.clear();
+		return refuse(g_formed.refused_queries);
 	}
 	return true;
 }
 
-void RenderExecutor::BindFormedView(const FormedRead& read, const ShaderRecompiler::IR::BufferResource& resource) {
-	auto& cache                 = m_context.GetBufferCache();
-	const auto [words, offset]  = cache.ObtainBuffer(read.address, sizeof(read.words), false, false, {}, ObtainFrom::Mirror);
+void RenderExecutor::BindFormedWords(uint64_t address) {
+	const auto [words, offset] =
+	    m_context.GetBufferCache().ObtainBuffer(address, 16, false, false, {}, ObtainFrom::Mirror);
 	if (!words->IsWindow()) {
-		EXIT("V# words at 0x%" PRIx64 " are not in a window of the guest mirror\n", read.address);
+		EXIT("V# words at 0x%" PRIx64 " are not in a window of the guest mirror\n", address);
 	}
 	g_formed.views.fetch_add(1, std::memory_order_relaxed);
-	const auto base  = read.view.base;
-	const auto bytes = read.view.bytes;
-	if (base == 0 || bytes == 0) return;
-	auto&      queries  = m_context.GetOcclusionQueries();
-	const bool counters = queries.PrepareRead(base, bytes);
-	auto [buffer, view_offset] = cache.ObtainBuffer(base, bytes, resource.written, false, {}, ObtainFrom::Mirror);
-	if (!buffer->IsWindow()) {
-		EXIT("GPU-formed view 0x%" PRIx64 " + 0x%" PRIx64 " is not a window of the guest mirror\n", base, bytes);
+}
+
+void RenderExecutor::ConsumeFormedViews(bool wait) {
+	if (m_view_log == nullptr || m_formed_consuming) return;
+	auto& scheduler = m_context.GetCommandScheduler();
+	auto& master    = scheduler.GetMasterSemaphore();
+	if (wait && m_view_log->LiveSegments() != 0) {
+		const auto tick = m_view_log->LastTick();
+		if (!master.IsFree(tick)) {
+			const auto begin = Common::SteadyNs();
+			scheduler.Wait(tick);
+			g_formed.gpu_waits.fetch_add(1, std::memory_order_relaxed);
+			g_formed.gpu_wait_ns.fetch_add(Common::SteadyNs() - begin, std::memory_order_relaxed);
+		}
 	}
-	if (counters) {
-		queries.NoteReadTarget(base, bytes, *buffer, view_offset);
+	if (m_view_log->LiveSegments() == 0 || !master.IsFree(m_view_log->Pending())) return;
+	const auto          begin = Common::SteadyNs();
+	FormedCacheSink     sink(m_context);
+	FormedConsumeResult result;
+	m_formed_consuming = true;
+	m_view_log->Consume(master.KnownGpuTick(), [&](const ViewLog::Consumed& consumed) {
+		ConsumeFormedSegment(consumed, FormedPrograms::Instance(), sink, g_consumed, result, FormedNow());
+	});
+	m_formed_consuming = false;
+	FormedPrograms::Instance().SetPending(m_view_log->LiveSegments());
+	auto& cache = m_context.GetBufferCache();
+	for (const auto& [base, bytes]: result.binds) {
+		g_formed.miss_binds.fetch_add(1, std::memory_order_relaxed);
+		(void)cache.ObtainBuffer(base, bytes, false, false, {}, ObtainFrom::Mirror);
 	}
-	if (resource.written) {
-		m_context.GetTextureCache().InvalidateMemoryFromGPU(base, bytes);
+	for (const auto& report: result.reports) {
+		const auto program = report.substr(report.find("program=") + 8, 16);
+		const auto kind    = report.substr(0, report.find(" program="));
+		auto&      count   = m_formed_reported[XXH3_64bits(kind.data(), kind.size()) ^ std::stoull(program, nullptr, 16)];
+		if (count++ >= (kind == "read miss" ? 1u : 4u)) continue;
+		Log::WriteToConsoleAndLog(fmt::format("[kyty-e2f] {}\n", report));
+	}
+	if (VerifiesViewLog()) {
+		for (const auto& report: m_view_log->TakeReports()) {
+			Log::WriteToConsoleAndLog(fmt::format("[kyty-e2f] view log {}\n", report));
+		}
+	}
+	g_formed.consume_ns.fetch_add(Common::SteadyNs() - begin, std::memory_order_relaxed);
+	if (result.stop && FormedMirrorCheck()) {
+		EXIT("KYTY_MIRROR_CHECK: a GPU-formed view missed its window or history, or met a guest write\n");
 	}
 }
 
-ViewLog::Segment RenderExecutor::ReserveViewLog(uint64_t program, std::vector<ViewLogEntry> views) {
+ViewLog::Segment RenderExecutor::ReserveViewLog(uint64_t program, uint32_t views, std::vector<ViewLogEntry> expected) {
 	auto& scheduler = m_context.GetCommandScheduler();
 	auto& master    = scheduler.GetMasterSemaphore();
 	if (m_view_log == nullptr) {
@@ -2987,13 +3137,8 @@ ViewLog::Segment RenderExecutor::ReserveViewLog(uint64_t program, std::vector<Vi
 		m_view_log = std::make_shared<ViewLog>(m_view_log_buffer->Mapped(), m_view_log_buffer->BufferDeviceAddress());
 		if (VerifiesViewLog()) m_view_log->Trace(64);
 	}
-	m_view_log->Consume(master.KnownGpuTick());
-	if (VerifiesViewLog()) {
-		for (const auto& report: m_view_log->TakeReports()) {
-			Log::WriteToConsoleAndLog(fmt::format("[kyty-e2f] view log {}\n", report));
-		}
-	}
-	const auto entries = static_cast<uint32_t>(m_formed_waves * views.size());
+	ConsumeFormedViews(false);
+	const auto entries = static_cast<uint32_t>(m_formed_waves * views);
 	const auto tick    = scheduler.CurrentTick();
 	uint64_t   wait    = 0;
 	auto       segment = m_view_log->Reserve(entries, tick, wait);
@@ -3001,11 +3146,12 @@ ViewLog::Segment RenderExecutor::ReserveViewLog(uint64_t program, std::vector<Vi
 		if (wait >= tick) EXIT("the view log is full inside one submission\n");
 		g_formed.waits.fetch_add(1, std::memory_order_relaxed);
 		master.Wait(wait);
-		m_view_log->Consume(master.KnownGpuTick());
+		ConsumeFormedViews(false);
 		segment = m_view_log->Reserve(entries, tick, wait);
 	}
 	if (!segment.has_value()) EXIT("a view log segment of %u entries does not fit\n", entries);
-	m_view_log->Attach(*segment, program, VerifiesViewLog() ? std::move(views) : std::vector<ViewLogEntry> {});
+	m_view_log->Attach(*segment, program, std::move(expected), m_formed_version);
+	FormedPrograms::Instance().SetPending(m_view_log->LiveSegments());
 	g_formed.dispatches.fetch_add(1, std::memory_order_relaxed);
 	g_formed.entries.fetch_add(entries, std::memory_order_relaxed);
 	return *segment;
@@ -3013,21 +3159,31 @@ ViewLog::Segment RenderExecutor::ReserveViewLog(uint64_t program, std::vector<Vi
 
 void RenderExecutor::LogFormedSummary() {
 	const auto take = [](std::atomic<uint64_t>& counter) { return counter.exchange(0, std::memory_order_relaxed); };
+	const auto ms   = [&](std::atomic<uint64_t>& counter) { return static_cast<double>(take(counter)) / 1e6; };
 	const auto dispatches = take(g_formed.dispatches);
 	const auto known      = take(g_formed.known);
 	const auto fallbacks  = take(g_formed.fallbacks);
-	if (m_view_log != nullptr) m_view_log->Consume(m_context.GetCommandScheduler().GetMasterSemaphore().KnownGpuTick());
-	if (dispatches == 0 && known == 0 && fallbacks == 0) return;
-	const auto stats = m_view_log != nullptr ? m_view_log->TakeStats() : ViewLog::Stats {};
+	if (m_view_log != nullptr) ConsumeFormedViews(false);
+	const auto counts = FormedPrograms::Instance().TakeCounts();
+	if (dispatches == 0 && known == 0 && fallbacks == 0 && counts.new_blocks == 0) return;
+	const auto stats    = m_view_log != nullptr ? m_view_log->TakeStats() : ViewLog::Stats {};
+	const auto consumed = std::exchange(g_consumed, {});
 	Log::WriteToConsoleAndLog(fmt::format(
-	    "[kyty-e2f] gpu-formed dispatches {} views {} entries {} (waits {}), cpu-known formed views {}, record-time V# "
-	    "reads clean {} mirror-lines {} readback {}, fallbacks {} (size {}, slot {}, shape {}, range {}, clamp {}); view "
-	    "log segments checked {} logged {} distinct {} expected {} matched {} missing {} extra {} overflow {} form-miss {}\n",
-	    dispatches, take(g_formed.views), take(g_formed.entries), take(g_formed.waits), known, take(g_formed.clean_reads),
-	    take(g_formed.around_reads), take(g_formed.fault_reads), fallbacks, take(g_formed.refused_size),
-	    take(g_formed.refused_slot), take(g_formed.refused_shape), take(g_formed.refused_range),
-	    take(g_formed.refused_clamp), stats.checked, stats.logged, stats.distinct,
-	    stats.expected, stats.matched, stats.missing, stats.extra, stats.overflow, stats.misses));
+	    "[kyty-e2f] gpu-formed dispatches {} views {} entries {} (waits {}), cpu-known formed views {}, fallbacks {} "
+	    "(warming {}, size {}, slot {}, queries {}); consumed segments {} views {} written {} read misses {} write misses "
+	    "{} form misses {} conflicts {} overflows {}; history new blocks {} activated {} demoted {} checks {} binds {} "
+	    "miss binds {}; gates resolve {} ({:.2f} ms) execute {} ({:.2f} ms, GPU waits {} {:.2f} ms), guest waits {} "
+	    "({:.2f} ms), consume {:.2f} ms; verify segments {} logged {} distinct {} expected {} matched {} missing {} extra "
+	    "{} overflow {} form-miss {}\n",
+	    dispatches, take(g_formed.views), take(g_formed.entries), take(g_formed.waits), known, fallbacks,
+	    take(g_formed.refused_warming), take(g_formed.refused_size), take(g_formed.refused_slot),
+	    take(g_formed.refused_queries), consumed.segments, consumed.views, consumed.written, consumed.read_misses,
+	    consumed.write_misses, consumed.form_misses, consumed.conflicts, consumed.overflows, counts.new_blocks,
+	    counts.activated, counts.demoted, take(g_formed.history_checks), take(g_formed.history_binds),
+	    take(g_formed.miss_binds), take(g_formed.resolve_gates), ms(g_formed.resolve_gate_ns),
+	    take(g_formed.execute_gates), ms(g_formed.execute_gate_ns), take(g_formed.gpu_waits), ms(g_formed.gpu_wait_ns),
+	    take(g_formed.guest_waits), ms(g_formed.guest_wait_ns), ms(g_formed.consume_ns), stats.checked, stats.logged,
+	    stats.distinct, stats.expected, stats.matched, stats.missing, stats.extra, stats.overflow, stats.misses));
 	if (m_view_log != nullptr) {
 		for (const auto& report: m_view_log->TakeReports()) {
 			Log::WriteToConsoleAndLog(fmt::format("[kyty-e2f] view log {}\n", report));
@@ -3105,6 +3261,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared, uint64_t invocati
 		}
 	}
 	std::vector<ViewLogEntry> formed_views;
+	uint32_t                  formed_count = 0;
 	for (uint32_t i = 0; i < program.info.buffers.size() && i < snapshot.buffers.size(); i++) {
 		const auto& resource = program.info.buffers[i];
 		if (resource.mirror_index == UINT32_MAX || resource.mirror_index >= prepared.mirror_sources.size()) continue;
@@ -3119,8 +3276,9 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared, uint64_t invocati
 			const uint32_t flags = (resource.read ? ViewLogEntry::Read : 0u) |
 			                       (resource.written ? ViewLogEntry::Written : 0u) |
 			                       (resource.mirror_index << ViewLogEntry::SlotShift);
-			BindFormedView(*read, resource);
-			formed_views.push_back(ViewLogEntry::Make(read->view.base, read->view.bytes, flags));
+			BindFormedWords(read->address);
+			formed_count++;
+			if (VerifiesViewLog()) formed_views.push_back(ViewLogEntry::Make(read->view.base, read->view.bytes, flags));
 			const auto formed_dword = dword + ShaderRecompiler::IR::Bindings::MirrorDwords;
 			prepared.shader_data[formed_dword]      = static_cast<uint32_t>(read->address);
 			prepared.shader_data[formed_dword + 1u] = static_cast<uint32_t>(read->address >> 32u);
@@ -3151,8 +3309,8 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared, uint64_t invocati
 		prepared.shader_data[dword + 2u] = static_cast<uint32_t>(size);
 		prepared.shader_data[dword + 3u] = static_cast<uint32_t>(size >> 32u);
 	}
-	if (!formed_views.empty()) {
-		const auto segment = ReserveViewLog(program.shader_hash, std::move(formed_views));
+	if (formed_count != 0) {
+		const auto segment = ReserveViewLog(program.shader_hash, formed_count, std::move(formed_views));
 		const auto dword   = layout.ViewLogDword();
 		prepared.shader_data[dword]      = static_cast<uint32_t>(segment.device_address);
 		prepared.shader_data[dword + 1u] = static_cast<uint32_t>(segment.device_address >> 32u);

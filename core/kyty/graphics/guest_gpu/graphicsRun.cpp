@@ -28,6 +28,7 @@
 #include "graphics/host_gpu/renderer/sync.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
 #include "libs/errno.h"
@@ -478,6 +479,19 @@ void GuestGpu::ExecutionThread() {
 		if (m_urgent_pending.load(std::memory_order_relaxed) != 0) {
 			RunUrgentCommands();
 		}
+#if defined(ANYPS5_KYTY)
+		if (const auto request = m_formed_gate_request.load(std::memory_order_acquire);
+		    request > m_formed_gate_done.load(std::memory_order_relaxed) && m_executed.Load() >= request) {
+			const auto begin = Common::SteadyNs();
+			m_renderer.GetRenderExecutor().ConsumeFormedViews(true);
+			{
+				std::lock_guard lock(m_formed_gate_mutex);
+				m_formed_gate_done.store(request, std::memory_order_release);
+			}
+			m_formed_gate_done_cv.notify_all();
+			RenderExecutor::NoteFormedGate(false, Common::SteadyNs() - begin);
+		}
+#endif
 		auto operation = operations.TryPop();
 		if (!operation) {
 			m_executed.Notify();
@@ -510,6 +524,9 @@ void GuestGpu::ExecutionThread() {
 			unnotified = 0;
 		}
 	}
+#if defined(ANYPS5_KYTY)
+	m_renderer.GetRenderExecutor().ConsumeFormedViews(true);
+#endif
 	m_executed.Notify();
 	g_gpu_thread    = false;
 	g_executing_gpu = nullptr;
@@ -525,6 +542,8 @@ void GuestGpu::ResolveThread() {
 	if (PipelineCache::NarrowProgramLock()) {
 		PipelineCache::BeginAheadThread(0);
 	}
+	uint64_t formed_last  = 0;
+	uint64_t formed_gated = 0;
 #endif
 	for (;;) {
 		auto operation = m_operations.TryPop();
@@ -534,6 +553,21 @@ void GuestGpu::ResolveThread() {
 				break;
 			}
 		}
+#if defined(ANYPS5_KYTY)
+		if (formed_last > formed_gated && (operation->guest_sync || operation->after_wait || operation->formed_sync)) {
+			const auto begin = Common::SteadyNs();
+			m_formed_gate_request.store(formed_last, std::memory_order_seq_cst);
+			m_resolved.Interrupt();
+			{
+				std::unique_lock lock(m_formed_gate_mutex);
+				m_formed_gate_done_cv.wait(lock, [&] {
+					return m_formed_gate_done.load(std::memory_order_acquire) >= formed_last;
+				});
+			}
+			formed_gated = formed_last;
+			RenderExecutor::NoteFormedGate(true, Common::SteadyNs() - begin);
+		}
+#endif
 		if (operation->kind == GpuOperationKind::Callback) {
 			const auto& write = operation->guest_write;
 			if (write.dwords != 0 && write.data != nullptr) {
@@ -615,6 +649,11 @@ void GuestGpu::ResolveThread() {
 				operation->ahead_note = RenderExecutor::AheadNote::Prepared;
 			}
 			RenderExecutor::NoteAhead(resolve_dispatch, operation->ahead_note, Common::SteadyNs() - resolve_begin);
+#if defined(ANYPS5_KYTY)
+			if (ShaderRecompiler::IR::TakeFormedSnapshot() && resolve_dispatch && operation->resolved != nullptr) {
+				formed_last = operation->sequence;
+			}
+#endif
 			const auto* next = m_operations.TryPeek();
 			operation->stream_in_place = next != nullptr && !IsDrawOperation(next->kind);
 		}
@@ -700,6 +739,7 @@ GpuOperation CommandProcessor::MakeOperation(GpuOperationKind kind) {
 	operation.num_instances = m_num_instances;
 	operation.after_wait    = std::exchange(m_wait_since_operation, false);
 	operation.guest_sync    = std::exchange(m_acquire_since_operation, false) || operation.after_wait;
+	operation.formed_sync   = std::exchange(m_formed_sync_since_operation, false);
 	operation.clean         = m_draw_observer != nullptr &&
 	                          (kind == GpuOperationKind::DrawIndex || kind == GpuOperationKind::DrawIndirect) &&
 	                          m_draw_observer->LastClean();
@@ -1023,6 +1063,7 @@ void CommandProcessor::MemSemaphore(uint64_t* counter, bool signal, bool write) 
 		*counter = write ? 1u : *counter + 1u;
 		YieldIfWaitedOn(reinterpret_cast<uint64_t>(counter), sizeof(*counter));
 	} else if (*counter == 0) {
+		m_formed_sync_since_operation = true;
 		if (g_gpu_state != nullptr) {
 #if defined(ANYPS5_KYTY)
 			g_gpu_state->NoteBlockedWait(reinterpret_cast<uint64_t>(counter), sizeof(*counter), 0,
@@ -2767,6 +2808,7 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 		return;
 	}
 
+	m_formed_sync_since_operation = true;
 	const auto sequence = EmitCallback([=, this] {
 		ExecuteReleaseMem(data_sel, interrupt, address, data, interrupt_context_id);
 	});
@@ -3184,6 +3226,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 		     event_type, event_index, event_address);
 	}
 
+	m_formed_sync_since_operation = true;
 	const auto sequence = EmitCallback([this, event_type, event_index, event_address] {
 		ExecuteTriggerEvent(event_type, event_index, event_address);
 	});

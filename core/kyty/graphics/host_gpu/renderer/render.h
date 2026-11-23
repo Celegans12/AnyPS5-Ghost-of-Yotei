@@ -192,7 +192,10 @@ class Buffer;
 
 class RenderExecutor {
 public:
-	explicit RenderExecutor(RenderContext& context): m_context(context) { ConfigureTableResolutions(); }
+	explicit RenderExecutor(RenderContext& context): m_context(context) {
+		ConfigureTableResolutions();
+		InstallFormedHooks();
+	}
 	~RenderExecutor();
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
@@ -248,6 +251,9 @@ public:
 	static void        NoteKnownFormedView() noexcept;
 	static void        NoteFormedFallback() noexcept;
 	void               LogFormedSummary();
+	void               ConsumeFormedViews(bool wait);
+	static void        NoteFormedGate(bool resolve, uint64_t ns) noexcept;
+	static void        NoteFormedGuestWait(uint64_t ns) noexcept;
 	void FindBuffers(std::span<PreparedBindings* const> stages, bool find_buffers = true);
 	void                           RebindBuffers(PreparedBindings& bindings, uint64_t invocations_x = 0);
 	void                           RebindImages(PreparedBindings& bindings);
@@ -611,10 +617,17 @@ private:
 		std::array<uint32_t, 4>                 words {};
 		ShaderRecompiler::IR::FormedView        view;
 	};
-	void BindFormedView(const FormedRead& read, const ShaderRecompiler::IR::BufferResource& resource);
-	[[nodiscard]] ViewLogSegment ReserveViewLog(uint64_t program, std::vector<ViewLogEntry> views);
+	struct FormedHistory;
+	static void InstallFormedHooks();
+	void        BindFormedWords(uint64_t address);
+	[[nodiscard]] bool PrepareFormedHistory(uint64_t program);
+	[[nodiscard]] ViewLogSegment ReserveViewLog(uint64_t program, uint32_t views, std::vector<ViewLogEntry> expected);
 	std::vector<FormedRead>  m_formed_reads;
-	uint64_t                 m_formed_waves = 0;
+	uint64_t                 m_formed_waves   = 0;
+	uint64_t                 m_formed_version = 0;
+	bool                     m_formed_consuming = false;
+	std::unordered_map<uint64_t, std::shared_ptr<FormedHistory>> m_formed_history;
+	std::unordered_map<uint64_t, uint32_t>                       m_formed_reported;
 	std::shared_ptr<Buffer>  m_view_log_buffer;
 	std::shared_ptr<ViewLog> m_view_log;
 	std::shared_ptr<RayTracingCheck>     m_rt_check;

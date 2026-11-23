@@ -2260,6 +2260,52 @@ void BufferCache::WriteTicks::Assign(uint64_t begin, uint64_t end, uint64_t tick
 	m_ranges.emplace(begin, Range {end, tick});
 }
 
+void BufferCache::WriteTicks::Raise(uint64_t begin, uint64_t end, uint64_t tick) {
+	if (begin >= end) {
+		return;
+	}
+	std::vector<std::pair<std::pair<uint64_t, uint64_t>, uint64_t>> later;
+	auto it = m_ranges.upper_bound(begin);
+	if (it != m_ranges.begin()) {
+		--it;
+	}
+	for (; it != m_ranges.end() && it->first < end; ++it) {
+		const auto low  = std::max(it->first, begin);
+		const auto high = std::min(it->second.end, end);
+		if (low < high && it->second.tick > tick) {
+			later.push_back({{low, high}, it->second.tick});
+		}
+	}
+	Assign(begin, end, tick);
+	for (const auto& [range, newer]: later) {
+		Assign(range.first, range.second, newer);
+	}
+}
+
+bool BufferCache::Windowed(uint64_t vaddr, uint64_t size) {
+	if (size == 0) {
+		return true;
+	}
+	const auto end    = vaddr + size;
+	auto       cursor = vaddr;
+	auto       it     = m_buffers.upper_bound(vaddr);
+	if (it != m_buffers.begin()) {
+		--it;
+	}
+	for (; it != m_buffers.end() && it->first < end && cursor < end; ++it) {
+		const auto& buffer = m_slot_buffers[it->second];
+		const auto  last   = buffer.CpuAddress() + buffer.Size();
+		if (last <= cursor) {
+			continue;
+		}
+		if (buffer.CpuAddress() > cursor || !buffer.IsWindow()) {
+			return false;
+		}
+		cursor = last;
+	}
+	return cursor >= end && (m_guest_mirror == nullptr || m_guest_mirror->Ready(vaddr, size));
+}
+
 uint64_t BufferCache::WriteTicks::Latest(uint64_t begin, uint64_t end) const {
 	auto it = m_ranges.upper_bound(begin);
 	if (it != m_ranges.begin()) {
@@ -3466,7 +3512,7 @@ void BufferCache::ProcessUseBuffer() {
 	});
 }
 
-void BufferCache::NoteGpuWrites(uint64_t vaddr, uint64_t size) {
+void BufferCache::NoteGpuWrites(uint64_t vaddr, uint64_t size, uint64_t tick) {
 	m_gpu_write_generation++;
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid GPU write range\n");
@@ -3485,7 +3531,13 @@ void BufferCache::NoteGpuWrites(uint64_t vaddr, uint64_t size) {
 			continue;
 		}
 		TouchBuffer(buffer);
-		NoteWrite(start, finish - start);
+		if (tick == 0) {
+			NoteWrite(start, finish - start);
+		} else {
+			if (m_copy_feedback_entries != 0) InvalidateCopyFeedback(start, finish - start);
+			m_write_ticks.Raise(start, finish, tick);
+			if (!m_mirror_lines.empty()) MarkMirrorLinesWritten(start, finish - start, tick);
+		}
 		m_memory_tracker.MarkRegionAsGpuModifiedUnlessCpuDirty(
 		    start, finish - start, [&](uint64_t page, uint64_t bytes) {
 			    const auto first = std::max(page, start);
@@ -3843,14 +3895,19 @@ void BufferCache::SynchronizeBuffersInSet(const RangeSet& set, SetRegions& state
 	if (m_set_chunks.size() < chunks) {
 		m_set_chunks.resize(chunks);
 	}
-	GetExecHelpers().ParallelFor(count, Grain, [&](uint32_t begin, uint32_t end) {
+	const auto run = [&](uint32_t begin, uint32_t end) {
 		auto& chunk = m_set_chunks[begin / Grain];
 		chunk.buffers.clear();
 		chunk.ranges.clear();
 		for (auto visited = begin; visited < end; visited++) {
 			visit(m_set_visits[visited], chunk);
 		}
-	});
+	};
+	if (count <= Grain) {
+		if (count != 0) run(0, count);
+	} else {
+		GetExecHelpers().ParallelFor(count, Grain, [&](uint32_t begin, uint32_t end) { run(begin, end); });
+	}
 	m_span_buffers.clear();
 	m_span_ranges.clear();
 	for (uint32_t chunk = 0; chunk < chunks; chunk++) {

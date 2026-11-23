@@ -261,6 +261,7 @@ private:
 #endif
 	bool m_wait_since_operation = false;
 	bool m_acquire_since_operation = true;
+	bool m_formed_sync_since_operation = false;
 
 public:
 	void NoteAcquireMem() noexcept { m_acquire_since_operation = true; }

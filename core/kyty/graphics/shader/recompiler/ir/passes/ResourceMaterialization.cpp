@@ -2414,13 +2414,69 @@ bool EmptyBuffersServe(const ResourcePlan& program, const ResourceSnapshot& snap
 }
 #endif
 
+#if defined(ANYPS5_KYTY)
+thread_local bool t_formed_snapshot      = false;
+std::atomic<bool (*)(uint64_t)>                     g_formed_allowed {nullptr};
+std::atomic<void (*)(uint64_t, uint64_t, uint64_t)> g_formed_seed {nullptr};
+std::atomic<void (*)(uint64_t)>                     g_formed_used {nullptr};
+
+bool FormedProgramAllowed(uint64_t program) {
+	const auto allowed = g_formed_allowed.load(std::memory_order_acquire);
+	return allowed == nullptr || allowed(program);
+}
+
+uint64_t FormableWrittenBuffers(const ResourcePlan& program) {
+	thread_local std::unordered_map<const ResourcePlan*, std::pair<uint64_t, uint64_t>> known;
+	const auto found = known.find(&program);
+	if (found != known.end() && found->second.first == program.shader_hash) return found->second.second;
+	uint64_t mask = 0;
+	if (std::ranges::any_of(program.gpu_formable_sources, [](uint8_t formable) { return formable != 0u; })) {
+		for (uint32_t index = 0; index < program.info.buffers.size() && index < 64u; ++index) {
+			if (program.info.buffers[index].written && FormedElementBytes(program, index) != 0u) {
+				mask |= uint64_t {1} << index;
+			}
+		}
+	}
+	known[&program] = {program.shader_hash, mask};
+	return mask;
+}
+
+void SeedFormedHistory(const ResourcePlan& program, const ResourceSnapshot& snapshot, uint64_t formed_now,
+                       uint64_t limit) {
+	const auto seed = g_formed_seed.load(std::memory_order_acquire);
+	if (seed == nullptr) return;
+	const auto mask = FormableWrittenBuffers(program) & ~formed_now;
+	if (mask == 0u) return;
+	if (const auto used = g_formed_used.load(std::memory_order_acquire); used != nullptr && formed_now == 0u) {
+		used(program.shader_hash);
+	}
+	for (auto bits = mask; bits != 0u; bits &= bits - 1u) {
+		const auto index = static_cast<uint32_t>(std::countr_zero(bits));
+		if (index >= snapshot.buffers.size() || snapshot.buffers[index].dword_count != 4u) continue;
+		const auto view = FormView(program.info.buffers[index], FormedElementBytes(program, index),
+		                           std::span<const uint32_t, 4>(snapshot.buffers[index].dwords.data(), 4u), limit);
+		if (view.serves && view.base != 0u && view.bytes != 0u) seed(program.shader_hash, view.base, view.bytes);
+	}
+}
+
+void SetFormedHooks(FormedHooks hooks) {
+	g_formed_allowed.store(hooks.allowed, std::memory_order_release);
+	g_formed_seed.store(hooks.seed, std::memory_order_release);
+	g_formed_used.store(hooks.used, std::memory_order_release);
+}
+
+bool TakeFormedSnapshot() {
+	return std::exchange(t_formed_snapshot, false);
+}
+#endif
+
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& given_runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
 	t_record_blocks.clear();
 #if defined(ANYPS5_KYTY)
 	snapshot.gpu_formed.clear();
 	auto runtime         = given_runtime;
-	runtime.defer_formed = runtime.defer_formed && !FormedViewsBlocked();
+	runtime.defer_formed = runtime.defer_formed && !FormedViewsBlocked() && FormedProgramAllowed(program.shader_hash);
 #else
 	const auto& runtime = given_runtime;
 #endif
@@ -2614,6 +2670,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& given_r
 #if defined(ANYPS5_KYTY)
 	if (MirrorsVsharpBuffers()) MirrorBuffers(program, snapshot, specialization);
 	if (formed_now != 0 || FormsVsharpBuffers()) FormBuffers(program, snapshot, specialization, formed_now);
+	t_formed_snapshot = t_formed_snapshot || !snapshot.gpu_formed.empty();
 #endif
 	snapshot.images.resize(program.info.images.size());
 	specialization.images.resize(program.info.images.size());
@@ -3302,6 +3359,7 @@ void FormBuffers(const ResourcePlan& program, const ResourceSnapshot& snapshot,
 	const auto count = std::min({specialization.buffers.size(), program.info.buffers.size(), snapshot.buffers.size(),
 	                             size_t {64}});
 	const auto limit = MirrorSize();
+	SeedFormedHistory(program, snapshot, formed_now, limit);
 	for (uint32_t index = 0; index < count; ++index) {
 		const auto bit = uint64_t {1} << index;
 		if ((formed_now & bit) == 0u) {

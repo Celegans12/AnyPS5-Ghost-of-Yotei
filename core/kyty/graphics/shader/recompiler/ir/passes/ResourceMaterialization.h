@@ -109,6 +109,13 @@ struct FormedView {
 	bool     none   = false;
 	bool     serves = false;
 };
+struct FormedHooks {
+	bool (*allowed)(uint64_t program)                             = nullptr;
+	void (*seed)(uint64_t program, uint64_t base, uint64_t bytes) = nullptr;
+	void (*used)(uint64_t program)                                = nullptr;
+};
+void       SetFormedHooks(FormedHooks hooks);
+bool       TakeFormedSnapshot();
 bool       FormsVsharpBuffers();
 void       BlockFormedViews(bool blocked);
 bool       FormedViewsBlocked();

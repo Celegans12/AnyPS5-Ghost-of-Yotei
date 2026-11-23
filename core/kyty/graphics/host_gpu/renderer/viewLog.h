@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -37,11 +38,22 @@ struct ViewLogSegment {
 	uint32_t capacity       = 0;
 };
 
+struct ViewLogConsumed {
+	uint64_t                      program  = 0;
+	uint64_t                      context  = 0;
+	uint64_t                      tick     = 0;
+	uint32_t                      count    = 0;
+	uint32_t                      capacity = 0;
+	std::span<const ViewLogEntry> views;
+};
+
 class ViewLog {
 public:
 	static constexpr uint32_t EntryBytes = 16;
 
-	using Segment = ViewLogSegment;
+	using Segment  = ViewLogSegment;
+	using Consumed = ViewLogConsumed;
+	using Sink     = std::function<void(const Consumed&)>;
 
 	struct Stats {
 		uint64_t segments  = 0;
@@ -61,9 +73,11 @@ public:
 	ViewLog(std::span<uint8_t> memory, uint64_t device_address);
 
 	[[nodiscard]] std::optional<Segment> Reserve(uint32_t entries, uint64_t tick, uint64_t& wait_tick);
-	void Attach(const Segment& segment, uint64_t program, std::vector<ViewLogEntry> expected);
-	void Consume(uint64_t completed_tick);
+	void Attach(const Segment& segment, uint64_t program, std::vector<ViewLogEntry> expected, uint64_t context = 0);
+	void Consume(uint64_t completed_tick, const Sink& sink = {});
 	[[nodiscard]] uint64_t Pending() const noexcept;
+	[[nodiscard]] uint64_t LastTick() const noexcept;
+	[[nodiscard]] size_t   LiveSegments() const noexcept { return m_live.size(); }
 	void Inject(const Segment& segment, std::span<const ViewLogEntry> entries);
 	[[nodiscard]] Stats TakeStats() noexcept;
 	[[nodiscard]] std::vector<std::string> TakeReports();
@@ -77,11 +91,13 @@ private:
 		uint32_t                  capacity = 0;
 		uint64_t                  tick     = 0;
 		uint64_t                  program  = 0;
+		uint64_t                  context  = 0;
 		bool                      attached = false;
 		std::vector<ViewLogEntry> expected;
 	};
 
-	void Check(const Live& live);
+	void Check(const Live& live, const std::vector<ViewLogEntry>& logged, uint32_t count);
+	[[nodiscard]] std::vector<ViewLogEntry> Collapse(const Live& live, uint32_t& count);
 	[[nodiscard]] uint32_t& Count(uint32_t first) noexcept;
 	[[nodiscard]] ViewLogEntry* Entries(uint32_t first) noexcept;
 

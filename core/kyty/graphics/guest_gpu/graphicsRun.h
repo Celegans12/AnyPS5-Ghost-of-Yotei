@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <condition_variable>
 #include <mutex>
 #include <semaphore>
 #include <span>
@@ -191,6 +192,12 @@ private:
 	std::unique_ptr<Scout::Ticket[]> m_table_tickets = std::make_unique<Scout::Ticket[]>(TableTicketRing);
 	uint64_t                        m_table_ticket_next = 0;
 	Common::ProgressCounter         m_executed;
+#if defined(ANYPS5_KYTY)
+	std::atomic<uint64_t>   m_formed_gate_request {0};
+	std::atomic<uint64_t>   m_formed_gate_done {0};
+	std::mutex              m_formed_gate_mutex;
+	std::condition_variable m_formed_gate_done_cv;
+#endif
 	uint64_t                        m_emitted = 0;
 	static constexpr size_t PendingWriteCapacity = 16384;
 	std::unique_ptr<GuestWrite[]> m_pending_writes;

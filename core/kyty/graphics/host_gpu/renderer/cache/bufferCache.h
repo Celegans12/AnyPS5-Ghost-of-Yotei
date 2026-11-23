@@ -213,7 +213,8 @@ public:
 	void ProcessWriteBuffer(FaultManager::PagesHandler&& handler) {
 		m_fault_manager.ProcessWriteBuffer(std::move(handler));
 	}
-	void NoteGpuWrites(uint64_t vaddr, uint64_t size);
+	void NoteGpuWrites(uint64_t vaddr, uint64_t size, uint64_t tick = 0);
+	[[nodiscard]] bool Windowed(uint64_t vaddr, uint64_t size);
 	template <typename Func>
 	void ConsumeCpuWrites(CpuWriteConsumer consumer, uint64_t vaddr, uint64_t size, Func&& func) {
 		m_memory_tracker.ConsumeCpuWrites(consumer, vaddr, size, std::forward<Func>(func));
@@ -402,6 +403,7 @@ private:
 	class WriteTicks {
 	public:
 		void Assign(uint64_t begin, uint64_t end, uint64_t tick);
+		void Raise(uint64_t begin, uint64_t end, uint64_t tick);
 		[[nodiscard]] uint64_t Latest(uint64_t begin, uint64_t end) const;
 
 	private:

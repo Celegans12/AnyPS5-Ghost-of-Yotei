@@ -4,7 +4,9 @@
 #include "common/logging/log.h"
 #include "common/emulatorConfig.h"
 #include "common/hackNotice.h"
+#include "common/timer.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/renderer/formedViews.h"
 #include "graphics/guest_gpu/scout.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/presentation/videoOut.h"
@@ -99,6 +101,11 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	if (WaitWriteBacks(fault_vaddr, fault_size)) {
 		return true;
 	}
+#if defined(ANYPS5_KYTY)
+	if (access == PageFaultAccess::Write && FormedPrograms::Instance().PendingMayWrite(fault_vaddr)) {
+		WaitFormedViews();
+	}
+#endif
 	if (access == PageFaultAccess::Write && GuestGpu::IsGpuThread()) {
 		m_bda_generation++;
 	}
@@ -136,6 +143,18 @@ static bool UrgentWriteBackWait() {
 		return value == nullptr || value[0] != '0';
 	}();
 	return on;
+}
+
+void RenderContext::WaitFormedViews() {
+	const auto begin = Common::SteadyNs();
+	if (GuestGpu::IsGpuThread()) {
+		m_render_executor.ConsumeFormedViews(true);
+	} else if (GuestGpu::IsCommandProcessorThread()) {
+		GetGpu().SendCommandSync([this] { m_render_executor.ConsumeFormedViews(true); });
+	} else {
+		GetGpu().SendUrgentCommandSync([this] { m_render_executor.ConsumeFormedViews(true); }, false);
+	}
+	RenderExecutor::NoteFormedGuestWait(Common::SteadyNs() - begin);
 }
 
 bool RenderContext::WaitWriteBacks(uint64_t vaddr, uint64_t size) {

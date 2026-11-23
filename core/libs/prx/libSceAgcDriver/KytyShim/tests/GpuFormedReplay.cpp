@@ -92,8 +92,8 @@ std::vector<Case> cases() {
         {sharp(Views + ViewStride, {.records = 0x40}), true, view(Views + ViewStride, 0x40)},
         {sharp(Views + 2 * ViewStride, {.records = 16, .stride = 16}), true, view(Views + 2 * ViewStride, 0x100)},
         {sharp(Views + 3 * ViewStride, {.records = 0x100, .type = 1}), true, view(0, 0)},
-        {sharp(Views + 4 * ViewStride + 2u, {.records = 0x100}), false, view(Views + 4 * ViewStride + 2u, 0x100)},
-        {sharp(Views + 5 * ViewStride, {.records = UINT32_MAX}), false, " 0:" + hex(Views + 5 * ViewStride) + "+0xffffffff"},
+        {sharp(Views + 4 * ViewStride + 2u, {.records = 0x100}), true, view(Views + 4 * ViewStride + 2u, 0x100)},
+        {sharp(Views + 5 * ViewStride, {.records = UINT32_MAX}), true, " 0:" + hex(Views + 5 * ViewStride) + "+0xffffffff:0x7"},
         {sharp(Views + 6 * ViewStride + 4u, {.records = 0x200}), true, view(Views + 6 * ViewStride + 4u, 0x200), FormedPair,
          Views + 6 * ViewStride + 4u + 0x100u},
         {sharp(Views + 8 * ViewStride, {.records = 0x200}), true, view(Views + 8 * ViewStride, 0x200), FormedPair,
@@ -268,6 +268,8 @@ Replay replay(const std::filesystem::path& tool, const std::filesystem::path& ro
     setVariable("KYTY_E2_GPU_FORMED", settings.formed);
     setVariable("KYTY_E2_GPU_FORMED_ALL", settings.all);
     setVariable("KYTY_E2_VIEWLOG_VERIFY", settings.verify);
+    setVariable("KYTY_E2_FORMED_WARMUP_MS", "0");
+    setVariable("KYTY_E2_FORMED_WARMUP_USES", "0");
     const auto command = quote(tool) + " " + quote(directory / "capture") + " --strict --no-synthesize --repeat " +
                          std::to_string(settings.repeat) + " --cold-pipelines --frames " + quote(frames) + " > " +
                          quote(log) + " 2>&1";
@@ -347,6 +349,8 @@ int main(int argc, char** argv) {
             failure = "with KYTY_E2_GPU_FORMED_ALL=1 no module formed its view in the shader";
         } else if (checked.size() < 4) {
             failure = "the view log of the first pass was not checked (" + std::to_string(checked.size()) + " segments)";
+        } else if (linesWith(formed.log, "[kyty-e2f] form miss program=").size() != 1) {
+            failure = "the V# the shader cannot form was not reported once as a form miss";
         } else if (!linesWith(formed.log, "[kyty-e2f] view log missing").empty() ||
                    !linesWith(formed.log, "[kyty-e2f] view log extra").empty()) {
             failure = "the view log disagrees with the ranges the CPU marked";

@@ -135,6 +135,7 @@ private:
 	};
 
 	bool WaitWriteBacks(uint64_t vaddr, uint64_t size);
+	void WaitFormedViews();
 
 	GraphicContext&           m_graphics;
 	Common::Mutex             m_mutex;
