@@ -999,6 +999,9 @@ if(BUILD_TESTING)
         add_test(NAME kyty_pipeline_stalls COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_kyty_pipeline_stalls.py)
         set_tests_properties(kyty_pipeline_stalls PROPERTIES TIMEOUT 30)
+        add_test(NAME kyty_manifest_float_modes COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_kyty_manifest_float_modes.py)
+        set_tests_properties(kyty_manifest_float_modes PROPERTIES TIMEOUT 30)
         add_test(NAME kyty_pgo COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_kyty_pgo.py)
         set_tests_properties(kyty_pgo PROPERTIES TIMEOUT 30)

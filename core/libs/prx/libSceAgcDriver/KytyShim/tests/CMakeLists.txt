@@ -376,6 +376,19 @@ add_test(NAME kyty_shim_empty_buffer_variants_off COMMAND kyty_shim_empty_buffer
 set_tests_properties(kyty_shim_empty_buffer_variants_off PROPERTIES TIMEOUT 20 ENVIRONMENT "KYTY_SHARE_EMPTY_BUFFERS=0"
         PASS_REGULAR_EXPRESSION "kyty_shim_empty_buffer_variants_off: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
 
+if(NOT ANYPS5_KYTY_DLL)
+    add_test_executable(kyty_shim_manifest_float_modes_tests ${CMAKE_CURRENT_SOURCE_DIR}/ManifestFloatModes.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+    target_include_directories(kyty_shim_manifest_float_modes_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    configure_host_test_executable(kyty_shim_manifest_float_modes_tests)
+    if(MINGW)
+        target_link_libraries(kyty_shim_manifest_float_modes_tests PRIVATE stdc++ gcc_eh)
+    endif()
+    target_link_libraries(kyty_shim_manifest_float_modes_tests PRIVATE Kyty::gpu libkernel libc)
+    add_test(NAME kyty_shim_manifest_float_modes COMMAND kyty_shim_manifest_float_modes_tests)
+    set_tests_properties(kyty_shim_manifest_float_modes PROPERTIES TIMEOUT 20
+            PASS_REGULAR_EXPRESSION "kyty_shim_manifest_float_modes: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+endif()
+
 add_test_executable(kyty_shim_gpu_control_loads_tests ${CMAKE_CURRENT_SOURCE_DIR}/GpuControlLoads.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
 target_include_directories(kyty_shim_gpu_control_loads_tests PRIVATE ${LIBS_INCLUDE_DIR})
 configure_host_test_executable(kyty_shim_gpu_control_loads_tests)
