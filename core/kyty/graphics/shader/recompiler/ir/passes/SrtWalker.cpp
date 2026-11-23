@@ -300,10 +300,9 @@ void LoadGuest(Xbyak::CodeGenerator& code, size_t cache, [[maybe_unused]] uint32
 	code.mov(code.r11d, code.eax);
 	code.and_(code.r11d, WalkerPageCacheSlots - 1u);
 	code.shl(code.r11d, 4);
-	code.add(code.r11, code.rdx);
-	code.cmp(code.rax, code.qword[code.r11 + cache]);
+	code.cmp(code.rax, code.qword[code.rdx + code.r11 + cache]);
 	code.jne(slow, Xbyak::CodeGenerator::T_NEAR);
-	code.mov(code.rcx, code.qword[code.r11 + cache + 8]);
+	code.mov(code.rcx, code.qword[code.rdx + code.r11 + cache + 8]);
 	code.test(code.rcx, code.rcx);
 	code.jz(direct, Xbyak::CodeGenerator::T_NEAR);
 	code.mov(code.r9d, code.r10d);
@@ -642,7 +641,7 @@ private:
 	Xbyak::Label                                      m_ret;
 	uint32_t m_shader_base = 0, m_page_cache = 0, m_reach = 0, m_states = 0, m_states_end = 0, m_bias = 0;
 	uint32_t m_user_data = 0, m_captures = 0;
-	bool     m_body = true;
+	bool     m_body = true, m_loads = false;
 	std::vector<uint32_t> m_flat_slots;
 	std::vector<bool>     m_zero_tested;
 	std::vector<uint32_t> m_gpu_control;
@@ -1070,6 +1069,7 @@ void WalkerCompiler::Layout() {
 		const size_t skip = op == ValueOpcode::LoadBufferU32 ? 1u : 0u;
 		const bool read = op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer ||
 		                  op == ValueOpcode::LoadBufferU32;
+		m_loads |= read;
 		if (read && node.result == Operand {Kind::Node, index} && node.args.size() > skip + 2u &&
 		    node.args[skip].kind == Kind::UserData && node.args[skip + 1].kind == Kind::UserData) {
 			m_bases.try_emplace({node.args[skip].value, node.args[skip + 1].value}, 0u);
@@ -1647,9 +1647,8 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 		Base({Kind::UserData, pair.first}, {Kind::UserData, pair.second});
 		c.mov(c.qword[At(slot)], c.rax);
 	}
-	for (uint32_t slot = 0; slot < WalkerPageCacheSlots; ++slot) {
+	for (uint32_t slot = 0; m_loads && slot < WalkerPageCacheSlots; ++slot) {
 		c.mov(c.qword[At(m_page_cache + slot * static_cast<uint32_t>(sizeof(WalkerCachedPage)))], -1);
-		c.mov(c.qword[At(m_page_cache + slot * static_cast<uint32_t>(sizeof(WalkerCachedPage)) + 8u)], 0);
 	}
 	Zero(m_reach, m_states_end - m_reach);
 	c.lea(c.r8, c.ptr[At(m_plan.srt_captures)]);
