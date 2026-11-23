@@ -25,10 +25,10 @@ bool FormedPrograms::StrictGate() {
 uint64_t FormedPrograms::WarmupUses() {
 	static const uint64_t warmup = [] {
 		const char* value = std::getenv("KYTY_E2_FORMED_WARMUP_USES");
-		if (value == nullptr || *value == '\0') return uint64_t {20000};
+		if (value == nullptr || *value == '\0') return uint64_t {100000};
 		char*      end  = nullptr;
 		const auto uses = std::strtoull(value, &end, 10);
-		return end != nullptr && *end == '\0' ? uint64_t {uses} : uint64_t {20000};
+		return end != nullptr && *end == '\0' ? uint64_t {uses} : uint64_t {100000};
 	}();
 	return warmup;
 }
@@ -36,10 +36,10 @@ uint64_t FormedPrograms::WarmupUses() {
 int64_t FormedPrograms::WarmupNs() {
 	static const int64_t warmup = [] {
 		const char* value = std::getenv("KYTY_E2_FORMED_WARMUP_MS");
-		if (value == nullptr || *value == '\0') return int64_t {3000} * 1000000;
+		if (value == nullptr || *value == '\0') return int64_t {10000} * 1000000;
 		char*      end = nullptr;
 		const auto ms  = std::strtoll(value, &end, 10);
-		return end != nullptr && *end == '\0' && ms >= 0 ? int64_t {ms} * 1000000 : int64_t {3000} * 1000000;
+		return end != nullptr && *end == '\0' && ms >= 0 ? int64_t {ms} * 1000000 : int64_t {10000} * 1000000;
 	}();
 	return warmup;
 }
