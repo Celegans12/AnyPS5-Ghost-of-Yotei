@@ -1079,6 +1079,12 @@ void DefineModule(EmitterState& state) {
 	if (state.program.info.subgroup_arithmetic) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformArithmetic);
 	}
+	if (state.lds_last_lane_stores) {
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformVote);
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformShuffle);
+	}
 	if (state.program.info.compute_derivatives && state.program.stage == ShaderType::Compute) {
 		state.builder.RequireCapability(spv::CapabilityComputeDerivativeGroupQuadsKHR);
 		state.builder.RequireExtension("SPV_KHR_compute_shader_derivatives");

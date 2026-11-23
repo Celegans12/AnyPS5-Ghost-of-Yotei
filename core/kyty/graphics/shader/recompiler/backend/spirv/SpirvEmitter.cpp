@@ -79,6 +79,10 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 	            !program.lane_local
 	        ? 2u
 	        : 1u;
+	state.lds_last_lane_stores =
+	    program.stage == ShaderType::Compute && workgroup != nullptr && split_hints == nullptr &&
+	    program.wave_size == 64u && workgroup->host_subgroup_size == 64u && !program.lane_local &&
+	    program.info.uses_lds && state.lds_storage_class == spv::StorageClassWorkgroup;
 	DefineModule(state);
 	EmitProgram(state);
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,

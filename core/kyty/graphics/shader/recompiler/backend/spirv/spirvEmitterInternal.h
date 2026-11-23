@@ -145,6 +145,7 @@ struct EmitterState {
 	uint32_t                                         tess_inner_variable = 0;
 
 	uint32_t                                         lane_count              = 1;
+	bool                                             lds_last_lane_stores    = false;
 	SplitHints*                                      split_hints             = nullptr;
 	std::optional<SplitHints::Update>                unordered_update;
 	uint32_t                                         lane_half               = 0;

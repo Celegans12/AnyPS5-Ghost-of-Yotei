@@ -825,6 +825,20 @@ void StoreLocalFlat(ValueEmitContext& ctx, const IR::Inst& inst) {
 	});
 }
 
+uint32_t LastLaneValueOfSharedAddress(EmitterState& state, uint32_t index, uint32_t data) {
+	const auto scope  = ConstantU32(state, spv::ScopeSubgroup);
+	const auto shared = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformAllEqual, TypeBool(state), shared, scope, index);
+	const auto ballot = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot, scope,
+	                          ConstantBool(state, true));
+	const auto last = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformBallotFindMSB, TypeU32(state), last, scope, ballot);
+	const auto value = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, TypeU32(state), value, scope, data, last);
+	return Select(state, TypeU32(state), shared, value, data);
+}
+
 void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                        const MemoryResourceAccess& resource, uint32_t data) {
 	if (resource.object_pointer == 0u) return;
@@ -832,7 +846,10 @@ void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 	const auto in_bounds = BufferIndexInBounds(ctx, inst, mem, resource,
 	    EmitStorageElementInBounds(ctx.state, resource, index));
 	EmitIfCondition(ctx.state, in_bounds, [&]() {
-		StoreWordInBounds(ctx, resource, index, data);
+		StoreWordInBounds(ctx, resource, index,
+		                  resource.kind == IR::ResourceKind::Lds && ctx.state.lds_last_lane_stores
+		                      ? LastLaneValueOfSharedAddress(ctx.state, index, data)
+		                      : data);
 	});
 }
 
