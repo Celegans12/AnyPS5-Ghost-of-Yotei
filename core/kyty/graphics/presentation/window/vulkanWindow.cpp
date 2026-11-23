@@ -533,12 +533,14 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		vk::StructureChain<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT>
 		    library_features;
 		physical_device.getFeatures2(&library_features.get<vk::PhysicalDeviceFeatures2>());
-		vk::StructureChain<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceGraphicsPipelineLibraryPropertiesEXT>
+		vk::StructureChain<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceGraphicsPipelineLibraryPropertiesEXT,
+		                   vk::PhysicalDeviceDriverProperties>
 		    library_properties;
 		physical_device.getProperties2(&library_properties.get<vk::PhysicalDeviceProperties2>());
 		const auto& library_limits =
 		    library_properties.get<vk::PhysicalDeviceGraphicsPipelineLibraryPropertiesEXT>();
 		graphics.pipeline_library_enabled =
+		    library_properties.get<vk::PhysicalDeviceDriverProperties>().driverID != vk::DriverId::eMesaRadv &&
 		    library_features.get<vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT>().graphicsPipelineLibrary ==
 		        VK_TRUE &&
 		    library_limits.graphicsPipelineLibraryFastLinking == VK_TRUE &&
