@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #if defined(ANYPS5_KYTY)
+#include "graphics/host_gpu/renderer/formedViews.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
 #endif
 
@@ -371,6 +372,30 @@ void NoteAheadWrites(const ShaderRecompiler::IR::ResourcePlan&     plan,
 		g_ahead_writes_sequence.store(sequence + 2, std::memory_order_release);
 	}
 }
+
+#if defined(ANYPS5_KYTY)
+void NoteFormedAheadWrites(uint64_t program) {
+	if (t_ahead_writes_copy != nullptr) {
+		Libs::Graphics::FormedPrograms::Ranges ranges;
+		Libs::Graphics::FormedPrograms::Instance().CopyRanges(program, ranges);
+		for (const auto& [begin, end]: ranges.ranges) t_ahead_writes_copy->Add(begin, end);
+		return;
+	}
+	thread_local std::unordered_map<uint64_t, Libs::Graphics::FormedPrograms::Ranges> noted;
+	auto&      ranges  = noted[program];
+	const auto version = ranges.version;
+	Libs::Graphics::FormedPrograms::Instance().CopyRanges(program, ranges);
+	if (ranges.version == version) return;
+	for (const auto& [begin, end]: ranges.ranges) {
+		if (g_ahead_writes.Has(begin, end)) continue;
+		const auto sequence = g_ahead_writes_sequence.load(std::memory_order_relaxed);
+		g_ahead_writes_sequence.store(sequence + 1, std::memory_order_relaxed);
+		std::atomic_thread_fence(std::memory_order_release);
+		g_ahead_writes.Add(begin, end);
+		g_ahead_writes_sequence.store(sequence + 2, std::memory_order_release);
+	}
+}
+#endif
 
 void RecordAheadLoad(void* userdata, uint64_t address, uint32_t value, uint32_t flat_slot) {
 	static_cast<GuestReadLog*>(userdata)->RecordLoad(address, value, flat_slot);
@@ -2885,6 +2910,7 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 			}
 		}
 		ahead.reads.ForgetLoads(forgotten);
+		if (!Libs::Graphics::FormedPrograms::StrictGate()) NoteFormedAheadWrites(program->resource_plan.shader_hash);
 	}
 #endif
 	NoteAheadWrites(program->resource_plan, resources);

@@ -2888,6 +2888,8 @@ struct FormedCounters {
 	std::atomic<uint64_t> guest_waits {0};
 	std::atomic<uint64_t> guest_wait_ns {0};
 	std::atomic<uint64_t> consume_ns {0};
+	std::atomic<uint64_t> history_marks {0};
+	std::atomic<uint64_t> history_mark_ns {0};
 };
 
 FormedCounters     g_formed;
@@ -2964,6 +2966,9 @@ struct RenderExecutor::FormedHistory {
 	RangeSet                                   set;
 	BufferCache::SetRegions                    regions;
 	uint64_t                                   register_epoch = UINT64_MAX;
+	uint64_t                                   marked_tick    = 0;
+	uint64_t                                   marked_version = 0;
+	uint64_t                                   marked_unmarks = 0;
 };
 
 void RenderExecutor::InstallFormedHooks() {
@@ -3030,6 +3035,22 @@ bool RenderExecutor::PrepareFormedHistory(uint64_t program) {
 		}
 	}
 	cache.SynchronizeBuffersInSet(history->set, history->regions);
+	if (!FormedPrograms::StrictGate()) {
+		const auto tick = m_context.GetCommandScheduler().CurrentTick();
+		if (history->marked_tick != tick || history->marked_version != history->ranges.version ||
+		    history->marked_unmarks != cache.GpuUnmarks()) {
+			const auto begin = Common::SteadyNs();
+			for (const auto& [first, end]: history->mapped) {
+				cache.NoteGpuWrites(first, end - first);
+				m_context.GetTextureCache().InvalidateMemoryFromGPU(first, end - first);
+			}
+			history->marked_tick    = tick;
+			history->marked_version = history->ranges.version;
+			history->marked_unmarks = cache.GpuUnmarks();
+			g_formed.history_marks.fetch_add(1, std::memory_order_relaxed);
+			g_formed.history_mark_ns.fetch_add(Common::SteadyNs() - begin, std::memory_order_relaxed);
+		}
+	}
 	return true;
 }
 
@@ -3100,7 +3121,8 @@ void RenderExecutor::ConsumeFormedViews(bool wait) {
 	FormedConsumeResult result;
 	m_formed_consuming = true;
 	m_view_log->Consume(master.KnownGpuTick(), [&](const ViewLog::Consumed& consumed) {
-		ConsumeFormedSegment(consumed, FormedPrograms::Instance(), sink, g_consumed, result, FormedNow());
+		ConsumeFormedSegment(consumed, FormedPrograms::Instance(), sink, g_consumed, result, FormedNow(),
+		                     !FormedPrograms::StrictGate());
 	});
 	m_formed_consuming = false;
 	FormedPrograms::Instance().SetPending(m_view_log->LiveSegments());
@@ -3172,7 +3194,7 @@ void RenderExecutor::LogFormedSummary() {
 	    "[kyty-e2f] gpu-formed dispatches {} views {} entries {} (waits {}), cpu-known formed views {}, fallbacks {} "
 	    "(warming {}, size {}, slot {}, queries {}); consumed segments {} views {} written {} read misses {} write misses "
 	    "{} form misses {} conflicts {} overflows {}; history new blocks {} activated {} demoted {} checks {} binds {} "
-	    "miss binds {}; gates resolve {} ({:.2f} ms) execute {} ({:.2f} ms, GPU waits {} {:.2f} ms), guest waits {} "
+	    "miss binds {} marks {} ({:.2f} ms); gates resolve {} ({:.2f} ms) execute {} ({:.2f} ms, GPU waits {} {:.2f} ms), guest waits {} "
 	    "({:.2f} ms), consume {:.2f} ms; verify segments {} logged {} distinct {} expected {} matched {} missing {} extra "
 	    "{} overflow {} form-miss {}\n",
 	    dispatches, take(g_formed.views), take(g_formed.entries), take(g_formed.waits), known, fallbacks,
@@ -3180,7 +3202,7 @@ void RenderExecutor::LogFormedSummary() {
 	    take(g_formed.refused_queries), consumed.segments, consumed.views, consumed.written, consumed.read_misses,
 	    consumed.write_misses, consumed.form_misses, consumed.conflicts, consumed.overflows, counts.new_blocks,
 	    counts.activated, counts.demoted, take(g_formed.history_checks), take(g_formed.history_binds),
-	    take(g_formed.miss_binds), take(g_formed.resolve_gates), ms(g_formed.resolve_gate_ns),
+	    take(g_formed.miss_binds), take(g_formed.history_marks), ms(g_formed.history_mark_ns), take(g_formed.resolve_gates), ms(g_formed.resolve_gate_ns),
 	    take(g_formed.execute_gates), ms(g_formed.execute_gate_ns), take(g_formed.gpu_waits), ms(g_formed.gpu_wait_ns),
 	    take(g_formed.guest_waits), ms(g_formed.guest_wait_ns), ms(g_formed.consume_ns), stats.checked, stats.logged,
 	    stats.distinct, stats.expected, stats.matched, stats.missing, stats.extra, stats.overflow, stats.misses));

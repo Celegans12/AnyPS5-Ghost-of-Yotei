@@ -14,6 +14,14 @@ FormedPrograms& FormedPrograms::Instance() {
 	return programs;
 }
 
+bool FormedPrograms::StrictGate() {
+	static const bool strict = [] {
+		const char* value = std::getenv("KYTY_E2_FORMED_GATE");
+		return value == nullptr || std::string_view {value} != "0";
+	}();
+	return strict;
+}
+
 uint64_t FormedPrograms::WarmupUses() {
 	static const uint64_t warmup = [] {
 		const char* value = std::getenv("KYTY_E2_FORMED_WARMUP_USES");
@@ -162,7 +170,8 @@ FormedPrograms::Counts FormedPrograms::TakeCounts() {
 }
 
 void ConsumeFormedSegment(const ViewLogConsumed& segment, FormedPrograms& programs, FormedSink& sink,
-                          FormedConsumeStats& stats, FormedConsumeResult& result, int64_t now_ns) {
+                          FormedConsumeStats& stats, FormedConsumeResult& result, int64_t now_ns,
+                          bool history_marked) {
 	stats.segments++;
 	const auto demote = [&](std::string_view why, uint64_t base, uint64_t bytes, uint32_t flags) {
 		result.stop = true;
@@ -208,18 +217,20 @@ void ConsumeFormedSegment(const ViewLogConsumed& segment, FormedPrograms& progra
 		}
 		if (!known || !windowed) {
 			stats.write_misses++;
-			demote(known ? "write miss outside a window" : "write miss outside the history", base, bytes, flags);
+			demote(known ? "write miss outside a window" : "write miss outside the history (CPU reads of it before now may have been stale)",
+			       base, bytes, flags);
 			programs.Seed(segment.program, base, bytes, now_ns);
 			result.binds.emplace_back(base, bytes);
 			if (windowed) sink.Written(base, bytes, segment.tick);
 			continue;
 		}
+		stats.written++;
+		if (history_marked) continue;
 		if (sink.CpuDirty(base, bytes)) {
 			stats.conflicts++;
 			demote("guest write conflict", base, bytes, flags);
 		}
 		sink.Written(base, bytes, segment.tick);
-		stats.written++;
 	}
 }
 

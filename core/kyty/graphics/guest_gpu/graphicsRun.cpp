@@ -20,6 +20,7 @@
 #include "graphics/guest_gpu/scout.h"
 #include "graphics/guest_gpu/psrShaders.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/formedViews.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/rayTracing.h"
@@ -554,7 +555,8 @@ void GuestGpu::ResolveThread() {
 			}
 		}
 #if defined(ANYPS5_KYTY)
-		if (formed_last > formed_gated && (operation->guest_sync || operation->after_wait || operation->formed_sync)) {
+		if (formed_last > formed_gated && (operation->guest_sync || operation->after_wait || operation->formed_sync) &&
+		    FormedPrograms::StrictGate()) {
 			const auto begin = Common::SteadyNs();
 			m_formed_gate_request.store(formed_last, std::memory_order_seq_cst);
 			m_resolved.Interrupt();

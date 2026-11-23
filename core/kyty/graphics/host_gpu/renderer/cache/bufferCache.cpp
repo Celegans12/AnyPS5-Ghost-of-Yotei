@@ -3104,6 +3104,7 @@ void BufferCache::ForgetCurrentGpuLines(uint64_t vaddr, uint64_t size) noexcept 
 }
 
 void BufferCache::UnmarkGpuModified(uint64_t vaddr, uint64_t size) {
+	m_gpu_unmarks++;
 	m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
 	ForgetCurrentGpuLines(Common::AlignDown(vaddr, TRACKER_PAGE_SIZE),
 	                      Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE) - Common::AlignDown(vaddr, TRACKER_PAGE_SIZE));
@@ -3166,6 +3167,8 @@ void BufferCache::NoteGpuModifiedChange(uint64_t vaddr, uint64_t size, bool dirt
 	}
 	if (dirty) {
 		NoteGpuLines(vaddr, size);
+	} else {
+		m_gpu_unmarks++;
 	}
 	const auto first = vaddr / PageSize;
 	const auto last  = (vaddr + size - 1) / PageSize;

@@ -119,7 +119,7 @@ struct Consumed {
 };
 
 Consumed ConsumeOne(FormedPrograms& programs, Sink& sink, std::vector<ViewLogEntry> waves, uint32_t capacity,
-                    uint32_t count_override = 0, uint64_t version = UINT64_MAX) {
+                    uint32_t count_override = 0, uint64_t version = UINT64_MAX, bool marked = false) {
 	std::vector<uint8_t> memory(Units * ViewLog::EntryBytes);
 	ViewLog              log(memory, DeviceBase);
 	uint64_t             wait    = 0;
@@ -133,7 +133,7 @@ Consumed ConsumeOne(FormedPrograms& programs, Sink& sink, std::vector<ViewLogEnt
 	Check(consumed.stats.segments == 0 && log.LiveSegments() == 1 && log.LastTick() == 7,
 	      "a segment is handed to the consumer only once its tick completed");
 	log.Consume(7, [&](const ViewLog::Consumed& view) {
-		ConsumeFormedSegment(view, programs, sink, consumed.stats, consumed.result, 50 * Ms);
+		ConsumeFormedSegment(view, programs, sink, consumed.stats, consumed.result, 50 * Ms, marked);
 	});
 	Check(log.LiveSegments() == 0, "a consumed segment is retired");
 	return consumed;
@@ -223,6 +223,30 @@ void ConflictDemotes() {
 	Check(sink.writes.size() == 1, "the conflicting range is still marked");
 }
 
+void MarkedHistory() {
+	{
+		FormedPrograms programs(0, 0);
+		Activate(programs);
+		Sink sink;
+		sink.dirty = 0x10'0180;
+		const auto result =
+		    ConsumeOne(programs, sink, {Entry(5, 0x10'0100, 0x100, ViewLogEntry::Written)}, 2, 0, UINT64_MAX, true);
+		Check(result.stats.written == 1 && result.stats.conflicts == 0 && sink.writes.empty() && !result.result.stop,
+		      "with the history marked when recorded, a covered write needs no mark and no conflict check");
+		Check(programs.State(Program) == FormedState::Active, "a covered write keeps the program");
+	}
+	{
+		FormedPrograms programs(0, 0);
+		Activate(programs);
+		Sink sink;
+		const auto result =
+		    ConsumeOne(programs, sink, {Entry(5, 0x60'0000, 0x100, ViewLogEntry::Written)}, 2, 0, UINT64_MAX, true);
+		Check(result.stats.write_misses == 1 && result.result.stop && sink.writes.size() == 1 &&
+		          programs.State(Program) == FormedState::Demoted,
+		      "with the history marked, a write outside it is still marked late, reported and demotes");
+	}
+}
+
 void FormMissAndOverflow() {
 	{
 		FormedPrograms programs(0, 0);
@@ -262,6 +286,7 @@ int main() {
 	WriteBeforeHistory();
 	WindowMissDemotes();
 	ConflictDemotes();
+	MarkedHistory();
 	FormMissAndOverflow();
 	if (g_failures != 0) return 1;
 	std::printf("kyty_shim_formed_consumer: ok\n");

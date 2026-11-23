@@ -30,6 +30,7 @@ public:
 	FormedPrograms(int64_t warmup_ns, uint64_t warmup_uses): m_warmup_ns(warmup_ns), m_warmup_uses(warmup_uses) {}
 
 	[[nodiscard]] static FormedPrograms& Instance();
+	[[nodiscard]] static bool            StrictGate();
 	[[nodiscard]] static int64_t         WarmupNs();
 	[[nodiscard]] static uint64_t        WarmupUses();
 
@@ -46,7 +47,7 @@ public:
 
 	void               SetPending(size_t segments) noexcept { m_pending.store(segments, std::memory_order_seq_cst); }
 	[[nodiscard]] bool Pending() const noexcept { return m_pending.load(std::memory_order_seq_cst) != 0; }
-	[[nodiscard]] bool PendingMayWrite(uint64_t address) const { return Pending() && MayWrite(address); }
+	[[nodiscard]] bool PendingMayWrite(uint64_t address) const { return StrictGate() && Pending() && MayWrite(address); }
 
 	struct Counts {
 		uint64_t new_blocks = 0;
@@ -105,7 +106,8 @@ struct FormedConsumeResult {
 };
 
 void ConsumeFormedSegment(const ViewLogConsumed& segment, FormedPrograms& programs, FormedSink& sink,
-                          FormedConsumeStats& stats, FormedConsumeResult& result, int64_t now_ns);
+                          FormedConsumeStats& stats, FormedConsumeResult& result, int64_t now_ns,
+                          bool history_marked = false);
 
 }
 

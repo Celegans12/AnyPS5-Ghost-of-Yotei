@@ -243,6 +243,7 @@ public:
 	[[nodiscard]] uint64_t RegisterEpoch() const { return m_register_epoch; }
 	[[nodiscard]] bool HasKeptPages() const noexcept { return m_kept_pages; }
 	[[nodiscard]] uint64_t GpuWriteGeneration() const noexcept { return m_gpu_write_generation; }
+	[[nodiscard]] uint64_t GpuUnmarks() const noexcept { return m_gpu_unmarks; }
 	[[nodiscard]] uint64_t CpuDirtyEpoch(uint64_t vaddr, uint64_t size) const {
 		uint64_t epoch = 0;
 		for (auto index = vaddr / TRACKER_REGION_SIZE; index * TRACKER_REGION_SIZE < vaddr + size;
@@ -472,6 +473,7 @@ private:
 	std::atomic<uint32_t>                             m_stale_ring_next {0};
 	MemoryTracker                                     m_memory_tracker;
 	uint64_t                                           m_gpu_write_generation = 0;
+	uint64_t                                           m_gpu_unmarks          = 0;
 	WriteTicks                                        m_write_ticks;
 	std::vector<std::pair<uint64_t, uint64_t>>        m_pending_writes;
 	struct InFlightReadback {

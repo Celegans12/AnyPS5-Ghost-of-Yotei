@@ -255,6 +255,7 @@ struct Settings {
     const char* formed = "0";
     const char* all = "0";
     const char* verify = "0";
+    const char* gate = "1";
     bool blank = false;
     int repeat = 1;
 };
@@ -270,6 +271,7 @@ Replay replay(const std::filesystem::path& tool, const std::filesystem::path& ro
     setVariable("KYTY_E2_VIEWLOG_VERIFY", settings.verify);
     setVariable("KYTY_E2_FORMED_WARMUP_MS", "0");
     setVariable("KYTY_E2_FORMED_WARMUP_USES", "0");
+    setVariable("KYTY_E2_FORMED_GATE", settings.gate);
     const auto command = quote(tool) + " " + quote(directory / "capture") + " --strict --no-synthesize --repeat " +
                          std::to_string(settings.repeat) + " --cold-pipelines --frames " + quote(frames) + " > " +
                          quote(log) + " 2>&1";
@@ -330,17 +332,24 @@ int main(int argc, char** argv) {
         }
         const auto formed = replay(tool, root, "formed", {.formed = "1", .all = "1", .verify = "1", .repeat = 2});
         const auto natural = replay(tool, root, "natural", {.formed = "1"});
+        const auto ungated = replay(tool, root, "ungated", {.formed = "1", .all = "1", .verify = "1", .gate = "0", .repeat = 2});
         const auto blank = replay(tool, root, "blank", {.blank = true});
         const auto builds = linesWith(bound.log, BuildLine);
         const auto formed_builds = linesWith(formed.log, BuildLine);
         const auto checked = linesWith(formed.log, CheckedLine);
         std::string failure;
-        if (!formed.completed || !natural.completed || !blank.completed) {
+        if (!formed.completed || !natural.completed || !blank.completed || !ungated.completed) {
             failure = "a replay failed";
         } else if (blank.frames[0] == bound.frames[0]) {
             failure = "the dispatches do not depend on what they read";
         } else if (formed.frames[0] != bound.frames[0]) {
             failure = "a view formed in the shader from GPU-written V# words gave another frame than the CPU-resolved V#";
+        } else if (ungated.frames[0] != bound.frames[0]) {
+            failure = "with KYTY_E2_FORMED_GATE=0 the frame changed";
+        } else if (!linesWith(ungated.log, "[kyty-e2f] view log missing").empty() ||
+                   !linesWith(ungated.log, "[kyty-e2f] view log extra").empty() ||
+                   linesWith(ungated.log, "[kyty-e2f] view log checked").size() < 4) {
+            failure = "with KYTY_E2_FORMED_GATE=0 the view log disagrees with the record-time words";
         } else if (natural.frames[0] != bound.frames[0]) {
             failure = "with KYTY_E2_GPU_FORMED=1 alone the frame changed";
         } else if (builds.empty() || anyContains(builds, " formed=1 ")) {
