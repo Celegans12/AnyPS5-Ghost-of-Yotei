@@ -324,6 +324,17 @@ struct alignas(4) GraphicsPipelineKey {
 
 static_assert(std::has_unique_object_representations_v<GraphicsPipelineKey>);
 
+struct ManifestFloatMode {
+	uint8_t float_mode = 0;
+	bool    ieee       = false;
+	bool    dx10_clamp = false;
+	bool    recorded   = false;
+
+	bool operator==(const ManifestFloatMode& other) const = default;
+};
+
+using ManifestFloatModes = std::array<ManifestFloatMode, 4>;
+
 #if defined(ANYPS5_KYTY)
 namespace HW {
 struct ModeControl;
@@ -448,6 +459,8 @@ public:
 		bool                    uses_image_heap       = false;
 		bool                    use_noted             = false;
 		bool                    native_bindings       = false;
+		ManifestFloatModes      float_modes {};
+		uint64_t                float_modes_generation = 0;
 	};
 
 	void GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state);
@@ -875,7 +888,8 @@ private:
 	void RecordModule(const ProgramKey& key, const ShaderRecompiler::CompileOptions& options,
 	                  std::span<const uint32_t> code, uint32_t push_data_cursor,
 	                  const ShaderModule& module);
-	void RecordPipeline(const GraphicsPipelineKey& key);
+	bool RecordPipeline(const GraphicsPipelineKey& key, const ManifestFloatModes& float_modes);
+	void NoteFloatModes(Pipeline& pipeline, const GraphicsPipelineKey& key, const HW::Shader& shaders);
 	void RecordLayout(uint64_t key, const ShaderTessellationInputInfo& layout);
 	static void OnShaderMapped(void* userdata, uint64_t hash, std::span<const uint32_t> code);
 	bool ProvideCode(uint64_t hash, std::span<const uint32_t> code, bool from_guest);

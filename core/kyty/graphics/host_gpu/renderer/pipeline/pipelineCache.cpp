@@ -4191,6 +4191,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		return &cached;
 	}
 	if (m_last_graphics_pipeline != nullptr && key == m_last_graphics_key) {
+		NoteFloatModes(*m_last_graphics_pipeline, key, command.GetShaders());
 		return m_last_graphics_pipeline;
 	}
 	if (const auto found = m_graphics_pipelines.find(key); found != m_graphics_pipelines.end()) {
@@ -4199,6 +4200,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		if (!found->second.use_noted) {
 			NoteUse(found->second, stages);
 		}
+		NoteFloatModes(found->second, key, command.GetShaders());
 		return &found->second;
 	}
 #if defined(ANYPS5_KYTY)
@@ -4263,6 +4265,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 				m_last_graphics_pipeline = &ready;
 				StorePipeline(key);
 				NoteUse(ready, stages);
+				NoteFloatModes(ready, key, command.GetShaders());
 				return &ready;
 			}
 			if (!m_async_pending_graphics.contains(key)) {
@@ -4305,6 +4308,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 						StorePipeline(key);
 						NoteCreatedPipeline(probe_started);
 						NoteUse(ready, stages);
+						NoteFloatModes(ready, key, command.GetShaders());
 						return &ready;
 					}
 				}
@@ -4402,6 +4406,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	StorePipeline(key);
 	NoteCreatedPipeline(started);
 	NoteUse(pipeline, stages);
+	NoteFloatModes(pipeline, key, command.GetShaders());
 	m_last_graphics_key      = key;
 	m_last_graphics_pipeline = &pipeline;
 

@@ -150,6 +150,27 @@ std::vector<uint32_t> StaticKey(const ManifestModule& module) {
 	return key;
 }
 
+struct FloatModeMerge {
+	bool changed = false;
+	bool mixed   = false;
+};
+
+FloatModeMerge MergeFloatModes(ManifestFloatModes& known, const ManifestFloatModes& seen) {
+	FloatModeMerge merge;
+	for (size_t i = 0; i < known.size(); i++) {
+		if (!seen[i].recorded) {
+			continue;
+		}
+		if (!known[i].recorded) {
+			known[i]      = seen[i];
+			merge.changed = true;
+		} else if (known[i] != seen[i]) {
+			merge.mixed = true;
+		}
+	}
+	return merge;
+}
+
 }
 
 struct PipelineCache::ManifestState {
@@ -167,7 +188,10 @@ struct PipelineCache::ManifestState {
 	std::deque<ManifestPipeline> warm_pipelines;
 	PipelineManifest                       recorded;
 	std::unordered_map<uint64_t, uint32_t> module_index;
-	std::unordered_set<uint64_t>           pipeline_identities;
+	std::unordered_map<uint64_t, uint32_t> pipeline_index;
+	std::unordered_set<uint32_t>           mixed_float_modes;
+	std::unordered_set<size_t>             unlinked_pipelines;
+	std::atomic<uint64_t>                  module_generation {1};
 	std::unordered_set<uint64_t>           layout_keys;
 	std::unordered_map<uint64_t, std::pair<uint32_t, bool>> module_records;
 	bool                                                    dirty           = false;
@@ -569,8 +593,13 @@ void PipelineCache::OpenManifest() {
 			for (auto& stage: pipeline.stages) {
 				stage = stage == ManifestPipeline::NoStage ? stage : indices[stage];
 			}
-			if (state.pipeline_identities.insert(ManifestPipelineIdentity(pipeline)).second) {
+			const auto [found, inserted] = state.pipeline_index.try_emplace(
+			    ManifestPipelineIdentity(pipeline), static_cast<uint32_t>(all.pipelines.size()));
+			if (inserted) {
 				all.pipelines.push_back(pipeline);
+			} else if (MergeFloatModes(all.pipelines[found->second].float_modes, pipeline.float_modes)
+			               .mixed) {
+				state.mixed_float_modes.insert(found->second);
 			}
 		}
 		for (const auto& layout: loaded.tessellation_layouts) {
@@ -2554,6 +2583,7 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 					if (module->plain != nullptr) {
 						state.module_records[module->plain->id] = {found->second, true};
 					}
+					state.module_generation.fetch_add(1, std::memory_order_release);
 				}
 			}
 			for (const auto pipeline: state.module_pipelines[index]) {
@@ -2861,15 +2891,15 @@ void PipelineCache::RecordModule(const ProgramKey&                       key,
 	if (module.plain != nullptr) {
 		state.module_records[module.plain->id] = {found->second, true};
 	}
+	state.module_generation.fetch_add(1, std::memory_order_release);
 }
 
-void PipelineCache::RecordPipeline(const GraphicsPipelineKey& key) {
-	if (m_manifest == nullptr || m_manifest->record_path.empty()) {
-		return;
-	}
+bool PipelineCache::RecordPipeline(const GraphicsPipelineKey& key,
+                                   const ManifestFloatModes&  float_modes) {
 	auto&            state = *m_manifest;
-	ManifestPipeline record {.key = key};
+	ManifestPipeline record {.key = key, .float_modes = float_modes};
 	record.key.stage_ids = {};
+	const auto       key_hash = GraphicsPipelineKeyHash {}(key);
 	std::scoped_lock lock(state.mutex);
 	for (size_t i = 0; i < key.stage_ids.size(); i++) {
 		if (key.stage_ids[i] == 0) {
@@ -2877,16 +2907,44 @@ void PipelineCache::RecordPipeline(const GraphicsPipelineKey& key) {
 		}
 		const auto found = state.module_records.find(key.stage_ids[i]);
 		if (found == state.module_records.end() || (found->second.second && i != 3)) {
-			return;
+			state.unlinked_pipelines.insert(key_hash);
+			return false;
 		}
 		record.stages[i]   = found->second.first;
 		record.plain_pixel = record.plain_pixel || found->second.second;
 	}
-	if (state.pipeline_identities.insert(ManifestPipelineIdentity(record)).second) {
+	state.unlinked_pipelines.erase(key_hash);
+	const auto [found, inserted] = state.pipeline_index.try_emplace(
+	    ManifestPipelineIdentity(record), static_cast<uint32_t>(state.recorded.pipelines.size()));
+	if (inserted) {
 		state.recorded.pipelines.push_back(record);
 		state.added_pipelines++;
 		state.dirty = true;
+		return true;
 	}
+	const auto merge =
+	    MergeFloatModes(state.recorded.pipelines[found->second].float_modes, float_modes);
+	state.dirty = state.dirty || merge.changed;
+	if (merge.mixed && state.mixed_float_modes.insert(found->second).second) {
+		state.dirty = true;
+	}
+	return true;
+}
+
+void PipelineCache::NoteFloatModes(Pipeline& pipeline, const GraphicsPipelineKey& key,
+                                   const HW::Shader& shaders) {
+	if (m_manifest == nullptr || m_manifest->record_path.empty()) {
+		return;
+	}
+	constexpr uint64_t Linked     = UINT64_MAX;
+	const auto         modes      = ReadManifestFloatModes(shaders, key.stage_ids);
+	const auto         generation = m_manifest->module_generation.load(std::memory_order_acquire);
+	if (modes == pipeline.float_modes &&
+	    (pipeline.float_modes_generation == Linked || pipeline.float_modes_generation == generation)) {
+		return;
+	}
+	pipeline.float_modes            = modes;
+	pipeline.float_modes_generation = RecordPipeline(key, modes) ? Linked : generation;
 }
 
 void PipelineCache::RecordLayout(uint64_t key, const ShaderTessellationInputInfo& layout) {
@@ -2909,6 +2967,8 @@ void PipelineCache::SaveManifestRecording() {
 	PipelineManifest manifest;
 	uint32_t         added_modules   = 0;
 	uint32_t         added_pipelines = 0;
+	size_t           mixed           = 0;
+	size_t           unlinked        = 0;
 	{
 		std::scoped_lock lock(state.mutex);
 		if (!state.dirty) {
@@ -2917,8 +2977,14 @@ void PipelineCache::SaveManifestRecording() {
 		manifest        = state.recorded;
 		added_modules   = state.added_modules;
 		added_pipelines = state.added_pipelines;
+		mixed           = state.mixed_float_modes.size();
+		unlinked        = state.unlinked_pipelines.size();
 		state.dirty     = false;
 	}
+	const auto with_modes =
+	    std::ranges::count_if(manifest.pipelines, [](const ManifestPipeline& pipeline) {
+		    return pipeline.float_modes[0].recorded;
+	    });
 	const auto bytes     = SaveManifest(manifest);
 	auto       temporary = state.record_path;
 	temporary += ".tmp";
@@ -2934,9 +3000,11 @@ void PipelineCache::SaveManifestRecording() {
 	std::filesystem::rename(temporary, state.record_path, error);
 	ManifestLog(
 	    "Pipeline manifest: wrote {} ({} modules, {} pipelines, {:.1f} KB; {} modules and {} "
-	    "pipelines new in this session)",
+	    "pipelines new in this session; float modes of {} pipelines, {} of them drawn with more "
+	    "than one, {} drawn pipelines whose modules the manifest does not list)",
 	    Common::PathToString(state.record_path), manifest.modules.size(), manifest.pipelines.size(),
-	    static_cast<double>(bytes.size()) / 1024.0, added_modules, added_pipelines);
+	    static_cast<double>(bytes.size()) / 1024.0, added_modules, added_pipelines, with_modes,
+	    mixed, unlinked);
 }
 
 }

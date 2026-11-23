@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineManifest.h"
+#include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/shaderCompiler.h"
 
@@ -806,6 +807,10 @@ bool ReadModule(std::span<const std::string_view> tokens, ManifestModule& module
 
 constexpr std::array<std::string_view, 4> PipelineStageKeys {"v", "h", "d", "p"};
 
+std::string FloatModeKey(size_t stage) {
+	return fmt::format("f{}", PipelineStageKeys[stage]);
+}
+
 std::string PipelineText(const ManifestPipeline&      pipeline,
                          std::span<const std::string> module_ids) {
 	[[maybe_unused]] const auto& [rendering_fields_a, rendering_fields_b, rendering_fields_c,
@@ -824,6 +829,13 @@ std::string PipelineText(const ManifestPipeline&      pipeline,
 	for (size_t i = 0; i < PipelineStageKeys.size(); i++) {
 		if (pipeline.stages[i] != ManifestPipeline::NoStage) {
 			w.Value(PipelineStageKeys[i], module_ids[pipeline.stages[i]]);
+		}
+	}
+	for (size_t i = 0; i < PipelineStageKeys.size(); i++) {
+		const auto& mode = pipeline.float_modes[i];
+		if (pipeline.stages[i] != ManifestPipeline::NoStage && mode.recorded) {
+			w.Value(FloatModeKey(i), fmt::format("{:x}.{:d}.{:d}", mode.float_mode, mode.ieee,
+			                                     mode.dx10_clamp));
 		}
 	}
 	bool plain = pipeline.plain_pixel;
@@ -919,6 +931,20 @@ bool ReadPipeline(std::span<const std::string_view>                     tokens,
 			if (found == modules.end()) return false;
 			pipeline.stages[i] = found->second;
 		}
+	}
+	for (size_t i = 0; i < PipelineStageKeys.size(); i++) {
+		const auto text = r.Find(FloatModeKey(i));
+		if (!text) continue;
+		const auto parts = Split(*text, '.');
+		uint64_t   values[3] {};
+		r.ok = r.ok && pipeline.stages[i] != ManifestPipeline::NoStage && parts.size() == 3 &&
+		       ParseNumber(parts[0], values[0], 16) && values[0] <= UINT8_MAX &&
+		       ParseNumber(parts[1], values[1]) && values[1] <= 1 &&
+		       ParseNumber(parts[2], values[2]) && values[2] <= 1;
+		pipeline.float_modes[i] = {.float_mode = static_cast<uint8_t>(values[0]),
+		                           .ieee       = values[1] != 0,
+		                           .dx10_clamp = values[2] != 0,
+		                           .recorded   = true};
 	}
 	r.Flag("plain", pipeline.plain_pixel);
 	auto&    rendering = pipeline.key.rendering;
@@ -1175,6 +1201,28 @@ uint64_t ManifestModuleIdentity(const ManifestModule&     module,
 	      module.push_data_cursor, module.specialization);
 	writer.Raw(static_state.data(), static_state.size_bytes());
 	return XXH3_64bits(writer.bytes.data(), writer.bytes.size());
+}
+
+ManifestFloatModes ReadManifestFloatModes(const HW::Shader&             shaders,
+                                          const std::array<uint64_t, 4>& stage_ids) {
+	const auto read = [](const auto& rsrc1) {
+		return ManifestFloatMode {.float_mode = rsrc1.float_mode,
+		                          .ieee       = rsrc1.ieee_mode,
+		                          .dx10_clamp = rsrc1.dx10_clamp,
+		                          .recorded   = true};
+	};
+	const auto&              vs           = shaders.GetVs();
+	const bool               tessellation = stage_ids[1] != 0;
+	const ManifestFloatModes registers {
+	    tessellation ? read(vs.hs_regs.rsrc1) : read(vs.gs_regs.rsrc1), read(vs.hs_regs.rsrc1),
+	    read(vs.gs_regs.rsrc1), read(shaders.GetPs().ps_regs.rsrc1)};
+	ManifestFloatModes modes {};
+	for (size_t i = 0; i < modes.size(); i++) {
+		if (stage_ids[i] != 0) {
+			modes[i] = registers[i];
+		}
+	}
+	return modes;
 }
 
 uint64_t ManifestPipelineIdentity(const ManifestPipeline& pipeline) {

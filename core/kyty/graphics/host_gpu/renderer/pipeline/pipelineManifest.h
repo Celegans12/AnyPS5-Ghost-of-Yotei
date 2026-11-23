@@ -56,6 +56,7 @@ struct ManifestPipeline {
 	std::array<uint32_t, 4> stages {NoStage, NoStage, NoStage, NoStage};
 	bool plain_pixel = false;
 	GraphicsPipelineKey key {};
+	ManifestFloatModes  float_modes {};
 	bool from_assets = false;
 };
 
@@ -74,6 +75,8 @@ bool LoadManifest(std::span<const uint8_t> bytes, PipelineManifest& manifest,
 [[nodiscard]] uint64_t ManifestModuleIdentity(const ManifestModule&     module,
                                               std::span<const uint32_t> static_state);
 [[nodiscard]] uint64_t ManifestPipelineIdentity(const ManifestPipeline& pipeline);
+[[nodiscard]] ManifestFloatModes ReadManifestFloatModes(const HW::Shader&             shaders,
+                                                        const std::array<uint64_t, 4>& stage_ids);
 
 }
 

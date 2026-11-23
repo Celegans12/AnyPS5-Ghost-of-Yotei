@@ -400,7 +400,6 @@ void PipelineCache::StoreModule(const ProgramKey& key, const Program& program,
 }
 
 void PipelineCache::StorePipeline(const GraphicsPipelineKey& key) {
-	RecordPipeline(key);
 	if (!m_store) {
 		return;
 	}
