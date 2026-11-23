@@ -2,6 +2,7 @@
 #include "common/emulatorConfig.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -15,10 +16,12 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <semaphore>
 #include <span>
 #include <stdexcept>
 
@@ -263,6 +266,45 @@ const char* ProbeBufferWriteCoverage(GraphicContext& graphics) {
 	return ProbeBufferWriteCoverageCase(graphics, true);
 }
 
+const char* ProbeRendererShutdown(GraphicContext& graphics) {
+	struct Completion {
+		std::binary_semaphore host_submit {0};
+		bool finishing = false;
+		bool saw_stopping_gpu = false;
+	} completion;
+	RenderContext renderer(graphics);
+	renderer.InitializeGpu(nullptr);
+	auto& scheduler = renderer.GetCommandScheduler();
+	CommandProcessor processor(renderer, 0);
+	processor.Reset();
+	scheduler.Begin(processor.GetCtx(), processor.GetUcfg(), processor.GetShCtx());
+	scheduler.SetSubmitHook([](void* data, Libs::Graphics::CommandBuffer&) {
+		auto& completion = *static_cast<Completion*>(data);
+		if (!GuestGpu::IsGpuThread() && !completion.finishing) {
+			completion.finishing = true;
+			completion.host_submit.release();
+		}
+	}, &completion);
+	scheduler.DeferHostOperation([&] {
+		if (completion.host_submit.try_acquire_for(std::chrono::seconds(5)) && completion.finishing) {
+			completion.saw_stopping_gpu = renderer.GetGpu().IsStopping();
+		}
+	}, true);
+
+	renderer.ShutdownGpu();
+	scheduler.SetSubmitHook(nullptr, nullptr);
+	if (!completion.finishing) {
+		completion.host_submit.release();
+		scheduler.DrainPriorityOperations();
+		return "the renderer did not finish its scheduler during GPU shutdown";
+	}
+	if (!completion.saw_stopping_gpu) {
+		return "the queued completion did not observe the stopped GPU during shutdown";
+	}
+	renderer.ShutdownGpu();
+	return nullptr;
+}
+
 int RunProbe(const char* name, const char* (*probe)(GraphicContext&)) {
 	try {
 		Common::InitializeThreads();
@@ -293,4 +335,8 @@ int RunProbe(const char* name, const char* (*probe)(GraphicContext&)) {
 extern "C" int RunKytyCrossQueueLabelOrderTest(bool buffer_write_coverage) {
 	return buffer_write_coverage ? RunProbe("kyty_shim_buffer_write_coverage", ProbeBufferWriteCoverage)
 	                             : RunProbe("kyty_shim_cross_queue_label_order", ProbeCrossQueueLabelOrder);
+}
+
+extern "C" int RunKytyRendererShutdownTest() {
+	return RunProbe("kyty_shim_renderer_shutdown", ProbeRendererShutdown);
 }

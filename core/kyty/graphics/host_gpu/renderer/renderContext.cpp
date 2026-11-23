@@ -62,17 +62,16 @@ void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {
 }
 
 void RenderContext::ShutdownGpu() {
-	if (m_gpu != nullptr) {
-		m_gpu->Shutdown();
-		m_gpu.reset();
+	if (m_gpu == nullptr) {
+		return;
 	}
-	if (m_video_out != nullptr) {
-		if (m_command_scheduler.Active()) {
-			m_command_scheduler.Finish();
-		}
-		m_command_scheduler.DrainPriorityOperations();
-		m_video_out = nullptr;
+	m_gpu->Shutdown();
+	if (m_command_scheduler.Active()) {
+		m_command_scheduler.Finish();
 	}
+	m_command_scheduler.DrainPriorityOperations();
+	m_gpu.reset();
+	m_video_out = nullptr;
 }
 
 GuestGpu& RenderContext::GetGpu() const {
