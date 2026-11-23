@@ -3817,6 +3817,26 @@ void BufferCache::AddToSet(RangeSet& set, SetRegions& state, uint64_t address, u
 	state.version = set.Version();
 }
 
+bool BufferCache::SetSynchronized(const RangeSet& set, const SetRegions& state) const {
+	if (state.version != set.Version() || state.regions.size() < m_region_buffer_count.size()) {
+		return false;
+	}
+	for (const auto index: state.covered) {
+		const auto word = index / 64;
+		if (word >= m_buffer_region_bits.size() || (m_buffer_region_bits[word] & (uint64_t {1} << (index % 64))) == 0) {
+			continue;
+		}
+		const auto epoch  = m_memory_tracker.RegionCpuDirtyEpoch(index);
+		const auto forces = m_region_forces[index] + 1;
+		const auto kept   = m_memory_tracker.RegionKeptSync(index);
+		const auto& synced = state.regions[index];
+		if (synced.second != forces || (epoch != 0 && synced.first != epoch) || (kept != 0 && kept >= state.pass)) {
+			return false;
+		}
+	}
+	return true;
+}
+
 void BufferCache::SynchronizeBuffersInSet(const RangeSet& set, SetRegions& state) {
 	const UploadBatch batch {*this};
 	const auto sync = ++m_device_syncs;

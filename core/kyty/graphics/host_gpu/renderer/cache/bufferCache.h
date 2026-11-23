@@ -237,6 +237,7 @@ public:
 		uint64_t                                   version = UINT64_MAX;
 	};
 	void SynchronizeBuffersInSet(const RangeSet& set, SetRegions& regions);
+	[[nodiscard]] bool SetSynchronized(const RangeSet& set, const SetRegions& regions) const;
 	void AddToSet(RangeSet& set, SetRegions& regions, uint64_t address, uint64_t size);
 	void FlushUploadBatch();
 	bool ScatterUploadBatch(const CommandRecorder& native);

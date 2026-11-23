@@ -106,6 +106,7 @@ bool FormedPrograms::Allowed(uint64_t program, int64_t now_ns) {
 	    entry.quiet_uses.load(std::memory_order_relaxed) >= m_warmup_uses) {
 		entry.state = FormedState::Active;
 		for (const auto& [block, added]: entry.blocks) m_blocks.insert(block);
+		m_state_epoch.fetch_add(1, std::memory_order_acq_rel);
 		m_activated.fetch_add(1, std::memory_order_relaxed);
 	}
 	return entry.state == FormedState::Active;
@@ -117,6 +118,7 @@ void FormedPrograms::Demote(uint64_t program) {
 	if (entry.state == FormedState::Demoted) return;
 	entry.state = FormedState::Demoted;
 	m_demoted.fetch_add(1, std::memory_order_relaxed);
+	m_state_epoch.fetch_add(1, std::memory_order_acq_rel);
 }
 
 FormedState FormedPrograms::State(uint64_t program) const {

@@ -39,6 +39,7 @@ public:
 	[[nodiscard]] bool Allowed(uint64_t program, int64_t now_ns);
 	void               Demote(uint64_t program);
 	[[nodiscard]] FormedState State(uint64_t program) const;
+	[[nodiscard]] uint64_t    StateEpoch() const noexcept { return m_state_epoch.load(std::memory_order_acquire); }
 	[[nodiscard]] bool        Covers(uint64_t program, uint64_t base, uint64_t bytes,
 	                                 uint64_t version = UINT64_MAX) const;
 	[[nodiscard]] bool        MayWrite(uint64_t address) const;
@@ -76,6 +77,7 @@ private:
 	std::atomic<uint64_t>                  m_new_blocks {0};
 	std::atomic<uint64_t>                  m_activated {0};
 	std::atomic<uint64_t>                  m_demoted {0};
+	std::atomic<uint64_t>                  m_state_epoch {0};
 };
 
 class FormedSink {

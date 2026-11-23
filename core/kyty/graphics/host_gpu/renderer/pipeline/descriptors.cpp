@@ -50,6 +50,8 @@
 #include <mutex>
 #include <span>
 #include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <xxhash.h>
 
@@ -2945,17 +2947,57 @@ int64_t FormedNow() {
 	return static_cast<int64_t>(Common::SteadyNs());
 }
 
-bool FormedAllowedHook(uint64_t program) {
+struct FormedThreadState {
+	uint64_t    epoch = UINT64_MAX;
+	FormedState state = FormedState::Warming;
+};
+
+FormedState CachedFormedState(uint64_t program) {
+	thread_local std::unordered_map<uint64_t, FormedThreadState> states;
+	auto&      programs = FormedPrograms::Instance();
+	const auto epoch    = programs.StateEpoch();
+	auto&      cached   = states[program];
+	if (cached.epoch != epoch) cached = {.epoch = epoch, .state = programs.State(program)};
+	return cached.state;
+}
+
+bool FormedAllowed(uint64_t program) {
+	const auto state = CachedFormedState(program);
+	if (state != FormedState::Warming) return state == FormedState::Active;
 	return FormedPrograms::Instance().Allowed(program, FormedNow());
 }
 
-void FormedUseHook(uint64_t program) {
-	FormedPrograms::Instance().NoteUse(program);
+bool FormedAllowedHook(uint64_t program) {
+	return FormedAllowed(program);
 }
 
+void FormedUseHook(uint64_t program) {
+	if (CachedFormedState(program) == FormedState::Warming) FormedPrograms::Instance().NoteUse(program);
+}
+
+struct FormedBlockKey {
+	uint64_t program = 0;
+	uint64_t block   = 0;
+	bool     operator==(const FormedBlockKey&) const = default;
+};
+
+struct FormedBlockHash {
+	size_t operator()(const FormedBlockKey& key) const noexcept {
+		return static_cast<size_t>(key.program ^ (key.block * 0x9e3779b97f4a7c15ull));
+	}
+};
+
 void FormedSeedHook(uint64_t program, uint64_t base, uint64_t bytes) {
+	thread_local std::unordered_set<FormedBlockKey, FormedBlockHash> known;
 	const auto mapped = MappedFormedBytes(base, bytes);
-	if (mapped != 0) FormedPrograms::Instance().Seed(program, base, mapped, FormedNow());
+	if (mapped == 0) return;
+	const auto first = base >> FormedPrograms::BlockBits;
+	const auto last  = (base + mapped - 1) >> FormedPrograms::BlockBits;
+	bool       all   = true;
+	for (auto block = first; block <= last && all; block++) all = known.contains({program, block});
+	if (all) return;
+	FormedPrograms::Instance().Seed(program, base, mapped, FormedNow());
+	for (auto block = first; block <= last; block++) known.insert({program, block});
 }
 
 }
@@ -3034,7 +3076,9 @@ bool RenderExecutor::PrepareFormedHistory(uint64_t program) {
 			if (queries.MayPrepareRead(begin, end - begin)) return false;
 		}
 	}
-	cache.SynchronizeBuffersInSet(history->set, history->regions);
+	if (!cache.SetSynchronized(history->set, history->regions)) {
+		cache.SynchronizeBuffersInSet(history->set, history->regions);
+	}
 	if (!FormedPrograms::StrictGate()) {
 		const auto tick = m_context.GetCommandScheduler().CurrentTick();
 		if (history->marked_tick != tick || history->marked_version != history->ranges.version ||
@@ -3064,7 +3108,7 @@ bool RenderExecutor::PrepareFormedViews(const ShaderStageRuntime& stage, uint64_
 		reason.fetch_add(1, std::memory_order_relaxed);
 		return false;
 	};
-	if (!FormedPrograms::Instance().Allowed(program.shader_hash, FormedNow())) return refuse(g_formed.refused_warming);
+	if (!FormedAllowed(program.shader_hash)) return refuse(g_formed.refused_warming);
 	if (waves == 0 || ShaderRecompiler::IR::MirrorSize() == 0 ||
 	    waves * snapshot.gpu_formed.size() > ViewLogBytes / ViewLog::EntryBytes / 4u) {
 		return refuse(g_formed.refused_size);
