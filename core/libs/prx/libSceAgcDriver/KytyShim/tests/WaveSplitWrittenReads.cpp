@@ -327,6 +327,10 @@ bool split(const std::string& log) {
            log.find("wave64 kept in lane pairs") == std::string::npos;
 }
 
+bool nativeWave64(const std::string& log) {
+    return log.find("subgroup_size: 64") != std::string::npos;
+}
+
 std::uint64_t emittedWords(const std::string& log) {
     constexpr std::string_view Marker = "SPIR-V EmitProgram words=";
     const auto at = log.find(Marker);
@@ -358,6 +362,10 @@ int main(int argc, char** argv) {
                           << (vulkan_required ? "" : "; skipping (no usable Vulkan device?)") << '\n';
                 printTail(result.log);
                 return vulkan_required ? 1 : 77;
+            }
+            if (!split(result.log) && nativeWave64(result.log)) {
+                std::cerr << test.name << ": skipped (the host subgroup is 64, so there is no split path to test)\n";
+                return 77;
             }
             std::string failure;
             const auto diff = compare(result.output, expected);
