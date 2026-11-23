@@ -56,6 +56,7 @@ std::string Hex(uint32_t value) {
 }
 
 constexpr std::array<uint32_t, 1> CvtI32Body {0x7e141104u};
+constexpr std::array<uint32_t, 1> CvtU32Body {0x7e140f04u};
 constexpr std::array<uint32_t, 2> FmaBody {0xd54b000au, 0x041a0b04u};
 constexpr std::array<uint32_t, 1> MoveFromS4Body {0x7e140204u};
 constexpr std::array<uint32_t, 1> MoveFromS12Body {0x7e14020cu};
@@ -82,6 +83,16 @@ constexpr std::array<Row, 8> CvtI32Rows {{
     {"two-and-half", {0x40200000u, 0u, 0u, 0u}, 0x00000002u},
     {"minus-two-and-half", {0xc0200000u, 0u, 0u, 0u}, 0xfffffffeu},
     {"neg-zero", {0x80000000u, 0u, 0u, 0u}, 0x00000000u},
+}};
+
+constexpr std::array<Row, 7> CvtU32Rows {{
+    {"nan", {0x7fc12345u, 0u, 0u, 0u}, 0x00000000u},
+    {"pos-inf", {0x7f800000u, 0u, 0u, 0u}, 0xffffffffu},
+    {"neg-inf", {0xff800000u, 0u, 0u, 0u}, 0x00000000u},
+    {"minus-one", {0xbf800000u, 0u, 0u, 0u}, 0x00000000u},
+    {"minus-half", {0xbf000000u, 0u, 0u, 0u}, 0x00000000u},
+    {"two-pow-32", {0x4f800000u, 0u, 0u, 0u}, 0xffffffffu},
+    {"one-and-half", {0x3fc00000u, 0u, 0u, 0u}, 0x00000001u},
 }};
 
 constexpr std::array<Row, 3> FmaRows {{
@@ -398,19 +409,19 @@ std::optional<std::vector<uint32_t>> RunRows(const KytyOracle::Device& device, c
 	}
 }
 
-void CheckCvtI32Rows(const KytyOracle::Device& device) {
+void CheckPs5ModeRows(const KytyOracle::Device& device, const std::string& probe, std::span<const uint32_t> body, std::span<const Row> rows) {
 	std::vector<uint32_t> input(Threads * KytyOracle::InputDwords, 0u);
 	for (uint32_t lane = 0; lane < Threads; ++lane) {
-		std::ranges::copy(CvtI32Rows[lane % CvtI32Rows.size()].input, input.begin() + lane * KytyOracle::InputDwords);
+		std::ranges::copy(rows[lane % rows.size()].input, input.begin() + lane * KytyOracle::InputDwords);
 	}
 	uint32_t runs = 0;
 	for (const auto wave: Waves) {
-		const auto output = RunRows(device, MakeKernel(CvtI32Body, wave, Ps5FloatMode, false, true), input);
+		const auto output = RunRows(device, MakeKernel(body, wave, Ps5FloatMode, false, true), input);
 		if (!output) continue;
 		++runs;
-		const auto prefix = "wave" + std::to_string(wave) + " v-cvt-i32-f32-limits ";
+		const auto prefix = "wave" + std::to_string(wave) + " " + probe + " ";
 		for (uint32_t lane = 0; lane < Threads; ++lane) {
-			const auto& row = CvtI32Rows[lane % CvtI32Rows.size()];
+			const auto& row = rows[lane % rows.size()];
 			const auto* out = &(*output)[lane * KytyOracle::OutputDwords];
 			Check(out[0] == row.hardware,
 			      prefix + row.name + " (lane " + std::to_string(lane) + ") is " + Hex(out[0]) + ", the hardware gives " + Hex(row.hardware));
@@ -419,7 +430,7 @@ void CheckCvtI32Rows(const KytyOracle::Device& device) {
 			}
 		}
 	}
-	Check(runs != 0, "v-cvt-i32-f32-limits ran at no wave size");
+	Check(runs != 0, probe + " ran at no wave size");
 }
 
 void PrintFusedRoundingRows(const KytyOracle::Device& device) {
@@ -452,7 +463,8 @@ int main(int argc, char** argv) {
 				return NoDevice(error.what());
 			}
 			device_name = device->Name();
-			CheckCvtI32Rows(*device);
+			CheckPs5ModeRows(*device, "v-cvt-i32-f32-limits", CvtI32Body, CvtI32Rows);
+			CheckPs5ModeRows(*device, "v-cvt-u32-f32-limits", CvtU32Body, CvtU32Rows);
 			PrintFusedRoundingRows(*device);
 		} else {
 			CodeObjectTests();
