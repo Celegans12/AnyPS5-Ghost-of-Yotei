@@ -5,6 +5,7 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/smallVector.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -125,6 +126,21 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 		EXIT("compute runtime buffer count does not match shader metadata\n");
 	}
 	auto& cache = buffer.GetContext().GetTextureCache();
+	const auto note_uncovered = [&] {
+		Common::SmallVector<GuestRange, 8> writes;
+		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+			const auto& resource = program.info.buffers[i];
+			if (!resource.written) {
+				continue;
+			}
+			if (resource.read) {
+				return;
+			}
+			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+			writes.push_back({descriptor.Base48(), descriptor.GetSize()});
+		}
+		cache.NoteUncoveredMetaClears(std::span(writes.begin(), writes.size()));
+	};
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		const auto& resource   = program.info.buffers[i];
 		const auto  descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
@@ -143,6 +159,7 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 		}
 		const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
 		if (!cache.CoversMeta(descriptor.Base48(), descriptor.GetSize())) {
+			note_uncovered();
 			return false;
 		}
 		clears = true;

@@ -35,6 +35,16 @@ struct TextureCacheTestAccess {
 		Common::ScopedLock lock {cache.m_lock};
 		return cache.DownloadImageMemory(image);
 	}
+
+	static bool TakePendingMetaClear(TextureCache& cache, const ImageInfo& info) {
+		Common::ScopedLock lock {cache.m_lock};
+		return cache.TakePendingMetaClear(info);
+	}
+
+	static void AddMeta(TextureCache& cache, uint64_t address) {
+		Common::ScopedLock lock {cache.m_lock};
+		cache.m_surface_metas.try_emplace(address);
+	}
 };
 
 }
@@ -55,6 +65,42 @@ constexpr uint32_t FillValue = 0x1234fedc;
 constexpr uint32_t CpuValue = 0x5aa5c33c;
 constexpr uint64_t MultisampleGuestBytes = 0x100000;
 constexpr uint64_t MultisampleAlignment = 0x10000;
+
+const char* CheckUncoveredMetaClearIsKept(GraphicContext& graphics, uint64_t address) {
+	RenderContext renderer(graphics);
+	auto&         textures = renderer.GetTextureCache();
+	constexpr uint64_t MetaBytes  = 0x4000;
+	constexpr uint64_t LayerBytes = MetaBytes / 2;
+	ImageInfo          info;
+	info.metadata.kind    = ImageMetadataKind::Htile;
+	info.metadata.range   = GuestRange {address, MetaBytes};
+	info.resources.layers = 2;
+	const auto kept       = [&](uint64_t clear_address, uint64_t size, uint32_t collections) {
+		const std::array<GuestRange, 1> writes {GuestRange {clear_address, size}};
+		textures.NoteUncoveredMetaClears(writes);
+		for (uint32_t collection = 0; collection < collections; ++collection) {
+			textures.RunGarbageCollector();
+		}
+		return TextureCacheTestAccess::TakePendingMetaClear(textures, info);
+	};
+	if (!kept(address, MetaBytes, 0)) return "a clear of the whole metadata issued before its entry was not kept";
+	if (TextureCacheTestAccess::TakePendingMetaClear(textures, info)) return "a kept metadata clear was applied twice";
+	if (!kept(address, LayerBytes, 0)) return "a clear of one metadata layer issued before its entry was not kept";
+	if (kept(address, LayerBytes - sizeof(uint32_t), 0)) return "a clear smaller than one metadata layer was kept";
+	if (kept(address, MetaBytes + sizeof(uint32_t), 0)) return "a clear larger than the metadata was kept";
+	if (kept(address + MetaBytes, MetaBytes, 0)) return "a clear at another address was kept";
+	if (!kept(address, MetaBytes, 1)) return "a clear from the previous GC tick was not kept";
+	if (kept(address, MetaBytes, 2)) return "a clear older than one GC tick was kept";
+	const std::array<GuestRange, 1> unmapped {GuestRange {address, MetaBytes}};
+	textures.NoteUncoveredMetaClears(unmapped);
+	textures.UnmapMemory(address, MetaBytes);
+	if (TextureCacheTestAccess::TakePendingMetaClear(textures, info)) return "a clear in memory unmapped before the bind was kept";
+	TextureCacheTestAccess::AddMeta(textures, address + 2 * MetaBytes);
+	const std::array<GuestRange, 2> mixed {GuestRange {address, MetaBytes}, GuestRange {address + 2 * MetaBytes, MetaBytes}};
+	textures.NoteUncoveredMetaClears(mixed);
+	if (TextureCacheTestAccess::TakePendingMetaClear(textures, info)) return "a dispatch that also writes existing metadata was kept";
+	return nullptr;
+}
 
 const char* CheckWriteBackOrder(GraphicContext& graphics, uint64_t address) {
 	RenderContext renderer(graphics);
@@ -594,6 +640,9 @@ extern "C" int RunKytyImageWriteBackAliasTest() {
 	}
 	if (failure == nullptr) {
 		failure = CheckRangePicksLatestWrite(graphics, address + GuestBytes / 8 * 7);
+	}
+	if (failure == nullptr) {
+		failure = CheckUncoveredMetaClearIsKept(graphics, address);
 	}
 	if (sceKernelMunmap(address, GuestBytes) != 0) {
 		std::fputs("kyty_shim_image_write_back_alias: FAILED: could not unmap guest backing\n", stderr);

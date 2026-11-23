@@ -2827,7 +2827,8 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc, I
 	image.info.metadata = desc.info.metadata;
 	if (desc.info.HasMetadata()) {
 		const auto [metadata, inserted] = m_surface_metas.try_emplace(desc.info.metadata.range.address);
-		if (inserted && image.info.htile_initial_clear) {
+		const bool pending_clear        = inserted && TakePendingMetaClear(image.info);
+		if (inserted && (image.info.htile_initial_clear || pending_clear)) {
 			metadata->second.clear_mask.set();
 		}
 		metadata->second.owner = id;
@@ -3700,6 +3701,28 @@ bool TextureCache::CoversMeta(uint64_t address, uint64_t size) {
 	return size >= info.metadata.range.size / std::max(info.resources.layers, 1u) && size <= info.metadata.range.size;
 }
 
+void TextureCache::NoteUncoveredMetaClears(std::span<const GuestRange> writes) {
+	Common::ScopedLock lock {m_lock};
+	if (std::ranges::any_of(writes, [this](const GuestRange& write) { return m_surface_metas.contains(write.address); })) {
+		return;
+	}
+	for (const auto& write: writes) {
+		m_pending_meta_clears[write.address] = {write.size, m_gc_tick};
+	}
+}
+
+bool TextureCache::TakePendingMetaClear(const ImageInfo& info) {
+	const auto found = m_pending_meta_clears.find(info.metadata.range.address);
+	if (found == m_pending_meta_clears.end()) {
+		return false;
+	}
+	const auto pending = found->second;
+	m_pending_meta_clears.erase(found);
+	return m_gc_tick - pending.tick <= 1 &&
+	       pending.size >= info.metadata.range.size / std::max(info.resources.layers, 1u) &&
+	       pending.size <= info.metadata.range.size;
+}
+
 bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 	Common::ScopedLock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
@@ -3737,6 +3760,8 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	DiscardParkedImages(address, size);
 	m_surface_metas.erase(m_surface_metas.lower_bound(address),
 	                      m_surface_metas.lower_bound(address + size));
+	m_pending_meta_clears.erase(m_pending_meta_clears.lower_bound(address),
+	                            m_pending_meta_clears.lower_bound(address + size));
 	m_meta_epoch.fetch_add(1, std::memory_order_relaxed);
 	Common::SmallVector<ImageId, 16> deleted_images;
 	ForEachImageInRegion(address, size, [&](ImageId id, Image&) { deleted_images.push_back(id); });
@@ -3775,6 +3800,7 @@ void TextureCache::MapMemory(uint64_t address, uint64_t size) {
 void TextureCache::RunGarbageCollector() {
 	Common::ScopedLock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
+	std::erase_if(m_pending_meta_clears, [this](const auto& entry) { return m_gc_tick - entry.second.tick > 1; });
 	DiscardParkedImages(0, 0);
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
