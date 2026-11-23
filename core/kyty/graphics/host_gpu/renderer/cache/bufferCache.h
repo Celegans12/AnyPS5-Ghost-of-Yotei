@@ -63,6 +63,8 @@ public:
 	static constexpr uint32_t HACK_MARK_ORACLE_WAVES      = HACK_MARK_GUEST_RAYS + 5;
 	static_assert(HACK_MARK_ORACLE_WAVES < HACK_MARK_DWORDS);
 
+	static constexpr uint32_t USE_SCAN_PERIOD = 256;
+
 	static constexpr uint32_t HackMarkEntry(uint64_t shader_hash) {
 		return (static_cast<uint32_t>(shader_hash) ^ static_cast<uint32_t>(shader_hash >> 32u)) %
 		       HACK_MARK_ENTRIES;
@@ -289,6 +291,7 @@ public:
 
 private:
 	friend struct BufferCacheTestAccess;
+	friend struct BufferCacheGcTestAccess;
 	friend class TextureCache;
 
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainSynchronizedBuffer(

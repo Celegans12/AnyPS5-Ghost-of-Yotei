@@ -36,6 +36,9 @@ namespace {
 
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
+constexpr uint64_t StaleAge      = 2048;
+constexpr uint64_t PinnedAge     = 4 * uint64_t {BufferCache::USE_SCAN_PERIOD};
+static_assert(PinnedAge < StaleAge);
 
 std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
                                         StreamBuffer& staging, uint64_t size, uint64_t alignment,
@@ -3081,7 +3084,6 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::CollectStaleBuffers(uint64_t tick) {
-	static constexpr uint64_t StaleAge      = 2048;
 	static constexpr uint64_t StalePeriod   = 8;
 	static constexpr size_t   StaleVisitMax = 64;
 	static constexpr size_t   StaleFreeMax  = 16;
@@ -3263,6 +3265,9 @@ void BufferCache::RunGarbageCollector() {
 	size_t                retire_count = 0;
 	m_lru_cache.ForEachItemBelow(tick - age, [&](BufferId id) {
 		auto& buffer = m_slot_buffers[id];
+		if (buffer.device_address_pinned && m_lru_cache.TickOf(buffer.lru_id) + PinnedAge > tick) {
+			return false;
+		}
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
 		                                           buffer.Size(), "garbage collection");
 		const bool dirty = m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());

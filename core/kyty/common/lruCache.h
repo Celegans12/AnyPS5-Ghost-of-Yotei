@@ -47,6 +47,8 @@ public:
 		}
 	}
 
+	[[nodiscard]] Tick TickOf(size_t id) const { return m_items[id].tick; }
+
 	void Free(size_t id) {
 		Detach(m_items[id]);
 		m_free.push_back(id);

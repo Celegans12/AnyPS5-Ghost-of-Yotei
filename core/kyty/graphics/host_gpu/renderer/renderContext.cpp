@@ -1118,12 +1118,11 @@ void RenderContext::RunGarbageCollector() {
 		m_buffer_cache.ProcessFaultBuffer();
 	}
 	m_image_heap.RunGarbageCollector();
-	constexpr uint32_t UseScanPeriod = 256;
 	if (m_use_scan_countdown != 0) {
 		m_use_scan_countdown--;
 	} else if (m_use_scan_pending) {
 		m_use_scan_pending   = false;
-		m_use_scan_countdown = UseScanPeriod;
+		m_use_scan_countdown = BufferCache::USE_SCAN_PERIOD;
 		m_buffer_cache.ProcessUseBuffer();
 	}
 	if (m_indirect_write_tables.TakePendingWrites()) {
