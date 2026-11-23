@@ -423,6 +423,37 @@ static int CheckDirectMemoryPages() {
 }
 #endif
 
+#if defined(_WIN32) && defined(ANYPS5_KYTY)
+static bool HostHasRoomFor(std::size_t bytes) {
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    return GlobalMemoryStatusEx(&status) != 0 && status.ullAvailPhys >= bytes + status.ullTotalPhys / 2;
+}
+
+static int CheckDirectMemoryPages() {
+    const char* requested = std::getenv("KYTY_DIRECT_MEMORY_PAGES");
+    Require(requested != nullptr);
+    const std::string mode{requested};
+    constexpr std::size_t length = 0x400000;
+    std::int64_t physical = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, length, 0x200000, 0, &physical) == 0);
+    void* mapping = nullptr;
+    Require(sceKernelMapDirectMemory(&mapping, length, 3, 0, physical, 0x200000) == 0);
+    SYSTEM_INFO system{};
+    GetSystemInfo(&system);
+    const std::size_t pageBytes = system.dwPageSize;
+    std::vector<PSAPI_WORKING_SET_EX_INFORMATION> pages(length / pageBytes);
+    for (std::size_t index = 0; index < pages.size(); ++index) pages[index].VirtualAddress = static_cast<char*>(mapping) + index * pageBytes;
+    Require(K32QueryWorkingSetEx(GetCurrentProcess(), pages.data(), static_cast<DWORD>(pages.size() * sizeof(pages[0]))) != 0);
+    const auto residentPages = std::count_if(pages.begin(), pages.end(), [](const PSAPI_WORKING_SET_EX_INFORMATION& page) { return page.VirtualAttributes.Valid != 0; });
+    if (mode == "demand") Require(residentPages == 0);
+    if (mode == "populate") Require(!HostHasRoomFor(length) || residentPages == static_cast<long>(pages.size()));
+    Require(sceKernelMunmap(reinterpret_cast<std::uint64_t>(mapping), length) == 0);
+    Require(sceKernelReleaseDirectMemory(physical, length) == 0);
+    return 0;
+}
+#endif
+
 static void CheckDirectMapRefusesExecute() {
     constexpr std::size_t length = 0x4000;
     constexpr int invalid = static_cast<int>(0x80020016u);
@@ -4994,7 +5025,7 @@ int main(int argc, char** argv) {
         return CheckExecutableSharedMappings() ? 0 : 77;
     }
 #endif
-#if defined(__linux__) && defined(ANYPS5_KYTY)
+#if (defined(__linux__) || defined(_WIN32)) && defined(ANYPS5_KYTY)
     if (argc == 2 && std::strcmp(argv[1], "direct-pages") == 0) return CheckDirectMemoryPages();
 #endif
     Require(argc == 1);

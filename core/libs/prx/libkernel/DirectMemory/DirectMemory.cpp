@@ -57,6 +57,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #else
+#include <thread>
 #include <windows.h>
 #include "prx/libc/include/WindowsDescriptor.hpp"
 
@@ -1951,10 +1952,82 @@ int MapDirectRecorded(void** addr, size_t len, int prot, int flags, int64_t phys
     return 0;
 }
 
+#if defined(_WIN32) && defined(ANYPS5_KYTY)
+static bool PopulatesDirectMappings() {
+    static const bool populates = [] {
+        const char* value = std::getenv("KYTY_DIRECT_MEMORY_PAGES");
+        const std::string_view text{value == nullptr ? "populate" : value};
+        if (text == "demand") {
+            std::fprintf(stderr, "[memory] direct memory: 4 KiB pages on demand, as KYTY_DIRECT_MEMORY_PAGES asks\n");
+            return false;
+        }
+        if (text == "private") throw std::runtime_error("KYTY_DIRECT_MEMORY_PAGES=private: the private tmpfs needs a Linux host");
+        if (text != "populate") throw std::invalid_argument("KYTY_DIRECT_MEMORY_PAGES must be private, populate or demand");
+        std::fprintf(stderr, "[memory] direct memory: mappings populated when they are made while the host has room%s\n", value != nullptr ? ", as KYTY_DIRECT_MEMORY_PAGES asks" : "");
+        return true;
+    }();
+    return populates;
+}
+
+static bool HostKeepsResident(std::size_t bytes) {
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    return GlobalMemoryStatusEx(&status) != 0 && status.ullAvailPhys >= bytes + status.ullTotalPhys / 4;
+}
+
+static bool ReadableProtection(DWORD protect) {
+    if ((protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) return false;
+    return (protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+}
+
+static void TouchReadablePages(std::uintptr_t start, std::uintptr_t end, std::size_t pageBytes) {
+    for (auto cursor = start; cursor < end;) {
+        MEMORY_BASIC_INFORMATION region{};
+        if (VirtualQuery(reinterpret_cast<const void*>(cursor), &region, sizeof(region)) != sizeof(region)) return;
+        const auto regionEnd = std::min(end, reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize);
+        if (region.State == MEM_COMMIT && ReadableProtection(region.Protect)) {
+            for (auto page = cursor; page < regionEnd; page += pageBytes) static_cast<void>(*reinterpret_cast<const volatile std::uint8_t*>(page));
+        }
+        cursor = regionEnd;
+    }
+}
+
+static void PopulateDirectMapping(std::uintptr_t address, std::size_t bytes) {
+    if (!PopulatesDirectMappings()) return;
+    if (!HostKeepsResident(bytes)) {
+        static std::once_flag noted;
+        std::call_once(noted, [bytes] { std::fprintf(stderr, "[memory] direct memory of %zu MiB and later mappings that do not fit in a quarter of host memory stay paged on demand\n", bytes >> 20); });
+        return;
+    }
+    SYSTEM_INFO system{};
+    GetSystemInfo(&system);
+    const std::size_t pageBytes = system.dwPageSize;
+    constexpr std::size_t chunkBytes = std::size_t{256} << 20;
+    const auto chunks = (bytes + chunkBytes - 1) / chunkBytes;
+    const auto workers = std::min<std::size_t>(chunks, std::max(1u, std::thread::hardware_concurrency()));
+    std::atomic<std::size_t> next{0};
+    const auto populate = [&] {
+        for (auto chunk = next++; chunk < chunks; chunk = next++) {
+            const auto first = address + chunk * chunkBytes;
+            TouchReadablePages(first, first + std::min(chunkBytes, bytes - chunk * chunkBytes), pageBytes);
+        }
+    };
+    std::vector<std::thread> threads;
+    try {
+        for (std::size_t worker = 1; worker < workers; ++worker) threads.emplace_back(populate);
+    } catch (const std::system_error&) {
+    }
+    populate();
+    for (auto& thread : threads) thread.join();
+}
+#endif
+
 int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart, size_t alignment) {
     const int result = MapDirectRecorded(addr, len, prot, flags, physStart, alignment);
 #if defined(__linux__) && defined(ANYPS5_KYTY)
     if (result == 0) PopulateDirectMapping(reinterpret_cast<std::uintptr_t>(*addr), len, LinuxProtFromSce(prot));
+#elif defined(_WIN32) && defined(ANYPS5_KYTY)
+    if (result == 0) PopulateDirectMapping(reinterpret_cast<std::uintptr_t>(*addr), len);
 #endif
     return result;
 }
