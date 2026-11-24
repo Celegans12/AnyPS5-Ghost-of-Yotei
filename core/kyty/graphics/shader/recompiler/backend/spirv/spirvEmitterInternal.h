@@ -811,6 +811,13 @@ uint32_t LoadUniformBufferWord(EmitterState& state, uint32_t uniform_index, uint
 
 template <typename Fn>
 uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind kind, Fn&& desired) {
+	if (kind == IR::ResourceKind::Lds && state.lds_storage_class != spv::StorageClassWorkgroup &&
+	    state.lds_storage_class != spv::StorageClassStorageBuffer) {
+		const auto old = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), old, pointer);
+		state.builder.AddFunction(spv::OpStore, pointer, desired(old));
+		return old;
+	}
 	const auto scope     = kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;
 	const auto preheader = state.builder.AllocateId();
 	const auto header    = state.builder.AllocateId();

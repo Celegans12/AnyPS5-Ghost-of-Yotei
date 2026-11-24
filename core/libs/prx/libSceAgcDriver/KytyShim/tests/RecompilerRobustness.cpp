@@ -22,6 +22,8 @@ const std::vector<Case> Cases = {
     {"backward-branch-before-the-program", 0x00, 0x00, {0xbf828000u, 0xbf810000u}},
     {"setreg-float-mode-denorm", 0x00, 0x00, {0xb9801901u, 0xbf810000u}},
     {"empty-program-end", 0x00, 0x00, {0xbf810000u}},
+    {"lds-atomic-in-a-pixel-shader", 0x04, 0x00, {0xd8000000u, 0x00000100u, 0xbf810000u}},
+    {"lds-umin-in-a-vertex-shader", 0x03, 0x00, {0xd8070000u, 0x00000100u, 0xbf810000u}},
 };
 
 struct Refusal {

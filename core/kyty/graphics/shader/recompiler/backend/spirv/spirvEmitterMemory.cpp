@@ -2311,11 +2311,57 @@ static std::optional<SplitHints::Update> UnorderedSharedUpdate(const IR::Inst& i
 	}
 }
 
+bool PrivateLdsStorage(const EmitterState& state) {
+	return state.lds_storage_class != spv::StorageClassWorkgroup &&
+	       state.lds_storage_class != spv::StorageClassStorageBuffer;
+}
+
+uint32_t EmitPrivateAtomic32Value(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t old) {
+	auto&      state = ctx.state;
+	const auto type  = TypeU32(state);
+	const auto value = ctx.Arg(inst, inst.NumArgs() - 2);
+	switch (inst.GetOpcode()) {
+		case IR::ValueOpcode::SharedAtomicIAdd32:
+			return Binary(state, spv::OpIAdd, type, old, value);
+		case IR::ValueOpcode::SharedAtomicISub32:
+			return Binary(state, spv::OpISub, type, old, value);
+		case IR::ValueOpcode::SharedAtomicSMin32: return EmitSMin32(state, old, value);
+		case IR::ValueOpcode::SharedAtomicSMax32: return EmitSMax32(state, old, value);
+		case IR::ValueOpcode::SharedAtomicUMin32: return EmitUMin32(state, old, value);
+		case IR::ValueOpcode::SharedAtomicUMax32: return EmitUMax32(state, old, value);
+		case IR::ValueOpcode::SharedAtomicAnd32:
+			return Binary(state, spv::OpBitwiseAnd, type, old, value);
+		case IR::ValueOpcode::SharedAtomicOr32:
+			return Binary(state, spv::OpBitwiseOr, type, old, value);
+		case IR::ValueOpcode::SharedAtomicXor32:
+			return Binary(state, spv::OpBitwiseXor, type, old, value);
+		case IR::ValueOpcode::SharedAtomicSwap32: return value;
+		case IR::ValueOpcode::SharedAtomicCmpSwap32: {
+			auto desired    = ctx.Arg(inst, inst.NumArgs() - 3);
+			auto comparator = ctx.Arg(inst, inst.NumArgs() - 2);
+			std::swap(desired, comparator);
+			return Select(state, type,
+			              Binary(state, spv::OpIEqual, TypeBool(state), old, comparator), desired,
+			              old);
+		}
+		default:
+			EXIT("LDS atomic 0x%08x in a stage without workgroup storage\n",
+			     static_cast<uint32_t>(inst.GetOpcode()));
+	}
+}
+
 uint32_t EmitAtomic32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto& mem = ctx.Memory(inst);
 	if (mem.kind == IR::ResourceKind::IndirectBuffer) return AtomicIndirectBuffer(ctx, inst);
 	const UnorderedUpdateScope unordered(ctx.state, UnorderedSharedUpdate(inst));
 	return EmitAtomicAccess(ctx, inst, mem, [&](uint32_t pointer) {
+		if (mem.kind == IR::ResourceKind::Lds && PrivateLdsStorage(ctx.state)) {
+			const auto old = ctx.state.builder.AllocateId();
+			ctx.state.builder.AddFunction(spv::OpLoad, TypeU32(ctx.state), old, pointer);
+			ctx.state.builder.AddFunction(
+			    spv::OpStore, pointer, EmitPrivateAtomic32Value(ctx, inst, old));
+			return old;
+		}
 		const auto scope =
 		    mem.kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;
 		const auto old = EmitAtomicOperation(ctx, inst, pointer, scope);
@@ -2369,8 +2415,39 @@ void EmitSharedAtomic64(ValueEmitContext& ctx, const IR::Inst& inst) {
 		state.builder.AddFunction(
 		    spv::OpAccessChain, TypePointer(state, state.lds_storage_class, TypeU64(state)),
 		    pointer, state.lds_u64_variable, ConstantU32(state, 0), native_index);
-		const auto old = state.builder.AllocateId();
+		const auto old    = state.builder.AllocateId();
 		const auto opcode = SpirvAtomicOpcode(inst.GetOpcode());
+		if (PrivateLdsStorage(state)) {
+			const auto wide  = TypeU64(state);
+			const auto value = ctx.Arg(inst, 1);
+			state.builder.AddFunction(spv::OpLoad, wide, old, pointer);
+			uint32_t next = 0;
+			switch (opcode) {
+				case spv::OpAtomicIAdd:
+					next = Binary(state, spv::OpIAdd, wide, old, value);
+					break;
+				case spv::OpAtomicOr:
+					next = Binary(state, spv::OpBitwiseOr, wide, old, value);
+					break;
+				case spv::OpAtomicUMax:
+					next = EmitGlsl<GLSLstd450UMax, IR::Type::U64, uint32_t, uint32_t>(
+					    state, old, value);
+					break;
+				case spv::OpAtomicCompareExchange: {
+					const auto desired    = ctx.Arg(inst, 2);
+					const auto comparator = ctx.Arg(inst, 1);
+					next = Select(state, wide,
+					              Binary(state, spv::OpIEqual, TypeBool(state), old, comparator),
+					              desired, old);
+					break;
+				}
+				default:
+					EXIT("LDS 64-bit atomic 0x%08x in a stage without workgroup storage\n",
+					     static_cast<uint32_t>(inst.GetOpcode()));
+			}
+			state.builder.AddFunction(spv::OpStore, pointer, next);
+			return old;
+		}
 		const auto scope = ConstantU32(state, spv::ScopeWorkgroup);
 		const auto acquire_release =
 		    ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | semantics);
