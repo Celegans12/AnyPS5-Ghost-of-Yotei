@@ -2629,8 +2629,13 @@ ImageId TextureCache::FindImageImpl(ImageDesc& desc, bool exact_format, bool spe
 				if (KeepsBoundDepth(desc.type, resolved)) {
 					return NullForBoundDepth(desc, resolved);
 				}
-				FreeImage(result);
-				result = {};
+				if (resolved.IsGpuModified() &&
+				    resolved.info.resources.levels == desc.info.resources.levels) {
+					result = ExpandImage(desc.info, result);
+				} else {
+					FreeImage(result);
+					result = {};
+				}
 			}
 		}
 		if (result && same_backing && desc.type != BindingType::VideoOut) {

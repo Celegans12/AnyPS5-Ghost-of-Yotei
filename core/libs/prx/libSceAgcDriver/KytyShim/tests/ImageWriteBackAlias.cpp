@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -333,6 +334,102 @@ const char* CheckRangePicksLatestWrite(GraphicContext& graphics, uint64_t addres
 	return nullptr;
 }
 
+struct LayerFormat {
+	vk::Format             host;
+	Prospero::BufferFormat guest;
+};
+
+const char* CheckLargerRequestOverGpuWrites(GraphicContext& graphics, uint64_t address,
+                                            LayerFormat cached_format, LayerFormat requested_format,
+                                            uint32_t requested_levels) {
+	RenderContext renderer(graphics);
+	CommandProcessor producer(renderer, 0);
+	producer.Reset();
+	auto& scheduler = renderer.GetCommandScheduler();
+	auto& textures = renderer.GetTextureCache();
+	auto& buffers = renderer.GetBufferCache();
+	scheduler.Begin(producer.GetCtx(), producer.GetUcfg(), producer.GetShCtx());
+
+	constexpr uint32_t Width = 64;
+	constexpr uint32_t Height = 4;
+	constexpr uint32_t CachedLayers = 4;
+	constexpr uint32_t RequestedLayers = 6;
+	constexpr uint32_t CachedWords = CachedLayers * Width * Height;
+	constexpr uint32_t RequestedWords = RequestedLayers * Width * Height;
+	const auto layered = [address](LayerFormat format, uint32_t levels, uint32_t layers) {
+		ImageInfo info;
+		info.data.address = address;
+		info.pixel_format = format.host;
+		info.guest_format = format.guest;
+		info.extent = vk::Extent3D {Width, Height, 1};
+		info.pitch = Width;
+		info.resources = {levels, layers};
+		info.UpdateSize();
+		return info;
+	};
+	const auto cached_info = layered(cached_format, 1, CachedLayers);
+	const auto requested_info = layered(requested_format, requested_levels, RequestedLayers);
+	const bool keeps = requested_levels == 1;
+	if (requested_info.data.size > GuestBytes / 8) return "the layered image does not fit its guest range";
+	const std::vector<uint32_t> guest(requested_info.data.size / sizeof(uint32_t), FillValue);
+	if (!Libs::LibKernel::Memory::TryWriteBacking(address, guest.data(), requested_info.data.size)) {
+		return "could not write the guest backing";
+	}
+
+	std::vector<uint32_t> written(CachedWords);
+	for (uint32_t i = 0; i < CachedWords; ++i) {
+		written[i] = ImageValue + i;
+	}
+	const std::array cached_copies {vk::BufferImageCopy {
+	    0, 0, 0, {vk::ImageAspectFlagBits::eColor, 0, 0, CachedLayers}, {}, cached_info.extent}};
+	const std::array requested_copies {vk::BufferImageCopy {
+	    0, 0, 0, {vk::ImageAspectFlagBits::eColor, 0, 0, RequestedLayers}, {}, requested_info.extent}};
+	Buffer initial(graphics, scheduler, MemoryUsage::Upload, 0, vk::BufferUsageFlagBits::eTransferSrc,
+	               CachedWords * sizeof(uint32_t));
+	std::memcpy(initial.Mapped().data(), written.data(), CachedWords * sizeof(uint32_t));
+	initial.Flush(0, CachedWords * sizeof(uint32_t));
+	const auto cached = TextureCacheTestAccess::Create(textures, cached_info);
+	textures.GetImage(cached).Upload(cached_copies, initial.Handle(), 0, CachedWords * sizeof(uint32_t));
+	textures.MarkGpuWritten(cached);
+
+	TextureCache::ImageDesc desc {.info = requested_info};
+	desc.view_info.format = requested_info.pixel_format;
+	const auto found = textures.FindImage(desc);
+	Buffer readback(graphics, scheduler, MemoryUsage::Download, 0, vk::BufferUsageFlagBits::eTransferDst,
+	                RequestedWords * sizeof(uint32_t));
+	bool kept_gpu_write = false;
+	uint32_t found_layers = 0;
+	if (found) {
+		textures.UpdateImage(found);
+		auto& image = textures.GetImage(found);
+		kept_gpu_write = image.IsGpuModified();
+		found_layers = image.info.resources.layers;
+		image.Download(requested_copies, readback.Handle(), 0, RequestedWords * sizeof(uint32_t));
+	}
+	const auto tick = scheduler.CurrentTick();
+	scheduler.Wait(tick);
+	scheduler.WaitPriorityOperations(tick);
+	(void)buffers.DropFreedRange(address, requested_info.data.size, nullptr, nullptr);
+	if (found_layers != RequestedLayers) return "the larger request found no image with its layers";
+	readback.Invalidate(0, RequestedWords * sizeof(uint32_t));
+	std::vector<uint32_t> actual(RequestedWords);
+	std::memcpy(actual.data(), readback.Mapped().data(), RequestedWords * sizeof(uint32_t));
+	for (uint32_t i = 0; i < CachedWords; ++i) {
+		if (actual[i] != (keeps ? written[i] : FillValue)) {
+			return keeps ? "a request for more layers dropped the GPU-written layers"
+			             : "an image with fewer levels was copied into the request's layers";
+		}
+	}
+	for (uint32_t i = CachedWords; i < RequestedWords; ++i) {
+		if (actual[i] != FillValue) return "the added layers were not loaded from guest memory";
+	}
+	if (kept_gpu_write != keeps) {
+		return keeps ? "the image that kept the GPU-written layers is not marked GPU-written"
+		             : "the image loaded from guest memory is marked GPU-written";
+	}
+	return nullptr;
+}
+
 }
 
 extern "C" int RunKytyImageWriteBackAliasTest() {
@@ -367,6 +464,18 @@ extern "C" int RunKytyImageWriteBackAliasTest() {
 		const auto* tiled = CheckPartialBufferCopy(graphics, address + GuestBytes / 2,
 		                                          Prospero::TileMode::kStandard4KB);
 		failure = linear != nullptr ? linear : tiled;
+	}
+	constexpr LayerFormat Words {vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt};
+	constexpr LayerFormat Bytes {vk::Format::eR8G8B8A8Unorm, Prospero::BufferFormat::k8_8_8_8UNorm};
+	constexpr LayerFormat SwappedBytes {vk::Format::eB8G8R8A8Unorm, Prospero::BufferFormat::k8_8_8_8UNorm};
+	if (failure == nullptr) {
+		failure = CheckLargerRequestOverGpuWrites(graphics, address + GuestBytes / 8 * 5, Words, Bytes, 1);
+	}
+	if (failure == nullptr) {
+		failure = CheckLargerRequestOverGpuWrites(graphics, address + GuestBytes / 8 * 6, SwappedBytes, Bytes, 1);
+	}
+	if (failure == nullptr) {
+		failure = CheckLargerRequestOverGpuWrites(graphics, address + GuestBytes / 8 * 5, Words, Bytes, 2);
 	}
 	if (failure == nullptr) {
 		failure = CheckRangePicksLatestWrite(graphics, address + GuestBytes / 8 * 7);
