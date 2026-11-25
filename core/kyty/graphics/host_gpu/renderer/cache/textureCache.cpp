@@ -1082,6 +1082,11 @@ void TextureCache::RefreshCopySource(ImageId id) {
 	}
 }
 
+static bool RefreshesAsCopySource(const Image& image) {
+	return image.info.samples == 1 && image.backing.samples == 1 &&
+	       image.info.metadata.compression == VideoOutCompression::Uncompressed;
+}
+
 static bool DepthColorCopyCompatible(vk::Format depth, vk::Format color) {
 	switch (depth) {
 		case vk::Format::eD16Unorm:
@@ -2629,7 +2634,7 @@ ImageId TextureCache::FindImageImpl(ImageDesc& desc, bool exact_format, bool spe
 				if (KeepsBoundDepth(desc.type, resolved)) {
 					return NullForBoundDepth(desc, resolved);
 				}
-				if (resolved.IsGpuModified() &&
+				if (resolved.IsGpuModified() && RefreshesAsCopySource(resolved) &&
 				    resolved.info.resources.levels == desc.info.resources.levels) {
 					result = ExpandImage(desc.info, result);
 				} else {

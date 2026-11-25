@@ -9,6 +9,7 @@
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #include "prx/libkernel/include/Api.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -51,6 +52,9 @@ constexpr uint32_t WriteWords = 4;
 constexpr uint32_t ImageValue = 0x19283746;
 constexpr uint32_t CopyValue = 0xdecafbad;
 constexpr uint32_t FillValue = 0x1234fedc;
+constexpr uint32_t CpuValue = 0x5aa5c33c;
+constexpr uint64_t MultisampleGuestBytes = 0x100000;
+constexpr uint64_t MultisampleAlignment = 0x10000;
 
 const char* CheckWriteBackOrder(GraphicContext& graphics, uint64_t address) {
 	RenderContext renderer(graphics);
@@ -430,6 +434,97 @@ const char* CheckLargerRequestOverGpuWrites(GraphicContext& graphics, uint64_t a
 	return nullptr;
 }
 
+const char* CheckLargerRequestOverInvalidatedWrites(GraphicContext& graphics, uint64_t address, uint64_t limit,
+                                                    LayerFormat cached_format, LayerFormat requested_format,
+                                                    uint32_t samples) {
+	RenderContext renderer(graphics);
+	CommandProcessor producer(renderer, 0);
+	producer.Reset();
+	auto& scheduler = renderer.GetCommandScheduler();
+	auto& textures = renderer.GetTextureCache();
+	auto& buffers = renderer.GetBufferCache();
+	scheduler.Begin(producer.GetCtx(), producer.GetUcfg(), producer.GetShCtx());
+
+	constexpr uint32_t Width = 32;
+	constexpr uint32_t Height = 4;
+	constexpr uint32_t CachedLayers = 4;
+	constexpr uint32_t RequestedLayers = 6;
+	constexpr uint32_t CachedWords = CachedLayers * Width * Height;
+	constexpr uint32_t RequestedWords = RequestedLayers * Width * Height;
+	const auto layered = [address, samples](LayerFormat format, uint32_t layers) {
+		ImageInfo info;
+		info.data.address = address;
+		info.pixel_format = format.host;
+		info.guest_format = format.guest;
+		info.extent = vk::Extent3D {Width, Height, 1};
+		info.tile_mode = samples == 1 ? Prospero::TileMode::kLinear : Prospero::TileMode::kRenderTarget;
+		info.pitch = samples == 1 ? Width : 0;
+		info.samples = samples;
+		info.resources = {1, layers};
+		info.UpdateSize();
+		return info;
+	};
+	const auto cached_info = layered(cached_format, CachedLayers);
+	const auto requested_info = layered(requested_format, RequestedLayers);
+	if (requested_info.data.size > limit) return "the layered image does not fit its guest range";
+	std::vector<uint32_t> guest(requested_info.data.size / sizeof(uint32_t), FillValue);
+	if (!Libs::LibKernel::Memory::TryWriteBacking(address, guest.data(), requested_info.data.size)) {
+		return "could not write the guest backing";
+	}
+
+	const auto cached = TextureCacheTestAccess::Create(textures, cached_info);
+	{
+		auto& image = textures.GetImage(cached);
+		const auto native = scheduler.Current().Handle();
+		image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, native);
+		const vk::ClearColorValue clear {.float32 = {std::array<float, 4> {1.0f, 0.5f, 0.25f, 1.0f}}};
+		const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eColor, 0, 1, 0, CachedLayers};
+		native.clearColorImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal, &clear, 1, &range);
+	}
+	textures.MarkGpuWritten(cached);
+	std::fill(guest.begin(), guest.begin() + cached_info.data.size / sizeof(uint32_t), CpuValue);
+	if (!Libs::LibKernel::Memory::TryWriteBacking(address, guest.data(), cached_info.data.size)) {
+		return "could not write the guest backing";
+	}
+	(void)textures.InvalidateMemory(address, cached_info.data.size);
+	const auto& invalidated = textures.GetImage(cached);
+	const bool stale = invalidated.IsGpuModified() && invalidated.IsDefinitelyCpuDirty();
+
+	TextureCache::ImageDesc desc {.info = requested_info};
+	desc.view_info.format = requested_info.pixel_format;
+	const auto found = textures.FindImage(desc);
+	const std::array requested_copies {vk::BufferImageCopy {
+	    0, 0, 0, {vk::ImageAspectFlagBits::eColor, 0, 0, RequestedLayers}, {}, requested_info.extent}};
+	Buffer readback(graphics, scheduler, MemoryUsage::Download, 0, vk::BufferUsageFlagBits::eTransferDst,
+	                RequestedWords * sizeof(uint32_t));
+	uint32_t found_layers = 0;
+	if (found) {
+		auto& image = textures.GetImage(found);
+		found_layers = image.info.resources.layers;
+		if (samples == 1) {
+			textures.UpdateImage(found);
+			image.Download(requested_copies, readback.Handle(), 0, RequestedWords * sizeof(uint32_t));
+		}
+	}
+	const auto tick = scheduler.CurrentTick();
+	scheduler.Wait(tick);
+	scheduler.WaitPriorityOperations(tick);
+	(void)buffers.DropFreedRange(address, requested_info.data.size, nullptr, nullptr);
+	if (!stale) return "the guest write did not invalidate the GPU-written image";
+	if (found_layers != RequestedLayers) return "the larger request found no image with its layers";
+	if (samples != 1) return nullptr;
+	readback.Invalidate(0, RequestedWords * sizeof(uint32_t));
+	std::vector<uint32_t> actual(RequestedWords);
+	std::memcpy(actual.data(), readback.Mapped().data(), RequestedWords * sizeof(uint32_t));
+	for (uint32_t i = 0; i < CachedWords; ++i) {
+		if (actual[i] != CpuValue) return "a request for more layers kept GPU writes over a newer guest write";
+	}
+	for (uint32_t i = CachedWords; i < RequestedWords; ++i) {
+		if (actual[i] != FillValue) return "the added layers were not loaded from guest memory";
+	}
+	return nullptr;
+}
+
 }
 
 extern "C" int RunKytyImageWriteBackAliasTest() {
@@ -476,6 +571,26 @@ extern "C" int RunKytyImageWriteBackAliasTest() {
 	}
 	if (failure == nullptr) {
 		failure = CheckLargerRequestOverGpuWrites(graphics, address + GuestBytes / 8 * 5, Words, Bytes, 2);
+	}
+	if (failure == nullptr) {
+		failure = CheckLargerRequestOverInvalidatedWrites(graphics, address + GuestBytes / 8 * 5, GuestBytes / 8,
+		                                                  SwappedBytes, Bytes, 1);
+	}
+	if (failure == nullptr) {
+		constexpr uint64_t Mapped = MultisampleGuestBytes + MultisampleAlignment;
+		void* multisample_guest = nullptr;
+		if (sceKernelMapFlexibleMemory(&multisample_guest, Mapped, CpuReadWrite, 0) != 0 ||
+		    multisample_guest == nullptr) {
+			failure = "could not map the multisample backing";
+		} else {
+			const auto mapped = reinterpret_cast<uint64_t>(multisample_guest);
+			const auto aligned = (mapped + MultisampleAlignment - 1) & ~(MultisampleAlignment - 1);
+			failure = CheckLargerRequestOverInvalidatedWrites(graphics, aligned, MultisampleGuestBytes,
+			                                                  SwappedBytes, Bytes, 4);
+			if (sceKernelMunmap(mapped, Mapped) != 0 && failure == nullptr) {
+				failure = "could not unmap the multisample backing";
+			}
+		}
 	}
 	if (failure == nullptr) {
 		failure = CheckRangePicksLatestWrite(graphics, address + GuestBytes / 8 * 7);

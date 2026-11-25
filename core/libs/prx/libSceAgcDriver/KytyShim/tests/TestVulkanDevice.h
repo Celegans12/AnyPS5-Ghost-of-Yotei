@@ -117,7 +117,9 @@ private:
 		const vk::PhysicalDeviceVulkan13Features features13 {
 		    .pNext = &features11, .synchronization2 = VK_TRUE, .dynamicRendering = VK_TRUE};
 		const vk::PhysicalDeviceFeatures core_features {
-		    .sampleRateShading = VK_TRUE, .shaderInt64 = VK_TRUE};
+		    .sampleRateShading = VK_TRUE,
+		    .shaderStorageImageMultisample = supported.features.shaderStorageImageMultisample,
+		    .shaderInt64 = VK_TRUE};
 		const float priority = 1.0f;
 		const vk::DeviceQueueCreateInfo queue_info {
 		    .queueFamilyIndex = static_cast<uint32_t>(family - families.begin()),
@@ -133,6 +135,9 @@ private:
 		VULKAN_HPP_DEFAULT_DISPATCHER.init(graphics.device);
 		graphics.physical_device = physical;
 		graphics.physical_device_properties = properties.properties;
+		if (!core_features.shaderStorageImageMultisample) {
+			graphics.physical_device_properties.limits.storageImageSampleCounts = vk::SampleCountFlagBits::e1;
+		}
 		graphics.physical_device_memory_properties = physical.getMemoryProperties();
 		graphics.queue_family = queue_info.queueFamilyIndex;
 		graphics.device.getQueue(graphics.queue_family, 0, &graphics.queue);
