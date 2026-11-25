@@ -130,7 +130,6 @@ option(ANYPS5_USE_SYSTEM_DEPS "Resolve SDL2, freetype, Vulkan-Headers, SPIRV-Hea
 if(DEFINED ANYPS5_GPU_BACKEND AND NOT ANYPS5_GPU_BACKEND STREQUAL "kyty")
     message(FATAL_ERROR "ANYPS5_GPU_BACKEND=${ANYPS5_GPU_BACKEND} is no longer supported: the historical AnyPS5 GPU driver was removed and Kyty is the only GPU driver. Drop the option; if the value comes from the CMakeCache.txt of an old build directory, configure in a new one (-DANYPS5_GPU_BACKEND=kyty is still accepted and does nothing).")
 endif()
-set(ANYPS5_GPU_BACKEND "kyty" CACHE STRING "The GPU driver: always kyty, the historical AnyPS5 driver was removed (docs/dev/THIRD_PARTY_KYTY.md)" FORCE)
 option(ANYPS5_KYTY_DLL "On Windows: build the Kyty core and the AgcDriver shim as kyty_gpu.prx with llvm-mingw clang and libc++, behind KytyDll.h" OFF)
 if(ANYPS5_KYTY_DLL AND NOT WIN32)
     message(FATAL_ERROR "ANYPS5_KYTY_DLL is for Windows only")
@@ -344,7 +343,7 @@ if(BUILD_TESTING)
         ENVIRONMENT_MODIFICATION
         "TMPDIR=set:${anyps5HostTestTemp};TEMP=set:${anyps5HostTestTemp};TMP=set:${anyps5HostTestTemp}")
     if(Python3_Interpreter_FOUND)
-        get_property(windows_tooling_before DIRECTORY PROPERTY TESTS)
+        get_property(tooling_tests_before DIRECTORY PROPERTY TESTS)
         add_test(NAME mingw_host_only_test_targets COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_mingw_host_only_test_targets.py)
         set_tests_properties(mingw_host_only_test_targets PROPERTIES TIMEOUT 30)
@@ -564,6 +563,9 @@ if(BUILD_TESTING)
         add_test(NAME conventions_debt_labels COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_conventions_debt_labels.py)
         set_tests_properties(conventions_debt_labels PROPERTIES TIMEOUT 20)
+        add_test(NAME conventions_helpers COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_conventions_helpers.py)
+        set_tests_properties(conventions_helpers PROPERTIES TIMEOUT 20)
         add_test(NAME test_registration COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_test_registration.py)
         set_tests_properties(test_registration PROPERTIES TIMEOUT 60)
@@ -613,7 +615,7 @@ if(BUILD_TESTING)
         add_test(NAME check_skips_ctest_policy COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_skips.py CtestSkipPolicyTests)
         add_test(NAME check_skips_device_policy COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_skips.py DeviceSkipPolicyTests DeviceLimitationsTests EnvironmentLoaderRetentionTests)
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_skips.py DeviceSkipPolicyTests DeviceLimitationsTests HighRefreshLimitationTests EnvironmentLoaderRetentionTests)
         add_test(NAME check_skips_cli_output COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_skips.py SkipCliOutputTests)
         set_tests_properties(check_skips check_skips_privilege check_skips_ctest_policy
@@ -704,6 +706,18 @@ if(BUILD_TESTING)
             add_test(NAME vulkan_validation_gate_nested_containment COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_vulkan_validation_gate.py NestedContainmentTests)
         endif()
+        add_test(NAME vulkan_validation_gate_arguments COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_vulkan_validation_gate.py ArgumentTests)
+        add_test(NAME vulkan_validation_gate_identity COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_vulkan_validation_gate.py IdentityTests)
+        add_test(NAME vulkan_validation_gate_cache COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_vulkan_validation_gate.py CacheTests)
+        add_test(NAME vulkan_validation_gate_save COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_vulkan_validation_gate.py SaveTests)
+        add_test(NAME vulkan_validation_gate_wait COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_vulkan_validation_gate.py WaitTests)
+        add_test(NAME vulkan_validation_gate_parse_report COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_vulkan_validation_gate.py ParseReportTests)
         add_test(NAME stubgen COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_stubgen.py)
         set(debt_split_source "${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_debt_split.py")
@@ -763,7 +777,9 @@ if(BUILD_TESTING)
         add_test(NAME pr_overlap_errors COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_pr_overlap_errors.py)
         add_test(NAME pr_overlap_branch_scan COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_pr_overlap_branch_scan.py)
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_pr_overlap_branch_scan.py BranchScanTests)
+        add_test(NAME pr_overlap_branch_scan_exports COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_pr_overlap_branch_scan.py ExportSourceTests)
         add_test(NAME pr_overlap_progress COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_pr_overlap_progress.py)
         add_test(NAME pr_overlap_pages COMMAND ${Python3_EXECUTABLE}
@@ -843,6 +859,9 @@ if(BUILD_TESTING)
         add_test(NAME conventions_bom_shebang COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_conventions_bom_shebang.py)
         set_tests_properties(conventions_bom_shebang PROPERTIES TIMEOUT 20)
+        add_test(NAME tool_script_modes COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_tool_script_modes.py)
+        set_tests_properties(tool_script_modes PROPERTIES TIMEOUT 20)
         add_test(NAME env_reference COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_env_reference.py)
         set_tests_properties(env_reference PROPERTIES TIMEOUT 20)
@@ -882,6 +901,10 @@ if(BUILD_TESTING)
         add_test(NAME conventions_alignment COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_conventions_alignment.py)
         set_tests_properties(conventions_alignment PROPERTIES TIMEOUT 20)
+
+        add_test(NAME trace_diff COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_trace_diff.py)
+        set_tests_properties(trace_diff PROPERTIES TIMEOUT 60)
         set(trace_digest_test_source "${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_trace_digest.py")
         set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${trace_digest_test_source}")
         file(STRINGS "${trace_digest_test_source}" trace_digest_cases REGEX "^class |^    def test_")
@@ -1007,26 +1030,28 @@ if(BUILD_TESTING)
         add_test(NAME relinker_fuzz_seeds COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_relinker_fuzz_seeds.py)
         set_tests_properties(relinker_fuzz_seeds PROPERTIES TIMEOUT 20)
-        if(WIN32)
-            get_property(windows_tooling_after DIRECTORY PROPERTY TESTS)
-            list(REMOVE_ITEM windows_tooling_after ${windows_tooling_before})
-            function(raise_windows_tooling_test_timeouts)
-                foreach(windows_tooling_test IN LISTS ARGN)
-                    get_test_property(${windows_tooling_test} TIMEOUT windows_tooling_timeout)
+        get_property(tooling_tests_after DIRECTORY PROPERTY TESTS)
+        list(REMOVE_ITEM tooling_tests_after ${tooling_tests_before})
+        function(configure_tooling_tests)
+            foreach(tooling_test IN LISTS ARGN)
+                set_property(TEST ${tooling_test} APPEND PROPERTY ENVIRONMENT_MODIFICATION
+                    "GIT_CONFIG_GLOBAL=set:/dev/null" "GIT_CONFIG_NOSYSTEM=set:1")
+                if(WIN32)
+                    get_test_property(${tooling_test} TIMEOUT windows_tooling_timeout)
                     if(windows_tooling_timeout STREQUAL "windows_tooling_timeout-NOTFOUND" OR (windows_tooling_timeout MATCHES "^[0-9.]+$" AND windows_tooling_timeout LESS 120))
-                        set_tests_properties(${windows_tooling_test} PROPERTIES TIMEOUT 120)
+                        set_tests_properties(${tooling_test} PROPERTIES TIMEOUT 120)
                     endif()
-                    set_property(TEST ${windows_tooling_test} APPEND PROPERTY ENVIRONMENT_MODIFICATION "PYTHONUTF8=set:1")
-                endforeach()
-            endfunction()
-            raise_windows_tooling_test_timeouts(${windows_tooling_after})
-            function(raise_windows_deferred_tooling_test_timeouts)
-                get_property(windows_deferred_tests DIRECTORY PROPERTY TESTS)
-                list(FILTER windows_deferred_tests INCLUDE REGEX "^check_compile_")
-                raise_windows_tooling_test_timeouts(${windows_deferred_tests})
-            endfunction()
-            cmake_language(DEFER CALL raise_windows_deferred_tooling_test_timeouts)
-        endif()
+                    set_property(TEST ${tooling_test} APPEND PROPERTY ENVIRONMENT_MODIFICATION "PYTHONUTF8=set:1")
+                endif()
+            endforeach()
+        endfunction()
+        configure_tooling_tests(${tooling_tests_after})
+        function(configure_deferred_tooling_tests)
+            get_property(deferred_tooling_tests DIRECTORY PROPERTY TESTS)
+            list(FILTER deferred_tooling_tests INCLUDE REGEX "^check_compile_")
+            configure_tooling_tests(${deferred_tooling_tests})
+        endfunction()
+        cmake_language(DEFER CALL configure_deferred_tooling_tests)
     endif()
     if(ANYPS5_ENABLE_TSAN AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
         add_test_executable(tsan_lavapipe_unload_tests tools/tests/TsanLavapipeUnload.cpp)
@@ -1086,6 +1111,10 @@ if(NOT ANYPS5_USE_SYSTEM_DEPS)
         if(ANYPS5_SDL_WAYLAND)
             get_directory_property(ANYPS5_SDL_WAYLAND_LIBDECOR DIRECTORY 3rdparty/SDL2 DEFINITION HAVE_WAYLAND_LIBDECOR)
             include(cmake/PatchSdlWayland.cmake)
+        endif()
+        get_directory_property(ANYPS5_SDL_PULSEAUDIO DIRECTORY 3rdparty/SDL2 DEFINITION HAVE_PULSEAUDIO)
+        if(ANYPS5_SDL_PULSEAUDIO)
+            include(cmake/PatchSdlPulseAudio.cmake)
         endif()
         get_directory_property(ANYPS5_SDL_X11_XRANDR DIRECTORY 3rdparty/SDL2 DEFINITION HAVE_X11_XRANDR)
         if(NOT ANYPS5_SDL_X11_XRANDR)

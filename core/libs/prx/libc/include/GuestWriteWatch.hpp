@@ -81,6 +81,10 @@ bool GuestWriteWatchHandleReadTrap_nid_postfix(int signal, siginfo_t* info, void
 #if defined(__linux__) && defined(ANYPS5_KYTY)
 void GuestWriteWatchSetGpuFaultHandler_nid_no_patch(GpuFaultHandler handler);
 #endif
+std::uint64_t GuestWriteWatchReadTrapGeneration_nid_postfix();
+bool GuestWriteWatchAwaitsReadTrap_nid_postfix(std::uint64_t thread);
+bool GuestWriteWatchBeginUntrappedAccess_nid_postfix(const void* pointer, std::size_t bytes);
+void GuestWriteWatchEndUntrappedAccess_nid_postfix(const void* pointer, std::size_t bytes);
 
 }
 

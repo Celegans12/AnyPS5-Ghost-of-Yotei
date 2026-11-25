@@ -107,6 +107,13 @@ also builds `libs` through the `patched_libraries_tests` dependency. Titles load
 files from `build/core/libs/libs`; running a title after a library change without rebuilding `libs`
 therefore tests the previous binaries and can show no effect at all.
 
+To rebuild one patched module, build its `libs_<name>` target, where `<name>` is the output file name
+without its extension: `cmake --build build --target libs_libSceAgcDriver` rebuilds and NID-patches
+`build/core/libs/libs/libSceAgcDriver.prx` and the targets it depends on, without patching the other
+modules. The same applies to the other files `libs` places beside them, such as `libs_mimalloc`.
+Name the target, not the output path: with the Makefile generators, an existing file passed as a
+target counts as up to date, so a stale patched module is not rebuilt.
+
 [Relinker usage and runtime layout](../user/USAGE.md).
 
 `tools/public_headers_manifest.py [--root <dir>]` inventories the inputs of the public header package, with a content hash for each file, without creating an archive. `--root` defaults to the repository that contains the script.
@@ -135,7 +142,13 @@ If configuration reports `Could NOT find Python3` or selects an unusable interpr
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DPython3_EXECUTABLE="C:/path/to/python.exe"
 ```
 
-The documentation runs the Python tools as `python3`. With the python.org installer for Windows, which provides `python.exe` and the `py` launcher but no `python3.exe`, `python3` resolves to the Microsoft Store alias in `WindowsApps`, which prints `Python was not found` and exits with code 9009 (49 in Git Bash). Installs that provide `python3.exe`, such as the Python Install Manager, are not affected. In that case run these commands with `python` or `py -3`, for example `py -3 tools/check_conventions.py --base origin/main`.
+The documentation runs the Python tools as `python3`. With the python.org installer for Windows, which provides `python.exe` and the `py` launcher but no `python3.exe`, `python3` resolves to the Microsoft Store alias in `WindowsApps`, which prints `Python was not found` and exits with code 9009 (49 in Git Bash). Installs that provide `python3.exe`, such as the Python Install Manager, are not affected. In that case run these commands with `python` or `py -3`, for example `py -3 tools/check_conventions.py`.
+
+If `windres` reports `preprocessing failed` and Windows prints the first part of the WinLibs installation path as an unrecognized command, `windres` may be splitting the path to its preprocessor at a space. This can occur when WinLibs GCC 15.2.0 r7 is installed in a directory with spaces. With the selected WinLibs `bin` directory first on `PATH`, append the following argument to the CMake configure command.
+
+```powershell
+'-DCMAKE_RC_FLAGS=--preprocessor=gcc.exe --preprocessor-arg=-E --preprocessor-arg=-xc --preprocessor-arg=-DRC_INVOKED'
+```
 
 If the build stops with `fatal error: opening dependency file ...\*.cpp.obj.d: No such file or directory` for a few sources with long names, the path of an object or dependency file under `build` is at or near the 260-character Windows limit. A checkout whose path was 92 characters failed this way with `LongPathsEnabled` set to 1 in the registry; the same tree at `C:\a5` built. Clone the repository to a short path such as `C:\a5` and configure in a new build directory: a CMake build tree stores absolute paths, so moving an existing `build` directory does not help.
 
@@ -192,7 +205,7 @@ SDL and FreeType settings forced by the root `CMakeLists.txt` cannot be overridd
 
 With `ANYPS5_USE_SYSTEM_DEPS=ON` those libraries come from the system (on Debian and Ubuntu: `libsdl2-dev`, `libfreetype-dev`, `libvulkan-dev`, `spirv-headers`, `glslang-dev`, `glslang-tools` and `spirv-tools`). A missing package, Vulkan-Headers missing AGC declarations (available since 1.4.330, including `VK_KHR_maintenance8`, `VK_KHR_present_mode_fifo_latest_ready`, `VK_KHR_shader_fma` and the Mesa KosmicKrisp driver ID), or an SDL2 without the HIDAPI joystick driver (sdl2-compat over SDL3, or a build with HIDAPI disabled, which breaks the pad and disk-audio tests), fails the configure with an error and never falls back to the submodule. The forced SDL and FreeType settings from the root `CMakeLists.txt` do not apply with the flag ON: the system SDL2 comes with whatever its distribution enabled. The prx libraries are shared objects, so SDL2 is linked from the system as a shared library; the default build keeps its own static SDL2. `ffmpeg-core`, `libjpeg-turbo`, `stb`, `VulkanMemoryAllocator`, `LibAtrac9`, `ogg`, `vorbis`, `opus`, `libusb-cmake`, `mbedtls`, `vgmstream`, `zstd`, `ZArchive` and, on Windows, `mimalloc` always stay bundled and still need `git submodule update --init`.
 
-`tools/configure_seed.py` writes the configure check results of a configured tree's `CMakeCache.txt` as an initial cache file for `cmake -C`. `--include` and `--exclude` take glob patterns on the check names, and `--stdout` prints the seed instead of writing a file. `tools/check_configure_seed.py` checks an unfiltered seed against its cache without writing anything.
+`tools/configure_seed.py` writes the configure check results of a configured tree's `CMakeCache.txt` as an initial cache file for `cmake -C`. `--include` and `--exclude` take glob patterns on the check names, and `--stdout` prints the seed instead of writing a file. `tools/check_configure_seed.py` checks an unfiltered seed against its cache without writing anything. It compares the generated text byte for byte, so an edited seed or one generated with filters can be reported as stale. The exit status is 0 for a match, 1 for a missing or stale seed, and 2 for an input error.
 
 ## HTTP locale tests
 
@@ -451,6 +464,8 @@ With `APS5_PROFILE_DRAW` set (any value), the driver prints a profile line on st
 
 With `APS5_PROFILE_DRAW=1`, the `lock wait` row in `[draw] driver phases` can include time spent enqueueing a draw, including waiting for space in the draw pipeline. Draws that acquire the GPU mutex also charge that acquisition to the same row. Use the per-thread `[lock]` counters or `GpuMutex.wait.<site>` trace slices to measure GPU mutex contention. For draw pipeline backpressure, use the `for room` time on the `[draw] pipelined` line. Check the producer's sampled stacks for `DrawPipeline::Enqueue` and the draw committer's trace to see where the time goes.
 
+With `APS5_PROFILE_DRAW` set, the queue worker hands no draw to the draw finisher (`APS5_DRAW_PIPELINE`) and finishes every draw itself, so the `[finisher]` line reports 0 draws handed to the draw finisher. A run with draw profiling does not measure the finisher: compare `APS5_DRAW_PIPELINE` with `main` in runs without `APS5_PROFILE_DRAW`, using the trace summaries (`APS5_TRACE_SUMMARY_EVERY`) instead.
+
 | Line | Counts |
 |---|---|
 | `[rescache] revalidate` | last 10 s |
@@ -494,7 +509,9 @@ On Linux x86-64, omit `CMAKE_OSX_ARCHITECTURES`; the full `BUILD_TESTING` build 
 
 - `tools/check_test_registration.py [build]` fails when a test executable is built but no ctest test runs it, or when a library source that defines exports is never compiled. `--list` and `--json` print the findings.
 - `tools/check_skips.py <junit> [--job linux|windows] [--require-tests]` fails when a test is skipped for a reason the job's device is not expected to hit.
-- `tools/compare_configure_checks.py <baseline> <candidate>` compares the recognized configure checks in two CMake caches without writing anything.
+  Use `--list` to inspect reported skip reasons without applying the job's policy. Use `--json` for policy decisions
+  and the list of unexpected skips in machine-readable form.
+- `tools/compare_configure_checks.py <baseline> <candidate>` compares the recognized configure checks in two CMake caches without writing anything. It prints a JSON object with `added`, `removed` and `changed` lists. Exit status 0 means the recognized checks match, 1 means they differ, and 2 means the command could not read or compare the inputs.
 
 ## Public-header archives
 

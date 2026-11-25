@@ -25,10 +25,14 @@ Set a switch before starting the emulator. Unless noted, any value enables it. M
 | `APS5_TRACE_WAITS` | Blocking waits aggregated by guest call site, including timeout counts and longest waits, every three seconds. |
 
 To inspect a guest address in a saved `APS5_TRACE_MEMORY` log, run
-`python3 tools/memory_trace_address.py <log> --address 0x... [--length <bytes>]`. It lists recorded mapping,
-remapping, protection, reservation and unmapping events whose ranges overlap the query, in log order. These are trace
+`python3 tools/memory_trace_address.py <log> --address 0x... [--length <bytes>] [--limit <events>]`. It lists recorded mapping,
+remapping, protection, reservation and unmapping events whose ranges overlap the query, in log order. By default it shows
+the last 40 matches. Raise `--limit` to inspect earlier events, such as the mapping that preceded a later unmap. These are trace
 records, not confirmation that each attempted operation succeeded; no matching event does not prove the address was
 unmapped.
+
+The address query reads UTF-8 logs and logs with a UTF-16 or UTF-32 byte-order mark. It prints source line numbers
+from the saved log.
 
 ## GPU and memory
 
@@ -47,6 +51,10 @@ See [Build](BUILD.md#performance-trace) for the trace format, summary fields and
 | `APS5_TRACE_SUMMARY_EVERY=<seconds>` | Writes periodic summary lines without recording trace events. Can be combined with either window switch. |
 | `KYTY_AB=<seconds>:<setting>[+<setting>...]` | The same with the Kyty backend, for the settings it can change at a flip; prints `[kyty-ab]` lines, and `python3 tools/kyty_ab_report.py <session>` gives each arm. See [the Kyty settings](THIRD_PARTY_KYTY.md#details). |
 | `APS5_VIDEOOUT_TELEMETRY_DIR=<path>` | Writes the presents and the pad changes of a run to `<path>/videoout.jsonl`; see [Usage](../user/USAGE.md#video-out-and-pad-telemetry). |
+
+For an event trace, repeat `--thread <name>` with exact track names to focus the digest on selected threads.
+Quote a name that contains spaces. This option applies to `aps5-trace-*.json.gz` and uncompressed event traces.
+Use the interval digest without a thread filter for `aps5-summary.jsonl`.
 
 ## Shader registers
 
@@ -79,3 +87,5 @@ It tracks the POSIX mutexes, read-write locks and spin locks each thread holds, 
 ## CSV exports
 
 - `tools/ab_split_csv.py <log> [--program P] [--class C]` exports the existing in-run A/B comparison of a log as CSV.
+  On Windows PowerShell 5.1, capture the log through `cmd /d /c "<command> 2> run.log"`. PowerShell's own
+  `2>` can write UTF-16 and wrap long report lines, which the A/B tools cannot use.
