@@ -213,6 +213,16 @@ static void ParseTest() {
     Require(multilineWarning.find('\r') == std::string::npos && multilineWarning.find('\n') == std::string::npos, "the warning contained raw line breaks");
 }
 
+static void WindowSizeParseTest() {
+    Require(ParseHostWindowSize("1920x1080") == HostWindowSize{1920, 1080}, "1920x1080 was not parsed");
+    Require(ParseHostWindowSize("1x1") == HostWindowSize{1, 1}, "1x1 was not parsed");
+    Require(ParseHostWindowSize("16384x16384") == HostWindowSize{16384, 16384}, "the largest size was refused");
+    for (const char* invalid : {"", "1920", "x1080", "1920x", "0x1080", "1920x0", "1920X1080", " 1920x1080", "1920x1080 ", "+1920x1080", "-1x5", "16385x100", "1920x1080x1", "99999999999x1", "1920,1080"}) {
+        Require(!ParseHostWindowSize(invalid).has_value(), (std::string("an invalid window size was accepted: ") + invalid).c_str());
+    }
+    Require(!ParseHostWindowSize(nullptr).has_value(), "unset was accepted as a window size");
+}
+
 static bool Borderless(const DisplayWindow& window) {
     return (SDL_GetWindowFlags(window.Handle()) & SDL_WINDOW_BORDERLESS) != 0;
 }
@@ -485,6 +495,7 @@ int main(int argc, char** argv) {
     if (argc > 1 && std::strcmp(argv[1], "libdecor-retry") == 0) return WaylandWindowTest(false);
 #endif
     ParseTest();
+    WindowSizeParseTest();
     Require(WindowModeStartsBorderless("borderless") && !WindowModeStartsBorderless(nullptr), "ANYPS5_WINDOW_MODE=borderless was not recognised");
     for (const char* other : {"", "windowed", "1", "0", "Borderless", "borderless ", "yes"}) {
         Require(!WindowModeStartsBorderless(other), (std::string("a window mode other than borderless started borderless: ") + other).c_str());

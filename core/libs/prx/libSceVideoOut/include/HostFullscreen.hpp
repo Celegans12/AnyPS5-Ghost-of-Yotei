@@ -19,6 +19,10 @@ struct HostWindowSize {
     friend bool operator==(const HostWindowSize&, const HostWindowSize&) = default;
 };
 
+inline constexpr int HostWindowSizeMaximum = 16384;
+
+std::optional<HostWindowSize> ParseHostWindowSize(const char* value);
+
 struct HostWindowRect {
     int x = 0;
     int y = 0;

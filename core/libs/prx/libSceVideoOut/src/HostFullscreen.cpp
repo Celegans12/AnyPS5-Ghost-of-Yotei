@@ -1,5 +1,7 @@
 #include "prx/libSceVideoOut/include/HostFullscreen.hpp"
+#include <charconv>
 #include <cstring>
+#include <string_view>
 
 HostFullscreenMode ParseHostFullscreenMode(const char* value, bool* unrecognized) {
     if (unrecognized != nullptr) *unrecognized = false;
@@ -7,6 +9,24 @@ HostFullscreenMode ParseHostFullscreenMode(const char* value, bool* unrecognized
     if (std::strcmp(value, "0") == 0 || std::strcmp(value, "windowed") == 0) return HostFullscreenMode::Windowed;
     if (std::strcmp(value, "1") != 0 && std::strcmp(value, "borderless") != 0 && unrecognized != nullptr) *unrecognized = true;
     return HostFullscreenMode::Borderless;
+}
+
+std::optional<HostWindowSize> ParseHostWindowSize(const char* value) {
+    if (value == nullptr) return std::nullopt;
+    const std::string_view text(value);
+    const auto separator = text.find('x');
+    if (separator == std::string_view::npos) return std::nullopt;
+    const auto dimension = [](std::string_view part) -> int {
+        if (part.empty() || part.front() < '0' || part.front() > '9') return 0;
+        int number = 0;
+        const auto [end, error] = std::from_chars(part.data(), part.data() + part.size(), number);
+        if (error != std::errc() || end != part.data() + part.size() || number > HostWindowSizeMaximum) return 0;
+        return number;
+    };
+    const int width = dimension(text.substr(0, separator));
+    const int height = dimension(text.substr(separator + 1));
+    if (width <= 0 || height <= 0) return std::nullopt;
+    return HostWindowSize{width, height};
 }
 
 bool WindowModeStartsBorderless(const char* value) {

@@ -7,6 +7,7 @@
 #include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
 #include "Decoder/Png.hpp"
 #include "SDL_vulkan.h"
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -101,7 +102,16 @@ void DisplayWindow::create(std::uint32_t sourceWidth, std::uint32_t sourceHeight
     require(usable.w > 0 && usable.h > 0, "usable display extent must be positive");
     const auto boundsWidth = static_cast<std::uint32_t>(static_cast<std::uint64_t>(usable.w) * DisplayWindowInitialSizePercent / 100);
     const auto boundsHeight = static_cast<std::uint32_t>(static_cast<std::uint64_t>(usable.h) * DisplayWindowInitialSizePercent / 100);
-    const auto initialSize = AgcDriver::ComputeContainSize_nid_postfix(sourceWidth, sourceHeight, boundsWidth, boundsHeight, true);
+    auto initialSize = AgcDriver::ComputeContainSize_nid_postfix(sourceWidth, sourceHeight, boundsWidth, boundsHeight, true);
+    const char* sizeSetting = std::getenv("ANYPS5_WINDOW_SIZE");
+    if (sizeSetting != nullptr && *sizeSetting != '\0') {
+        if (const auto size = ParseHostWindowSize(sizeSetting)) {
+            initialSize.width = std::max(static_cast<std::uint32_t>(size->width), DisplayWindowMinimumWidth);
+            initialSize.height = std::max(static_cast<std::uint32_t>(size->height), DisplayWindowMinimumHeight);
+        } else {
+            std::fprintf(stderr, "DisplayWindow: ANYPS5_WINDOW_SIZE is not <width>x<height> with each side from 1 to %d; the window keeps its default size\n", HostWindowSizeMaximum);
+        }
+    }
     require(initialSize.width >= DisplayWindowMinimumWidth && initialSize.height >= DisplayWindowMinimumHeight, "initial window extent is smaller than the minimum");
     const char* fullscreenSetting = std::getenv("ANYPS5_FULLSCREEN");
     bool unrecognizedFullscreen = false;
