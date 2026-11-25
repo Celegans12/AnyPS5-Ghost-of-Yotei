@@ -283,7 +283,7 @@ This build does not read KytyPS5's `KYTY_PIPELINE_PRECOMPILE`: stopping the game
 | `KYTY_SHADER_LOG_FOLDER` | path | `_Shaders` | Folder of the shader dumps | debug | all | Kyty option |
 | `KYTY_COMMAND_BUFFER_DUMP` | `0` or `1`, else stops | `0` | Writes each command buffer the title submits to a file under `KYTY_COMMAND_BUFFER_DUMP_FOLDER`, named by frame and number | debug | all | Kyty option |
 | `KYTY_COMMAND_BUFFER_DUMP_FOLDER` | path | `_Buffers` | Folder of the command buffer dumps | debug | all | Kyty option |
-| `KYTY_GRAPHICS_DEBUG_DUMP` | `0` or `1`, else stops | `0` | Emits debug info in the shaders and turns the shader store off | debug | all | Kyty option |
+| `KYTY_GRAPHICS_DEBUG_DUMP` | `0` or `1`, else stops | `0` | Emits debug info in the shaders and turns the shader store off; with `KYTY_PRINTF_DIRECTION` not `Silent`, logs each draw's registers and the address, format, size, pitch and tile mode of every texture its stages read, and each direct dispatch with its buffers and textures | debug | all | Kyty option |
 | `KYTY_PROFILE` | `0` or `1`, else stops | `0` | Starts the Tracy profiler, which listens on `127.0.0.1:8086` | debug | all | Kyty option |
 | `KYTY_VULKAN_VALIDATION` | `0` or `1`, else stops | `0` | Enables the Khronos validation layer | debug | all | Kyty option |
 | `KYTY_GPU_ASSISTED_VALIDATION` | `0` or `1`, else stops | `0` | GPU-assisted validation; it turns `KYTY_VULKAN_VALIDATION` on | debug | all | Kyty option |

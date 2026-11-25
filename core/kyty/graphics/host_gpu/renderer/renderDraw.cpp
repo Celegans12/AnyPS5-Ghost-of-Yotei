@@ -1874,11 +1874,50 @@ static void CommitIndexBuffer(CommandRecorder vk_buffer, const PreparedIndexBuff
 	vk_buffer.bindIndexBuffer(prepared.buffer, prepared.offset, prepared.type);
 }
 
+static void LogStageTextures(const char* stage_name, const ShaderStageRuntime& stage) {
+	if (!stage) {
+		return;
+	}
+	const auto& program  = stage.module->info;
+	const auto& snapshot = *stage.resources;
+	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		const auto& image    = program.info.images[i];
+		const char* indirect = image.heap ? "heap"
+		                       : image.table != ShaderRecompiler::IR::ImageResource::NoImageTable
+		                           ? "table"
+		                           : nullptr;
+		if (indirect != nullptr || i >= snapshot.images.size() ||
+		    snapshot.images[i].dword_count < 8u) {
+			LOGF("  %s texture[%u]: hash=0x%016" PRIx64 " source=%u %s\n", stage_name, i,
+			     program.shader_hash, image.source, indirect != nullptr ? indirect : "unresolved");
+			continue;
+		}
+		const auto r     = DecodeNativeDescriptor<ShaderTextureResource>(snapshot.images[i]);
+		const auto width = static_cast<uint32_t>(r.Width5()) + 1u;
+		LOGF("  %s texture[%u]: hash=0x%016" PRIx64 " source=%u usage=%s addr=0x%010" PRIx64
+		     " type=%u fmt=%u extent=%ux%u pitch=%u depth=%u tile=%u\n",
+		     stage_name, i, program.shader_hash, image.source,
+		     image.written ? "read-write" : "read-only", r.Base40(),
+		     static_cast<uint32_t>(r.Type()), static_cast<uint32_t>(r.Format()), width,
+		     static_cast<uint32_t>(r.Height5()) + 1u,
+		     TileGetTexturePitch(r.Format(), width, r.TileMode()),
+		     static_cast<uint32_t>(r.Depth()) + 1u, static_cast<uint32_t>(r.TileMode()));
+	}
+}
+
 static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo& draw,
                                  const DrawRenderState& state, const DrawTargets& targets,
                                  uint32_t index_type_and_size, const void* index_addr) {
 	if (!graphics_debug_dump_enabled()) {
 		return;
+	}
+
+	static constexpr const char* stage_names[] = {"??", "VS", "PS", "CS", "MS", "LS", "HS", "DS"};
+	for (const auto& vertex: state.VertexStages()) {
+		LogStageTextures(stage_names[static_cast<uint32_t>(vertex.logical_stage)], vertex.stage);
+	}
+	if (state.ps_active) {
+		LogStageTextures("PS", state.ps_input_info.stage);
 	}
 
 	if (!draw.indexed && !Prospero::IsRectList(buffer.GetUserConfig().GetPrimType())) {
