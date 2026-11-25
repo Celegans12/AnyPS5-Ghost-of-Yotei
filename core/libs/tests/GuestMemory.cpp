@@ -1818,6 +1818,33 @@ static void CheckNoOverwriteRefusesLiveMapping() {
     Require(sceKernelReleaseDirectMemory(phys, page * 2) == 0);
 }
 
+static void CheckNoOverwriteFillsReservedRange() {
+    constexpr std::size_t page = 0x4000;
+    void* reservation = nullptr;
+    Require(sceKernelReserveVirtualRange(&reservation, page * 4, 0, 0) == 0 && reservation != nullptr);
+    auto* const base = static_cast<unsigned char*>(reservation);
+    void* inner = base + page;
+    Require(sceKernelReserveVirtualRange(&inner, page, 0x90, 0) == 0);
+    Require(inner == base + page);
+    VirtualQueryInfo reserved{};
+    Require(sceKernelVirtualQuery(inner, 0, &reserved, sizeof(reserved)) == 0);
+    Require(!reserved.is_committed && !reserved.is_direct && reserved.protection == 0);
+    std::int64_t phys = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, page, 0, 0, &phys) == 0);
+    void* mapped = base + page * 2;
+    Require(sceKernelMapDirectMemory(&mapped, page, 3, 0x90, phys, 0) == 0);
+    Require(mapped == base + page * 2);
+    static_cast<volatile unsigned char*>(mapped)[0] = 17;
+    VirtualQueryInfo direct{};
+    Require(sceKernelVirtualQuery(mapped, 0, &direct, sizeof(direct)) == 0);
+    Require(direct.is_direct && direct.offset == static_cast<std::uint64_t>(phys));
+    void* again = mapped;
+    Require(sceKernelReserveVirtualRange(&again, page, 0x90, 0) == static_cast<int>(0x8002000cu));
+    Require(static_cast<volatile unsigned char*>(mapped)[0] == 17);
+    Require(sceKernelMunmap(reinterpret_cast<std::uint64_t>(reservation), page * 4) == 0);
+    Require(sceKernelReleaseDirectMemory(phys, page) == 0);
+}
+
 #ifdef _WIN32
 constexpr std::uint32_t ReadWriteProtection = PAGE_READWRITE;
 #else
@@ -5036,6 +5063,7 @@ int main(int argc, char** argv) {
     CheckReservedRangeIsNotCommitted();
     CheckHintInsideReservation();
     CheckNoOverwriteRefusesLiveMapping();
+    CheckNoOverwriteFillsReservedRange();
     CheckMlock();
     CheckSharedDirectMemoryLifecycle();
     CheckGetDirectMemoryType();

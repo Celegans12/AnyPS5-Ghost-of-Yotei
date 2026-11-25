@@ -440,6 +440,8 @@ static void MapUnmappedPages(void* addr, size_t len) {
 }
 #endif
 
+bool Reserved(const void* addr, size_t len);
+
 namespace {
 
 constexpr int GuestMapFixedFlag = 0x10;
@@ -1558,7 +1560,8 @@ void RequireAliasesUnpinned(GuestAllocations::Mutation& mutation, std::uint64_t 
 bool RemapFixedIntoRegistered(GuestAllocations::Mutation& mutation, void* addr, size_t len, int prot, int flags, int64_t physStart = -1, bool zero = false) {
     constexpr int GuestMapFixed = 0x10;
     constexpr int GuestMapNoOverwrite = 0x80;
-    if (addr == nullptr || (flags & GuestMapFixed) == 0 || (flags & GuestMapNoOverwrite) != 0 || !mutation.Covers(addr, len)) return false;
+    if (addr == nullptr || (flags & GuestMapFixed) == 0 || !mutation.Covers(addr, len)) return false;
+    if ((flags & GuestMapNoOverwrite) != 0 && !Reserved(addr, len)) return false;
     ValidateRange(addr, len, PS5_PAGE_SIZE);
     RequireResidentUnpinned(mutation, reinterpret_cast<std::uintptr_t>(addr), len);
     if (physStart >= 0) RequireAliasesUnpinned(mutation, static_cast<std::uint64_t>(physStart), len);
@@ -2446,7 +2449,7 @@ int DoReserveVirtual(void** addr, size_t len, int flags, size_t alignment) {
         if (FixedNoOverwriteConflict(mutation, *addr, len, flags)) return SCE_KERNEL_ERROR_ENOMEM;
         if (mutation.Covers(*addr, len)) {
             constexpr int GuestMapNoOverwrite = 0x80;
-            if ((flags & GuestMapNoOverwrite) == 0 && RemapFixedIntoRegistered(mutation, *addr, len, 0, GuestMapFixedFlag)) {
+            if (((flags & GuestMapNoOverwrite) == 0 || Reserved(*addr, len)) && RemapFixedIntoRegistered(mutation, *addr, len, 0, GuestMapFixedFlag)) {
                 RecordProtection(*addr, len, -1);
                 RecordReservation(*addr, len);
                 return 0;
