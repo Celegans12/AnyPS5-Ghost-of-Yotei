@@ -162,17 +162,6 @@ extern "C" int RunKytySpeculativeCompileTest(int argc, char** argv) {
 		std::fprintf(stderr, "kyty_shim_speculative_compile: a required compile did not stop\n");
 		return 1;
 	}
-	if (argc > 1 && std::strcmp(argv[1], "uncontained") == 0) {
-		Program program;
-		Check(!Common::Fallback::Containable(), "this platform catches a stop");
-		Check(program.JudgeSpeculativeCompile(ShaderType::Compute, valid, Cursor, true) == Speculation::Uncontained,
-		      "a variant from a walk that left a load unread is compiled ahead where a stop cannot be caught");
-		Check(program.JudgeSpeculativeCompile(ShaderType::Compute, valid, Cursor, false) == Speculation::Compile,
-		      "a variant from a walk that read everything is not compiled ahead");
-		Check(program.JudgeSpeculativeCompile(ShaderType::Compute, reserved, Cursor, false) == Speculation::Refused,
-		      "a reserved dst_sel is not refused before compiling");
-		return Finish("kyty_shim_speculative_compile_uncontained");
-	}
 	Check(!Common::Fallback::Enabled(), "the test runs with KYTY_FALLBACKS=0");
 	Check(Common::Fallback::Containable(), "this platform does not catch a stop");
 

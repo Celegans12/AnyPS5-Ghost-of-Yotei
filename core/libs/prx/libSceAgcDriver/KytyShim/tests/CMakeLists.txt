@@ -317,11 +317,10 @@ if(NOT ANYPS5_KYTY_DLL)
 add_test_executable(kyty_shim_fallback_tests ${CMAKE_CURRENT_SOURCE_DIR}/Fallback.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
 target_include_directories(kyty_shim_fallback_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(kyty_shim_fallback_tests PRIVATE Kyty::gpu libkernel libc)
-if(NOT WIN32)
-    add_test(NAME kyty_shim_fallback COMMAND kyty_shim_fallback_tests)
-    set_tests_properties(kyty_shim_fallback PROPERTIES TIMEOUT 20 PASS_REGULAR_EXPRESSION "kyty_shim_fallback: ok"
-            FAIL_REGULAR_EXPRESSION "terminate called")
-endif()
+configure_windows_unwind(kyty_shim_fallback_tests)
+add_test(NAME kyty_shim_fallback COMMAND kyty_shim_fallback_tests)
+set_tests_properties(kyty_shim_fallback PROPERTIES TIMEOUT 20 ENVIRONMENT "KYTY_FALLBACKS=1"
+        PASS_REGULAR_EXPRESSION "kyty_shim_fallback: ok" FAIL_REGULAR_EXPRESSION "terminate called")
 add_test(NAME kyty_shim_fallback_off COMMAND kyty_shim_fallback_tests stop)
 set_tests_properties(kyty_shim_fallback_off PROPERTIES TIMEOUT 20 ENVIRONMENT "KYTY_FALLBACKS=0"
         PASS_REGULAR_EXPRESSION "shader decode reached the code boundary before S_ENDPGM"
@@ -406,15 +405,9 @@ target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/SpeculativeCo
 add_test_executable(kyty_shim_speculative_compile_tests ${CMAKE_CURRENT_SOURCE_DIR}/SpeculativeCompileMain.cpp)
 configure_host_test_executable(kyty_shim_speculative_compile_tests)
 target_link_libraries(kyty_shim_speculative_compile_tests PRIVATE libSceAgcDriver libkernel libc)
-if(NOT WIN32)
-    add_test(NAME kyty_shim_speculative_compile COMMAND kyty_shim_speculative_compile_tests)
-    set_tests_properties(kyty_shim_speculative_compile PROPERTIES TIMEOUT 60 ENVIRONMENT "KYTY_FALLBACKS=0"
-            PASS_REGULAR_EXPRESSION "kyty_shim_speculative_compile: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
-else()
-    add_test(NAME kyty_shim_speculative_compile_uncontained COMMAND kyty_shim_speculative_compile_tests uncontained)
-    set_tests_properties(kyty_shim_speculative_compile_uncontained PROPERTIES TIMEOUT 60
-            PASS_REGULAR_EXPRESSION "kyty_shim_speculative_compile_uncontained: ok" FAIL_REGULAR_EXPRESSION "FAILED")
-endif()
+add_test(NAME kyty_shim_speculative_compile COMMAND kyty_shim_speculative_compile_tests)
+set_tests_properties(kyty_shim_speculative_compile PROPERTIES TIMEOUT 60 ENVIRONMENT "KYTY_FALLBACKS=0"
+        PASS_REGULAR_EXPRESSION "kyty_shim_speculative_compile: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
 add_test(NAME kyty_shim_speculative_compile_required COMMAND kyty_shim_speculative_compile_tests required)
 set_tests_properties(kyty_shim_speculative_compile_required PROPERTIES TIMEOUT 60 ENVIRONMENT "KYTY_FALLBACKS=0"
         PASS_REGULAR_EXPRESSION "buffer descriptor has reserved dst_sel" FAIL_REGULAR_EXPRESSION "did not stop")

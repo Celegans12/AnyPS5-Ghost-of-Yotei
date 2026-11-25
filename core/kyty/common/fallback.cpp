@@ -33,7 +33,7 @@ bool Enabled() {
 }
 
 bool Containable() {
-#if defined(__cpp_exceptions) && !defined(_WIN32)
+#if defined(__cpp_exceptions)
 	return true;
 #else
 	return false;

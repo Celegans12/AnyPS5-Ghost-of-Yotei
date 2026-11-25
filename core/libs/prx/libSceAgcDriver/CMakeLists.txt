@@ -38,6 +38,7 @@ target_include_directories(libSceAgcDriver PRIVATE ${LIBS_INCLUDE_DIR} ${ANYPS5_
         ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(libSceAgcDriver PRIVATE $<IF:$<TARGET_EXISTS:Kyty::gpu>,Kyty::gpu,kyty_gpu> SDL2-static libc libkernel ${CMAKE_DL_LIBS})
 target_link_options(libSceAgcDriver PRIVATE LINKER:--undefined=SDL_ShowMessageBox)
+configure_windows_unwind(libSceAgcDriver)
 if(WIN32)
     target_link_options(libSceAgcDriver PRIVATE LINKER:--exclude-symbols=__emutls_get_address)
     set_source_files_properties(${kytyShimSources} PROPERTIES COMPILE_OPTIONS "-march=x86-64-v3;-fno-strict-aliasing;-ffp-contract=off;-fno-extern-tls-init")

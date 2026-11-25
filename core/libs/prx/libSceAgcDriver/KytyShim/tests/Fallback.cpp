@@ -62,7 +62,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "kyty_shim_fallback: KYTY_FALLBACKS=0 did not stop\n");
         return 0;
     }
-    Require(Common::Fallback::Enabled(), "KYTY_FALLBACKS is not on by default");
+    Require(Common::Fallback::Enabled(), "the test runs with KYTY_FALLBACKS=1");
     Require(Prepare(Ends), "a shader that ends was refused");
     Require(!Prepare(RunsOff), "a shader the decoder stops on was not caught");
     Require(!Prepare({}), "an empty shader was not caught");
