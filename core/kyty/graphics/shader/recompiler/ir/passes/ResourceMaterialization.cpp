@@ -576,12 +576,15 @@ bool ResolveSelectorKeys(const ResourcePlan& program, const DescriptorSource::In
 		    !std::has_single_bit(selector->stride) || (selector->offset & 3u) != 0u)
 			return false;
 		const auto domain_count = (uint64_t {1} << 32u) / selector->stride;
-		const auto available = material.GetSize() > selector->offset
-		    ? material.GetSize() - selector->offset : 0u;
+		uint32_t bias = 0;
+		if (!indirect.selector_byte_bias.IsEmpty() &&
+		    !WalkedValue(program, indirect.selector_byte_bias, bias)) return false;
+		const auto first = uint64_t {selector->offset} + ((bias % selector->stride) & ~3u);
+		const auto available = material.GetSize() > first ? material.GetSize() - first : 0u;
 		const auto count = std::min(domain_count,
 		    available < 4u ? 0u : (available - 4u) / selector->stride + 1u);
 		if (count > MaxIndirectDescriptorProbes ||
-		    !read_keys(material.Base48(), material.GetSize(), selector->offset, selector->stride, count)) return false;
+		    !read_keys(material.Base48(), material.GetSize(), first, selector->stride, count)) return false;
 		if (count < domain_count) keys.push_back(0u);
 	}
 	if (selector->byte_ranges.empty()) {
@@ -2145,6 +2148,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 			    Clone(target.indirect_descriptor->selector_first);
 			target.indirect_descriptor->selector_mask =
 			    Clone(target.indirect_descriptor->selector_mask);
+			target.indirect_descriptor->selector_byte_bias = Clone(target.indirect_descriptor->selector_byte_bias);
 		}
 		for (uint32_t dword = 0; dword < source.dword_count; dword++) {
 			target.dwords[dword] = Clone(source.dwords[dword]);

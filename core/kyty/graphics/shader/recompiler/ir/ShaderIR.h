@@ -6,6 +6,7 @@
 #include "common/stringUtils.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/gpu_format.h"
+#include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/Block.h"
 #include "graphics/shader/recompiler/ir/ResourceSnapshot.h"
@@ -90,7 +91,11 @@ struct MemoryInfo {
 	}
 
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
-		if (typed) return false;
+		if (typed) {
+			const auto format = Format::DecodeTBufferFormat(data_format, number_format);
+			if (!formatted || data_bits != 32u || Format::GetFormatComponentType(format) == Format::ComponentType::Unknown)
+				return false;
+		}
 		if (data_bits == 8u) return !formatted && opcode == ValueOpcode::LoadBufferU8;
 		if (data_bits == 16u) return !formatted && opcode == ValueOpcode::LoadBufferU16;
 		return data_bits == 32u &&
@@ -801,6 +806,7 @@ struct DescriptorSource {
 		Value    key_count;
 		Value                 selector_first;
 		Value    selector_mask;
+		Value    selector_byte_bias;
 		std::vector<uint32_t> sources;
 
 		bool operator==(const IndirectDescriptor& other) const = default;

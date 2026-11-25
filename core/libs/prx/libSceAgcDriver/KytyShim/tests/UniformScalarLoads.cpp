@@ -101,6 +101,7 @@ struct Compiled {
 	IR::Bindings          bindings;
 	std::vector<uint32_t> uniform_reads;
 	std::vector<uint32_t> storage_only;
+	uint32_t              indirect_typed_loads = 0;
 	std::vector<uint32_t> spirv;
 };
 
@@ -146,6 +147,13 @@ Compiled Compile(const std::vector<uint32_t>& code, const std::array<uint32_t, 1
 	auto compiled   = Recompiler::CompileProgram(std::move(translated), options, specialization, 0);
 	result.ok       = !compiled.spirv.empty();
 	result.bindings = compiled.program.bindings;
+	for (const auto* block: compiled.program.blocks) {
+		for (const auto& inst: *block) {
+			if (IR::BufferAccessOf(inst.GetOpcode()) != IR::BufferAccess::Read) continue;
+			const auto& mem = compiled.program.memory_info.at(inst.Flags<IR::MemoryFlags>().index);
+			if (mem.kind == IR::ResourceKind::IndirectBuffer && mem.typed) ++result.indirect_typed_loads;
+		}
+	}
 	for (const auto& buffer: compiled.program.info.buffers) {
 		if (!buffer.live) continue;
 		(buffer.uniform_index != UINT32_MAX ? result.uniform_reads : result.storage_only).push_back(buffer.descriptor_index);
@@ -260,17 +268,71 @@ void TableRead(bool robust) {
 	      name + "the uniform view is declared in the Uniform storage class");
 }
 
-void RuntimeOffsetDescriptors(bool wave_record) {
-	std::vector<uint32_t> code {
-	    0x936bb00cu, 0xf4201a84u, 0xd6000008u, 0xf4201ac4u, 0xd6000000u, WaitAll,
-	    0x8f6a846au, 0x8f6b856bu, 0xf4280600u, 0xd4000000u, 0xf42c0402u, 0xd6000000u, WaitAll,
-	    0xf0800109u, 0x00c40400u, WaitAll, 0xf8000801u, 0x00000004u, EndProgram,
+void IndirectTypedLoad() {
+	const std::vector<uint32_t> code {
+	    0xd760000cu, 0x00000500u, 0x870c810cu, 0x8f0c840cu, 0xf4280304u, 0x18000000u, WaitAll,
+	    0xe8eb1000u, 0x80030200u, WaitAll, 0xe0781000u, 0x80010200u, EndProgram,
 	};
-	if (wave_record) {
+	auto user_data = ConstantUserData(1u);
+	for (uint32_t entry = 0; entry < 2u; ++entry) {
+		const auto sharp = MakeSharp(SrtAddress + 256u * entry, 256u, Format32UInt, 0u, 3u);
+		for (size_t word = 0; word < sharp.size(); ++word)
+			Poke(ConstantAddress + 16u * entry + 4u * word, sharp[word]);
+	}
+	const auto compiled = Compile(code, user_data, true);
+	Check(compiled.ok && compiled.valid, "typed load from a GPU-selected buffer: " + compiled.messages);
+	Check(compiled.indirect_typed_loads == 1u, "the typed load keeps its GPU-selected V#");
+}
+
+const IR::Inst* ReadLaneSource(IR::Value value) {
+	const auto* inst = value.Resolve().TryInstruction();
+	if (inst == nullptr) return nullptr;
+	switch (inst->GetOpcode()) {
+		case IR::ValueOpcode::ReadLane: return inst;
+		case IR::ValueOpcode::IAdd32:
+		case IR::ValueOpcode::ShiftLeftLogical32:
+		case IR::ValueOpcode::IEqual32:
+		case IR::ValueOpcode::LogicalAnd:
+			if (const auto* lane = ReadLaneSource(inst->Arg(0))) return lane;
+			return ReadLaneSource(inst->Arg(1));
+		default: return nullptr;
+	}
+}
+
+enum class RecordIndex { UserData, FirstLane, Waterfall };
+
+void RuntimeOffsetDescriptors(RecordIndex index) {
+	const bool waterfall = index == RecordIndex::Waterfall;
+	const bool wave_record = index != RecordIndex::UserData;
+	const uint32_t sampler_field = waterfall ? 128u : 8u;
+	const uint32_t image_field = waterfall ? 64u : 0u;
+	std::vector<uint32_t> code;
+	uint32_t loop_start = 0;
+	if (waterfall) {
+		constexpr std::array<uint32_t, 6> LaneParityAndSaveExec {
+		    0xd7650002u, 0x000100c1u, 0xd7660002u, 0x000204c1u, 0x36040481u, 0xbea0047eu,
+		};
+		constexpr std::array<uint32_t, 6> SelectMatchingLanes {
+		    0xbe8e147eu, 0xd760000cu, 0x00001d02u, 0xd4c2001cu, 0x0002040cu, 0xbe9e241cu,
+		};
+		code.assign(LaneParityAndSaveExec.begin(), LaneParityAndSaveExec.end());
+		loop_start = static_cast<uint32_t>(code.size());
+		code.insert(code.end(), SelectMatchingLanes.begin(), SelectMatchingLanes.end());
+	} else if (wave_record) {
 		constexpr uint32_t ConvertPositionX = 0x7e040f00u;
 		constexpr uint32_t ReadFirstLaneS12 = 0x7e180502u;
-		code.insert(code.begin(), {ConvertPositionX, ReadFirstLaneS12});
+		code = {ConvertPositionX, ReadFirstLaneS12};
 	}
+	code.insert(code.end(), {
+	    waterfall ? 0x98eb0d0cu : 0x936bb00cu, 0xf4201a84u, 0xd6000000u | sampler_field,
+	    0xf4201ac4u, 0xd6000000u | image_field, WaitAll, 0x8f6a846au, 0x8f6b856bu, 0xf4280600u,
+	    0xd4000000u, 0xf42c0402u, 0xd6000000u, WaitAll, 0xf0800109u, 0x00c40400u, WaitAll,
+	});
+	if (waterfall) {
+		const auto back = loop_start - static_cast<uint32_t>(code.size() + 2u);
+		code.insert(code.end(), {0x89fe1e7eu, 0xbf890000u | (back & 0xffffu), 0xbefe0420u});
+	}
+	code.insert(code.end(), {0xf8000801u, 0x00000004u, EndProgram});
 	const uint64_t sampler_table = SrtAddress;
 	const uint64_t image_table   = SrtAddress + 0x100u;
 	constexpr std::array<std::array<uint32_t, 4>, 2> samplers {{
@@ -297,24 +359,38 @@ void RuntimeOffsetDescriptors(bool wave_record) {
 	options.user_data        = user_data;
 	const auto source = Recompiler::PrepareShaderSource(code, options);
 	auto translated   = Recompiler::TranslateProgram(source.decoded, options);
-	const auto plan   = IR::ExtractResourcePlan(translated.program);
+	auto plan = IR::ExtractResourcePlan(translated.program);
+	if (waterfall) {
+		IR::EncodeFailure failure;
+		std::vector<uint8_t> bytes;
+		IR::ResourcePlan restored;
+		if (!IR::SaveResourcePlan(plan, bytes, failure) || !IR::LoadResourcePlan(bytes, restored)) {
+			Check(false, "the waterfall selector survives a shader cache round trip");
+			return;
+		}
+		plan = std::move(restored);
+	}
 	const auto bind_table = [&](size_t reg, uint64_t address, uint32_t bytes) {
 		const auto sharp = MakeSharp(address, bytes, Format32UInt, SwizzleXyzw, 3);
 		std::copy(sharp.begin(), sharp.end(), user_data.begin() + reg);
 	};
 	bind_table(0, sampler_table, sizeof(samplers));
 	bind_table(4, image_table, sizeof(images));
-	bind_table(8, ConstantAddress, 96u);
+	bind_table(8, ConstantAddress, waterfall ? 160u : 96u);
+	if (waterfall) user_data[13] = 5u;
 	const IR::SrtRuntime runtime {.user_data = user_data, .read_specialization_memory = ReadMemory};
 	IR::ResourceSpecialization specialization;
 	for (uint32_t record = 0; record < 2u; ++record) {
-		Poke(ConstantAddress + record * 48u, 1u - record);
-		Poke(ConstantAddress + record * 48u + 8u, record);
+		const auto address = ConstantAddress + (waterfall ? 4u + record * 16u : record * 48u);
+		if (waterfall) Poke(address - 4u + sampler_field, 7u);
+		Poke(address + image_field, 1u - record);
+		Poke(address + sampler_field, record);
 	}
+	IR::ResourceSnapshot snapshot;
 	for (uint32_t record = 0; record < 2u; ++record) {
-		user_data[12] = record;
-		IR::ResourceSnapshot snapshot;
-		if (!IR::MaterializeResources(plan, runtime, snapshot, specialization)) {
+		if (!wave_record) user_data[12] = record;
+		if ((!wave_record || record == 0u) &&
+		    !IR::MaterializeResources(plan, runtime, snapshot, specialization)) {
 			Check(false, "runtime table descriptors materialize");
 			return;
 		}
@@ -343,13 +419,16 @@ void RuntimeOffsetDescriptors(bool wave_record) {
 		for (const auto* block: compiled.program.blocks) {
 			for (const auto& inst: *block) {
 				if (inst.GetOpcode() != IR::ValueOpcode::ImageSampleRaw) continue;
+				const auto* selected_lane = waterfall ? ReadLaneSource(inst.Arg(inst.NumArgs() - 1u)) : nullptr;
 				const auto record_offset = [&](size_t operand) {
 					const auto* handle = inst.Arg(operand).ResolveInstruction();
 					const auto* key    = handle->Arg(0).Resolve().TryInstruction();
 					if (key == nullptr || key->GetOpcode() != IR::ValueOpcode::ReadConstBuffer) return UINT32_MAX;
+					if (waterfall && (selected_lane == nullptr || ReadLaneSource(key->Arg(1)) != selected_lane))
+						return UINT32_MAX;
 					return compiled.program.memory_info.at(key->Flags<IR::MemoryFlags>().index).offset;
 				};
-				independent_keys = record_offset(0) == 0u && record_offset(1) == 8u;
+				independent_keys = record_offset(0) == image_field && record_offset(1) == sampler_field;
 			}
 		}
 		Check(independent_keys, "the emitted sample selects its image and sampler from their respective record fields");
@@ -364,8 +443,18 @@ void RuntimeOffsetDescriptors(bool wave_record) {
 int main() {
 	Common::SoftExitScope soft;
 	IR::SetComputeIndirectFloors(256, 8);
-	RuntimeOffsetDescriptors(false);
-	RuntimeOffsetDescriptors(true);
+	RuntimeOffsetDescriptors(RecordIndex::UserData);
+	RuntimeOffsetDescriptors(RecordIndex::FirstLane);
+	try {
+		RuntimeOffsetDescriptors(RecordIndex::Waterfall);
+	} catch (const Common::SoftExitError& error) {
+		Check(false, error.what());
+	}
+	try {
+		IndirectTypedLoad();
+	} catch (const Common::SoftExitError& error) {
+		Check(false, error.what());
+	}
 	for (const bool robust: {true, false}) {
 		DynamicOffset(robust);
 		VectorReadBuffer(robust);

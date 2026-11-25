@@ -171,7 +171,8 @@ bool EquivalentSelectorDomain(const ResourcePlan& program,
 	       left.workgroup_shift == right.workgroup_shift &&
 	       EquivalentValue(program, left.key_count, right.key_count) &&
 	       EquivalentValue(program, left.selector_first, right.selector_first) &&
-	       EquivalentValue(program, left.selector_mask, right.selector_mask);
+	       EquivalentValue(program, left.selector_mask, right.selector_mask) &&
+	       EquivalentValue(program, left.selector_byte_bias, right.selector_byte_bias);
 }
 
 Value ResolveInvariantPhi(const ResourcePlan& program, Value value) {
@@ -482,7 +483,7 @@ void ValidateProgram(const Program& program) {
 				if (memory.kind == ResourceKind::IndirectBuffer &&
 				    !memory.SupportsIndirectBufferAccess(inst.GetOpcode())) {
 					return Fail("indirect buffer requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, "
-					            "or 32-bit formatted load, a raw DWORD store or a raw 32-bit integer atomic");
+					            "or 32-bit formatted (including typed) load, a raw DWORD store or a raw 32-bit integer atomic");
 				}
 				const auto access = BufferAccessOf(inst.GetOpcode());
 				const bool packed_formatted =

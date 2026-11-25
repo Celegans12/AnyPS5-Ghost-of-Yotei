@@ -660,6 +660,7 @@ void WalkerCompiler::Consume(std::vector<std::vector<uint32_t>>& gates) {
 		AddOutput(indirect->key_count, root);
 		AddOutput(indirect->selector_first, root);
 		AddOutput(indirect->selector_mask, root);
+		AddOutput(indirect->selector_byte_bias, root);
 	};
 	for (const auto& buffer: m_plan.info.buffers) consume(buffer.source);
 	for (const auto& image: m_plan.info.images) consume(image.source);

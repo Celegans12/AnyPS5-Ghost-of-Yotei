@@ -1303,6 +1303,7 @@ private:
 				    a.signed_count != b.signed_count ||
 				    a.table_mask != b.table_mask || a.table_array != b.table_array ||
 				    !EquivalentValue(m_program, a.key_count, b.key_count) ||
+				    !EquivalentValue(m_program, a.selector_byte_bias, b.selector_byte_bias) ||
 				    a.selector_first.IsEmpty() != b.selector_first.IsEmpty() ||
 				    (!a.selector_first.IsEmpty() &&
 				     !EquivalentValue(m_program, a.selector_first, b.selector_first)) ||
@@ -2655,6 +2656,25 @@ private:
 		return false;
 	}
 
+	bool MatchBiasedScalarOffset(Value address, uint32_t& stride, Value& bias) const {
+		const auto* sum = address.Resolve().TryInstruction();
+		if (sum == nullptr || sum->GetOpcode() != ValueOpcode::IAdd32) return false;
+		for (uint32_t arm = 0; arm < 2u; ++arm) {
+			Value index;
+			uint32_t offset = 0, scale = 0;
+			if (!MatchTableOffset(sum->Arg(arm), index, offset, scale) || offset != 0u) continue;
+			const auto base = sum->Arg(arm ^ 1u);
+			stride = std::max(4u, 1u << std::countr_zero(scale));
+			if (ValidateRuntimeValue(m_program, base, RuntimeValueType::Integer)) {
+				bias = base;
+			} else {
+				stride = std::max(4u, std::gcd(stride, PossibleU32Bits(base)));
+			}
+			return true;
+		}
+		return false;
+	}
+
 	bool MatchScalarMaterialKey(Value key, DescriptorSource::IndirectDescriptor& indirect,
 	                            DescriptorSource& material_source, bool require_bound,
 	                            bool allow_scalar_domain = false) {
@@ -2666,6 +2686,7 @@ private:
 		Value index;
 		Value count;
 		Value first(0u);
+		Value byte_bias;
 		uint32_t workgroup_axis = UINT32_MAX;
 		DescriptorSource count_source;
 		uint32_t row_stride = 0;
@@ -2702,6 +2723,9 @@ private:
 		           !require_bound && allow_scalar_domain && affine && stride != 0u) {
 			stride = 1u << std::countr_zero(stride);
 			offset %= stride;
+		} else if (!affine && !require_bound && allow_scalar_domain && memory->kind == ResourceKind::ScalarBuffer &&
+		           MatchBiasedScalarOffset(read->Arg(1), stride, byte_bias)) {
+			offset = 0u;
 		} else if (count.IsEmpty() && workgroup_axis == UINT32_MAX) {
 			auto address = read->Arg(1);
 			auto active = Value(true);
@@ -2735,6 +2759,7 @@ private:
 		selector.stride = stride;
 		selector.offset = offset + (memory->offset & ~3u);
 		indirect.selector = std::move(selector);
+		indirect.selector_byte_bias = byte_bias;
 		indirect.key_count = count;
 		indirect.workgroup_axis = workgroup_axis;
 		if (rows) indirect.selector->rows.emplace(
@@ -3852,6 +3877,7 @@ private:
 						indirect.key_count = selected.key_count;
 						indirect.selector_first = selected.selector_first;
 						indirect.selector_mask = selected.selector_mask;
+						indirect.selector_byte_bias = selected.selector_byte_bias;
 						indirect.signed_count = selected.signed_count;
 						indirect.workgroup_axis = selected.workgroup_axis;
 						if (selected.table_scalar) {
@@ -5513,10 +5539,12 @@ private:
 				} else if (memory.kind != (op == ValueOpcode::ReadConstBuffer ? ResourceKind::ScalarBuffer
 				                                                               : ResourceKind::Buffer) ||
 				           !memory.SupportsIndirectBufferLoad(op)) {
-					Fail(flags.pc,
-					     "buffer descriptor is not a valid runtime value; GPU-selected access "
-					     "requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, or 32-bit formatted load, "
-					     "or a raw DWORD store or 32-bit integer atomic from a user-data base");
+					Fail(flags.pc, fmt::format(
+					    "buffer descriptor is not a valid runtime value for {} ({}-bit, typed={}, formatted={}); "
+					    "GPU-selected access requires a scalar, raw 8/16-bit, raw DWORD x1..x4, or 32-bit "
+					    "formatted load with a supported format, or a raw DWORD store or 32-bit integer atomic "
+					    "from a user-data base",
+					    ValueOpcodeName(op), memory.data_bits, memory.typed, memory.formatted));
 				}
 				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
 				m_dma_tracked                           = true;

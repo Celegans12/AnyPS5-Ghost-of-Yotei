@@ -1529,7 +1529,23 @@ uint32_t LoadBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compon
 	if (mem.kind == IR::ResourceKind::IndirectBuffer) {
 		const auto function = state.indirect_buffer_load_functions.at(
 		    {mem.data_bits, components, uint32_t(mem.coherent), uint32_t(mem.formatted)});
-		const auto args   = IndirectBufferArgs(ctx, inst);
+		auto args = IndirectBufferArgs(ctx, inst);
+		if (mem.typed) {
+			const auto format = Format::DecodeTBufferFormat(mem.data_format, mem.number_format);
+			const auto info = Format::GetFormatInfo(format);
+			uint32_t fields = static_cast<uint32_t>(format) << 12u;
+			for (uint32_t component = 0; component < info.component_count; ++component)
+				fields |= (4u + component) << (component * 3u);
+			const auto descriptor = args[3];
+			const auto control = Binary(state, spv::OpBitwiseAnd, TypeU32(state), descriptor,
+			                            ConstantU32(state, ~0x7ffffu));
+			const auto valid = Binary(state, spv::OpINotEqual, TypeBool(state),
+			    EmitBitFieldUExtract(state, descriptor, ConstantU32(state, 12u), ConstantU32(state, 7u)),
+			    ConstantU32(state, 0u));
+			args[3] = Select(state, TypeU32(state), valid,
+			                 Binary(state, spv::OpBitwiseOr, TypeU32(state), control, ConstantU32(state, fields)),
+			                 control);
+		}
 		const auto result = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpFunctionCall, TypeU32Composite(state, components), result,
 		                          function, args, ctx.Arg(inst, inst.NumArgs() - 1));
