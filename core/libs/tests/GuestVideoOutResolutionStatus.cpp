@@ -21,6 +21,25 @@ static constexpr std::uint64_t PIXEL_FORMAT = 0x8000000022000000ull;
 
 static void Require(bool value) { if (!value) std::abort(); }
 
+static void SetOutputResolution(const char* value) {
+#ifdef _WIN32
+    Require(_putenv_s("APS5_OUTPUT_RESOLUTION", value) == 0);
+#else
+    Require(setenv("APS5_OUTPUT_RESOLUTION", value, 1) == 0);
+#endif
+}
+
+static void RequireSize(int handle, std::uint32_t width, std::uint32_t height, std::uint32_t resolution) {
+    VideoOutResolutionStatus status;
+    std::memset(&status, 0xff, sizeof(status));
+    Require(sceVideoOutGetResolutionStatus(handle, &status) == 0);
+    Require(status.fullWidth == width && status.fullHeight == height);
+    Require(status.paneWidth == width && status.paneHeight == height);
+    VideoOutOutputStatus output{};
+    Require(sceVideoOutGetOutputStatus(handle, &output) == 0);
+    Require(output.resolution == resolution);
+}
+
 static bool Rejects(int handle, VideoOutResolutionStatus* status) {
     try {
         sceVideoOutGetResolutionStatus(handle, status);
@@ -41,6 +60,7 @@ static bool RejectsOutputStatus(int handle, VideoOutOutputStatus* status) {
 
 int main() {
     VideoOutTestEnvironment environment;
+    SetOutputResolution("1920x1080");
     int handle = 0;
     try {
         handle = sceVideoOutOpen(SYSTEM_USER, MAIN_BUS, 0, nullptr);
@@ -50,20 +70,28 @@ int main() {
         return 77;
     }
     Require(handle > 0);
+    RequireSize(handle, 1920, 1080, 1);
+    SetOutputResolution("3840x2160");
+    RequireSize(handle, 3840, 2160, 2);
+    SetOutputResolution("1920x1080");
 
     std::array<std::byte, 96> fresh;
     fresh.fill(std::byte{0xff});
     Require(sceVideoOutGetOutputStatusWithVrr(handle, fresh.data()) == NO_BUFFERS_REGISTERED);
     for (const auto byte : fresh) Require(byte == std::byte{0xff});
-    std::vector<std::byte> allocation(16u * 1024u * 1024u);
+    std::vector<std::byte> allocation(40u * 1024u * 1024u);
     const auto aligned = (reinterpret_cast<std::uintptr_t>(allocation.data()) + 65535u) & ~static_cast<std::uintptr_t>(65535u);
     VideoOutBuffers buffers{reinterpret_cast<void*>(aligned), nullptr, {nullptr, nullptr}};
     VideoOutBufferAttribute2 attribute{};
-    attribute.width = 1920;
-    attribute.height = 1080;
+    attribute.width = 3840;
+    attribute.height = 2160;
     attribute.pixel_format = PIXEL_FORMAT;
     attribute.tiling_mode = TILING_MODE_LINEAR;
     Require(sceVideoOutRegisterBuffers2(handle, 0, 0, &buffers, 1, &attribute, 0, nullptr) == 0);
+    RequireSize(handle, 1920, 1080, 1);
+    SetOutputResolution("3840x2160");
+    RequireSize(handle, 3840, 2160, 2);
+    SetOutputResolution("1920x1080");
 
     VideoOutResolutionStatus status;
     std::memset(&status, 0xff, sizeof(status));

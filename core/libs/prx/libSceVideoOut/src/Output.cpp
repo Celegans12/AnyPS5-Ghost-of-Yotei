@@ -296,11 +296,12 @@ int APS5_VABI sceVideoOutGetResolutionStatus(int handle, VideoOutResolutionStatu
     }
     std::unique_lock lock(cfg->mutex);
     cfg->Check();
+    const bool uhd = VideoOutDriver::Get().GetDisplayResolution() == VIDEO_OUT_RESOLUTION_2160P;
     VideoOutResolutionStatus value{};
-    value.fullWidth = cfg->width;
-    value.fullHeight = cfg->height;
-    value.paneWidth = cfg->width;
-    value.paneHeight = cfg->height;
+    value.fullWidth = uhd ? 3840 : 1920;
+    value.fullHeight = uhd ? 2160 : 1080;
+    value.paneWidth = value.fullWidth;
+    value.paneHeight = value.fullHeight;
     value.refreshRate = (cfg->outputMode == VIDEO_OUT_OUTPUT_MODE_119_88HZ) ? VIDEO_OUT_REFRESH_RATE_119_88HZ : VIDEO_OUT_REFRESH_RATE_59_94HZ;
     if (!GuestPtr<VideoOutResolutionStatus>(status).CopyOut(value)) return VIDEO_OUT_ERROR_INVALID_ADDRESS;
     return 0;
