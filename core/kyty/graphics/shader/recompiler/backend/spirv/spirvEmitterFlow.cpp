@@ -851,6 +851,22 @@ uint32_t EmitLiveMask(EmitterState& state) {
 }
 
 uint32_t EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto& state = ctx.state;
+	if (ctx.other_half == nullptr && !QuadLanes(state)) {
+		const auto first   = ctx.FirstLane(ctx.Ballot(inst.Arg(1)));
+		const auto u32     = TypeU32(state);
+		const auto is_first = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpIEqual, TypeBool(state), is_first,
+		                          EmitSubgroupLocalInvocationId(state), first);
+		const auto part = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelect, u32, part, is_first, ctx.Arg(inst, 0),
+		                          ConstantU32(state, 0));
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpGroupNonUniformBitwiseOr, u32, result,
+		                          ConstantU32(state, spv::ScopeSubgroup), spv::GroupOperationReduce,
+		                          part);
+		return result;
+	}
 	ctx.quad_read     = true;
 	const auto ballot = ctx.Ballot(inst.Arg(1));
 	const auto lane   = ctx.FirstLane(ballot);

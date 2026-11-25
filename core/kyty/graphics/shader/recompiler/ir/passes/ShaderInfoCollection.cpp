@@ -596,6 +596,10 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 			if (inst.GetOpcode() == ValueOpcode::DppMoveU32) {
 				info.subgroup_local_invocation_id = true;
 			}
+			if (inst.GetOpcode() == ValueOpcode::ReadFirstLane) {
+				info.subgroup_arithmetic          = true;
+				info.subgroup_local_invocation_id = true;
+			}
 			break;
 		}
 		case ValueOpcode::DppUpdateU32:
