@@ -41,6 +41,10 @@ struct Insn {
     DecodedInstructionInfo Info;
 };
 
+bool segmentAccess(const DecodedInstructionInfo& info) {
+    return info.HasMemoryOperand && (info.SegmentPrefix == 0x64 || info.SegmentPrefix == 0x65);
+}
+
 std::optional<std::uint8_t> pushedRegister(const std::uint8_t* code, const Insn& insn) {
     if (insn.Length == 1 && code[0] >= 0x50 && code[0] <= 0x57 && code[0] != 0x50 + kRegRsp) return static_cast<std::uint8_t>(code[0] - 0x50);
     if (insn.Length == 2 && code[0] == 0x41 && code[1] >= 0x50 && code[1] <= 0x57) return static_cast<std::uint8_t>(code[1] - 0x50 + 8);
@@ -624,8 +628,7 @@ void frameSegment(
                                         info.FlowKind == ControlFlowKind::IndirectJump ||
                                         info.FlowKind == ControlFlowKind::Return ||
                                         info.FlowKind == ControlFlowKind::Trap;
-                const bool tls = info.HasMemoryOperand && (info.SegmentPrefix == 0x64 || info.SegmentPrefix == 0x65);
-                if (!terminator || tls || address + match.Length > nextLimit) {
+                if (!terminator || segmentAccess(info) || address + match.Length > nextLimit) {
                     skip("instruction crosses the range end");
                     invalid = true;
                     break;
@@ -682,6 +685,7 @@ void frameSegment(
             constexpr std::int64_t shift = kRelocatedShift;
             if (bodyEnd - static_cast<std::int64_t>(start) < static_cast<std::int64_t>(kJumpBytes)) return "leaf shorter than a jump";
             if (overlapsExisting(start, static_cast<std::size_t>(bodyEnd))) return "overlaps another stub";
+            if (std::any_of(body.begin(), body.end(), [](const Insn& insn) { return segmentAccess(insn.Info); })) return "segment-relative access in a relocated leaf";
             if (enteredFromOutside(start + 1, start + kJumpBytes)) return "branch from outside into the start of a relocated leaf";
             const auto inside = [&](const std::int64_t target) -> std::optional<std::size_t> {
                 if (target < static_cast<std::int64_t>(start) || target >= bodyEnd) return std::nullopt;
@@ -1118,6 +1122,7 @@ void frameSegment(
             std::vector<RedZoneSiteEdit> siteEdits;
             const auto copy = [&](const std::size_t k) -> std::optional<Copied> {
                 const auto& insn = body[k];
+                if (segmentAccess(insn.Info)) return std::nullopt;
                 Copied out;
                 if (insn.Info.FlowKind == ControlFlowKind::ConditionalBranch) {
                     if (!insn.Info.HasBranchTarget || insn.Info.HasRipRelativeDisp || insn.Info.OpcodeOffset != 0) return std::nullopt;
@@ -1398,6 +1403,7 @@ void frameSegment(
             }
             const auto prologueEnd = p > 0 ? body[p - 1].Offset + body[p - 1].Length : start;
             if (reason == nullptr && !thunk && std::any_of(stackMoves.begin(), stackMoves.end(), [&](const std::size_t k) { return std::none_of(exits.begin(), exits.end(), [&](const ExitSite& exit) { return exit.Begin <= body[k].Offset && body[k].Offset < exit.End; }); })) reason = "push or pop inside the body";
+            if (reason == nullptr && std::any_of(body.begin(), body.begin() + static_cast<std::ptrdiff_t>(p), [](const Insn& insn) { return segmentAccess(insn.Info); })) reason = "segment-relative access in the prologue";
             auto entryEnd = prologueEnd;
             auto entryLast = p;
             Copied entryTail;

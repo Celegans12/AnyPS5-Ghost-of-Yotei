@@ -381,6 +381,20 @@ void framesLeavesWithoutPushes() {
     require(sites[1].OriginalBytes.size() == LoadBelowRsp.size() + Ret.size() && sites[1].Body == stubBody(exitBody), "the exit stub does not run the load moved by the shift, raise rsp and return");
 }
 
+void leavesSegmentRelativeAccessesInPlace() {
+    const std::vector<std::uint8_t> loadFsZero{0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00};
+    std::vector<std::uint8_t> body = loadFsZero;
+    append(body, StoreBelowRsp);
+    append(body, LoadBelowRsp);
+    const auto input = image({framelessLeaf({}, body, Ret)});
+    Codegen::RedZoneFrameReport report;
+    std::vector<Codegen::RedZoneDisplacement> displacements;
+    const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
+    const auto access = Base + 0x40;
+    require(std::none_of(sites.begin(), sites.end(), [&](const Codegen::TrampolineSite& site) { return site.Address < access + loadFsZero.size() && access < site.Address + site.Length; }), "an fs-relative load was moved into a stub, where the Windows TLS rewrite does not reach it");
+    require(report.Framed == 0 && !report.Skipped.empty(), "a leaf whose only entry site would move an fs-relative load was not reported as skipped");
+}
+
 void skipsFragmentsThatPopWithoutPushing() {
     std::vector<std::uint8_t> body = StoreBelowRsp;
     append(body, LoadBelowRsp);
@@ -1286,6 +1300,7 @@ int main() {
         widensShortProloguesAndExits();
         widensAShortFramePointerPrologue();
         framesLeavesWithoutPushes();
+        leavesSegmentRelativeAccessesInPlace();
         skipsFragmentsThatPopWithoutPushing();
         framesLeavesEnteredByATailJump();
         framesLeavesReadingAh();
