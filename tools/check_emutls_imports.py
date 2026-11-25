@@ -36,6 +36,7 @@ ALLOWED = {
     "libSceNpCommon.prx",
     "libScePngDec.prx",
     "libScePngEnc.prx",
+    "libScePngParser.prx",
     "libScePosixForWebKit.prx",
     "libSceRudp.prx",
     "libSceS3da.prx",
