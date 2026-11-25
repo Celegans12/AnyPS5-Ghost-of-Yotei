@@ -104,6 +104,18 @@ struct Compiled {
 	std::vector<uint32_t> spirv;
 };
 
+bool ValidateSpirv(std::span<const uint32_t> spirv, std::string& messages) {
+	spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
+	tools.SetMessageConsumer([&messages](spv_message_level_t, const char*, const spv_position_t&, const char* message) {
+		messages += message;
+		messages += '\n';
+	});
+	spvtools::ValidatorOptions validator;
+	validator.SetUniformBufferStandardLayout(true);
+	validator.SetAllowOffsetTextureOperand(true);
+	return tools.Validate(spirv.data(), spirv.size(), validator);
+}
+
 Compiled Compile(const std::vector<uint32_t>& code, const std::array<uint32_t, 16>& user_data, bool robust) {
 	ShaderComputeInputInfo info {};
 	info.wave_size          = 64;
@@ -138,15 +150,7 @@ Compiled Compile(const std::vector<uint32_t>& code, const std::array<uint32_t, 1
 		if (!buffer.live) continue;
 		(buffer.uniform_index != UINT32_MAX ? result.uniform_reads : result.storage_only).push_back(buffer.descriptor_index);
 	}
-	spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
-	tools.SetMessageConsumer([&result](spv_message_level_t, const char*, const spv_position_t&, const char* message) {
-		result.messages += message;
-		result.messages += '\n';
-	});
-	spvtools::ValidatorOptions validator;
-	validator.SetUniformBufferStandardLayout(true);
-	validator.SetAllowOffsetTextureOperand(true);
-	result.valid = result.ok && tools.Validate(compiled.spirv.data(), compiled.spirv.size(), validator);
+	result.valid = result.ok && ValidateSpirv(compiled.spirv, result.messages);
 	result.spirv = std::move(compiled.spirv);
 	return result;
 }
@@ -256,11 +260,112 @@ void TableRead(bool robust) {
 	      name + "the uniform view is declared in the Uniform storage class");
 }
 
+void RuntimeOffsetDescriptors(bool wave_record) {
+	std::vector<uint32_t> code {
+	    0x936bb00cu, 0xf4201a84u, 0xd6000008u, 0xf4201ac4u, 0xd6000000u, WaitAll,
+	    0x8f6a846au, 0x8f6b856bu, 0xf4280600u, 0xd4000000u, 0xf42c0402u, 0xd6000000u, WaitAll,
+	    0xf0800109u, 0x00c40400u, WaitAll, 0xf8000801u, 0x00000004u, EndProgram,
+	};
+	if (wave_record) {
+		constexpr uint32_t ConvertPositionX = 0x7e040f00u;
+		constexpr uint32_t ReadFirstLaneS12 = 0x7e180502u;
+		code.insert(code.begin(), {ConvertPositionX, ReadFirstLaneS12});
+	}
+	const uint64_t sampler_table = SrtAddress;
+	const uint64_t image_table   = SrtAddress + 0x100u;
+	constexpr std::array<std::array<uint32_t, 4>, 2> samplers {{
+	    {0x12u, 0x1000u, 0u, 0u}, {0x24u, 0x2000u, 0x100u, 0x40000000u},
+	}};
+	const std::array images {MakeTexture(TextureA, Format32UInt), MakeTexture(TextureB, Format32UInt)};
+	for (size_t i = 0; i < images.size(); ++i) {
+		for (size_t w = 0; w < samplers[i].size(); ++w) {
+			Poke(sampler_table + sizeof(samplers[i]) * i + 4u * w, samplers[i][w]);
+		}
+		for (size_t w = 0; w < images[i].size(); ++w) {
+			Poke(image_table + sizeof(images[i]) * i + 4u * w, images[i][w]);
+		}
+	}
+	std::array<uint32_t, 16> user_data {};
+	ShaderPixelInputInfo     pixel {};
+	pixel.ps_pos_x              = true;
+	pixel.ps_pos_y              = true;
+	pixel.target_output_mode[0] = 1;
+	Recompiler::CompileOptions options;
+	options.stage            = ShaderType::Pixel;
+	options.dump_ir          = false;
+	options.input_info.pixel = &pixel;
+	options.user_data        = user_data;
+	const auto source = Recompiler::PrepareShaderSource(code, options);
+	auto translated   = Recompiler::TranslateProgram(source.decoded, options);
+	const auto plan   = IR::ExtractResourcePlan(translated.program);
+	const auto bind_table = [&](size_t reg, uint64_t address, uint32_t bytes) {
+		const auto sharp = MakeSharp(address, bytes, Format32UInt, SwizzleXyzw, 3);
+		std::copy(sharp.begin(), sharp.end(), user_data.begin() + reg);
+	};
+	bind_table(0, sampler_table, sizeof(samplers));
+	bind_table(4, image_table, sizeof(images));
+	bind_table(8, ConstantAddress, 96u);
+	const IR::SrtRuntime runtime {.user_data = user_data, .read_specialization_memory = ReadMemory};
+	IR::ResourceSpecialization specialization;
+	for (uint32_t record = 0; record < 2u; ++record) {
+		Poke(ConstantAddress + record * 48u, 1u - record);
+		Poke(ConstantAddress + record * 48u + 8u, record);
+	}
+	for (uint32_t record = 0; record < 2u; ++record) {
+		user_data[12] = record;
+		IR::ResourceSnapshot snapshot;
+		if (!IR::MaterializeResources(plan, runtime, snapshot, specialization)) {
+			Check(false, "runtime table descriptors materialize");
+			return;
+		}
+		const auto sampler = record;
+		const auto image = 1u - record;
+		auto selected_image = snapshot.images.at(0);
+		uint32_t selected_sampler = 0;
+		if (wave_record) {
+			const auto& table = snapshot.image_tables.at(specialization.images.at(0).table);
+			selected_image = table.slots.at(table.mapping.at(1u + image));
+			const auto offset = specialization.samplers.at(0).indirect_mapping_offset;
+			const auto& mapping = snapshot.flattened_srt;
+			Check(mapping.at(offset) == 2u && mapping.at(offset + 1u + sampler * 2u) == sampler,
+			      "both record keys occur in the sampler mapping");
+			selected_sampler = mapping.at(offset + 2u + sampler * 2u);
+		}
+		Check(selected_image.dwords == images[image], "the sample uses the selected texture");
+		const auto& selected = snapshot.samplers.at(selected_sampler);
+		Check(selected.dword_count == samplers[sampler].size() &&
+		          std::equal(samplers[sampler].begin(), samplers[sampler].end(), selected.dwords.begin()),
+		      "the sample uses the selected sampler");
+	}
+	const auto compiled = Recompiler::CompileProgram(std::move(translated), options, specialization, 0);
+	if (wave_record) {
+		bool independent_keys = false;
+		for (const auto* block: compiled.program.blocks) {
+			for (const auto& inst: *block) {
+				if (inst.GetOpcode() != IR::ValueOpcode::ImageSampleRaw) continue;
+				const auto record_offset = [&](size_t operand) {
+					const auto* handle = inst.Arg(operand).ResolveInstruction();
+					const auto* key    = handle->Arg(0).Resolve().TryInstruction();
+					if (key == nullptr || key->GetOpcode() != IR::ValueOpcode::ReadConstBuffer) return UINT32_MAX;
+					return compiled.program.memory_info.at(key->Flags<IR::MemoryFlags>().index).offset;
+				};
+				independent_keys = record_offset(0) == 0u && record_offset(1) == 8u;
+			}
+		}
+		Check(independent_keys, "the emitted sample selects its image and sampler from their respective record fields");
+	}
+	std::string messages;
+	const bool valid = !compiled.spirv.empty() && ValidateSpirv(compiled.spirv, messages);
+	Check(valid, "pixel shader with runtime table descriptors: " + messages);
+}
+
 }
 
 int main() {
 	Common::SoftExitScope soft;
 	IR::SetComputeIndirectFloors(256, 8);
+	RuntimeOffsetDescriptors(false);
+	RuntimeOffsetDescriptors(true);
 	for (const bool robust: {true, false}) {
 		DynamicOffset(robust);
 		VectorReadBuffer(robust);

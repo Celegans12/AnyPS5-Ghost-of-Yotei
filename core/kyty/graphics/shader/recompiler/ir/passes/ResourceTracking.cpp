@@ -4477,8 +4477,7 @@ private:
 						m_indirect_descriptors.push_back(std::move(plan));
 					}
 				};
-				if (inst.GetOpcode() == ValueOpcode::ImageSampleRaw &&
-				    (memory.image_sample_flags & Decoder::ImageSampleFlagAdjust) == 0u) {
+				if (inst.GetOpcode() == ValueOpcode::ImageSampleRaw) {
 					plan_handle(inst.Arg(1), 4u, memory.sampler * 4u, true);
 				}
 				plan_handle(inst.Arg(0), IndirectBufferAccess(inst) ? 4u : 8u,
