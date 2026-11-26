@@ -263,7 +263,7 @@ def merge(number, words):
     if git("merge-base", base, head).decode().strip() != base:
         return
     revision_range = f"{base}..{head}"
-    paths = git("log", "--format=", "--name-only", "-z", revision_range).split(b"\0")
+    paths = git("log", "-m", "--format=", "--name-only", "-z", revision_range).split(b"\0")
     if any(path.lstrip(b"\n").startswith(b".github/") for path in paths):
         note(f"- #{number} needs a manual merge because it changes the GitHub configuration.")
         return
@@ -274,8 +274,7 @@ def merge(number, words):
             note(f"- #{number} needs a manual review before merging binary or submodule changes.")
             return
         changes += b"\n".join(line for line in patch.splitlines() if line.startswith(b"+")) + b"\n"
-    title = f"chore: integrate reviewed pull request #{number}"
-    if not safe_for_publication(changes + b"\n" + title.encode(), words):
+    if not safe_for_publication(changes, words):
         note(f"- #{number} needs a manual publication check.")
         return
     latest = gh(pull_api(number))
@@ -286,16 +285,13 @@ def merge(number, words):
         or not approved(number, head) or not ci_passed(number, latest)
     ):
         return
-    message = f"Integrate the approved revision of pull request #{number}."
-    if not safe_for_publication(message.encode(), words):
-        note(f"- #{number} needs a manual publication check.")
-        return
-    result = gh(pull_api(number, "/merge"), method="PUT", data={
-        "sha": head, "merge_method": "merge", "commit_title": title, "commit_message": message,
-    })
-    if not result["merged"]:
-        raise RuntimeError("GitHub did not merge the pull request")
-    note(f"- Merged #{number}.")
+    branch = f"refs/heads/{BASE_BRANCH}"
+    git(
+        "-c", "credential.helper=",
+        "-c", "credential.https://github.com.helper=!gh auth git-credential",
+        "push", f"--force-with-lease={branch}:{base}", "origin", f"{head}:{branch}",
+    )
+    note(f"- Integrated the approved revision of #{number}.")
 
 
 def run(mode):
