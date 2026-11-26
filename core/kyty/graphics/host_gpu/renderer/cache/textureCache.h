@@ -475,10 +475,12 @@ private:
 	std::unordered_map<ImageId, std::vector<ImageId>> m_stencil_copies;
 	std::vector<std::pair<ImageId, uint64_t>>         m_parked_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
+	uint64_t                                          m_memory_budget      = 0;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
+	void             UpdateMemoryThresholds(uint64_t budget_bytes);
 	uint64_t         m_gc_tick                = 0;
 	std::atomic<uint32_t> m_partial_candidates {0};
 	uint64_t         m_image_set_epoch        = 0;
@@ -499,6 +501,7 @@ private:
 	[[nodiscard]] uint64_t      ImageEpochInRegionUnlocked(uint64_t address, uint64_t size) const;
 
 	friend struct TextureCacheTestAccess;
+	friend struct VramBudgetTestAccess;
 	friend class BufferCache;
 	friend class RenderExecutor;
 	friend class ImageHeap;

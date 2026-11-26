@@ -164,16 +164,20 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 	m_readback_storage_images = write_back_value != "0";
 #endif
 	if (m_graphics.CanReportMemoryUsage()) {
-		constexpr int64_t GiB = 1024ll * 1024 * 1024;
-		const auto        budget =
-		    static_cast<int64_t>(std::min<uint64_t>(m_graphics.GetTotalMemoryBudget(), INT64_MAX));
-		const auto threshold = std::min<int64_t>(budget, 8 * GiB);
-		m_pressure_gc_memory = static_cast<uint64_t>(
-		    std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
-		m_critical_gc_memory = static_cast<uint64_t>(
-		    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
-		m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
+		UpdateMemoryThresholds(m_graphics.GetTotalMemoryBudget());
 	}
+}
+
+void TextureCache::UpdateMemoryThresholds(uint64_t budget_bytes) {
+	m_memory_budget = budget_bytes;
+	constexpr int64_t GiB = 1024ll * 1024 * 1024;
+	const auto        budget = static_cast<int64_t>(std::min<uint64_t>(budget_bytes, INT64_MAX));
+	const auto        threshold = std::min<int64_t>(budget, 8 * GiB);
+	m_pressure_gc_memory = static_cast<uint64_t>(
+	    std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
+	m_critical_gc_memory = static_cast<uint64_t>(
+	    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
+	m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
 }
 
 TextureCache::~TextureCache() {
@@ -3777,6 +3781,10 @@ void TextureCache::RunGarbageCollector() {
 	const uint64_t   tick = m_gc_tick++;
 	DiscardParkedImages(0, 0);
 	if (m_graphics.CanReportMemoryUsage()) {
+		const auto budget = m_graphics.GetTotalMemoryBudget();
+		if (budget != m_memory_budget) {
+			UpdateMemoryThresholds(budget);
+		}
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
 	if (m_total_used_memory < m_trigger_gc_memory) {
@@ -3788,10 +3796,10 @@ void TextureCache::RunGarbageCollector() {
 		uint64_t age        = 16;
 		size_t   deletions  = 10;
 		if (aggressive) {
-			age       = 160;
+			age       = 2;
 			deletions = 40;
 		} else if (pressured) {
-			age       = GcDownloadAge;
+			age       = 8;
 			deletions = 20;
 		}
 		age = std::min(age, tick);
@@ -3834,6 +3842,9 @@ void TextureCache::RunGarbageCollector() {
 	collect(false);
 	if (m_total_used_memory >= m_critical_gc_memory) {
 		collect(true);
+	}
+	if (m_total_used_memory >= m_pressure_gc_memory) {
+		m_graphics.TrimRecycledImages();
 	}
 }
 

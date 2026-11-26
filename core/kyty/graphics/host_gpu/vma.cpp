@@ -357,4 +357,11 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 	image.allocation = nullptr;
 }
 
+void GraphicContext::TrimRecycledImages() {
+	if (allocator == nullptr) {
+		return;
+	}
+	DestroyRecycledImages(allocator);
+}
+
 }

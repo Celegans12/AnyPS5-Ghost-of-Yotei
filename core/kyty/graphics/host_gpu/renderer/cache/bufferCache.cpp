@@ -392,15 +392,19 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	if (!m_graphics.CanReportMemoryUsage()) {
 		return;
 	}
+	UpdateMemoryThresholds(m_graphics.GetTotalMemoryBudget());
+}
+
+void BufferCache::UpdateMemoryThresholds(uint64_t budget_bytes) {
+	m_memory_budget = budget_bytes;
 	constexpr int64_t GiB              = 1024ll * 1024 * 1024;
 	constexpr int64_t target_threshold = 8 * GiB;
-	const auto        budget =
-	    static_cast<int64_t>(std::min<uint64_t>(m_graphics.GetTotalMemoryBudget(), INT64_MAX));
-	const auto threshold = std::min(budget, target_threshold);
-	const auto expected  = std::min(budget - 6 * threshold / 10, budget - GiB);
-	const auto critical  = std::min(budget - 2 * threshold / 10, budget - GiB / 2);
-	m_trigger_gc_memory  = static_cast<uint64_t>(std::max<int64_t>(expected, GiB));
-	m_critical_gc_memory = static_cast<uint64_t>(std::max<int64_t>(critical, 2 * GiB));
+	const auto        budget           = static_cast<int64_t>(std::min<uint64_t>(budget_bytes, INT64_MAX));
+	const auto        threshold        = std::min(budget, target_threshold);
+	const auto        expected         = std::min(budget - 6 * threshold / 10, budget - GiB);
+	const auto        critical         = std::min(budget - 2 * threshold / 10, budget - GiB / 2);
+	m_trigger_gc_memory                = static_cast<uint64_t>(std::max<int64_t>(expected, GiB));
+	m_critical_gc_memory               = static_cast<uint64_t>(std::max<int64_t>(critical, 2 * GiB));
 }
 
 BufferCache::~BufferCache() {
@@ -3251,6 +3255,10 @@ void BufferCache::RunGarbageCollector() {
 	const auto tick = m_gc_tick++;
 	CollectStaleBuffers(tick);
 	if (m_graphics.CanReportMemoryUsage()) {
+		const auto budget = m_graphics.GetTotalMemoryBudget();
+		if (budget != m_memory_budget) {
+			UpdateMemoryThresholds(budget);
+		}
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
 	if (m_total_used_memory < m_trigger_gc_memory) {
