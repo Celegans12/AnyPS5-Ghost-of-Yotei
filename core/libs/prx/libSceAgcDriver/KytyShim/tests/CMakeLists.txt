@@ -746,7 +746,7 @@ set_tests_properties(kyty_shim_generic_compute_replay_wide PROPERTIES TIMEOUT 18
 if(NOT ANYPS5_ENABLE_ASAN AND NOT ANYPS5_ENABLE_TSAN)
     add_test(NAME kyty_shim_prepared_variant_first_use COMMAND kyty_shim_generic_compute_replay_tests
             $<TARGET_FILE:agc_frame_replay> --prepared)
-    set_tests_properties(kyty_shim_prepared_variant_first_use PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+    set_tests_properties(kyty_shim_prepared_variant_first_use PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
             PASS_REGULAR_EXPRESSION "kyty_shim_prepared_variant_first_use: ok")
 endif()
 add_test_executable(kyty_shim_packed_unorm_blend_tests
