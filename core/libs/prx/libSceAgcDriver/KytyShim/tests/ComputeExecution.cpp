@@ -67,11 +67,23 @@ struct Gpu {
 	vk::Queue                          queue;
 	uint32_t                           family = 0;
 	vk::PhysicalDeviceMemoryProperties memory;
+	uint32_t                           compute_subgroup = 0;
 	uint32_t                           min_subgroup = 0;
 	uint32_t                           max_subgroup = 0;
+	uint32_t                           max_compute_subgroups = 0;
 	bool                               subgroup_control = false;
 	std::string                        name;
 };
+
+enum class Subgroup32 { Unavailable, Native, Required };
+
+Subgroup32 ComputeSubgroup32(const Gpu& gpu, uint32_t threads) {
+	if (gpu.subgroup_control && gpu.min_subgroup <= HostSubgroup && HostSubgroup <= gpu.max_subgroup &&
+	    threads <= static_cast<uint64_t>(gpu.max_compute_subgroups) * HostSubgroup) {
+		return Subgroup32::Required;
+	}
+	return gpu.compute_subgroup == HostSubgroup ? Subgroup32::Native : Subgroup32::Unavailable;
+}
 
 int NoDevice(const char* why) {
 	const char* required = std::getenv("ANYPS5_REQUIRE_VULKAN");
@@ -146,13 +158,17 @@ std::optional<Gpu> OpenGpu(const char*& why) {
 	gpu.memory = gpu.physical.getMemoryProperties();
 
 	vk::PhysicalDeviceVulkan13Properties properties13;
+	vk::PhysicalDeviceSubgroupProperties subgroup;
 	vk::PhysicalDeviceDriverProperties   driver;
 	vk::PhysicalDeviceProperties2        properties;
-	driver.pNext     = &properties13;
+	subgroup.pNext   = &properties13;
+	driver.pNext     = &subgroup;
 	properties.pNext = &driver;
 	gpu.physical.getProperties2(&properties);
+	if (subgroup.supportedStages & vk::ShaderStageFlagBits::eCompute) gpu.compute_subgroup = subgroup.subgroupSize;
 	gpu.min_subgroup = properties13.minSubgroupSize;
 	gpu.max_subgroup = properties13.maxSubgroupSize;
+	gpu.max_compute_subgroups = properties13.maxComputeWorkgroupSubgroups;
 	gpu.subgroup_control = features13.subgroupSizeControl == VK_TRUE &&
 	                       (properties13.requiredSubgroupSizeStages & vk::ShaderStageFlagBits::eCompute);
 	gpu.name = std::string(properties.properties.deviceName.data()) + " (" + driver.driverName.data() + ", " +
@@ -313,9 +329,9 @@ bool Run(const Gpu& gpu, const Dispatch& dispatch) {
 	auto compiled = Recompiler::CompileProgram(std::move(translated), options, specialization, 0u);
 	RequireValid(compiled.spirv, what);
 	const auto info = std::move(compiled.program).TakeCompiledInfo();
-	if (!lane_local && gpu.max_subgroup < HostSubgroup) {
-		std::printf("%s: %s: skipped, the program is not lane-local and the device's subgroups hold %u lanes\n", Name,
-		            dispatch.name, gpu.max_subgroup);
+	const auto subgroup32 = ComputeSubgroup32(gpu, dispatch.threads);
+	if (!lane_local && subgroup32 == Subgroup32::Unavailable) {
+		std::printf("%s: %s: skipped, the program needs a 32-lane compute subgroup\n", Name, dispatch.name);
 		return false;
 	}
 	const auto& layout = info.bindings;
@@ -403,7 +419,7 @@ bool Run(const Gpu& gpu, const Dispatch& dispatch) {
 	pipeline_info.stage.stage  = vk::ShaderStageFlagBits::eCompute;
 	pipeline_info.stage.module = module;
 	pipeline_info.stage.pName  = "main";
-	if (gpu.subgroup_control && HostSubgroup >= gpu.min_subgroup && HostSubgroup <= gpu.max_subgroup) {
+	if (subgroup32 == Subgroup32::Required) {
 		subgroup.requiredSubgroupSize = HostSubgroup;
 		pipeline_info.stage.pNext     = &subgroup;
 	}
@@ -970,7 +986,7 @@ void MultiplyThenAddRoundsProduct(const Gpu& gpu) {
 }
 
 void SamplerSpill(const Gpu& gpu) {
-	constexpr uint32_t Threads = 32;
+	constexpr uint32_t Threads = HostSubgroup;
 	alignas(256) std::array<uint32_t, Threads> output;
 	alignas(256) const std::array<uint32_t, 64> texture {};
 	output.fill(0xdeadbeefu);
@@ -1001,10 +1017,15 @@ int main(int argc, char** argv) {
 	auto        gpu = OpenGpu(why);
 	if (!gpu) return NoDevice(why);
 	if (argc == 2 && std::string_view(argv[1]) == "sampler-spill") {
-		if (gpu->max_subgroup < HostSubgroup) {
+		const auto subgroup32 = ComputeSubgroup32(*gpu, HostSubgroup);
+		if (subgroup32 == Subgroup32::Unavailable) {
+			std::printf("%s: sampler spill: skipped, %s has no 32-lane compute subgroup\n", Name, gpu->name.c_str());
 			CloseGpu(*gpu);
-			return NoDevice("a 32-lane subgroup is unavailable");
+			return SkippedExit;
 		}
+		std::printf("sampler spill: %s compute subgroup size %u (native compute size %u, supported size range %u-%u)\n",
+		            subgroup32 == Subgroup32::Required ? "requesting" : "using native", HostSubgroup, gpu->compute_subgroup,
+		            gpu->min_subgroup, gpu->max_subgroup);
 		SamplerSpill(*gpu);
 	} else {
 		SumOfAbsoluteDifferences(*gpu);
