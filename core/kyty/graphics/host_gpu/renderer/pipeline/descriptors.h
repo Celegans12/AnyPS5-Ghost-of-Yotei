@@ -60,7 +60,8 @@ struct TextureBinding {
 	vk::ImageLayout            layout = vk::ImageLayout::eUndefined;
 	std::vector<vk::ImageView> mip_views;
 	TextureDescDerivation* lookup = nullptr;
-	bool                   reused = false;
+	bool                   reused   = false;
+	bool                   declined = false;
 };
 
 struct PreparedBindings {

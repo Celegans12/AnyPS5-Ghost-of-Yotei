@@ -171,6 +171,7 @@ private:
 	uint64_t                             m_suspend_draw = 0;
 	std::vector<ShaderRecompiler::IR::ImageResource>  m_profiles;
 	std::vector<bool>                                 m_table_profiles;
+	std::vector<uint32_t>                             m_key_profiles;
 	std::vector<Element>                              m_elements;
 	std::vector<std::vector<Use>>                     m_uses;
 	std::vector<uint32_t>                             m_marked;
@@ -180,6 +181,7 @@ private:
 	std::vector<uint32_t>                             m_pending;
 	std::vector<uint32_t>                             m_released;
 	std::vector<uint32_t>                             m_held;
+	std::vector<uint32_t>                             m_declined;
 	std::vector<uint32_t>                             m_dcc;
 	std::vector<std::pair<uint64_t, ImageId>>         m_away;
 	uint64_t                                          m_held_serial = 0;

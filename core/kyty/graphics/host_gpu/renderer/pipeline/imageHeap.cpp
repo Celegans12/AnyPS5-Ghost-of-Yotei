@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
@@ -12,6 +13,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <iterator>
 #include <type_traits>
@@ -61,6 +63,25 @@ std::unique_ptr<Buffer> SlotBuffer(RenderContext& context, uint64_t size) {
 	    vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eStorageBuffer |
 	        vk::BufferUsageFlagBits::eShaderDeviceAddress,
 	    std::bit_ceil(size + 4u));
+}
+
+IR::ImageResource ResolutionProfile(const IR::ImageResource& root) {
+	auto resolved                       = root;
+	resolved.source                     = 0;
+	resolved.descriptor_index           = UINT32_MAX;
+	resolved.first_use_pc               = 0;
+	resolved.indirect_root              = IR::ImageResource::NoIndirectImage;
+	resolved.indirect_mapping_offset    = 0;
+	resolved.indirect_search_iterations = 0;
+	resolved.indirect_resources.clear();
+	resolved.table                      = IR::ImageResource::NoImageTable;
+	resolved.table_capacity             = 0;
+	resolved.table_mapping_offset       = 0;
+	resolved.table_entry_mask           = 0;
+	resolved.table_descriptor_base      = UINT32_MAX;
+	resolved.unfiltered_access_only     = false;
+	resolved.sample_access_only         = false;
+	return resolved;
 }
 
 std::pair<uint64_t, uint64_t> PageRange(uint64_t base, uint64_t size, size_t begin, size_t end) {
@@ -217,7 +238,13 @@ uint32_t ImageHeap::Profile(const IR::ImageResource& root, bool table) {
 	}
 	m_profiles.push_back(root);
 	m_table_profiles.push_back(table);
-	return static_cast<uint32_t>(m_profiles.size() - 1u);
+	const auto profile = static_cast<uint32_t>(m_profiles.size() - 1u);
+	m_key_profiles.push_back(profile);
+	if (auto resolved = ResolutionProfile(root); resolved != root) {
+		const auto key_profile  = Profile(resolved, table);
+		m_key_profiles[profile] = key_profile;
+	}
+	return profile;
 }
 
 bool ImageHeap::AcquireList(const IR::ImageHeapList& list, IR::ImageHeapView& result) {
@@ -242,7 +269,8 @@ bool ImageHeap::AcquireList(const IR::ImageHeapList& list, IR::ImageHeapView& re
 	m_scratch.reserve(list.values.size());
 	for (auto value: list.values) {
 		const auto kind = IR::ImageHeapKind(m_profiles[profile], value);
-		m_scratch.push_back(kind == 0u ? 0u : Intern(view, kind, {.value = value, .profile = profile}));
+		m_scratch.push_back(
+		    kind == 0u ? 0u : Intern(view, kind, {.value = value, .profile = m_key_profiles[profile]}));
 	}
 	const auto slots = list.values.size() + 2u;
 	for (auto slot = slots - 1u; slot < held.slots.size(); ++slot) Assign(held, slot, 0u);
@@ -362,7 +390,7 @@ void ImageHeap::UpdateProbe(View& view, uint64_t probe) {
 	const auto& profile = m_profiles[view.profile];
 	const auto& words   = view.memory.words;
 	const auto  offset  = static_cast<uint32_t>((view.first + probe * view.step) / 4u);
-	Key         key {.value = {.dword_count = 8u}, .profile = view.profile};
+	Key         key {.value = {.dword_count = 8u}, .profile = m_key_profiles[view.profile]};
 	std::copy_n(words.begin() + offset,
 	            std::min<size_t>(profile.r128 ? 4u : 8u, words.size() - offset),
 	            key.value.dwords.begin());
@@ -579,15 +607,34 @@ ImageId ImageHeap::CurrentImage(const Image::HeapChange& change) {
 
 uint32_t ImageHeap::Allocate(bool may_fail) {
 	auto& scheduler = m_context.GetCommandScheduler();
-	while (!m_retired.empty() && scheduler.IsFree(m_retired.front().first)) {
-		m_free.push_back(m_retired.front().second);
-		m_retired.pop_front();
+	const auto reclaim = [&] {
+		while (!m_retired.empty() && scheduler.IsFree(m_retired.front().first)) {
+			m_free.push_back(m_retired.front().second);
+			m_retired.pop_front();
+		}
+	};
+	reclaim();
+	if (m_free.empty() && m_elements.size() + SlotsKeptFromTables >= IR::ImageHeapCapacity) {
+		Retire();
+		reclaim();
+		if (m_free.empty() && m_elements.size() == IR::ImageHeapCapacity && !m_retired.empty() &&
+		    m_retired.front().first < scheduler.CurrentTick()) {
+			scheduler.Wait(m_retired.front().first);
+			reclaim();
+		}
 	}
 	if (may_fail && IR::ImageHeapCapacity - m_elements.size() + m_free.size() <= SlotsKeptFromTables) return 0u;
 	if (m_free.empty()) {
 		if (m_elements.size() == IR::ImageHeapCapacity) {
-			if (may_fail) return 0u;
-			EXIT("image heaps exceed %u resident images\n", IR::ImageHeapCapacity);
+			if (!may_fail) {
+				static std::atomic_bool reported {false};
+				if (!reported.exchange(true, std::memory_order_relaxed)) {
+					LOGF("Image heap: all %u slots are in use; a heap view that needs another one is released and its "
+					     "draws bind their textures without the heap\n",
+					     IR::ImageHeapCapacity);
+				}
+			}
+			return 0u;
 		}
 		m_elements.emplace_back();
 		m_uses.emplace_back();
@@ -693,6 +740,8 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 			binding.image_view = textures.FindTexture(binding.image_id, binding.desc);
 			if (binding.desc.info.metadata.kind == ImageMetadataKind::Dcc) m_dcc.push_back(index);
 			m_away.emplace_back(image.serial, binding.image_id);
+		} else if (binding.declined) {
+			m_declined.push_back(index);
 		} else if (!binding.desc.info.data.Empty()) {
 			m_held.push_back(index);
 		}
@@ -700,6 +749,11 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 		                             binding.image_view ? binding.layout : vk::ImageLayout::eGeneral}});
 	}
 	m_pending.clear();
+	if (!m_declined.empty()) {
+		for (const auto index: m_declined) Mark(index, State::Buried);
+		m_declined.clear();
+		Repoint();
+	}
 	WriteDescriptors();
 }
 

@@ -1048,7 +1048,9 @@ static TextureBinding DeclineTableView(TextureCache::ImageDesc& desc, vk::Format
 	    "RenderExecutor::ResolveTexture (incompatible image view)", 0, 0,
 	    fmt::format("texture 0x{:016x} image format {} view format {}", desc.info.data.address,
 	                static_cast<int>(image_format), static_cast<int>(view_format)));
-	return {ImageId {}, nullptr, std::move(desc)};
+	TextureBinding binding {ImageId {}, nullptr, std::move(desc)};
+	binding.declined = true;
+	return binding;
 }
 
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
