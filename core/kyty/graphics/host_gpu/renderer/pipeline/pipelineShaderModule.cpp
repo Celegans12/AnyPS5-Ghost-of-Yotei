@@ -153,14 +153,6 @@ ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	        .subgroup_stages     = SubgroupStages(graphics.subgroup_supported_stages)};
 }
 
-uint64_t ManifestModule::ProgramHash() const {
-	if (back_hash == 0) {
-		return code_hash;
-	}
-	const uint64_t hashes[] = {code_hash, back_hash};
-	return XXH3_64bits(hashes, sizeof(hashes));
-}
-
 bool PipelineCache::ResolveTessellationLayout(const HW::ShaderRegisters& sh, const ShaderParams& ls,
                                               const ShaderParams& hs, uint64_t address, bool lookup_only,
                                               ShaderTessellationInputInfo& tess) {
