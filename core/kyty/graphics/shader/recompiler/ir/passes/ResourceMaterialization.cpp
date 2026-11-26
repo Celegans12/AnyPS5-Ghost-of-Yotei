@@ -1598,11 +1598,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		    static_cast<Prospero::TileMode>((descriptor.dwords[3] >> 20u) & 0x1fu) ==
 		        Prospero::TileMode::kDepth;
 		image.conversion_format = depth_bits ? format : ImageConversionFormat(format);
-		const auto* base_source = Source(program, base.source);
-		const bool  table_heap  = image.heap && base_source != nullptr &&
-		                         base_source->indirect_descriptor.has_value() &&
-		                         base_source->indirect_descriptor->table_array;
-		image.skip_degamma = !table_heap && Prospero::IsSrgbFormat(format) &&
+		image.skip_degamma = !image.heap && Prospero::IsSrgbFormat(format) &&
 		                     SamplerSkipsDegamma(program, snapshot, base_index);
 		if (!storage && !base.depth_compare && !image.skip_degamma &&
 		    image.indirect_root == ImageResource::NoIndirectImage &&
