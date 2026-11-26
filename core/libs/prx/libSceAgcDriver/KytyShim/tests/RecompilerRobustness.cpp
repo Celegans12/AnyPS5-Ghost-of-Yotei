@@ -2,8 +2,10 @@
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "spirv/unified1/spirv.hpp"
 
+#include <array>
 #include <cstdint>
 #include <cstdio>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -183,6 +185,94 @@ bool FlatOffsets() {
 	return ok;
 }
 
+struct MadCase {
+	const char*           name;
+	std::vector<uint32_t> words;
+	bool                  fused;
+};
+
+const std::vector<MadCase> MadCases = {
+    {"v_mac_f32", {0x7e080302u, 0x3e080300u, 0xf8000801u, 0x00000004u, 0xbf810000u}, false},
+    {"v_mad_f32", {0xd5410004u, 0x040a0300u, 0xf8000801u, 0x00000004u, 0xbf810000u}, false},
+    {"v_fmac_f32", {0x7e080302u, 0x56080300u, 0xf8000801u, 0x00000004u, 0xbf810000u}, true},
+    {"v_fma_f32", {0xd54b0004u, 0x040a0300u, 0xf8000801u, 0x00000004u, 0xbf810000u}, true},
+};
+
+struct MadScan {
+	uint32_t fma            = 0;
+	uint32_t product_sums   = 0;
+	uint32_t exact_products = 0;
+};
+
+MadScan ScanMad(const std::vector<uint32_t>& words) {
+	MadScan                              scan;
+	std::set<uint32_t>                   glsl;
+	std::set<uint32_t>                   f32_types;
+	std::set<uint32_t>                   no_contraction;
+	std::set<uint32_t>                   products;
+	std::vector<std::array<uint32_t, 3>> sums;
+	for (size_t offset = 5; offset < words.size();) {
+		const uint32_t count = words[offset] >> 16u;
+		if (count == 0u || count > words.size() - offset) break;
+		const auto opcode = static_cast<spv::Op>(words[offset] & 0xffffu);
+		if (opcode == spv::OpExtInstImport &&
+		    std::string_view(reinterpret_cast<const char*>(&words[offset + 2u])).starts_with("GLSL.std.450")) {
+			glsl.insert(words[offset + 1u]);
+		}
+		if (opcode == spv::OpTypeFloat && words[offset + 2u] == 32u) f32_types.insert(words[offset + 1u]);
+		if (opcode == spv::OpDecorate && words[offset + 2u] == spv::DecorationNoContraction) no_contraction.insert(words[offset + 1u]);
+		if (opcode == spv::OpExtInst && glsl.contains(words[offset + 3u]) && words[offset + 4u] == 50u) ++scan.fma;
+		if (opcode == spv::OpFMul && f32_types.contains(words[offset + 1u])) products.insert(words[offset + 2u]);
+		if (opcode == spv::OpFAdd && f32_types.contains(words[offset + 1u])) {
+			sums.push_back({words[offset + 2u], words[offset + 3u], words[offset + 4u]});
+		}
+		offset += count;
+	}
+	for (const auto& [sum, left, right]: sums) {
+		for (const auto operand: {left, right}) {
+			if (!products.contains(operand)) continue;
+			++scan.product_sums;
+			scan.exact_products += no_contraction.contains(operand) && no_contraction.contains(sum);
+		}
+	}
+	return scan;
+}
+
+bool MadNotFused() {
+	bool ok = true;
+	for (const auto& entry: MadCases) {
+		for (const bool exact: {true, false}) {
+			const std::string what = std::string(entry.name) + (exact ? "" : " with f32_product_no_contraction off");
+			auto profile = KytyFuzz::Profile();
+			profile.f32_product_no_contraction = exact;
+			std::vector<uint32_t> spirv;
+			std::string           refusal;
+			bool                  emitted = false;
+			KytyFuzz::Run(entry.words, 0x04, 0x00, &refusal, &emitted, &profile, &spirv);
+			if (!emitted) {
+				std::printf("mad-not-fused: FAILED, %s did not emit SPIR-V: %s\n", what.c_str(), refusal.c_str());
+				ok = false;
+				continue;
+			}
+			std::string message;
+			if (!KytyFuzz::Valid(spirv, message)) {
+				std::printf("mad-not-fused: FAILED, %s is not valid SPIR-V: %s\n", what.c_str(), message.c_str());
+				ok = false;
+				continue;
+			}
+			const auto scan     = ScanMad(spirv);
+			const bool expected = entry.fused ? scan.fma == 1u && scan.product_sums == 0u
+			                                  : scan.fma == 0u && scan.product_sums == 1u && scan.exact_products == 1u;
+			if (!expected) {
+				std::printf("mad-not-fused: FAILED, %s: fma=%u product_sums=%u no_contraction_pairs=%u\n", what.c_str(), scan.fma,
+				            scan.product_sums, scan.exact_products);
+				ok = false;
+			}
+		}
+	}
+	return ok;
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -229,6 +319,11 @@ int main(int argc, char** argv) {
 			return 1;
 		}
 		std::printf("%s: ok\n", entry.name);
+	}
+	if (argc < 2 || std::string_view(argv[1]) == "mad-not-fused") {
+		found = true;
+		if (!MadNotFused()) return 1;
+		std::printf("mad-not-fused: ok\n");
 	}
 	if (!found) {
 		std::printf("kyty_shim_recompiler_robustness: unknown case %s\n", argv[1]);
