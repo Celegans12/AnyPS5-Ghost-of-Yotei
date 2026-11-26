@@ -1969,10 +1969,13 @@ static bool PopulatesDirectMappings() {
     return populates;
 }
 
-static bool HostKeepsResident(std::size_t bytes) {
+static std::size_t ResidentRoom(std::size_t bytes, std::size_t pageBytes) {
     MEMORYSTATUSEX status{};
     status.dwLength = sizeof(status);
-    return GlobalMemoryStatusEx(&status) != 0 && status.ullAvailPhys >= bytes + status.ullTotalPhys / 4;
+    if (GlobalMemoryStatusEx(&status) == 0) return 0;
+    const std::uint64_t reserve = status.ullTotalPhys / 16;
+    const std::uint64_t room = status.ullAvailPhys > reserve ? (status.ullAvailPhys - reserve) / pageBytes * pageBytes : 0;
+    return static_cast<std::size_t>(std::min<std::uint64_t>(bytes, room));
 }
 
 static bool TouchPages(std::uintptr_t start, std::uintptr_t end, std::size_t pageBytes) {
@@ -1984,16 +1987,17 @@ static bool TouchPages(std::uintptr_t start, std::uintptr_t end, std::size_t pag
     return true;
 }
 
-static void PopulateDirectMapping(std::uintptr_t address, std::size_t bytes) {
+static void PopulateDirectMapping(std::uintptr_t address, std::size_t mappedBytes) {
     if (!PopulatesDirectMappings()) return;
-    if (!HostKeepsResident(bytes)) {
-        static std::once_flag noted;
-        std::call_once(noted, [bytes] { std::fprintf(stderr, "[memory] direct memory of %zu MiB and later mappings that do not fit in a quarter of host memory stay paged on demand\n", bytes >> 20); });
-        return;
-    }
     SYSTEM_INFO system{};
     GetSystemInfo(&system);
     const std::size_t pageBytes = system.dwPageSize;
+    const std::size_t bytes = ResidentRoom(mappedBytes, pageBytes);
+    if (bytes < mappedBytes) {
+        static std::once_flag noted;
+        std::call_once(noted, [bytes, mappedBytes] { std::fprintf(stderr, "[memory] direct memory: %zu MiB of a %zu MiB mapping populated, so a sixteenth of host memory stays available; the rest, and what later mappings do not fit, stays paged on demand\n", bytes >> 20, mappedBytes >> 20); });
+    }
+    if (bytes == 0) return;
     constexpr std::size_t chunkBytes = std::size_t{256} << 20;
     const auto chunks = (bytes + chunkBytes - 1) / chunkBytes;
     const auto workers = std::min<std::size_t>(chunks, std::max(1u, std::thread::hardware_concurrency()));
