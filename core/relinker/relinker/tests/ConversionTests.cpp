@@ -6,6 +6,7 @@
 #include <io/BufferUtils.hpp>
 #include <io/NativePath.hpp>
 #include <codegen/IAmd64OnlyConverter.hpp>
+#include <codegen/CodegenException.hpp>
 #include <elfpatcher/windows/WindowsRelocationBuilder.hpp>
 #include <algorithm>
 #include <array>
@@ -684,6 +685,75 @@ void sysvHashBoundsInCodeInstructionCollector() {
     }
 }
 
+void windowsToIntelKeepsSegmentAccesses() {
+    TestProgress progress;
+    const Relinker::Conversion converter(progress);
+    Relinker::ConversionOptions options;
+    options.Target = Relinker::TargetSystem::Windows;
+    options.ToIntel = true;
+    const auto withCode = [](const std::vector<std::uint8_t>& code) {
+        auto bytes = fixture();
+        Io::WriteU64(bytes, 64 + 32, code.size());
+        Io::WriteU64(bytes, 64 + 40, code.size());
+        const std::size_t tls = 64 + 3 * 56;
+        Io::WriteU32(bytes, tls, 7);
+        Io::WriteU32(bytes, tls + 4, 4);
+        Io::WriteU64(bytes, tls + 8, 0x2000);
+        Io::WriteU64(bytes, tls + 16, 0x2000);
+        Io::WriteU64(bytes, tls + 24, 0x2000);
+        Io::WriteU64(bytes, tls + 32, 8);
+        Io::WriteU64(bytes, tls + 40, 8);
+        Io::WriteU64(bytes, tls + 48, 8);
+        std::copy(code.begin(), code.end(), bytes.begin() + 0x1000);
+        return bytes;
+    };
+    const std::vector<std::uint8_t> clzero{0x0F, 0x01, 0xFC};
+    const std::vector<std::uint8_t> fsRead{0x64, 0x48, 0x8B, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00};
+    const std::vector<std::uint8_t> add{0x48, 0x83, 0xC0, 0x01};
+    {
+        auto code = clzero;
+        code.insert(code.end(), fsRead.begin(), fsRead.end());
+        code.push_back(0xC3);
+        auto source = input();
+        source.Executable = withCode(code);
+        bool refused = false;
+        try {
+            static_cast<void>(converter.Convert(std::move(source), options));
+        } catch (const Codegen::CodegenException&) {
+            refused = true;
+        }
+        require(refused, "Windows --to-intel executable lowering moved an fs: access into a stub");
+    }
+    {
+        auto code = clzero;
+        code.insert(code.end(), fsRead.begin(), fsRead.end());
+        code.push_back(0xC3);
+        auto source = input();
+        source.Modules.push_back({"virtual/title/sce_module/plugin.prx", withCode(code)});
+        bool refused = false;
+        try {
+            static_cast<void>(converter.Convert(std::move(source), options));
+        } catch (const Codegen::CodegenException&) {
+            refused = true;
+        }
+        require(refused, "Windows --to-intel module lowering moved an fs: access into a stub");
+    }
+    {
+        auto code = add;
+        code.insert(code.end(), add.begin(), add.end());
+        code.insert(code.end(), clzero.begin(), clzero.end());
+        code.insert(code.end(), fsRead.begin(), fsRead.end());
+        code.push_back(0xC3);
+        auto source = input();
+        source.Executable = withCode(code);
+        source.Modules.push_back({"virtual/title/sce_module/plugin.prx", withCode(code)});
+        const auto output = converter.Convert(std::move(source), options);
+        require(output.Modules.size() == 1, "Windows --to-intel module with fs: access was not converted");
+        require(std::search(output.Executable.begin(), output.Executable.end(), fsRead.begin(), fsRead.end()) == output.Executable.end(), "Windows --to-intel executable left an unrewritten fs: access");
+        require(std::search(output.Modules.front().Bytes.begin(), output.Modules.front().Bytes.end(), fsRead.begin(), fsRead.end()) == output.Modules.front().Bytes.end(), "Windows --to-intel module left an unrewritten fs: access");
+    }
+}
+
 int main() {
     try {
         convert();
@@ -700,6 +770,7 @@ int main() {
         runtimeDirectories();
         relocationValidation();
         sysvHashBoundsInCodeInstructionCollector();
+        windowsToIntelKeepsSegmentAccesses();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;
