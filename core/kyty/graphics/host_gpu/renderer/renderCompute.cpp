@@ -5,7 +5,6 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
-#include "common/smallVector.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -126,21 +125,6 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 		EXIT("compute runtime buffer count does not match shader metadata\n");
 	}
 	auto& cache = buffer.GetContext().GetTextureCache();
-	const auto note_uncovered = [&] {
-		Common::SmallVector<GuestRange, 8> writes;
-		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-			const auto& resource = program.info.buffers[i];
-			if (!resource.written) {
-				continue;
-			}
-			if (resource.read) {
-				return;
-			}
-			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-			writes.push_back({descriptor.Base48(), descriptor.GetSize()});
-		}
-		cache.NoteUncoveredMetaClears(std::span(writes.begin(), writes.size()));
-	};
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		const auto& resource   = program.info.buffers[i];
 		const auto  descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
@@ -159,7 +143,6 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 		}
 		const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
 		if (!cache.CoversMeta(descriptor.Base48(), descriptor.GetSize())) {
-			note_uncovered();
 			return false;
 		}
 		clears = true;
@@ -341,9 +324,11 @@ bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 	const bool image_clear =
 	    cache.ClearImageFromBuffer(command, descriptor.Base48(), size, packed_clear);
 	if (!image_clear) {
-		if ((descriptor.Base48() & 3u) != 0 ||
-		    !m_context.IsMapped(descriptor.Base48(), size) ||
-		    cache.IsRegionRegistered(descriptor.Base48(), size)) {
+		if ((descriptor.Base48() & 3u) != 0 || !m_context.IsMapped(descriptor.Base48(), size)) {
+			return false;
+		}
+		if (cache.IsRegionRegistered(descriptor.Base48(), size)) {
+			m_refused_fill = {descriptor.Base48(), size, packed_clear};
 			return false;
 		}
 		m_context.GetBufferCache().FillBuffer(descriptor.Base48(), size, packed_clear, false);
@@ -530,6 +515,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 
 	const auto& resources = *input_info.stage.resources;
 	m_replicated[2] = 0;
+	m_refused_fill  = {};
 	if (resources.specialization_reads.empty() &&
 	    (TryConsumeComputeMetaClear(input_info, buffer) ||
 	     TryConsumeComputeFill(input_info, buffer, thread_group_x, thread_group_y,
@@ -712,6 +698,10 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		m_deferred_barrier       = true;
 		m_deferred_barrier_queue = m_guest_queue;
 		ResetBindings();
+		if (m_refused_fill.address != 0) {
+			m_context.GetTextureCache().NoteMetaFill(m_refused_fill.address, m_refused_fill.size,
+			                                         m_refused_fill.value, false);
+		}
 	};
 	if (RtCheck().Sample(*compute_module, buffer)) {
 		const auto             hash   = compute_module->info.shader_hash;

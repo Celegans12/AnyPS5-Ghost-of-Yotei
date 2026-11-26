@@ -2827,8 +2827,10 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc, I
 	image.info.metadata = desc.info.metadata;
 	if (desc.info.HasMetadata()) {
 		const auto [metadata, inserted] = m_surface_metas.try_emplace(desc.info.metadata.range.address);
-		const bool pending_clear        = inserted && TakePendingMetaClear(image.info);
-		if (inserted && (image.info.htile_initial_clear || pending_clear)) {
+		if (inserted) {
+			ApplyPendingMetaClears(image.info, metadata->second);
+		}
+		if (inserted && image.info.htile_initial_clear) {
 			metadata->second.clear_mask.set();
 		}
 		metadata->second.owner = id;
@@ -2895,6 +2897,7 @@ void TextureCache::CommitGpuWrite(Image& image) {
 	image.MarkGpuModified();
 	image.gpu_write_sequence =
 	    Image::gpu_write_sequences.fetch_add(1u, std::memory_order_relaxed) + 1u;
+	DropPendingMetaClears(image.info.data.address, image.info.data.size);
 }
 
 bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
@@ -3462,6 +3465,7 @@ void TextureCache::ProtectPendingImageWriteBacks(uint64_t address, uint64_t size
 }
 
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
+	DropPendingMetaClears(address, size);
 	Common::ScopedLock lock {m_lock};
 	ForEachImageInRegion(address, size, [&](ImageId, Image& image) {
 		if (image.info.data.address != address) {
@@ -3577,6 +3581,7 @@ bool TextureCache::CopyToImage(uint64_t address, uint64_t source, uint64_t size)
 		copy.imageSubresource.baseArrayLayer = static_cast<uint32_t>(offset / stride);
 	}
 	image.Upload(copies, texels.buffer, texels.offset, texels.size);
+	DropPendingMetaClears(address, size);
 	return true;
 }
 
@@ -3595,6 +3600,7 @@ bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size, bool inc
 }
 
 bool TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
+	DropPendingMetaClears(address, size);
 	ImagePageTable::PageRange pages {};
 	if (ImagePageTable::TryGetPageRange(address, size, pages) &&
 	    !m_registered_pages.Any(pages.first, pages.last_exclusive)) {
@@ -3701,26 +3707,158 @@ bool TextureCache::CoversMeta(uint64_t address, uint64_t size) {
 	return size >= info.metadata.range.size / std::max(info.resources.layers, 1u) && size <= info.metadata.range.size;
 }
 
-void TextureCache::NoteUncoveredMetaClears(std::span<const GuestRange> writes) {
-	Common::ScopedLock lock {m_lock};
-	if (std::ranges::any_of(writes, [this](const GuestRange& write) { return m_surface_metas.contains(write.address); })) {
+bool TextureCache::OverlapsSurfaceMetaLocked(uint64_t address, uint64_t size) const {
+	const uint64_t end   = size > UINT64_MAX - address ? UINT64_MAX : address + size;
+	auto           found = m_surface_metas.lower_bound(address);
+	if (found != m_surface_metas.end() && found->first < end) {
+		return true;
+	}
+	if (found == m_surface_metas.begin()) {
+		return false;
+	}
+	--found;
+	const auto* owner = m_slot_images.try_get(found->second.owner);
+	return owner == nullptr || owner->info.metadata.range.address != found->first ||
+	       owner->info.metadata.range.End() > address;
+}
+
+void TextureCache::NoteMetaFill(uint64_t address, uint64_t size, uint32_t value, bool in_memory) {
+	if ((value & 0xfu) != 0 || size == 0) {
 		return;
 	}
-	for (const auto& write: writes) {
-		m_pending_meta_clears[write.address] = {write.size, m_gc_tick};
+	Common::ScopedLock lock {m_lock};
+	if (OverlapsSurfaceMetaLocked(address, size)) {
+		return;
+	}
+	Common::ScopedLock pending {m_pending_meta_lock};
+	DropPendingMetaClearsLocked(address, size);
+	m_pending_meta_clears[address] = {size, m_gc_tick, value, in_memory};
+	std::array<uint64_t, 64> granules {};
+	AddPendingMetaGranules(granules, address, size);
+	for (size_t word = 0; word < granules.size(); ++word) {
+		if (granules[word] != 0) {
+			m_pending_meta_granules[word].fetch_or(granules[word], std::memory_order_relaxed);
+		}
+	}
+	UpdatePendingMetaBoundsLocked();
+}
+
+void TextureCache::AddPendingMetaGranules(std::array<uint64_t, 64>& words, uint64_t address, uint64_t size) {
+	const auto first = address >> PendingMetaGranuleBits;
+	const auto last  = (address + size - 1) >> PendingMetaGranuleBits;
+	for (auto granule = first; granule <= last && granule - first < 4096u; ++granule) {
+		const auto bit = granule & 4095u;
+		words[bit >> 6u] |= uint64_t {1} << (bit & 63u);
 	}
 }
 
-bool TextureCache::TakePendingMetaClear(const ImageInfo& info) {
-	const auto found = m_pending_meta_clears.find(info.metadata.range.address);
-	if (found == m_pending_meta_clears.end()) {
-		return false;
+void TextureCache::UpdatePendingMetaBoundsLocked() {
+	if (m_pending_meta_clears.empty()) {
+		m_pending_meta_begin.store(UINT64_MAX, std::memory_order_relaxed);
+		m_pending_meta_end.store(0, std::memory_order_relaxed);
+		for (auto& word: m_pending_meta_granules) {
+			word.store(0, std::memory_order_relaxed);
+		}
+	} else {
+		const auto& [last_address, last] = *m_pending_meta_clears.rbegin();
+		m_pending_meta_begin.store(m_pending_meta_clears.begin()->first, std::memory_order_relaxed);
+		m_pending_meta_end.store(last_address + last.size, std::memory_order_relaxed);
 	}
-	const auto pending = found->second;
-	m_pending_meta_clears.erase(found);
-	return m_gc_tick - pending.tick <= 1 &&
-	       pending.size >= info.metadata.range.size / std::max(info.resources.layers, 1u) &&
-	       pending.size <= info.metadata.range.size;
+	m_pending_meta_count.store(m_pending_meta_clears.size(), std::memory_order_release);
+}
+
+void TextureCache::DropPendingMetaClears(uint64_t address, uint64_t size) {
+	if (size == 0 || m_pending_meta_count.load(std::memory_order_acquire) == 0) {
+		return;
+	}
+	const uint64_t end = size > UINT64_MAX - address ? UINT64_MAX : address + size;
+	if (end <= m_pending_meta_begin.load(std::memory_order_relaxed) ||
+	    address >= m_pending_meta_end.load(std::memory_order_relaxed) || !MaybePendingMeta(address, end)) {
+		return;
+	}
+	Common::ScopedLock lock {m_pending_meta_lock};
+	DropPendingMetaClearsLocked(address, size);
+}
+
+bool TextureCache::MaybePendingMeta(uint64_t address, uint64_t end) const {
+	const auto first = address >> PendingMetaGranuleBits;
+	const auto last  = (end - 1) >> PendingMetaGranuleBits;
+	if (last - first >= 64u) {
+		return true;
+	}
+	for (auto granule = first; granule <= last; ++granule) {
+		const auto bit = granule & 4095u;
+		if (((m_pending_meta_granules[bit >> 6u].load(std::memory_order_relaxed) >> (bit & 63u)) & 1u) != 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+void TextureCache::DropPendingMetaClearsLocked(uint64_t address, uint64_t size) {
+	if (size == 0) {
+		return;
+	}
+	auto first = m_pending_meta_clears.lower_bound(address);
+	if (first != m_pending_meta_clears.begin()) {
+		const auto previous = std::prev(first);
+		if (previous->first + previous->second.size > address) {
+			first = previous;
+		}
+	}
+	const auto last =
+	    size > UINT64_MAX - address ? m_pending_meta_clears.end() : m_pending_meta_clears.lower_bound(address + size);
+	if (first == last) {
+		return;
+	}
+	m_pending_meta_clears.erase(first, last);
+	UpdatePendingMetaBoundsLocked();
+}
+
+static bool HoldsFill(uint64_t address, uint64_t size, uint32_t value) {
+	std::array<uint32_t, 256> words {};
+	for (uint64_t offset = 0; offset + sizeof(uint32_t) <= size;) {
+		const auto count = std::min<uint64_t>(words.size(), (size - offset) / sizeof(uint32_t));
+		if (!LibKernel::Memory::TryReadBacking(address + offset, words.data(), count * sizeof(uint32_t)) ||
+		    !std::all_of(words.begin(), words.begin() + count, [value](uint32_t word) { return word == value; })) {
+			return false;
+		}
+		offset += count * sizeof(uint32_t);
+	}
+	return true;
+}
+
+void TextureCache::ApplyPendingMetaClears(const ImageInfo& info, MetaDataInfo& meta) {
+	if (m_pending_meta_count.load(std::memory_order_acquire) == 0) {
+		return;
+	}
+	const auto     range  = info.metadata.range;
+	const uint64_t layers = std::max(info.resources.layers, 1u);
+	const uint64_t slice  = range.size / layers;
+	Common::ScopedLock lock {m_pending_meta_lock};
+	auto first = m_pending_meta_clears.lower_bound(range.address);
+	if (first != m_pending_meta_clears.begin()) {
+		const auto previous = std::prev(first);
+		if (previous->first + previous->second.size > range.address) {
+			first = previous;
+		}
+	}
+	const auto last = m_pending_meta_clears.lower_bound(range.End());
+	for (auto it = first; slice != 0 && it != last; ++it) {
+		const auto [address, pending] = *it;
+		if (m_gc_tick - pending.tick > 1 || (info.metadata.stencil_compressed && ((pending.value >> 8u) & 0x3u) != 0)) {
+			continue;
+		}
+		for (uint64_t layer = 0; layer < layers && layer < meta.clear_mask.size(); ++layer) {
+			const auto begin = range.address + layer * slice;
+			if (begin >= address && begin + slice <= address + pending.size &&
+			    (!pending.in_memory || HoldsFill(begin, slice, pending.value))) {
+				meta.clear_mask.set(layer);
+			}
+		}
+	}
+	m_pending_meta_clears.erase(first, last);
+	UpdatePendingMetaBoundsLocked();
 }
 
 bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
@@ -3760,8 +3898,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	DiscardParkedImages(address, size);
 	m_surface_metas.erase(m_surface_metas.lower_bound(address),
 	                      m_surface_metas.lower_bound(address + size));
-	m_pending_meta_clears.erase(m_pending_meta_clears.lower_bound(address),
-	                            m_pending_meta_clears.lower_bound(address + size));
+	DropPendingMetaClears(address, size);
 	m_meta_epoch.fetch_add(1, std::memory_order_relaxed);
 	Common::SmallVector<ImageId, 16> deleted_images;
 	ForEachImageInRegion(address, size, [&](ImageId id, Image&) { deleted_images.push_back(id); });
@@ -3800,7 +3937,18 @@ void TextureCache::MapMemory(uint64_t address, uint64_t size) {
 void TextureCache::RunGarbageCollector() {
 	Common::ScopedLock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
-	std::erase_if(m_pending_meta_clears, [this](const auto& entry) { return m_gc_tick - entry.second.tick > 1; });
+	{
+		Common::ScopedLock pending {m_pending_meta_lock};
+		std::erase_if(m_pending_meta_clears, [this](const auto& entry) { return m_gc_tick - entry.second.tick > 1; });
+		std::array<uint64_t, 64> granules {};
+		for (const auto& [address, record]: m_pending_meta_clears) {
+			AddPendingMetaGranules(granules, address, record.size);
+		}
+		for (size_t word = 0; word < granules.size(); ++word) {
+			m_pending_meta_granules[word].store(granules[word], std::memory_order_relaxed);
+		}
+		UpdatePendingMetaBoundsLocked();
+	}
 	DiscardParkedImages(0, 0);
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
