@@ -597,7 +597,6 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 				info.subgroup_local_invocation_id = true;
 			}
 			if (inst.GetOpcode() == ValueOpcode::ReadFirstLane) {
-				info.subgroup_arithmetic          = true;
 				info.subgroup_local_invocation_id = true;
 			}
 			break;

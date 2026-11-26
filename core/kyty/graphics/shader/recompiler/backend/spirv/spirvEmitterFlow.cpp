@@ -852,7 +852,9 @@ uint32_t EmitLiveMask(EmitterState& state) {
 
 uint32_t EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& state = ctx.state;
-	if (ctx.other_half == nullptr && !QuadLanes(state)) {
+	if (ctx.other_half == nullptr && !QuadLanes(state) &&
+	    state.program.stage != ShaderType::Pixel) {
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformArithmetic);
 		const auto first   = ctx.FirstLane(ctx.Ballot(inst.Arg(1)));
 		const auto u32     = TypeU32(state);
 		const auto is_first = state.builder.AllocateId();
