@@ -292,6 +292,7 @@ public:
 private:
 	friend struct BufferCacheTestAccess;
 	friend struct BufferCacheGcTestAccess;
+	friend struct IndirectDispatchTestAccess;
 	friend class TextureCache;
 
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainSynchronizedBuffer(
