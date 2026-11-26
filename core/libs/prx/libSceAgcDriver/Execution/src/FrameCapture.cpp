@@ -227,11 +227,25 @@ void FrameCaptureWriter::WriteCall(const FrameCall& call) {
 }
 
 void FrameCaptureWriter::WriteRange(std::uint64_t address, std::uint64_t bytes, FrameRangeKind kind, std::uint32_t protection, std::uint32_t access) {
+    requireCapture(kind != FrameRangeKind::Alias, "an alias range needs the address of the range it maps: use WriteAlias");
     FrameMemoryChunk chunk;
     chunk.kind = FrameMemoryKind::Range;
     chunk.rangeKind = kind;
     chunk.protection = protection;
     chunk.access = access;
+    chunk.address = address;
+    chunk.bytes = bytes;
+    std::lock_guard lock(mutex);
+    writeChunk(chunk, {});
+}
+
+void FrameCaptureWriter::WriteAlias(std::uint64_t address, std::uint64_t bytes, std::uint64_t target, std::uint32_t protection, std::uint32_t access) {
+    FrameMemoryChunk chunk;
+    chunk.kind = FrameMemoryKind::Range;
+    chunk.rangeKind = FrameRangeKind::Alias;
+    chunk.protection = protection;
+    chunk.access = access;
+    chunk.group = target;
     chunk.address = address;
     chunk.bytes = bytes;
     std::lock_guard lock(mutex);

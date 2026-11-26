@@ -132,7 +132,8 @@ void FilterFrameCapture(const std::filesystem::path& source, const std::filesyst
             const auto& chunk = reader.Chunks()[index];
             if (plan.chunks.contains(index) || (chunk.kind == AgcDriver::FrameMemoryKind::Delta && removedGroups.contains(chunk.group))) continue;
             if (chunk.kind == AgcDriver::FrameMemoryKind::Range) {
-                writer.WriteRange(chunk.address, chunk.bytes, chunk.rangeKind, chunk.protection, chunk.access);
+                if (chunk.rangeKind == AgcDriver::FrameRangeKind::Alias) writer.WriteAlias(chunk.address, chunk.bytes, chunk.group, chunk.protection, chunk.access);
+                else writer.WriteRange(chunk.address, chunk.bytes, chunk.rangeKind, chunk.protection, chunk.access);
                 continue;
             }
             const auto bytes = reader.Read(chunk);

@@ -91,6 +91,7 @@ public:
 
     void WriteCall(const FrameCall& call);
     void WriteRange(std::uint64_t address, std::uint64_t bytes, FrameRangeKind kind, std::uint32_t protection, std::uint32_t access);
+    void WriteAlias(std::uint64_t address, std::uint64_t bytes, std::uint64_t target, std::uint32_t protection, std::uint32_t access);
     std::uint64_t WriteSnapshot(std::uint64_t address, std::span<const std::byte> bytes);
     void WriteDelta(std::uint64_t group, std::uint64_t completed, std::uint64_t address, std::span<const std::byte> bytes);
     void WriteReference(std::uint64_t index, std::uint64_t address, std::span<const std::byte> pixels);

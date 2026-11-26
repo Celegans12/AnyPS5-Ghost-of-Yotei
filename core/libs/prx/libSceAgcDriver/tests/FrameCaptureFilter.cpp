@@ -316,6 +316,34 @@ void testRangeMetadata(const std::filesystem::path& root) {
     check(after.address == before.address && after.bytes == before.bytes && after.rangeKind == before.rangeKind && after.protection == before.protection && after.access == before.access, "filtering changed range metadata");
 }
 
+
+void testAliasRange(const std::filesystem::path& root) {
+    const auto source = root / "alias-source";
+    const auto output = root / "alias-copy";
+    {
+        AgcDriver::FrameCaptureWriter writer(source);
+        const auto access = AgcDriver::FrameRangeAccess::Readable | AgcDriver::FrameRangeAccess::Writable;
+        writer.WriteRange(0x10000, 0x4000, AgcDriver::FrameRangeKind::Watched, 3, access);
+        writer.WriteAlias(0x20000, 0x4000, 0x10000, 3, access);
+        AgcDriver::FrameCall start;
+        start.kind = AgcDriver::FrameCallKind::FrameStart;
+        start.ordinal = 1;
+        writer.WriteCall(start);
+        AgcDriver::FrameCall end;
+        end.kind = AgcDriver::FrameCallKind::End;
+        end.ordinal = 2;
+        writer.WriteCall(end);
+        writer.Finish("{\"magic\":\"aps5-frame-capture 1\"}\n");
+    }
+    AgcDriverTools::FrameCaptureFilterPlan plan;
+    AgcDriverTools::FilterFrameCapture(source, output, plan);
+    const AgcDriver::FrameCaptureReader filtered(output);
+    check(filtered.Chunks().size() == 2, "filtering dropped a range of a capture with an alias range");
+    const auto& alias = filtered.Chunks().back();
+    check(alias.rangeKind == AgcDriver::FrameRangeKind::Alias && alias.address == 0x20000 && alias.bytes == 0x4000 && alias.group == 0x10000,
+          "filtering changed an alias range or its target");
+}
+
 }
 
 int main() {
@@ -339,6 +367,7 @@ int main() {
     testTruncatedCapture(root);
     testNormalizedSourceAlias(root);
     testRangeMetadata(root);
+    testAliasRange(root);
     std::filesystem::remove_all(root);
     std::filesystem::create_directories(root);
     testCallFilter(root);
