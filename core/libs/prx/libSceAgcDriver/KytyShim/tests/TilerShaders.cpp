@@ -123,8 +123,8 @@ void VerifySpirvModule(const char* label, std::span<const uint32_t> code) {
 		    if (!errors.empty()) errors += "; ";
 		    errors += message;
 	    });
-	Require(validator.Validate(code.data(), code.size()),
-	        std::string(label) + ": spirv-val failed: " + errors);
+	const bool valid = validator.Validate(code.data(), code.size());
+	Require(valid, std::string(label) + ": spirv-val failed: " + errors);
 
 	std::set<uint32_t> vector_types;
 	size_t             offset = 5u;
@@ -237,6 +237,12 @@ void RunTilerDispatch(vk::Queue queue, vk::CommandBuffer cmd, vk::PipelineLayout
 	cmd.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
 	cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, layout, 0, 1, &set, 0, nullptr);
 	cmd.dispatch((num_texels + 63u) / 64u, 1, 1);
+	const vk::MemoryBarrier barrier {
+	    .srcAccessMask = vk::AccessFlagBits::eShaderWrite,
+	    .dstAccessMask = vk::AccessFlagBits::eHostRead,
+	};
+	cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+	                    vk::PipelineStageFlagBits::eHost, {}, 1, &barrier, 0, nullptr, 0, nullptr);
 	Checked(cmd.end(), "endCommandBuffer");
 	vk::SubmitInfo submit {};
 	submit.commandBufferCount = 1;
