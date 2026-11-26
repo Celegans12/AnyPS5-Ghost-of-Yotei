@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/FrameCapture.hpp"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -206,6 +207,7 @@ void setVariable(const char* name, const char* value) {
 
 struct Replay {
     bool completed = false;
+    int status = 0;
     std::string log;
     std::string frame;
     std::string dump;
@@ -230,6 +232,7 @@ Replay replay(const std::filesystem::path& tool, const std::filesystem::path& ro
     const int status = std::system(command.c_str());
 #endif
     Replay result;
+    result.status = status;
     result.log = readFile(log);
     result.frame = readFile(frames / "replay-0.bmp");
     result.completed = status == 0 && !result.frame.empty();
@@ -268,6 +271,7 @@ Replay preparedReplay(const std::filesystem::path& tool, const std::filesystem::
 #endif
     std::filesystem::current_path(previous);
     Replay result;
+    result.status = status;
     result.log = readFile(log);
     result.frame = readFile(frames / "replay-0.bmp");
     result.dump = readFile(dump);
@@ -279,6 +283,19 @@ std::size_t count(const std::string& text, std::string_view line) {
     std::size_t found = 0;
     for (auto at = text.find(line); at != std::string::npos; at = text.find(line, at + line.size())) ++found;
     return found;
+}
+
+bool vulkanUnavailable(const Replay& result) {
+    if (result.status == 0) return false;
+    constexpr std::array<std::string_view, 5> diagnostics{
+        "Could not find suitable device:",
+        "kyty presentation: the Vulkan loader offers no window surface extension",
+        "Unable to find a compatible Vulkan Driver",
+        "Could not load Vulkan",
+        " is required, but loader supports only "};
+    return std::ranges::any_of(diagnostics, [&result](std::string_view diagnostic) {
+        return result.log.find(diagnostic) != std::string::npos;
+    });
 }
 
 std::vector<std::string_view> readyPipelineIds(const std::string& log) {
@@ -341,7 +358,7 @@ int prepared(const std::filesystem::path& tool, const std::filesystem::path& roo
     if (!seed.completed) {
         std::cerr << "prepared replay files: " << root << '\n';
         printTail(seed.log);
-        if (std::getenv("ANYPS5_REQUIRE_VULKAN") == nullptr) return 77;
+        if (std::getenv("ANYPS5_REQUIRE_VULKAN") == nullptr && vulkanUnavailable(seed)) return 77;
         throw std::runtime_error("the two-variant seed replay did not complete");
     }
     const auto both_cache = root / "both" / "_PipelineCache";
