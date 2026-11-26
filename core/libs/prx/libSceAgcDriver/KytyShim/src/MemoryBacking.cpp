@@ -131,6 +131,18 @@ public:
 		}
 	}
 
+	template <typename Visit>
+	void ForEachBacking(uint64_t vaddr, uint64_t size, Visit&& visit) const {
+		for (auto page = vaddr >> PageBits; page < (vaddr + size) >> PageBits; ++page) {
+			if (page / BucketPages >= BucketCount) return;
+			if (m_buckets[page / BucketPages].load(std::memory_order_acquire) == nullptr) {
+				page = (page / BucketPages + 1u) * BucketPages - 1u;
+				continue;
+			}
+			if (const auto entry = LoadBacking(page); entry != 0) visit(entry);
+		}
+	}
+
 	[[nodiscard]] bool AnyMapped(uint64_t vaddr, uint64_t size) const {
 		for (auto page = vaddr >> PageBits; page < (vaddr + size + PageMask) >> PageBits; ++page) {
 			if (page / BucketPages >= BucketCount) return false;
@@ -278,6 +290,54 @@ struct ViewState {
 PageTable& Pages() {
 	static auto* pages = new PageTable;
 	return *pages;
+}
+
+constexpr uint64_t ShareBucketCount = (uint64_t {PrivateEntry} + BucketPages - 1u) / BucketPages;
+
+class ShareTable {
+public:
+	static constexpr uint32_t CountMask = 0xffu;
+	static constexpr uint32_t Generation = CountMask + 1u;
+
+	[[nodiscard]] uint32_t Load(uint32_t entry) const {
+		const auto page = uint64_t {entry} - 1u;
+		if (page / BucketPages >= ShareBucketCount) return CountMask;
+		const auto* words = m_buckets[page / BucketPages].load(std::memory_order_acquire);
+		return words != nullptr ? words[page % BucketPages].load(std::memory_order_acquire) : 0;
+	}
+
+	void Change(uint32_t entry, bool mapped) {
+		const auto page = uint64_t {entry} - 1u;
+		if (page / BucketPages >= ShareBucketCount) return;
+		auto& bucket = m_buckets[page / BucketPages];
+		auto* words = bucket.load(std::memory_order_acquire);
+		if (words == nullptr) {
+			words = new std::atomic<uint32_t>[BucketPages] {};
+			bucket.store(words, std::memory_order_release);
+		}
+		auto& word = words[page % BucketPages];
+		const auto current = word.load(std::memory_order_relaxed);
+		auto count = current & CountMask;
+		if (!mapped && count == 0) {
+			Shim::Fail("KytyShim memory: view page 0x%" PRIx64 " was unmapped more often than it was mapped\n", page);
+		}
+		if (count != CountMask) {
+			count = mapped ? count + 1u : count - 1u;
+		}
+		word.store(((current & ~CountMask) + Generation) | count, std::memory_order_release);
+	}
+
+private:
+	std::array<std::atomic<std::atomic<uint32_t>*>, ShareBucketCount> m_buckets {};
+};
+
+ShareTable& Shares() {
+	static auto* shares = new ShareTable;
+	return *shares;
+}
+
+void ReleaseShares(uint64_t address, uint64_t bytes) {
+	Pages().ForEachBacking(address, bytes, [](uint32_t entry) { Shares().Change(entry, false); });
 }
 
 ViewState& State() {
@@ -646,6 +706,7 @@ void OnViewChange(std::uintptr_t address, std::size_t bytes, std::uint64_t offse
 	if (offset == DirectMemoryViewReplacing) {
 		if (pages.AnyMapped(address, bytes)) {
 			if (g_unmap_hook != nullptr) g_unmap_hook(address, bytes);
+			ReleaseShares(address, bytes);
 			pages.Store(address, bytes, 0, false);
 			BumpBackingEpoch(address, bytes);
 		}
@@ -655,6 +716,7 @@ void OnViewChange(std::uintptr_t address, std::size_t bytes, std::uint64_t offse
 	if (offset == DirectMemoryViewUnmapped) {
 		const bool mapped = pages.AnyMapped(address, bytes);
 		if (mapped && g_unmap_hook != nullptr) g_unmap_hook(address, bytes);
+		ReleaseShares(address, bytes);
 		pages.Store(address, bytes, 0, false);
 		BumpBackingEpoch(address, bytes);
 		GuestArena::GuestArenaNoteHostProtection_nid_no_patch(address, bytes, true);
@@ -669,7 +731,13 @@ void OnViewChange(std::uintptr_t address, std::size_t bytes, std::uint64_t offse
 		first = static_cast<uint32_t>(offset >> PageBits) + 1u;
 		step = true;
 	}
+	ReleaseShares(address, bytes);
 	pages.Store(address, bytes, first, step);
+	if (step) {
+		for (uint64_t page = 0; page < bytes >> PageBits; ++page) {
+			Shares().Change(first + static_cast<uint32_t>(page), true);
+		}
+	}
 	BumpBackingEpoch(address, bytes);
 	if (g_map_hook != nullptr) g_map_hook(address, bytes);
 }
@@ -904,6 +972,23 @@ bool IsBackingReadable(uint64_t vaddr, uint64_t size) {
 
 uint64_t BackingEpoch() noexcept {
 	return g_backing_epoch.load(std::memory_order_acquire);
+}
+
+BackingShare SoleBackingStamp(uint64_t vaddr, uint64_t size, uint64_t* stamp) {
+	if (!ValidRange(vaddr, size) || !Shim::ViewEnabled()) return BackingShare::Unmapped;
+	const auto& pages = Pages();
+	const auto& shares = Shares();
+	uint64_t mixed = 0xcbf29ce484222325ull;
+	for (auto page = vaddr >> PageBits; page <= (vaddr + size - 1u) >> PageBits; ++page) {
+		const auto entry = pages.Load(page);
+		if (entry == 0) return BackingShare::Unmapped;
+		if (entry == PrivateEntry) return BackingShare::Private;
+		const auto word = shares.Load(entry);
+		if ((word & ShareTable::CountMask) != 1u) return BackingShare::Aliased;
+		mixed = (mixed ^ ((uint64_t {entry} << 32u) | word)) * 0x100000001b3ull;
+	}
+	*stamp = mixed;
+	return BackingShare::Sole;
 }
 
 bool BackingChangesSince(uint64_t epoch, std::vector<std::pair<uint64_t, uint64_t>>& changes) {

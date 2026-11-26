@@ -200,10 +200,11 @@ public:
 
 private:
 	struct PendingMetaClear {
-		uint64_t size      = 0;
-		uint64_t tick      = 0;
-		uint32_t value     = 0;
-		bool     in_memory = false;
+		uint64_t size          = 0;
+		uint64_t tick          = 0;
+		uint32_t value         = 0;
+		bool     in_memory     = false;
+		uint64_t backing_stamp = 0;
 	};
 	using PendingMetaClears = std::map<uint64_t, PendingMetaClear>;
 

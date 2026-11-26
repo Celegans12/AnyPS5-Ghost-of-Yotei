@@ -37,6 +37,7 @@ constexpr std::uint64_t Depth = GuestBase + Block;
 constexpr std::uint64_t Htile = GuestBase + 3 * Block;
 constexpr std::uint64_t Color = GuestBase + 4 * Block;
 constexpr std::uint64_t GuestBytes = 8 * Block;
+constexpr std::uint64_t HtileAlias = GuestBase + GuestBytes;
 constexpr std::uint32_t Width = 64;
 constexpr std::uint32_t Height = 4;
 constexpr std::uint32_t Layers = 2;
@@ -77,14 +78,17 @@ struct Case {
     std::uint32_t value;
     std::uint64_t bytes;
     bool overwrite;
+    bool alias;
 };
 
 constexpr std::array Cases{
-    Case{"expanded", true, Expanded, Layers * HtileSliceBytes, false},
-    Case{"cleared", true, Cleared, Layers * HtileSliceBytes, false},
-    Case{"first-layer", true, Cleared, HtileSliceBytes, false},
-    Case{"overwritten", true, Cleared, Layers * HtileSliceBytes, true},
-    Case{"consumed", false, Cleared, Layers * HtileSliceBytes, false},
+    Case{"expanded", true, Expanded, Layers * HtileSliceBytes, false, false},
+    Case{"cleared", true, Cleared, Layers * HtileSliceBytes, false, false},
+    Case{"first-layer", true, Cleared, HtileSliceBytes, false, false},
+    Case{"overwritten", true, Cleared, Layers * HtileSliceBytes, true, false},
+    Case{"consumed", false, Cleared, Layers * HtileSliceBytes, false, false},
+    Case{"alias-written", true, Cleared, Layers * HtileSliceBytes, true, true},
+    Case{"alias-kept", true, Cleared, Layers * HtileSliceBytes, false, true},
 };
 
 std::uint32_t low(std::uint64_t address) {
@@ -238,10 +242,18 @@ void makeCapture(const std::filesystem::path& path, const Case& test) {
     write(memory, Htile, std::span<const std::uint32_t>(expanded));
 
     AgcDriver::FrameCaptureWriter writer(path);
-    writer.WriteRange(GuestBase, memory.size(), AgcDriver::FrameRangeKind::Watched, 0, 7);
+    if (test.alias) {
+        writer.WriteRange(GuestBase, Htile - GuestBase, AgcDriver::FrameRangeKind::Watched, 0, 7);
+        writer.WriteRange(Htile, Block, AgcDriver::FrameRangeKind::Watched, 0, 7);
+        writer.WriteRange(Htile + Block, GuestBase + GuestBytes - Htile - Block, AgcDriver::FrameRangeKind::Watched, 0, 7);
+        writer.WriteAlias(HtileAlias, Block, Htile, 0, 7);
+    } else {
+        writer.WriteRange(GuestBase, memory.size(), AgcDriver::FrameRangeKind::Watched, 0, 7);
+    }
     const auto snapshot = writer.WriteSnapshot(GuestBase, memory);
     const std::array<std::uint32_t, 4> overwrite{Expanded, Expanded, Expanded, Expanded};
-    if (test.overwrite) writer.WriteDelta(1, 0, Htile + HtileSliceBytes, std::as_bytes(std::span(overwrite)));
+    const auto stored = (test.alias ? HtileAlias : Htile) + HtileSliceBytes;
+    if (test.overwrite) writer.WriteDelta(1, 0, stored, std::as_bytes(std::span(overwrite)));
     std::uint64_t ordinal = 0;
     std::uint64_t windowCalls = 0;
     const auto emit = [&](AgcDriver::FrameCall call) {
@@ -273,7 +285,7 @@ void makeCapture(const std::filesystem::path& path, const Case& test) {
     emit({.kind = FrameCallKind::End, .accepted = 2});
     writer.Finish("{\"magic\":\"aps5-frame-capture 1\",\"arena_base\":65536,\"arena_bytes\":1082331693056,"
                   "\"start_boundary\":1,\"frames\":1,\"calls\":" + std::to_string(windowCalls) +
-                  ",\"prologue_calls\":6,\"ranges\":1,\"snapshot_bytes\":" + std::to_string(snapshot) +
+                  ",\"prologue_calls\":6,\"ranges\":" + std::to_string(test.alias ? 4 : 1) + ",\"snapshot_bytes\":" + std::to_string(snapshot) +
                   ",\"unreadable_bytes\":0,\"host_only_sample_bytes\":0,\"warnings\":[]}\n");
 }
 
@@ -389,6 +401,14 @@ int main(int argc, char** argv) {
                 failures.emplace_back("a fill over a registered HTile range was consumed instead of running on the GPU");
                 break;
             }
+        }
+        if (lit(5, false) || lit(5, true)) {
+            failures.emplace_back("after a fill on the GPU and a host store through a second mapping of its HTile, the bind "
+                                  "cleared depth");
+        }
+        if (lit(6, false) || lit(6, true)) {
+            failures.emplace_back("a fill on the GPU of an HTile mapped twice cleared depth at the bind, so its record was not "
+                                  "declined");
         }
         if (results[4].log.find(ConsumedFill) == std::string::npos) {
             failures.emplace_back("a fill over an unregistered HTile range printed no consumed fill, so the check that the other "

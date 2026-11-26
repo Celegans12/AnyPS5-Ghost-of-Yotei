@@ -61,6 +61,8 @@ using namespace Libs::Graphics;
 
 constexpr uint64_t GuestBytes = 0x20000;
 constexpr int CpuReadWrite = 0x03;
+constexpr int GpuReadWrite = 0x30;
+constexpr int MapFixed = 0x10;
 constexpr uint32_t ImageWords = 64;
 constexpr uint32_t CopyWord = 9;
 constexpr uint32_t FillWord = 21;
@@ -355,6 +357,100 @@ const char* CheckFilledMetaClearReachesBind(GraphicContext& graphics, uint64_t b
 	scheduler.WaitPriorityOperations(tick);
 	BufferCacheTestAccess::DiscardGpuWrites(buffers, base, DepthGuestBytes);
 	(void)buffers.DropFreedRange(base, DepthGuestBytes, nullptr, nullptr);
+	return failure;
+}
+
+const char* CheckSharedBackingFill(GraphicContext& graphics) {
+	RenderContext renderer(graphics);
+	CommandProcessor producer(renderer, 0);
+	producer.Reset();
+	auto& scheduler = renderer.GetCommandScheduler();
+	auto& textures = renderer.GetTextureCache();
+	scheduler.Begin(producer.GetCtx(), producer.GetUcfg(), producer.GetShCtx());
+
+	constexpr uint64_t Bytes = 0x10000;
+	constexpr uint64_t SliceBytes = 0x400;
+	constexpr uint64_t MetaBytes = SliceBytes * 2;
+	const auto direct_size = static_cast<int64_t>(sceKernelGetDirectMemorySize());
+	int64_t phys = -1;
+	int64_t other = -1;
+	if (sceKernelAllocateDirectMemory(0, direct_size, Bytes, 0, 0, &phys) != 0 || phys < 0 ||
+	    sceKernelAllocateDirectMemory(0, direct_size, Bytes, 0, 0, &other) != 0 || other < 0) {
+		return "could not allocate direct memory for the shared HTile";
+	}
+	void* mapped = nullptr;
+	if (sceKernelMapDirectMemory(&mapped, Bytes, CpuReadWrite | GpuReadWrite, 0, phys, 0) != 0 || mapped == nullptr) {
+		return "could not map the shared HTile memory";
+	}
+	const auto meta = reinterpret_cast<uint64_t>(mapped);
+	const auto none = std::array<bool, 2> {false, false};
+	const auto both = std::array<bool, 2> {true, true};
+	const char* failure = nullptr;
+	const auto expect = [&failure](std::array<bool, 2> actual, std::array<bool, 2> wanted, const char* message) {
+		if (failure == nullptr && actual != wanted) failure = message;
+	};
+	const auto pending = [&]() {
+		ImageInfo info;
+		info.resources = {1, 2};
+		info.metadata.kind = ImageMetadataKind::Htile;
+		info.metadata.range = GuestRange {meta, MetaBytes};
+		return TextureCacheTestAccess::ApplyPendingClears(textures, info);
+	};
+	const auto watched = [&]() { return TextureCacheTestAccess::Watched(textures, meta); };
+	uint64_t alias = 0;
+	const auto map_alias = [&]() {
+		void* second = nullptr;
+		if (sceKernelMapDirectMemory(&second, Bytes, CpuReadWrite | GpuReadWrite, 0, phys, 0) != 0 || second == nullptr) {
+			failure = failure != nullptr ? failure : "could not map the HTile memory a second time";
+			return false;
+		}
+		alias = reinterpret_cast<uint64_t>(second);
+		return true;
+	};
+	const auto unmap_alias = [&]() {
+		if (sceKernelMunmap(alias, Bytes) != 0 && failure == nullptr) failure = "could not unmap the second mapping";
+	};
+
+	textures.NoteMetaFill(meta, MetaBytes, 0, false);
+	expect(pending(), both, "a record of a fill on the GPU over memory mapped once did not clear the HTile");
+	if (map_alias()) {
+		textures.NoteMetaFill(meta, MetaBytes, 0, false);
+		expect({watched(), false}, none, "a declined record of a fill on the GPU over memory mapped twice write-protected it");
+		expect(pending(), none, "a record of a fill on the GPU over memory mapped twice was kept");
+		unmap_alias();
+	}
+	textures.NoteMetaFill(meta, MetaBytes, 0, false);
+	if (map_alias()) {
+		expect(pending(), none, "a record of a fill on the GPU was applied after a second mapping of its memory appeared");
+		unmap_alias();
+	}
+	textures.NoteMetaFill(meta, MetaBytes, 0, false);
+	if (map_alias()) {
+		unmap_alias();
+		expect(pending(), none, "a record of a fill on the GPU was applied after a second mapping of its memory came and went");
+	}
+	std::memset(mapped, 0, MetaBytes);
+	textures.NoteMetaFill(meta, MetaBytes, 0, true);
+	expect(pending(), both, "a record of a fill done in memory over memory mapped once did not clear the HTile");
+	if (map_alias()) {
+		textures.NoteMetaFill(meta, MetaBytes, 0, true);
+		expect(pending(), none, "a record of a fill done in memory over memory mapped twice was kept");
+		unmap_alias();
+	}
+	textures.NoteMetaFill(meta, MetaBytes, 0, false);
+	void* remapped = mapped;
+	if (sceKernelMapDirectMemory(&remapped, Bytes, CpuReadWrite | GpuReadWrite, MapFixed, other, 0) != 0 || remapped != mapped) {
+		failure = failure != nullptr ? failure : "could not map other memory at the HTile address";
+	} else {
+		expect(pending(), none, "a record of a fill on the GPU was applied after its address was mapped to other memory");
+	}
+	const auto tick = scheduler.CurrentTick();
+	scheduler.Wait(tick);
+	scheduler.WaitPriorityOperations(tick);
+	if (sceKernelMunmap(meta, Bytes) != 0 && failure == nullptr) failure = "could not unmap the HTile memory";
+	if ((sceKernelReleaseDirectMemory(phys, Bytes) != 0 || sceKernelReleaseDirectMemory(other, Bytes) != 0) && failure == nullptr) {
+		failure = "could not release the HTile memory";
+	}
 	return failure;
 }
 
@@ -908,6 +1004,9 @@ extern "C" int RunKytyImageWriteBackAliasTest() {
 				failure = "could not unmap the depth backing";
 			}
 		}
+	}
+	if (failure == nullptr) {
+		failure = CheckSharedBackingFill(graphics);
 	}
 	if (sceKernelMunmap(address, GuestBytes) != 0) {
 		std::fputs("kyty_shim_image_write_back_alias: FAILED: could not unmap guest backing\n", stderr);

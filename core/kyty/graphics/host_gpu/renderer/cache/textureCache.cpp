@@ -3734,13 +3734,18 @@ void TextureCache::NoteMetaFill(uint64_t address, uint64_t size, uint32_t value,
 	if ((value & 0xfu) != 0 || size == 0 || (!in_memory && !GuestRange {address, size}.Valid())) {
 		return;
 	}
+	uint64_t backing_stamp = 0;
+	if (LibKernel::Memory::SoleBackingStamp(address, size, &backing_stamp) != LibKernel::Memory::BackingShare::Sole) {
+		DropPendingMetaClears(address, size);
+		return;
+	}
 	Common::ScopedLock lock {m_lock};
 	if (OverlapsSurfaceMetaLocked(address, size)) {
 		return;
 	}
 	Common::ScopedLock pending {m_pending_meta_lock};
 	DropPendingMetaClearsLocked(address, size);
-	m_pending_meta_clears[address] = {size, m_gc_tick, value, in_memory};
+	m_pending_meta_clears[address] = {size, m_gc_tick, value, in_memory, backing_stamp};
 	std::array<uint64_t, 64> granules {};
 	AddPendingMetaGranules(granules, address, size);
 	for (size_t word = 0; word < granules.size(); ++word) {
@@ -3931,6 +3936,11 @@ void TextureCache::ApplyPendingMetaClears(const ImageInfo& info, MetaDataInfo& m
 	for (auto it = first; slice != 0 && it != last; ++it) {
 		const auto [address, pending] = *it;
 		if (m_gc_tick - pending.tick > 1 || (info.metadata.stencil_compressed && ((pending.value >> 8u) & 0x3u) != 0)) {
+			continue;
+		}
+		uint64_t backing_stamp = 0;
+		if (LibKernel::Memory::SoleBackingStamp(address, pending.size, &backing_stamp) != LibKernel::Memory::BackingShare::Sole ||
+		    backing_stamp != pending.backing_stamp) {
 			continue;
 		}
 		for (uint64_t layer = 0; layer < layers && layer < meta.clear_mask.size(); ++layer) {
