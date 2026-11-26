@@ -1,3 +1,4 @@
+#include "SamplerSpillProgram.hpp"
 #include "common/assert.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -15,6 +16,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -200,6 +202,59 @@ void DestroyHostBuffer(const Gpu& gpu, HostBuffer& buffer) {
 	gpu.device.freeMemory(buffer.memory);
 }
 
+struct SampledTexture {
+	vk::Image image;
+	vk::DeviceMemory memory;
+	vk::ImageView view;
+	vk::Sampler sampler;
+};
+
+SampledTexture CreateSampledTexture(const Gpu& gpu) {
+	SampledTexture texture;
+	vk::ImageCreateInfo image;
+	image.imageType   = vk::ImageType::e2D;
+	image.format      = vk::Format::eR8G8B8A8Unorm;
+	image.extent      = vk::Extent3D(1, 1, 1);
+	image.mipLevels   = 1;
+	image.arrayLayers = 1;
+	image.usage       = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled;
+	texture.image    = Checked(gpu.device.createImage(image), "sampled image creation");
+	const auto needs = gpu.device.getImageMemoryRequirements(texture.image);
+	vk::MemoryAllocateInfo allocate;
+	allocate.allocationSize = needs.size;
+	allocate.memoryTypeIndex = std::countr_zero(needs.memoryTypeBits);
+	texture.memory = Checked(gpu.device.allocateMemory(allocate), "sampled image memory");
+	Checked(gpu.device.bindImageMemory(texture.image, texture.memory, 0), "sampled image binding");
+	vk::ImageViewCreateInfo view;
+	view.image            = texture.image;
+	view.viewType         = vk::ImageViewType::e2D;
+	view.format           = image.format;
+	view.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	texture.view    = Checked(gpu.device.createImageView(view), "sampled image view");
+	texture.sampler = Checked(gpu.device.createSampler(vk::SamplerCreateInfo {}), "sampler creation");
+	return texture;
+}
+
+void ClearSampledTexture(vk::CommandBuffer command, const SampledTexture& texture) {
+	vk::ImageMemoryBarrier barrier;
+	barrier.image               = texture.image;
+	barrier.subresourceRange    = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.newLayout           = vk::ImageLayout::eTransferDstOptimal;
+	barrier.dstAccessMask       = vk::AccessFlagBits::eTransferWrite;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe, vk::PipelineStageFlagBits::eTransfer,
+	                        {}, 0, nullptr, 0, nullptr, 1, &barrier);
+	const vk::ClearColorValue red(std::array<float, 4> {1.0f, 0.0f, 0.0f, 1.0f});
+	command.clearColorImage(texture.image, barrier.newLayout, &red, 1, &barrier.subresourceRange);
+	barrier.oldLayout     = barrier.newLayout;
+	barrier.newLayout     = vk::ImageLayout::eShaderReadOnlyOptimal;
+	barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eComputeShader,
+	                        {}, 0, nullptr, 0, nullptr, 1, &barrier);
+}
+
 void RequireValid(const std::vector<uint32_t>& spirv, const std::string& what) {
 	spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
 	std::string          messages;
@@ -221,6 +276,8 @@ struct Dispatch {
 	std::span<const uint32_t>          code;
 	std::array<uint32_t, UserDataDwords> user_data {};
 	uint32_t                           threads = 0;
+	uint32_t                           wave_size = WaveSize;
+	std::optional<uint32_t>            sampler_word;
 };
 
 bool Run(const Gpu& gpu, const Dispatch& dispatch) {
@@ -229,12 +286,12 @@ bool Run(const Gpu& gpu, const Dispatch& dispatch) {
 	compute.threads_num[0]     = dispatch.threads;
 	compute.threads_num[1]     = 1u;
 	compute.threads_num[2]     = 1u;
-	compute.wave_size          = WaveSize;
+	compute.wave_size          = dispatch.wave_size;
 	compute.host_subgroup_size = HostSubgroup;
 	compute.thread_ids_num     = 1;
 	Recompiler::CompileOptions options;
 	options.stage                 = ShaderType::Compute;
-	options.wave_size             = WaveSize;
+	options.wave_size             = dispatch.wave_size;
 	options.user_data_base        = 0u;
 	options.shader_hash           = 0x5ad0u;
 	options.dump_ir               = false;
@@ -249,6 +306,10 @@ bool Run(const Gpu& gpu, const Dispatch& dispatch) {
 	Recompiler::IR::ResourceSpecialization specialization;
 	Require(Recompiler::IR::MaterializeResources(plan, runtime, snapshot, specialization),
 	        what + ": the program's resources were not materialized");
+	if (dispatch.sampler_word) {
+		Require(snapshot.samplers.size() == 1 && snapshot.samplers.front().dwords[0] == *dispatch.sampler_word,
+		        what + ": sampler dword 0 did not match the saved value");
+	}
 	auto compiled = Recompiler::CompileProgram(std::move(translated), options, specialization, 0u);
 	RequireValid(compiled.spirv, what);
 	const auto info = std::move(compiled.program).TakeCompiledInfo();
@@ -259,12 +320,6 @@ bool Run(const Gpu& gpu, const Dispatch& dispatch) {
 	}
 	const auto& layout = info.bindings;
 	Require(layout.UsesPushData(), what + ": the shader data does not fit the push constants");
-	for (auto mask = layout.descriptor_mask; mask != 0; mask &= mask - 1u) {
-		const auto kind = static_cast<BindingKind>(std::countr_zero(mask));
-		Require(kind == BindingKind::Buffers, what + ": descriptor binding kind " +
-		                                          std::to_string(static_cast<uint32_t>(kind)) + " is not served by this test");
-	}
-
 	const auto buffer_count = layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)];
 	std::vector<HostBuffer>      buffers(buffer_count);
 	std::vector<void*>           targets(buffer_count, nullptr);
@@ -309,6 +364,25 @@ bool Run(const Gpu& gpu, const Dispatch& dispatch) {
 		set_bindings.push_back({Recompiler::IR::NativeBinding(ShaderType::Compute, BindingKind::Buffers),
 		                        vk::DescriptorType::eStorageBuffer, buffer_count, vk::ShaderStageFlagBits::eCompute, nullptr});
 	}
+	std::optional<SampledTexture> texture;
+	if (dispatch.sampler_word) texture = CreateSampledTexture(gpu);
+	for (auto mask = layout.descriptor_mask; mask != 0; mask &= mask - 1u) {
+		const auto kind = static_cast<BindingKind>(std::countr_zero(mask));
+		if (kind == BindingKind::Buffers) continue;
+		const bool sampler = kind == BindingKind::Samplers;
+		Require(texture && layout.descriptor_counts[static_cast<size_t>(kind)] == 1u &&
+		            (sampler || Recompiler::IR::ImageBindingResourceClass(kind) == Recompiler::IR::ImageResourceClass::Sampled),
+		        what + ": unsupported descriptor binding " + std::to_string(static_cast<uint32_t>(kind)));
+		set_bindings.push_back({Recompiler::IR::NativeBinding(ShaderType::Compute, kind),
+		                        sampler ? vk::DescriptorType::eSampler : vk::DescriptorType::eSampledImage,
+		                        1, vk::ShaderStageFlagBits::eCompute, nullptr});
+	}
+	if (texture) {
+		for (const auto type: {vk::DescriptorType::eSampledImage, vk::DescriptorType::eSampler}) {
+			Require(std::ranges::count(set_bindings, type, &vk::DescriptorSetLayoutBinding::descriptorType) == 1,
+			        what + ": expected one image and one sampler binding");
+		}
+	}
 	vk::DescriptorSetLayoutCreateInfo set_layout_info;
 	set_layout_info.bindingCount = static_cast<uint32_t>(set_bindings.size());
 	set_layout_info.pBindings    = set_bindings.data();
@@ -337,11 +411,13 @@ bool Run(const Gpu& gpu, const Dispatch& dispatch) {
 	vk::Pipeline pipeline;
 	Checked(gpu.device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &pipeline), "pipeline creation");
 
-	const vk::DescriptorPoolSize pool_size {vk::DescriptorType::eStorageBuffer, std::max(buffer_count, 1u)};
+	std::vector<vk::DescriptorPoolSize> pool_sizes;
+	for (const auto& binding: set_bindings) pool_sizes.push_back({binding.descriptorType, binding.descriptorCount});
+	if (pool_sizes.empty()) pool_sizes.push_back({vk::DescriptorType::eStorageBuffer, 1u});
 	vk::DescriptorPoolCreateInfo pool_info;
 	pool_info.maxSets       = 1;
-	pool_info.poolSizeCount = 1;
-	pool_info.pPoolSizes    = &pool_size;
+	pool_info.poolSizeCount = static_cast<uint32_t>(pool_sizes.size());
+	pool_info.pPoolSizes    = pool_sizes.data();
 	const auto pool         = Checked(gpu.device.createDescriptorPool(pool_info), "descriptor pool creation");
 	vk::DescriptorSetAllocateInfo set_info;
 	set_info.descriptorPool     = pool;
@@ -360,6 +436,19 @@ bool Run(const Gpu& gpu, const Dispatch& dispatch) {
 		write.pBufferInfo     = buffer_infos.data();
 		gpu.device.updateDescriptorSets(1, &write, 0, nullptr);
 	}
+	if (texture) {
+		const vk::DescriptorImageInfo image {texture->sampler, texture->view, vk::ImageLayout::eShaderReadOnlyOptimal};
+		for (const auto& binding: set_bindings) {
+			if (binding.descriptorType == vk::DescriptorType::eStorageBuffer) continue;
+			vk::WriteDescriptorSet write;
+			write.dstSet          = set;
+			write.dstBinding      = binding.binding;
+			write.descriptorCount = 1;
+			write.descriptorType  = binding.descriptorType;
+			write.pImageInfo      = &image;
+			gpu.device.updateDescriptorSets(1, &write, 0, nullptr);
+		}
+	}
 
 	vk::CommandPoolCreateInfo command_pool_info;
 	command_pool_info.queueFamilyIndex = gpu.family;
@@ -373,6 +462,7 @@ bool Run(const Gpu& gpu, const Dispatch& dispatch) {
 	vk::CommandBufferBeginInfo begin;
 	begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
 	Checked(command.begin(begin), "command buffer begin");
+	if (texture) ClearSampledTexture(command, *texture);
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
 	command.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline_layout, 0, 1, &set, 0, nullptr);
 	command.pushConstants(pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
@@ -399,6 +489,12 @@ bool Run(const Gpu& gpu, const Dispatch& dispatch) {
 	gpu.device.destroyShaderModule(module);
 	gpu.device.destroyPipelineLayout(pipeline_layout);
 	gpu.device.destroyDescriptorSetLayout(set_layout);
+	if (texture) {
+		gpu.device.destroySampler(texture->sampler);
+		gpu.device.destroyImageView(texture->view);
+		gpu.device.destroyImage(texture->image);
+		gpu.device.freeMemory(texture->memory);
+	}
 	return true;
 }
 
@@ -873,17 +969,50 @@ void MultiplyThenAddRoundsProduct(const Gpu& gpu) {
 	          nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr});
 }
 
+void SamplerSpill(const Gpu& gpu) {
+	constexpr uint32_t Threads = 32;
+	alignas(256) std::array<uint32_t, Threads> output;
+	alignas(256) const std::array<uint32_t, 64> texture {};
+	output.fill(0xdeadbeefu);
+	Dispatch dispatch;
+	dispatch.name         = "sampler spill";
+	dispatch.code         = SamplerSpillProgram::Words;
+	dispatch.threads      = Threads;
+	dispatch.wave_size    = 32;
+	dispatch.sampler_word = 18;
+	const auto buffer = BufferDescriptor(output.data(), sizeof(output), 0, 0x30014000u | 0xfacu);
+	std::ranges::copy(buffer, dispatch.user_data.begin() + 4);
+	const auto base = reinterpret_cast<uint64_t>(texture.data()) >> 8u;
+	const std::array<uint32_t, 8> image {
+	    static_cast<uint32_t>(base), static_cast<uint32_t>((base >> 32u) & 0xffu) | (56u << 20u) | (3u << 30u),
+	    15u, 0xfacu | (9u << 28u), 0u, 0u, 0u, 0u,
+	};
+	std::ranges::copy(image, dispatch.user_data.begin() + 8);
+	Require(Run(gpu, dispatch), "sampler spill dispatch did not run");
+	const auto sampled = std::ranges::count(output, 0x3f800000u);
+	Check(sampled == Threads, "sampler spill: every lane must sample 1.0");
+	std::printf("sampler spill: %td/%u lanes sampled 1.0\n", sampled, Threads);
 }
 
-int main() {
+}
+
+int main(int argc, char** argv) {
 	const char* why = nullptr;
 	auto        gpu = OpenGpu(why);
 	if (!gpu) return NoDevice(why);
-	SumOfAbsoluteDifferences(*gpu);
-	ByteAverage(*gpu);
-	QuadSumOfAbsoluteDifferences(*gpu);
-	SumOfAbsoluteDifferencesClamp(*gpu);
-	MultiplyThenAddRoundsProduct(*gpu);
+	if (argc == 2 && std::string_view(argv[1]) == "sampler-spill") {
+		if (gpu->max_subgroup < HostSubgroup) {
+			CloseGpu(*gpu);
+			return NoDevice("a 32-lane subgroup is unavailable");
+		}
+		SamplerSpill(*gpu);
+	} else {
+		SumOfAbsoluteDifferences(*gpu);
+		ByteAverage(*gpu);
+		QuadSumOfAbsoluteDifferences(*gpu);
+		SumOfAbsoluteDifferencesClamp(*gpu);
+		MultiplyThenAddRoundsProduct(*gpu);
+	}
 	const auto name = gpu->name;
 	CloseGpu(*gpu);
 	if (g_failures != 0) {

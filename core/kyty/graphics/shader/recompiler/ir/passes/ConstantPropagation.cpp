@@ -37,7 +37,9 @@ public:
 	};
 
 	void Register(Block::iterator instruction) {
-		Queue(locations.emplace(&*instruction, Location {instruction}).first->second);
+		const auto [entry, inserted] = locations.emplace(&*instruction, Location {instruction});
+		if (inserted && instruction->GetOpcode() == ValueOpcode::Phi) phis.push_back(&*instruction);
+		Queue(entry->second);
 	}
 
 	void Queue(Location& location) {
@@ -72,6 +74,7 @@ public:
 	std::unordered_map<Inst*, Location> locations;
 	std::vector<Location*>              pending;
 	std::unordered_set<Inst*> lowered_ancillary;
+	std::vector<Inst*> phis;
 
 private:
 	std::vector<Inst*> affected;
@@ -167,6 +170,119 @@ bool FoldPhi(Inst& inst) {
 	}
 	Replace(inst, same);
 	return true;
+}
+
+struct PhiConstant {
+	Value value;
+	bool  varying = false;
+	std::vector<PhiConstant*> users;
+
+	bool Merge(Value incoming, bool incoming_varies) {
+		if (varying) return false;
+		if (incoming_varies || (!value.IsEmpty() && !incoming.IsEmpty() && value != incoming)) {
+			varying = true;
+			return true;
+		}
+		if (!value.IsEmpty() || incoming.IsEmpty()) return false;
+		value = incoming;
+		return true;
+	}
+};
+
+bool FoldReachablePhis(const BlockList& blocks, FoldWorklist& worklist) {
+	if (worklist.phis.empty()) return false;
+	std::unordered_map<const Block*, const Block*> reachable;
+	std::vector<const Block*> pending_blocks {blocks.front()};
+	while (!pending_blocks.empty()) {
+		const auto* block = pending_blocks.back();
+		pending_blocks.pop_back();
+		const auto [entry, inserted] = reachable.try_emplace(block, nullptr);
+		if (!inserted) continue;
+		const auto& term = block->terminator;
+		const auto condition = block->condition.Resolve();
+		if (term.kind == CFG::TerminatorKind::ConditionalBranch && IsImmediate(condition, Type::U1)) {
+			entry->second = condition.U1() ? term.true_block : term.false_block;
+		}
+		if (entry->second != nullptr) {
+			pending_blocks.push_back(entry->second);
+		} else {
+			const auto successors = block->ImmSuccessors();
+			pending_blocks.insert(pending_blocks.end(), successors.begin(), successors.end());
+		}
+	}
+
+	std::unordered_map<Inst*, PhiConstant> constants;
+	std::vector<Inst*> phis;
+	const auto enabled = [&](const Inst& phi, size_t arg) {
+		const auto edge = reachable.find(phi.PhiBlock(arg));
+		return edge != reachable.end() && (edge->second == nullptr || edge->second == phi.Parent());
+	};
+	bool changed = false;
+	const auto fold = [&](Inst& phi, Value value) {
+		worklist.QueueUsers(phi.Uses());
+		Replace(phi, value);
+		changed = true;
+	};
+	for (auto* phi: worklist.phis) {
+		if (phi->GetOpcode() != ValueOpcode::Phi || !reachable.contains(phi->Parent())) continue;
+		PhiConstant state;
+		bool dependent = false;
+		for (size_t arg = 0; arg < phi->NumArgs() && !state.varying; ++arg) {
+			if (!enabled(*phi, arg)) continue;
+			const auto source = Arg(*phi, arg);
+			const auto* inst = source.TryInstruction();
+			if (inst != nullptr && inst->GetOpcode() == ValueOpcode::Phi) {
+				dependent = true;
+			} else {
+				state.Merge(source, !source.IsImmediate() || source.IsEmpty());
+			}
+		}
+		if (state.varying) continue;
+		if (dependent) {
+			constants.try_emplace(phi);
+			phis.push_back(phi);
+		} else if (!state.value.IsEmpty()) {
+			fold(*phi, state.value);
+		}
+	}
+	std::vector<PhiConstant*> pending;
+	for (auto* phi: phis) {
+		auto& state = constants.at(phi);
+		for (size_t arg = 0; arg < phi->NumArgs(); ++arg) {
+			if (!enabled(*phi, arg)) continue;
+			const auto source = Arg(*phi, arg);
+			if (const auto from = constants.find(source.TryInstruction()); from != constants.end()) {
+				from->second.users.push_back(&state);
+			} else if (source.IsImmediate() && !source.IsEmpty()) {
+				state.Merge(source, false);
+			} else {
+				state.Merge({}, true);
+			}
+		}
+		if (state.varying || !state.value.IsEmpty()) pending.push_back(&state);
+	}
+	const auto propagate = [&] {
+		for (size_t i = 0; i < pending.size(); ++i) {
+			const auto* source = pending[i];
+			for (auto* target: source->users) {
+				if (target->Merge(source->value, source->varying)) pending.push_back(target);
+			}
+		}
+		pending.clear();
+	};
+	propagate();
+	for (auto* phi: phis) {
+		auto& state = constants.at(phi);
+		if (state.value.IsEmpty() && state.Merge({}, true)) pending.push_back(&state);
+	}
+	propagate();
+
+	for (auto* phi: phis) {
+		const auto& state = constants.at(phi);
+		if (state.varying) continue;
+		fold(*phi, state.value);
+	}
+	return changed;
 }
 
 bool FoldBitCast(Inst& inst, ValueOpcode reverse) {
@@ -992,7 +1108,7 @@ void ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size) {
 	drain();
 	bool normalized;
 	do {
-		normalized = false;
+		normalized = FoldReachablePhis(blocks, worklist);
 		for (auto* source: worklist.lowered_ancillary) {
 			if (source->GetOpcode() == ValueOpcode::Identity) continue;
 			const bool retained_only = std::ranges::all_of(source->Uses(), [](const Use& use) {
