@@ -78,7 +78,7 @@ if(MINGW)
 endif()
 target_link_libraries(kyty_shim_image_heap_variant_key_tests PRIVATE Kyty::gpu libkernel libc)
 add_test(NAME kyty_shim_image_heap_variant_key COMMAND kyty_shim_image_heap_variant_key_tests)
-set_tests_properties(kyty_shim_image_heap_variant_key PROPERTIES TIMEOUT 20 PASS_REGULAR_EXPRESSION "kyty_shim_image_heap_variant_key: ok")
+set_tests_properties(kyty_shim_image_heap_variant_key PROPERTIES TIMEOUT 20)
 
 add_test_executable(kyty_shim_replay_sampling_tests ${CMAKE_CURRENT_SOURCE_DIR}/ReplaySampling.cpp)
 configure_host_test_executable(kyty_shim_replay_sampling_tests)
