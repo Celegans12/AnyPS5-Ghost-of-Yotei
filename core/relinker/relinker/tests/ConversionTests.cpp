@@ -709,48 +709,58 @@ void windowsToIntelKeepsSegmentAccesses() {
     };
     const std::vector<std::uint8_t> clzero{0x0F, 0x01, 0xFC};
     const std::vector<std::uint8_t> fsRead{0x64, 0x48, 0x8B, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00};
+    const std::vector<std::uint8_t> gsRead{0x65, 0x48, 0x8B, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00};
     const std::vector<std::uint8_t> add{0x48, 0x83, 0xC0, 0x01};
-    {
-        auto code = clzero;
-        code.insert(code.end(), fsRead.begin(), fsRead.end());
-        code.push_back(0xC3);
-        auto source = input();
-        source.Executable = withCode(code);
-        bool refused = false;
+    const auto expectRefusal = [&](auto&& action, const char* message) {
         try {
-            static_cast<void>(converter.Convert(std::move(source), options));
-        } catch (const Codegen::CodegenException&) {
-            refused = true;
+            action();
+        } catch (const Codegen::CodegenException& error) {
+            require(
+                std::string_view(error.what()).find("No room for a jump to the stub of CLZERO") != std::string_view::npos &&
+                error.FailureOffset == 0x1000,
+                message
+            );
+            return;
         }
-        require(refused, "Windows --to-intel executable lowering moved an fs: access into a stub");
-    }
-    {
-        auto code = clzero;
-        code.insert(code.end(), fsRead.begin(), fsRead.end());
-        code.push_back(0xC3);
-        auto source = input();
-        source.Modules.push_back({"virtual/title/sce_module/plugin.prx", withCode(code)});
-        bool refused = false;
-        try {
-            static_cast<void>(converter.Convert(std::move(source), options));
-        } catch (const Codegen::CodegenException&) {
-            refused = true;
+        require(false, message);
+    };
+    for (const auto& segmentRead : {fsRead, gsRead}) {
+        {
+            auto code = clzero;
+            code.insert(code.end(), segmentRead.begin(), segmentRead.end());
+            code.push_back(0xC3);
+            auto source = input();
+            source.Executable = withCode(code);
+            expectRefusal(
+                [&] { static_cast<void>(converter.Convert(std::move(source), options)); },
+                "Windows --to-intel executable lowering did not refuse moving a segment-prefixed access into a stub"
+            );
         }
-        require(refused, "Windows --to-intel module lowering moved an fs: access into a stub");
-    }
-    {
-        auto code = add;
-        code.insert(code.end(), add.begin(), add.end());
-        code.insert(code.end(), clzero.begin(), clzero.end());
-        code.insert(code.end(), fsRead.begin(), fsRead.end());
-        code.push_back(0xC3);
-        auto source = input();
-        source.Executable = withCode(code);
-        source.Modules.push_back({"virtual/title/sce_module/plugin.prx", withCode(code)});
-        const auto output = converter.Convert(std::move(source), options);
-        require(output.Modules.size() == 1, "Windows --to-intel module with fs: access was not converted");
-        require(std::search(output.Executable.begin(), output.Executable.end(), fsRead.begin(), fsRead.end()) == output.Executable.end(), "Windows --to-intel executable left an unrewritten fs: access");
-        require(std::search(output.Modules.front().Bytes.begin(), output.Modules.front().Bytes.end(), fsRead.begin(), fsRead.end()) == output.Modules.front().Bytes.end(), "Windows --to-intel module left an unrewritten fs: access");
+        {
+            auto code = clzero;
+            code.insert(code.end(), segmentRead.begin(), segmentRead.end());
+            code.push_back(0xC3);
+            auto source = input();
+            source.Modules.push_back({"virtual/title/sce_module/plugin.prx", withCode(code)});
+            expectRefusal(
+                [&] { static_cast<void>(converter.Convert(std::move(source), options)); },
+                "Windows --to-intel module lowering did not refuse moving a segment-prefixed access into a stub"
+            );
+        }
+        {
+            auto code = add;
+            code.insert(code.end(), add.begin(), add.end());
+            code.insert(code.end(), clzero.begin(), clzero.end());
+            code.insert(code.end(), segmentRead.begin(), segmentRead.end());
+            code.push_back(0xC3);
+            auto source = input();
+            source.Executable = withCode(code);
+            source.Modules.push_back({"virtual/title/sce_module/plugin.prx", withCode(code)});
+            const auto output = converter.Convert(std::move(source), options);
+            require(output.Modules.size() == 1, "Windows --to-intel module with segment-prefixed access was not converted");
+            require(std::search(output.Executable.begin(), output.Executable.end(), segmentRead.begin(), segmentRead.end()) == output.Executable.end(), "Windows --to-intel executable left an unrewritten segment-prefixed access");
+            require(std::search(output.Modules.front().Bytes.begin(), output.Modules.front().Bytes.end(), segmentRead.begin(), segmentRead.end()) == output.Modules.front().Bytes.end(), "Windows --to-intel module left an unrewritten segment-prefixed access");
+        }
     }
 }
 
