@@ -429,6 +429,8 @@ public:
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	void Save();
+	void FlushManifestRecording();
+	[[nodiscard]] bool WaitForManifestCompletion(std::chrono::milliseconds timeout) const;
 
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;

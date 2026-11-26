@@ -29,6 +29,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <exception>
@@ -377,7 +378,11 @@ extern "C" std::size_t AgcDriverAwaitedWaits_nid_postfix(AgcDriver::AwaitedWait*
 }
 
 extern "C" void AgcDriverWaitForPipelineJournal_nid_postfix() {
-    static_cast<void>(KytyShim::Entry::Renderer());
+    auto& renderer = KytyShim::Entry::Renderer();
+    if (std::getenv("APS5_REPLAY_WAIT_MANIFEST") != nullptr &&
+        !renderer.GetPipelineCache().WaitForManifestCompletion(std::chrono::seconds(30))) {
+        throw std::runtime_error("frame replay: the pipeline manifest did not finish preparing its shaders and pipelines");
+    }
     AgcDriverWaitIdle_nid_postfix();
 }
 

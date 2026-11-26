@@ -94,6 +94,7 @@ struct Options {
     std::size_t submits = 0;
     bool traceSerials = false;
     bool coldPipelines = false;
+    bool waitManifest = false;
 };
 
 struct ThreadSample {
@@ -1091,7 +1092,7 @@ struct Replay {
 
 int usage() {
     std::fprintf(stderr, "usage: agc_frame_replay <capture directory> [--no-pace] [--pace-timeout-ms <n>] [--no-release] [--release-after-ms <n>] [--strict]\n"
-                         "                        [--repeat <n>] [--cold-pipelines] [--dump <address>:<bytes>:<file>]...\n"
+                         "                        [--repeat <n>] [--cold-pipelines] [--wait-manifest] [--dump <address>:<bytes>:<file>]...\n"
                          "  replays the driver calls and guest memory that APS5_FRAME_CAPTURE=<directory> recorded, through this\n"
                          "  build's AGC driver with no title running, and prints one JSON line with the frame times\n"
                          "  --no-pace           issues calls without waiting for the in-flight depth the title had\n"
@@ -1104,6 +1105,7 @@ int usage() {
                          "  --repeat <n>        replays the frames n times in this process, restoring the snapshot before each pass;\n"
                          "                      with n > 1 the frame times come from passes 2 to n, after the first warmed the caches\n"
                          "  --cold-pipelines    starts with an empty Vulkan pipeline cache instead of the title's pipeline cache file\n"
+                          "  --wait-manifest     waits up to 30 seconds for the saved pipeline manifest to finish preparing\n"
                          "  --shaders           replays nothing and maps no guest memory; lists each shader registration with its code\n"
                          "                      address, size and code hash as the snapshot and the captured writes before it hold them,\n"
                          "                      and how many registrations share that code\n"
@@ -1696,10 +1698,13 @@ void configureEnvironment(const Options& options) {
 #ifdef _WIN32
     _putenv_s("APS5_FRAME_CAPTURE", "");
     _putenv_s("APS5_HEADLESS_PIPELINE_CACHE", options.coldPipelines ? "" : "1");
+    _putenv_s("APS5_REPLAY_WAIT_MANIFEST", options.waitManifest ? "1" : "");
 #else
     unsetenv("APS5_FRAME_CAPTURE");
     if (options.coldPipelines) unsetenv("APS5_HEADLESS_PIPELINE_CACHE");
     else setenv("APS5_HEADLESS_PIPELINE_CACHE", "1", 1);
+    if (options.waitManifest) setenv("APS5_REPLAY_WAIT_MANIFEST", "1", 1);
+    else unsetenv("APS5_REPLAY_WAIT_MANIFEST");
 #endif
 }
 
@@ -1727,6 +1732,7 @@ int main(int argc, char** argv) {
             if (error != std::errc{} || end != value.data() + value.size() || options.submits == 0) return usage();
         } else if (argument == "--trace-serials") options.traceSerials = true;
         else if (argument == "--cold-pipelines") options.coldPipelines = true;
+        else if (argument == "--wait-manifest") options.waitManifest = true;
         else if (argument == "--dump" && index + 1 < argc) options.dumps.push_back(parseDump(argv[++index]));
         else if (argument == "--frames" && index + 1 < argc) options.frames = argv[++index];
         else if (!argument.starts_with("-") && options.directory.empty()) options.directory = argument;
