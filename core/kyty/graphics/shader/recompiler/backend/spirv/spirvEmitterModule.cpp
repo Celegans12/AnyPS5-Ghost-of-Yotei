@@ -1085,10 +1085,6 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformShuffle);
 	}
-	if (state.program.info.compute_derivatives && state.program.stage == ShaderType::Compute) {
-		state.builder.RequireCapability(spv::CapabilityComputeDerivativeGroupQuadsKHR);
-		state.builder.RequireExtension("SPV_KHR_compute_shader_derivatives");
-	}
 	const bool fragment_barycentric =
 	    state.program.stage == ShaderType::Pixel &&
 	    std::any_of(state.inputs.begin(), state.inputs.end(), [](const InputBinding& input) {
@@ -1124,6 +1120,10 @@ void DefineModule(EmitterState& state) {
 		local_x             = cs->threads_num[0] != 0u ? cs->threads_num[0] : local_x;
 		local_y             = cs->threads_num[1] != 0u ? cs->threads_num[1] : local_y;
 		local_z             = cs->threads_num[2] != 0u ? cs->threads_num[2] : local_z;
+		if (state.program.stage == ShaderType::Compute && state.program.info.compute_derivatives &&
+		    (uint64_t {local_x} * local_y * local_z) % 4u != 0u) {
+			EXIT("compute derivatives require four-lane workgroups (got %ux%ux%u)", local_x, local_y, local_z);
+		}
 		if (state.lane_count == 2) {
 			local_x = ((local_x * local_y * local_z + 63u) / 64u) * 32u;
 			local_y = local_z = 1u;
@@ -1134,6 +1134,21 @@ void DefineModule(EmitterState& state) {
 		}
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeLocalSize, local_x,
 		                               local_y, local_z);
+		if (state.program.stage == ShaderType::Compute && state.program.info.compute_derivatives) {
+			const bool quads_layout = (local_x & 1u) == 0u && (local_y & 1u) == 0u;
+			const bool linear_layout = (uint64_t {local_x} * local_y * local_z) % 4u == 0u;
+			if (quads_layout && state.profile.compute_derivative_quads) {
+				state.builder.RequireCapability(spv::CapabilityComputeDerivativeGroupQuadsKHR);
+				state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDerivativeGroupQuadsKHR);
+			} else if (linear_layout && state.profile.compute_derivative_linear) {
+				state.builder.RequireCapability(spv::CapabilityComputeDerivativeGroupLinearKHR);
+				state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDerivativeGroupLinearKHR);
+			} else {
+				EXIT("compute derivative group feature unavailable for local size %ux%ux%u", local_x,
+				     local_y, local_z);
+			}
+			state.builder.RequireExtension("SPV_KHR_compute_shader_derivatives");
+		}
 	}
 	if (state.program.stage == ShaderType::Pixel) {
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOriginUpperLeft);
@@ -1154,9 +1169,6 @@ void DefineModule(EmitterState& state) {
 			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeEarlyFragmentTests);
 		}
 #endif
-	}
-	if (state.program.info.compute_derivatives && state.program.stage == ShaderType::Compute) {
-		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDerivativeGroupQuadsKHR);
 	}
 	state.builder.AddName(state.main_func, "main");
 	if (state.program.info.function_lds) {

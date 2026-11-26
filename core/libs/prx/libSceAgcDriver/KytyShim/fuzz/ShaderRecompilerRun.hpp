@@ -72,7 +72,9 @@ inline void ReportInvalid(const std::string& message, std::span<const uint32_t> 
 }
 
 inline void Run(std::span<const uint32_t> original, uint8_t mode, uint8_t shape,
-	            std::string* refusal = nullptr, bool* emitted = nullptr) {
+	            std::string* refusal = nullptr, bool* emitted = nullptr,
+	            const Recompiler::Spirv::Profile* device_profile = nullptr,
+	            std::vector<uint32_t>* spirv_output = nullptr, uint32_t compute_local_x = 0u) {
 	if (emitted != nullptr) *emitted = false;
 	static const auto profile = Profile();
 	std::vector<uint32_t> storage(original.begin(), original.end());
@@ -84,7 +86,7 @@ inline void Run(std::span<const uint32_t> original, uint8_t mode, uint8_t shape,
 	options.emit_debug_info    = false;
 	options.native_ray_tracing = true;
 	options.ray_stats          = false;
-	options.profile            = &profile;
+	options.profile            = device_profile != nullptr ? device_profile : &profile;
 	const std::vector<uint32_t> user_data(16u + (shape & 15u), 0u);
 	options.user_data = user_data;
 
@@ -107,7 +109,7 @@ inline void Run(std::span<const uint32_t> original, uint8_t mode, uint8_t shape,
 		default:
 			compute.wave_size          = wave;
 			compute.host_subgroup_size = 32;
-			compute.threads_num[0]     = 1u << (shape & 3u);
+			compute.threads_num[0]     = compute_local_x != 0u ? compute_local_x : 1u << (shape & 3u);
 			compute.threads_num[1]     = 1u << ((shape >> 2) & 3u);
 			compute.threads_num[2]     = 1;
 			compute.thread_ids_num     = 2;
@@ -137,6 +139,7 @@ inline void Run(std::span<const uint32_t> original, uint8_t mode, uint8_t shape,
 		if (!IR::ResourceSpecializationFits(translated.program, specialization)) return;
 		auto compiled = Recompiler::CompileProgram(std::move(translated), options, specialization, 0);
 		if (emitted != nullptr) *emitted = !compiled.spirv.empty();
+		if (spirv_output != nullptr) *spirv_output = compiled.spirv;
 		const char* policy = std::getenv("KYTY_FUZZ_SPIRV");
 		if (!compiled.spirv.empty() && policy != nullptr && std::strcmp(policy, "off") != 0 && policy[0] != 0) {
 			std::string message;

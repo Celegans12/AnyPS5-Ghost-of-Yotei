@@ -78,6 +78,14 @@ int main() {
 	Write(legacy, old_header.bytes);
 	WriteModule<LegacyWriter>(legacy, 0x102, 0x201, ShaderType::Vertex, vertex, {});
 	WriteModule<LegacyWriter>(legacy, 0x101, 0x201, ShaderType::Vertex, vertex, {});
+	std::ofstream previous("previous.shaders", std::ios::binary);
+	Writer previous_header;
+	const uint32_t all_stages = ~0u;
+	IoAll(previous_header, stamp, off, off, clock_period, off, off, off, off, off,
+	      on, on, on, on, on, on, on, all_stages, shared_memory);
+	Write(previous, previous_header.bytes);
+	WriteModule(previous, 0x102, 0x201, ShaderType::Vertex, vertex, {});
+	WriteModule(previous, 0x101, 0x201, ShaderType::Vertex, vertex, {});
 
 	std::ofstream malformed("malformed.shaders", std::ios::binary);
 	Write(malformed, header.bytes);
@@ -93,5 +101,5 @@ int main() {
 	WriteDump("plain.spv", plain);
 	WriteDump("missing.spv", missing);
 	WriteDump("invalid.spv", {0, 0, 0, 0, 0});
-	return !store || !legacy || !malformed || !bad_header;
+	return !store || !legacy || !previous || !malformed || !bad_header;
 }

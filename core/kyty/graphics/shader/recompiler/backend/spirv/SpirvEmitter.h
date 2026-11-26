@@ -18,6 +18,8 @@ struct Profile {
 	bool r8g8_srgb_views = false;
 	bool relaxed_float = false;
 	bool ray_query = false;
+	bool compute_derivative_quads = true;
+	bool compute_derivative_linear = true;
 	bool lds_lane_sync = true;
 	bool native_float16 = true;
 	bool f32_product_no_contraction = true;

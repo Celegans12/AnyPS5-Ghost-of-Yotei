@@ -44,6 +44,8 @@ bool ReadDump(const std::filesystem::path& path, Dump& dump) {
 template <size_t Flags>
 using EarlierProfile = std::tuple<bool, bool, uint32_t, std::array<bool, Flags>>;
 
+using PreviousProfile = std::tuple<bool, bool, uint32_t, std::array<bool, 12>, uint32_t>;
+
 bool ReadStoreHeader(std::istream& input) {
 	input.seekg(0, std::ios::end);
 	const auto end = input.tellg();
@@ -67,7 +69,8 @@ bool ReadStoreHeader(std::istream& input) {
 		input.seekg(size);
 		return bool(input);
 	};
-	return try_profile(ShaderRecompiler::Spirv::Profile{}) || try_profile(EarlierProfile<9>{}) ||
+	return try_profile(ShaderRecompiler::Spirv::Profile{}) || try_profile(PreviousProfile{}) ||
+	       try_profile(EarlierProfile<9>{}) ||
 	       try_profile(EarlierProfile<8>{}) || try_profile(EarlierProfile<7>{}) || try_profile(EarlierProfile<6>{});
 }
 

@@ -526,6 +526,8 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		    "Some games may render incorrectly or crash.\n");
 	}
 	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
+	graphics.compute_derivative_quads_enabled = compute_derivatives.computeDerivativeGroupQuads == VK_TRUE;
+	graphics.compute_derivative_linear_enabled = compute_derivatives.computeDerivativeGroupLinear == VK_TRUE;
 #if defined(ANYPS5_KYTY)
 	if (PipelineLibrariesWanted() && extended_dynamic_state &&
 	    HasExtension(available_extensions, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) &&
@@ -800,7 +802,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	if (!graphics.conditional_rendering_enabled) {
 		create.unlink<vk::PhysicalDeviceConditionalRenderingFeaturesEXT>();
 	}
-	if (!compute_derivatives.computeDerivativeGroupQuads) {
+	if (!graphics.compute_derivative_quads_enabled && !graphics.compute_derivative_linear_enabled) {
 		create.unlink<vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR>();
 	}
 	if (!extended_dynamic_state) {
