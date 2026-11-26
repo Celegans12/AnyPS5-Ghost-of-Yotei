@@ -432,6 +432,21 @@ set_tests_properties(kyty_shim_tiled_layout_stop PROPERTIES TIMEOUT 20
         PASS_REGULAR_EXPRESSION "TileGetTiledTextureLayout.*: format 76, tile mode 24, 2D 1009x1x1, 2 levels"
         FAIL_REGULAR_EXPRESSION "did not stop")
 
+add_test_executable(kyty_shim_tiler_shaders_tests ${CMAKE_CURRENT_SOURCE_DIR}/TilerShaders.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+target_include_directories(kyty_shim_tiler_shaders_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_include_directories(kyty_shim_tiler_shaders_tests SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/3rdparty/SPIRV-Tools/include)
+configure_host_test_executable(kyty_shim_tiler_shaders_tests)
+if(MINGW)
+    target_link_libraries(kyty_shim_tiler_shaders_tests PRIVATE stdc++ gcc_eh)
+endif()
+target_link_libraries(kyty_shim_tiler_shaders_tests PRIVATE Kyty::gpu libkernel libc)
+add_test(NAME kyty_shim_tiler_shaders COMMAND kyty_shim_tiler_shaders_tests)
+set_tests_properties(kyty_shim_tiler_shaders PROPERTIES TIMEOUT 20
+        PASS_REGULAR_EXPRESSION "kyty_shim_tiler_shaders: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+add_test(NAME kyty_shim_tiler_shaders_gpu COMMAND kyty_shim_tiler_shaders_tests gpu)
+set_tests_properties(kyty_shim_tiler_shaders_gpu PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "kyty_shim_tiler_shaders_gpu: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+
 add_test_executable(kyty_shim_merged_hull_tests ${CMAKE_CURRENT_SOURCE_DIR}/MergedHull.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
 target_include_directories(kyty_shim_merged_hull_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_include_directories(kyty_shim_merged_hull_tests SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/3rdparty/SPIRV-Tools/include)
