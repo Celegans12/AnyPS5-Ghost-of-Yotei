@@ -648,6 +648,12 @@ private:
 	uint64_t                                           m_linear_copy_generation  = 0;
 	uint32_t                                           m_linear_copy_uses        = 0;
 	std::array<uint64_t, 4>                            m_replicated {};
+	struct RefusedFill {
+		uint64_t address = 0;
+		uint64_t size    = 0;
+		uint32_t value   = 0;
+	};
+	RefusedFill                                        m_refused_fill {};
 	std::unique_ptr<DrawRenderStorage, void (*)(DrawRenderStorage*)> m_draw_state {nullptr,
 	                                                                               nullptr};
 	std::unique_ptr<ResolvedDrawRing, void (*)(ResolvedDrawRing*)> m_resolved_ring {nullptr,

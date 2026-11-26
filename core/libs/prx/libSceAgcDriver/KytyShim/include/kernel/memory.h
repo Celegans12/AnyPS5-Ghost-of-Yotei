@@ -175,6 +175,8 @@ bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t
 bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
 bool                   IsBackingReadable(uint64_t vaddr, uint64_t size);
 [[nodiscard]] uint64_t BackingEpoch() noexcept;
+enum class BackingShare : uint8_t { Sole, Aliased, Private, Unmapped };
+[[nodiscard]] BackingShare SoleBackingStamp(uint64_t vaddr, uint64_t size, uint64_t* stamp);
 [[nodiscard]] bool BackingChangesSince(uint64_t epoch,
                                        std::vector<std::pair<uint64_t, uint64_t>>& changes);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);

@@ -98,6 +98,7 @@ public:
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
 	[[nodiscard]] bool CoversMeta(uint64_t address, uint64_t size);
+	void               NoteMetaFill(uint64_t address, uint64_t size, uint32_t value, bool in_memory);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
@@ -161,6 +162,7 @@ public:
 		return settled;
 	}
 	void NoteMetadataWrite(uint64_t vaddr, uint64_t size) {
+		DropPendingMetaClears(vaddr, size);
 		if (vaddr < m_settled_end.load(std::memory_order_acquire) &&
 		    vaddr + size > m_settled_begin.load(std::memory_order_acquire) && MaybeSettled(vaddr, size)) {
 			ForgetSettledMetadata(vaddr, size);
@@ -197,6 +199,15 @@ public:
 	void RunGarbageCollector();
 
 private:
+	struct PendingMetaClear {
+		uint64_t size          = 0;
+		uint64_t tick          = 0;
+		uint32_t value         = 0;
+		bool     in_memory     = false;
+		uint64_t backing_stamp = 0;
+	};
+	using PendingMetaClears = std::map<uint64_t, PendingMetaClear>;
+
 	struct MetaDataInfo {
 		std::bitset<8192> clear_mask;
 		ImageId owner;
@@ -351,6 +362,18 @@ private:
 	void                      DeleteImage(ImageId id) KYTY_REQUIRES(m_lock);
 	void                      ReleaseDepthFeedbackCopy(ImageId depth_id);
 	void                      FreeImage(ImageId id) KYTY_REQUIRES(m_lock);
+	void                      ApplyPendingMetaClears(const ImageInfo& info, MetaDataInfo& meta) KYTY_REQUIRES(m_lock);
+	void                      DropPendingMetaClears(uint64_t address, uint64_t size);
+	void                      DropPendingMetaClearsLocked(uint64_t address, uint64_t size)
+	    KYTY_REQUIRES(m_pending_meta_lock);
+	void                      UpdatePendingMetaBoundsLocked() KYTY_REQUIRES(m_pending_meta_lock);
+	void                      ErasePendingMetaClearsLocked(PendingMetaClears::iterator first, PendingMetaClears::iterator last)
+	    KYTY_REQUIRES(m_pending_meta_lock);
+	void HoldPendingMetaPagesLocked(uint64_t address, uint64_t size, bool hold) KYTY_REQUIRES(m_pending_meta_lock);
+	void DropPendingMetaClearsAround(uint64_t address, uint64_t size);
+	[[nodiscard]] bool        OverlapsSurfaceMetaLocked(uint64_t address, uint64_t size) const KYTY_REQUIRES(m_lock);
+	[[nodiscard]] bool        MaybePendingMeta(uint64_t address, uint64_t end) const;
+	static void               AddPendingMetaGranules(std::array<uint64_t, 64>& words, uint64_t address, uint64_t size);
 	void                      TouchImage(Image& image) KYTY_NO_THREAD_SAFETY_ANALYSIS;
 	void                      TrackImage(ImageId id);
 	void                      TrackImageHead(ImageId id);
@@ -475,6 +498,14 @@ private:
 	std::unordered_map<ImageId, std::vector<ImageId>> m_stencil_copies;
 	std::vector<std::pair<ImageId, uint64_t>>         m_parked_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
+	Common::AnnotatedMutex                            m_pending_meta_lock;
+	PendingMetaClears                                 m_pending_meta_clears KYTY_GUARDED_BY(m_pending_meta_lock);
+	std::map<uint64_t, uint32_t>                      m_pending_meta_pages KYTY_GUARDED_BY(m_pending_meta_lock);
+	std::atomic<uint64_t>                             m_pending_meta_count {0};
+	std::atomic<uint64_t>                             m_pending_meta_begin {UINT64_MAX};
+	std::atomic<uint64_t>                             m_pending_meta_end {0};
+	static constexpr uint32_t                         PendingMetaGranuleBits = 16;
+	std::array<std::atomic<uint64_t>, 64>             m_pending_meta_granules {};
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;

@@ -181,6 +181,63 @@ void TestDirect() {
     std::printf("direct 0x%llx and alias 0x%llx: one backing, coherent both ways\n", static_cast<unsigned long long>(Address(first)), static_cast<unsigned long long>(Address(alias)));
 }
 
+void TestSoleBacking() {
+    constexpr std::size_t bytes = Page * 4;
+    const auto directSize = static_cast<int64_t>(sceKernelGetDirectMemorySize());
+    int64_t phys = -1;
+    int64_t other = -1;
+    Require(sceKernelAllocateDirectMemory(0, directSize, bytes, 0, 0, &phys) == 0 && phys >= 0);
+    Require(sceKernelAllocateDirectMemory(0, directSize, bytes, 0, 0, &other) == 0 && other >= 0 && other != phys);
+    void* place = nullptr;
+    Require(sceKernelReserveVirtualRange(&place, bytes, 0, 0) == 0 && place != nullptr);
+    void* mapped = place;
+    Require(sceKernelMapDirectMemory(&mapped, bytes, CpuReadWrite | GpuReadWrite, MapFixed, phys, 0) == 0 && mapped == place);
+    const auto address = Address(place);
+    std::uint64_t whole = 0;
+    std::uint64_t head = 0;
+    std::uint64_t stamp = 0;
+    Require(Memory::SoleBackingStamp(address, bytes, &whole) == Memory::BackingShare::Sole);
+    Require(Memory::SoleBackingStamp(address, bytes, &stamp) == Memory::BackingShare::Sole && stamp == whole);
+    Require(Memory::SoleBackingStamp(address, Page, &head) == Memory::BackingShare::Sole);
+
+    void* alias = nullptr;
+    Require(sceKernelMapDirectMemory(&alias, Page, CpuReadWrite | GpuReadWrite, 0, phys + static_cast<int64_t>(Page), 0) == 0 && alias != nullptr);
+    Require(Memory::SoleBackingStamp(address, bytes, &stamp) == Memory::BackingShare::Aliased);
+    Require(Memory::SoleBackingStamp(Address(alias), Page, &stamp) == Memory::BackingShare::Aliased);
+    Require(Memory::SoleBackingStamp(address, Page, &stamp) == Memory::BackingShare::Sole && stamp == head);
+    Require(sceKernelMunmap(Address(alias), Page) == 0);
+    Require(Memory::SoleBackingStamp(Address(alias), Page, &stamp) == Memory::BackingShare::Unmapped);
+    Require(Memory::SoleBackingStamp(address, bytes, &stamp) == Memory::BackingShare::Sole && stamp != whole);
+
+    Require(Memory::SoleBackingStamp(address, bytes, &whole) == Memory::BackingShare::Sole);
+    void* remapped = place;
+    Require(sceKernelMapDirectMemory(&remapped, bytes, CpuReadWrite | GpuReadWrite, MapFixed, other, 0) == 0 && remapped == place);
+    Require(Memory::SoleBackingStamp(address, bytes, &stamp) == Memory::BackingShare::Sole && stamp != whole);
+    Require(sceKernelMunmap(address, bytes) == 0);
+    Require(Memory::SoleBackingStamp(address, bytes, &stamp) == Memory::BackingShare::Unmapped);
+    Require(sceKernelReleaseDirectMemory(phys, bytes) == 0);
+    Require(sceKernelReleaseDirectMemory(other, bytes) == 0);
+
+    void* flexible = nullptr;
+    Require(sceKernelMapFlexibleMemory(&flexible, Page * 2, CpuReadWrite, 0) == 0 && flexible != nullptr);
+    Require(Memory::SoleBackingStamp(Address(flexible), Page * 2, &stamp) == Memory::BackingShare::Sole);
+    Require(sceKernelMunmap(Address(flexible), Page * 2) == 0);
+
+    const int file = memfd_create("kyty sole backing", MFD_CLOEXEC);
+    Require(file >= 0 && ftruncate(file, static_cast<off_t>(Page)) == 0);
+    void* shared = nullptr;
+    void* second = nullptr;
+    Require(DoMapFileBacked_nid_no_patch(&shared, Page, CpuReadWrite, 1, file, 0, Page) == 0 && shared != nullptr);
+    Require(DoMapFileBacked_nid_no_patch(&second, Page, CpuReadWrite, 1, file, 0, Page) == 0 && second != nullptr && second != shared);
+    static_cast<std::uint8_t*>(second)[5] = 0x6b;
+    Require(static_cast<const std::uint8_t*>(shared)[5] == 0x6b);
+    Require(Memory::SoleBackingStamp(Address(shared), Page, &stamp) == Memory::BackingShare::Private);
+    Require(sceKernelMunmap(Address(second), Page) == 0);
+    Require(sceKernelMunmap(Address(shared), Page) == 0);
+    ::close(file);
+    std::printf("sole backing: one mapping keeps its stamp, a second mapping of a page reads as aliased, an unmapped alias or a remap changes the stamp, a file mapped twice reads as private\n");
+}
+
 void TestGpuHooks() {
     void* before = nullptr;
     Require(sceKernelMapFlexibleMemory(&before, Page * 2, CpuReadWrite, 0) == 0);
@@ -1190,6 +1247,7 @@ int main() {
     Require(Libs::LibKernel::Memory::Shim::ViewEnabled());
     TestFlexible();
     TestDirect();
+    TestSoleBacking();
     TestGpuHooks();
     TestReleaseWhileMapped();
     TestHostProtectionTable();

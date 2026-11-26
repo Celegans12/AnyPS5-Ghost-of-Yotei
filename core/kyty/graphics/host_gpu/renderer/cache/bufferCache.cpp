@@ -2059,7 +2059,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	if (vaddr == 0) {
 		EXIT("BufferCache: invalid fill memory address\n");
 	}
-	(void)m_texture_cache.ClearMeta(vaddr);
+	const bool meta = m_texture_cache.ClearMeta(vaddr);
 	if (!IsRegionGpuModified(vaddr, size) && !ServesInPlace(vaddr, size) && !DeferredLabelPending(vaddr, size)) {
 		InvalidateMemory(vaddr, size);
 		m_texture_cache.InvalidateMemory(vaddr, size);
@@ -2067,6 +2067,9 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 		auto* destination = reinterpret_cast<uint32_t*>(vaddr);
 		std::fill(destination, destination + size / sizeof(uint32_t), value);
 		LibKernel::Memory::NoteEmulatorWrite(vaddr, size);
+		if (!meta) {
+			m_texture_cache.NoteMetaFill(vaddr, size, value, true);
+		}
 		return;
 	}
 
@@ -2076,6 +2079,9 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	m_in_place_write       = InPlaceMemory::WriteKind::Binding;
 	m_texture_cache.ProtectPendingImageWriteBacks(vaddr, size);
 	dst->Fill(dst_offset, size, value);
+	if (!meta) {
+		m_texture_cache.NoteMetaFill(vaddr, size, value, false);
+	}
 }
 
 bool BufferCache::ReplicateBuffer(uint64_t destination, uint64_t count, uint64_t source,

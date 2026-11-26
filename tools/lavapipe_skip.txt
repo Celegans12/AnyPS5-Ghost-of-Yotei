@@ -18,3 +18,4 @@ kyty_shim_cross_queue_recycled_label	same device requirement as kyty_shim_depth_
 kyty_shim_cross_queue_early_label	same device requirement as kyty_shim_depth_target_alias
 kyty_shim_cross_queue_recycled_label_own_tick	same device requirement as kyty_shim_depth_target_alias
 kyty_shim_wave_split_written_reads	same device requirement as kyty_shim_depth_target_alias, and the wave64 split it checks needs subgroups of 32
+kyty_shim_depth_meta_fill	same device requirement as kyty_shim_depth_target_alias
