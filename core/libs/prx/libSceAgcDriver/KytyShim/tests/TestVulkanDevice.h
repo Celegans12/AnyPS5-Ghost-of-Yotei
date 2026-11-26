@@ -58,7 +58,8 @@ struct TestVulkanDevice {
 private:
 	bool InitializeDevice(vk::PhysicalDevice physical, bool require_tiling) {
 		vk::PhysicalDeviceVulkan12Properties limits {};
-		vk::PhysicalDeviceProperties2 properties {.pNext = &limits};
+		vk::PhysicalDeviceVulkan11Properties properties11 {.pNext = &limits};
+		vk::PhysicalDeviceProperties2 properties {.pNext = &properties11};
 		physical.getProperties2(&properties);
 		if (properties.properties.apiVersion < Libs::Graphics::VULKAN_TARGET_API_VERSION ||
 		    std::min({limits.maxDescriptorSetUpdateAfterBindSampledImages,
@@ -135,6 +136,8 @@ private:
 		VULKAN_HPP_DEFAULT_DISPATCHER.init(graphics.device);
 		graphics.physical_device = physical;
 		graphics.physical_device_properties = properties.properties;
+		graphics.subgroup_supported_stages = properties11.subgroupSupportedStages;
+		graphics.subgroup_supported_operations = properties11.subgroupSupportedOperations;
 		if (!core_features.shaderStorageImageMultisample) {
 			graphics.physical_device_properties.limits.storageImageSampleCounts = vk::SampleCountFlagBits::e1;
 		}
