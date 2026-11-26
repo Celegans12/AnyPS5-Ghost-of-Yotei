@@ -228,6 +228,7 @@ struct PipelineCache::ManifestState {
 	uint32_t                              pipelines_known  = 0;
 	uint32_t                              pipelines_failed = 0;
 	uint32_t                              compute          = 0;
+	uint32_t                              compute_failed   = 0;
 	std::atomic<uint32_t>                 dropped {0};
 	uint64_t                              build_ns         = 0;
 	uint64_t                              pipeline_ns      = 0;
@@ -808,6 +809,15 @@ void PipelineCache::CloseManifest() {
 		state.threads.clear();
 		ManifestProgress(true);
 	}
+	state.saver = {};
+	SaveManifestRecording();
+}
+
+void PipelineCache::FlushManifestRecording() {
+	if (m_manifest == nullptr) {
+		return;
+	}
+	auto& state = *m_manifest;
 	state.saver = {};
 	SaveManifestRecording();
 }
@@ -2744,7 +2754,7 @@ void PipelineCache::CreateManifestComputePipeline(const ShaderModule& module, bo
 		m_async_pending_compute.erase(module.id);
 	}
 	std::scoped_lock lock(state.mutex);
-	state.compute += created ? 1u : 0u;
+	(created ? state.compute : state.compute_failed)++;
 	state.pipeline_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 	                                               std::chrono::steady_clock::now() - start)
 	                                               .count());
@@ -2770,6 +2780,31 @@ PipelineCache::ManifestBacklog PipelineCache::GetManifestBacklog() const {
 	backlog.module_seconds   = state.module_time.Get();
 	backlog.pipeline_seconds = state.pipeline_time.Get();
 	return backlog;
+}
+
+bool PipelineCache::WaitForManifestCompletion(std::chrono::milliseconds timeout) const {
+	if (!m_manifest_warm || m_manifest == nullptr) {
+		return false;
+	}
+	auto& state = *m_manifest;
+	const auto deadline = std::chrono::steady_clock::now() + timeout;
+	std::unique_lock lock(state.mutex);
+	for (;;) {
+		const bool complete = !state.scanning.load(std::memory_order_acquire) &&
+		                      state.module_jobs.empty() && state.pipeline_jobs.empty() && state.running == 0 &&
+		                      state.built + state.found + state.failed == state.warm_modules.size() &&
+		                      state.pipelines + state.pipelines_known + state.pipelines_failed == state.warm_pipelines.size() &&
+		                      std::ranges::all_of(state.missing_code, [](uint8_t missing) { return missing == 0; });
+		if (complete) {
+			return state.failed == 0 && state.pipelines_failed == 0 && state.compute_failed == 0 &&
+			       state.dropped.load(std::memory_order_relaxed) == 0;
+		}
+		if (state.available.wait_until(lock, std::min(deadline, std::chrono::steady_clock::now() +
+		                                         std::chrono::milliseconds(10))) == std::cv_status::timeout &&
+		    std::chrono::steady_clock::now() >= deadline) {
+			return false;
+		}
+	}
 }
 
 void PipelineCache::ManifestProgress(bool force) {
@@ -2800,12 +2835,12 @@ void PipelineCache::ManifestProgress(bool force) {
 	state.logged_idle = idle;
 	ManifestLog("Pipeline manifest: {} at {:.1f} s: {} modules compiled ({:.0f} ms), {} compiled "
 	            "already, {} failed, {} waiting for their shaders; {} pipelines and {} compute "
-	            "pipelines created ({:.0f} ms), {} created already, {} failed; {} records dropped "
+	            "pipelines created ({:.0f} ms), {} created already, {} failed; {} compute failed; {} records dropped "
 	            "after a fatal error",
 	            idle ? "idle" : "stopped", Seconds(now - state.start), state.built,
 	            Milliseconds(state.build_ns), state.found, state.failed, waiting, state.pipelines,
 	            state.compute, Milliseconds(state.pipeline_ns), state.pipelines_known,
-	            state.pipelines_failed, state.dropped.load(std::memory_order_relaxed));
+	            state.pipelines_failed, state.compute_failed, state.dropped.load(std::memory_order_relaxed));
 }
 
 void PipelineCache::RecordModule(const ProgramKey&                       key,

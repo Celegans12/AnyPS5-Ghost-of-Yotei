@@ -743,6 +743,10 @@ set_tests_properties(kyty_shim_generic_compute_replay PROPERTIES TIMEOUT 180 SKI
 add_test(NAME kyty_shim_generic_compute_replay_wide COMMAND kyty_shim_generic_compute_replay_tests $<TARGET_FILE:agc_frame_replay>)
 set_tests_properties(kyty_shim_generic_compute_replay_wide PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77
         ENVIRONMENT "KYTY_GENERIC_COMPUTE_SPECIALIZE=0" PASS_REGULAR_EXPRESSION "kyty_shim_generic_compute_replay_wide: ok")
+add_test(NAME kyty_shim_prepared_variant_first_use COMMAND kyty_shim_generic_compute_replay_tests
+        $<TARGET_FILE:agc_frame_replay> --prepared)
+set_tests_properties(kyty_shim_prepared_variant_first_use PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "kyty_shim_prepared_variant_first_use: ok")
 add_test_executable(kyty_shim_packed_unorm_blend_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/PackedUnormBlend.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp
@@ -815,7 +819,8 @@ set_tests_properties(kyty_shim_cross_queue_recycled_label_own_tick PROPERTIES TI
 if(WIN32)
     set_property(TEST kyty_shim_buffer_null_range kyty_shim_uniform_scalar_replay kyty_shim_empty_buffer_replay
             kyty_shim_empty_buffer_replay_off kyty_shim_bda_load_forms
-            kyty_shim_generic_compute_replay kyty_shim_generic_compute_replay_wide kyty_shim_bda_submission_sync
+            kyty_shim_generic_compute_replay kyty_shim_generic_compute_replay_wide
+            kyty_shim_prepared_variant_first_use kyty_shim_bda_submission_sync
             kyty_shim_cross_queue_compute_waits_graphics_data kyty_shim_cross_queue_graphics_waits_compute_data
             kyty_shim_cross_queue_dma_wait kyty_shim_cross_queue_compute_waits_graphics_clock
             kyty_shim_cross_queue_graphics_waits_compute_clock kyty_shim_cross_queue_recycled_label

@@ -38,6 +38,7 @@ constexpr std::uint32_t Fill = 0xdeadbeefu;
 constexpr std::string_view BuildLine = "[kyty-variant] build stage=CS";
 constexpr std::string_view ServeLine = "[kyty-variant] serve stage=CS";
 constexpr std::string_view WidenLine = "[kyty-variant] widen stage=CS";
+constexpr std::string_view ReadyLine = "[kyty-variant] ready-pipeline stage=CS module=";
 
 constexpr std::array<std::uint32_t, 31> LoopWords{
     0xf4080600, 0xfa000100, 0x7e080d00, 0x060808f0, 0x100808ff, 0x3c800000, 0x7e0a02f0, 0x340c0084,
@@ -61,6 +62,11 @@ constexpr std::array<Dispatch, 7> Dispatches{{
     {{FloatB, FloatB, FloatB}, 3u},
     {{FloatB, UintC, FloatA}, 3u},
     {{FloatA, FloatB, FloatA}, 2u},
+}};
+
+constexpr std::array<Dispatch, 2> PreparedDispatches{{
+    {{FloatA, FloatB, FloatA}, 2u},
+    {{FloatA, UintC, FloatA}, 2u},
 }};
 
 constexpr std::uint32_t Rows = 32;
@@ -89,9 +95,9 @@ void append(std::vector<std::uint32_t>& words, std::uint32_t opcode, std::initia
     words.insert(words.end(), payload);
 }
 
-std::vector<std::uint32_t> dispatchWords() {
+std::vector<std::uint32_t> dispatchWords(std::span<const Dispatch> dispatches) {
     std::vector<std::uint32_t> words;
-    for (std::uint32_t row = 0; row < Dispatches.size(); ++row) {
+    for (std::uint32_t row = 0; row < dispatches.size(); ++row) {
         const auto table = Tables + row * 0x200u;
         const auto target = output(row);
         append(words, 0x76, {0x20c, static_cast<std::uint32_t>(Code >> 8u), static_cast<std::uint32_t>(Code >> 40u)});
@@ -100,7 +106,7 @@ std::vector<std::uint32_t> dispatchWords() {
         append(words, 0x76, {0x207, Lanes, 1u, 1u});
         append(words, 0x76,
                {0x240, static_cast<std::uint32_t>(table), static_cast<std::uint32_t>(table >> 32u),
-                Dispatches[row].count, 0u, target[0], target[1], target[2], target[3]});
+                dispatches[row].count, 0u, target[0], target[1], target[2], target[3]});
         append(words, 0x15, {1u, 1u, 1u, 0x41u});
     }
     return words;
@@ -132,17 +138,17 @@ void writeShader(std::span<std::byte> memory) {
     write(memory, Code, std::span<const std::uint32_t>(LoopWords));
 }
 
-void makeCapture(const std::filesystem::path& path) {
+void makeCapture(const std::filesystem::path& path, std::span<const Dispatch> dispatches) {
     using AgcDriver::FrameCallKind;
     auto memory = std::vector<std::byte>(GuestBytes);
-    const auto commands = dispatchWords();
+    const auto commands = dispatchWords(dispatches);
     writeShader(memory);
     write(memory, Commands, std::span(commands));
-    for (std::uint32_t row = 0; row < Dispatches.size(); ++row) {
+    for (std::uint32_t row = 0; row < dispatches.size(); ++row) {
         const std::array<std::uint32_t, 4> sampler{0x12u, 0u, 0u, 0u};
         const auto table = Tables + row * 0x200u;
-        for (std::uint32_t entry = 0; entry < Dispatches[row].table.size(); ++entry) {
-            const auto descriptor = tsharp(Dispatches[row].table[entry]);
+        for (std::uint32_t entry = 0; entry < dispatches[row].table.size(); ++entry) {
+            const auto descriptor = tsharp(dispatches[row].table[entry]);
             write(memory, table + entry * 0x20u, std::span<const std::uint32_t>(descriptor));
         }
         write(memory, table + 0x100u, std::span<const std::uint32_t>(sampler));
@@ -202,13 +208,14 @@ struct Replay {
     bool completed = false;
     std::string log;
     std::string frame;
+    std::string dump;
 };
 
 Replay replay(const std::filesystem::path& tool, const std::filesystem::path& root, const char* name,
               const char* generic, const char* specialize) {
     const auto directory = root / name;
     std::filesystem::create_directories(directory);
-    makeCapture(directory / "capture");
+    makeCapture(directory / "capture", Dispatches);
     const auto log = directory / "replay.log";
     const auto frames = directory / "frames";
     setVariable("KYTY_GENERIC_COMPUTE_VARIANT", generic);
@@ -229,10 +236,61 @@ Replay replay(const std::filesystem::path& tool, const std::filesystem::path& ro
     return result;
 }
 
+Replay preparedReplay(const std::filesystem::path& tool, const std::filesystem::path& root,
+                      const char* scenario, const char* phase, std::span<const Dispatch> dispatches,
+                      bool wait_manifest) {
+    const auto directory = root / scenario;
+    const auto run = directory / phase;
+    std::filesystem::create_directories(directory / "app0" / "sce_sys");
+    std::filesystem::create_directories(run);
+    {
+        std::ofstream param(directory / "app0" / "sce_sys" / "param.json", std::ios::binary | std::ios::trunc);
+        param << "{\"titleId\":\"PREP00001\",\"appVersion\":\"01.00\"}\n";
+        if (!param) throw std::runtime_error("could not write synthetic title metadata");
+    }
+    makeCapture(run / "capture", dispatches);
+    const auto log = run / "replay.log";
+    const auto frames = run / "frames";
+    const auto dump = run / "output.bin";
+    const auto command = quote(tool) + " " + quote(run / "capture") +
+                         " --strict --no-synthesize --repeat 1 --cold-pipelines" +
+                         (wait_manifest ? " --wait-manifest" : "") + " --frames " + quote(frames) +
+                         " --dump \"" + std::to_string(Output) + ":" +
+                         std::to_string(Width * Rows * 4u) + ":" + dump.string() + "\"" +
+                         " > " + quote(log) + " 2>&1";
+    const auto previous = std::filesystem::current_path();
+    std::filesystem::current_path(directory);
+    std::fflush(nullptr);
+#ifdef _WIN32
+    const int status = std::system(('"' + command + '"').c_str());
+#else
+    const int status = std::system(command.c_str());
+#endif
+    std::filesystem::current_path(previous);
+    Replay result;
+    result.log = readFile(log);
+    result.frame = readFile(frames / "replay-0.bmp");
+    result.dump = readFile(dump);
+    result.completed = status == 0 && !result.frame.empty() && result.dump.size() == Width * Rows * 4u;
+    return result;
+}
+
 std::size_t count(const std::string& text, std::string_view line) {
     std::size_t found = 0;
     for (auto at = text.find(line); at != std::string::npos; at = text.find(line, at + line.size())) ++found;
     return found;
+}
+
+std::vector<std::string_view> readyPipelineIds(const std::string& log) {
+    std::vector<std::string_view> ids;
+    const std::string_view text(log);
+    for (auto at = text.find(ReadyLine); at != std::string_view::npos;
+         at = text.find(ReadyLine, at + ReadyLine.size())) {
+        const auto start = at + ReadyLine.size();
+        if (text.size() - start < 16) return {};
+        ids.push_back(text.substr(start, 16));
+    }
+    return ids;
 }
 
 void printTail(const std::string& log) {
@@ -240,16 +298,120 @@ void printTail(const std::string& log) {
     std::cerr << (log.size() > TailBytes ? log.substr(log.size() - TailBytes) : log) << '\n';
 }
 
+std::uint64_t manifestCompute(const std::string& log) {
+    const auto at = log.rfind("Pipeline manifest: idle at ");
+    if (at == std::string::npos) return UINT64_MAX;
+    const auto end = log.find('\n', at);
+    const auto line = log.substr(at, end == std::string::npos ? end : end - at);
+    const auto phrase = line.find(" compute pipelines created");
+    if (phrase == std::string::npos) return UINT64_MAX;
+    auto start = phrase;
+    while (start > 0 && line[start - 1] >= '0' && line[start - 1] <= '9') --start;
+    if (start == phrase) return UINT64_MAX;
+    return std::strtoull(line.c_str() + start, nullptr, 10);
+}
+
+bool changedOutput(std::string_view output) {
+    if (output.size() != RowBytes) return false;
+    for (std::size_t at = 0; at < output.size(); at += sizeof(std::uint32_t)) {
+        std::uint32_t value = 0;
+        std::memcpy(&value, output.data() + at, sizeof(value));
+        if (value == Fill) return false;
+    }
+    return true;
+}
+
+int prepared(const std::filesystem::path& tool, const std::filesystem::path& root) {
+    setVariable("KYTY_PIPELINE_MANIFEST", "1");
+    setVariable("KYTY_RECORD_PIPELINE_MANIFEST", "1");
+    setVariable("KYTY_GENERIC_COMPUTE_VARIANT", "0");
+    setVariable("KYTY_GENERIC_COMPUTE_SPECIALIZE", "0");
+    setVariable("KYTY_SHADER_VARIANT_LOG", "1");
+    setVariable("KYTY_ASYNC_PIPELINES", "0");
+    setVariable("KYTY_GPU_PIPELINE", "0");
+    setVariable("KYTY_PIPELINE_STALL_LOG_MS", "0");
+    setVariable("ANYPS5_NO_SHADER_CACHE", "1");
+    const auto require = [&](bool condition, const char* message, const Replay& result) {
+        if (condition) return;
+        std::cerr << "prepared replay files: " << root << '\n';
+        printTail(result.log);
+        throw std::runtime_error(message);
+    };
+    const auto seed = preparedReplay(tool, root, "both", "seed", PreparedDispatches, false);
+    if (!seed.completed) {
+        std::cerr << "prepared replay files: " << root << '\n';
+        printTail(seed.log);
+        if (std::getenv("ANYPS5_REQUIRE_VULKAN") == nullptr) return 77;
+        throw std::runtime_error("the two-variant seed replay did not complete");
+    }
+    const auto both_cache = root / "both" / "_PipelineCache";
+    const auto cache_file = both_cache / "PREP00001_01.00.kpm";
+    const auto code_file = both_cache / "PREP00001_01.00.code";
+    require(std::filesystem::is_regular_file(cache_file) && std::filesystem::file_size(cache_file) > 0 &&
+                std::filesystem::is_regular_file(code_file) && std::filesystem::file_size(code_file) > 0,
+            "the seed did not save a manifest and shader code", seed);
+    require(readyPipelineIds(seed.log).empty() && changedOutput(std::string_view(seed.dump).substr(0, RowBytes)) &&
+                changedOutput(std::string_view(seed.dump).substr(RowBytes, RowBytes)) &&
+                seed.dump.substr(0, RowBytes) != seed.dump.substr(RowBytes, RowBytes) &&
+                seed.log.find("\"dispatches\":2.0") != std::string::npos,
+            "the two seed dispatches did not produce distinct output values", seed);
+
+    const auto warm = preparedReplay(tool, root, "both", "warm", PreparedDispatches, true);
+    const auto warm_ready = readyPipelineIds(warm.log);
+    require(warm.completed && warm.dump == seed.dump && warm.frame == seed.frame &&
+                warm.log.find("Pipeline manifest: 2 modules, 0 pipelines in ") != std::string::npos &&
+                manifestCompute(warm.log) == 2 &&
+                warm_ready.size() == 2 && warm_ready[0] != warm_ready[1] &&
+                warm.log.find("compute-sync") == std::string::npos &&
+                warm.log.find("compute-wait") == std::string::npos &&
+                warm.log.find("TEMPORARY COMPUTE DISPATCH SKIP") == std::string::npos &&
+                warm.log.find("\"dispatches\":2.0") != std::string::npos &&
+                warm.log.find("\"unfinished\":0") != std::string::npos &&
+                warm.log.find("\"skipped_bytes\":0") != std::string::npos,
+            "the prepared variants were not both served on first use without a pipeline wait", warm);
+
+    const auto only_a = std::span<const Dispatch>(PreparedDispatches.data(), 1);
+    const auto only_b = std::span<const Dispatch>(PreparedDispatches.data() + 1, 1);
+    const auto control_seed = preparedReplay(tool, root, "one", "seed", only_a, false);
+    require(control_seed.completed && readyPipelineIds(control_seed.log).empty() &&
+                control_seed.dump.substr(0, RowBytes) == seed.dump.substr(0, RowBytes) &&
+                control_seed.log.find("\"dispatches\":1.0") != std::string::npos,
+            "the one-variant control seed did not produce the first expected output", control_seed);
+    const auto control_file = root / "one" / "_PipelineCache" / "PREP00001_01.00.kpm";
+    require(std::filesystem::is_regular_file(control_file) && std::filesystem::file_size(control_file) > 0,
+            "the one-variant control did not save its manifest", control_seed);
+    const auto control = preparedReplay(tool, root, "one", "missing", only_b, true);
+    require(control.completed && readyPipelineIds(control.log).empty() &&
+                control.dump.substr(0, RowBytes) == seed.dump.substr(RowBytes, RowBytes) &&
+                control.log.find("Pipeline manifest: 1 modules, 0 pipelines in ") != std::string::npos &&
+                manifestCompute(control.log) == 1 &&
+                count(control.log, "compute-sync") == 1 &&
+                control.log.find("\"dispatches\":1.0") != std::string::npos &&
+                control.log.find("\"unfinished\":0") != std::string::npos,
+            "omitting the second variant did not expose its first-use pipeline miss", control);
+
+    if (std::getenv("APS5_REPLAY_KEEP_ARTIFACTS") == nullptr) {
+        std::filesystem::remove_all(root);
+    } else {
+        std::cout << "prepared replay files: " << root << '\n';
+    }
+    std::cout << "kyty_shim_prepared_variant_first_use: ok (2 prepared native hits, 0 waits; omitted variant: 1 compute-sync miss)\n";
+    return 0;
+}
+
 }
 
 int main(int argc, char** argv) {
     try {
-        if (argc != 2) throw std::runtime_error("usage: kyty_shim_generic_compute_replay_tests <agc_frame_replay>");
+        if (argc != 2 && (argc != 3 || std::strcmp(argv[2], "--prepared") != 0)) {
+            throw std::runtime_error("usage: kyty_shim_generic_compute_replay_tests <agc_frame_replay> [--prepared]");
+        }
         const std::filesystem::path tool = argv[1];
         const auto root = std::filesystem::temp_directory_path() /
                           ("kyty-generic-compute-replay-" +
                            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
         std::filesystem::create_directories(root);
+        if (argc == 3) return prepared(tool, root);
         const bool vulkan_required = std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr;
         const char* setting = std::getenv("KYTY_GENERIC_COMPUTE_SPECIALIZE");
         const bool specialize = setting == nullptr || std::strcmp(setting, "0") != 0;
