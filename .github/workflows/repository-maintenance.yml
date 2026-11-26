@@ -4,7 +4,7 @@ on:
   issues:
     types: [opened, reopened, edited]
   issue_comment:
-    types: [created]
+    types: [created, edited]
   pull_request_target:
     branches: [AnyKyty, Brainrot]
     types: [opened, reopened, synchronize, ready_for_review, labeled]
@@ -22,7 +22,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: repository-maintenance-${{ github.repository }}
+  group: repository-maintenance-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number || inputs.pull_request || github.event_name }}
   cancel-in-progress: false
 
 jobs:
@@ -43,7 +43,6 @@ jobs:
       github.repository == 'simnJS/AnyPS5' &&
       github.ref == 'refs/heads/AnyKyty' &&
       github.event.sender.type != 'Bot' &&
-      (github.event_name != 'issue_comment' || !github.event.issue.pull_request) &&
       (github.event_name != 'pull_request_target' || github.event.action != 'labeled')
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -63,6 +62,9 @@ jobs:
         run: python3 -I tools/repository_maintenance.py review
 
   merge:
+    concurrency:
+      group: repository-maintenance-merge
+      cancel-in-progress: false
     if: >-
       github.repository == 'simnJS/AnyPS5' &&
       github.ref == 'refs/heads/AnyKyty' &&

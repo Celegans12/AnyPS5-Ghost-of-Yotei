@@ -35,6 +35,11 @@ on actionable defects that can be established from the diff or a clearly
 missing verification that matters for the change. Review the diff against its own
 base branch. Do not suggest retargeting either of the supported branches. Do not
 claim to have run tests.
+When follow_up is present, respond to that comment in the ongoing conversation.
+Answer direct questions and acknowledge substantive fixes or test results.
+Recheck earlier findings against the current diff when it is included. If
+the diff is incomplete, distinguish reported results from what you can verify.
+Keep acknowledgements brief; skip empty updates or thanks alone.
 Use plain Markdown without mentions, links, or HTML. Use 'reply' and give the
 public message in body, 'escalate' and use an empty body, or 'skip' and use
 an empty body. Never approve, close, label, or merge.
@@ -136,6 +141,15 @@ def public_reply(body):
     )
 
 
+def maintenance_reply(comment):
+    return comment["user"]["login"] == BOT and f"<!-- {MARKER}:" in comment["body"]
+
+
+def reply_marker(version):
+    digest = hashlib.sha256(json.dumps(version).encode()).hexdigest()
+    return f"<!-- {MARKER}:{digest} -->"
+
+
 def review(number, key, words, *, targeted=False):
     issue = gh(issue_api(number))
     if issue["state"] != "open" or issue["locked"] or issue["user"]["type"] == "Bot":
@@ -150,18 +164,23 @@ def review(number, key, words, *, targeted=False):
         return False
     thread = paginated(issue_api(number, "/comments?per_page=100"))
     human = [item for item in thread if item["user"]["type"] != "Bot"]
+    bot_replies = [item for item in thread if maintenance_reply(item)]
+    latest_human = human[-1] if human else None
+    latest_bot = bot_replies[-1] if bot_replies else None
+    follow_up = latest_human and (
+        not latest_bot or latest_human["id"] > latest_bot["id"]
+        or latest_human["updated_at"] > latest_bot["created_at"]
+    )
     version = [number, issue["title"], issue["body"]]
     if pull:
         version.append(pull["head"]["sha"])
-    elif human:
-        version.extend([human[-1]["id"], human[-1]["updated_at"]])
-    digest = hashlib.sha256(json.dumps(version).encode()).hexdigest()
-    marker = f"<!-- {MARKER}:{digest} -->"
-    bot_replies = [
-        item["body"] for item in thread
-        if item["user"]["login"] == BOT and f"<!-- {MARKER}:" in item["body"]
-    ]
-    if any(marker in item for item in bot_replies) or len(bot_replies) >= 3:
+        legacy_marker = reply_marker(version)
+        if not follow_up and any(legacy_marker in item["body"] for item in bot_replies):
+            return False
+    if latest_human:
+        version.extend([latest_human["id"], latest_human["updated_at"]])
+    marker = reply_marker(version)
+    if any(marker in item["body"] for item in bot_replies):
         return False
     context = {
         "kind": "pull request" if pull else "issue",
@@ -171,24 +190,29 @@ def review(number, key, words, *, targeted=False):
             {"association": item["author_association"], "body": item["body"][:2000]}
             for item in human[-8:]
         ],
-        "previous_replies": [item.split(f"<!-- {MARKER}:", 1)[0] for item in bot_replies],
+        "previous_replies": [
+            item["body"].split(f"<!-- {MARKER}:", 1)[0] for item in bot_replies[-4:]
+        ],
         "project_guidance": (
             Path("docs/dev/START_HERE.md").read_text(encoding="utf-8").split("## Rules\n")[-1][:6000]
         ),
     }
+    if follow_up:
+        context["follow_up"] = latest_human["body"][:4000]
     if pull:
         context["base_branch"] = pull["base"]["ref"]
-        if pull["changed_files"] > 25:
-            note(f"- #{number} needs maintainer review because the diff is large.")
-            return False
-        files = gh(pull_api(number, "/files?per_page=30"))
-        if len(files) != pull["changed_files"] or any("patch" not in item for item in files):
-            note(f"- #{number} needs maintainer review because the diff is incomplete.")
-            return False
-        context["diff"] = [{"file": item["filename"], "patch": item["patch"]} for item in files]
-        if len(json.dumps(context["diff"])) > 45_000:
-            note(f"- #{number} needs maintainer review because the diff is large.")
-            return False
+        files = gh(pull_api(number, "/files?per_page=30")) if pull["changed_files"] <= 25 else []
+        diff = [{"file": item["filename"], "patch": item.get("patch")} for item in files]
+        if (
+            len(diff) != pull["changed_files"] or any(item["patch"] is None for item in diff)
+            or len(json.dumps(diff)) > 45_000
+        ):
+            if not follow_up:
+                note(f"- #{number} needs maintainer review because the diff is large or incomplete.")
+                return False
+            context["diff_status"] = "The complete diff is unavailable for this follow-up."
+        else:
+            context["diff"] = diff
     result = model_review(context, key)
     if result["action"] == "skip":
         if targeted:
@@ -199,9 +223,22 @@ def review(number, key, words, *, targeted=False):
         note(f"- #{number} needs maintainer attention.")
         return True
     latest = gh(issue_api(number))
-    if latest["state"] != "open" or latest["locked"] or latest["updated_at"] != issue["updated_at"]:
+    if (
+        latest["state"] != "open" or latest["locked"]
+        or latest["title"] != issue["title"] or latest["body"] != issue["body"]
+    ):
         return True
-    if pull and gh(pull_api(number))["head"]["sha"] != pull["head"]["sha"]:
+    if pull:
+        current = gh(pull_api(number))
+        if current["draft"] or current["head"]["sha"] != pull["head"]["sha"] or current["base"]["ref"] != pull["base"]["ref"]:
+            return True
+    current_thread = paginated(issue_api(number, "/comments?per_page=100"))
+    current_human = next((item for item in reversed(current_thread) if item["user"]["type"] != "Bot"), None)
+    current_version = [current_human["id"], current_human["updated_at"]] if current_human else []
+    previous_version = [latest_human["id"], latest_human["updated_at"]] if latest_human else []
+    if current_version != previous_version or any(
+        marker in item["body"] for item in current_thread if maintenance_reply(item)
+    ):
         return True
     gh(issue_api(number, "/comments"), method="POST", data={"body": f"{body}\n\n{marker}"})
     note(f"- Replied to #{number}.")
