@@ -452,6 +452,32 @@ static int CheckDirectMemoryPages() {
     Require(sceKernelReleaseDirectMemory(physical, length) == 0);
     return 0;
 }
+
+static int CheckDirectMemoryPagesWhileMappingsChange() {
+    constexpr std::size_t length = 0x4000000;
+    std::int64_t physical = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, length, 0x200000, 0, &physical) == 0);
+    void* mapping = nullptr;
+    Require(sceKernelMapDirectMemory(&mapping, length, 3, 0, physical, 0x200000) == 0);
+    const auto address = reinterpret_cast<std::uint64_t>(mapping);
+    std::atomic<bool> done{false};
+    std::thread changer([&] {
+        for (std::size_t round = 0; !done.load(); ++round) {
+            const auto offset = (round * 0x200000) % length;
+            static_cast<void>(sceKernelMprotect(reinterpret_cast<void*>(address + offset), 0x200000, (round & 1) != 0 ? 0 : 3));
+            if (round % 7 == 0) static_cast<void>(sceKernelMunmap(address + offset, 0x200000));
+        }
+    });
+    for (int round = 0; round < 40; ++round) {
+        void* again = mapping;
+        Require(sceKernelMapDirectMemory(&again, length, 3, 0x10, physical, 0x200000) == 0 && again == mapping);
+    }
+    done.store(true);
+    changer.join();
+    Require(sceKernelMunmap(address, length) == 0);
+    Require(sceKernelReleaseDirectMemory(physical, length) == 0);
+    return 0;
+}
 #endif
 
 static void CheckDirectMapRefusesExecute() {
@@ -5027,6 +5053,9 @@ int main(int argc, char** argv) {
 #endif
 #if (defined(__linux__) || defined(_WIN32)) && defined(ANYPS5_KYTY)
     if (argc == 2 && std::strcmp(argv[1], "direct-pages") == 0) return CheckDirectMemoryPages();
+#endif
+#if defined(_WIN32) && defined(ANYPS5_KYTY)
+    if (argc == 2 && std::strcmp(argv[1], "direct-pages-changing") == 0) return CheckDirectMemoryPagesWhileMappingsChange();
 #endif
     Require(argc == 1);
     CheckResidentMappingBookkeepingStaysSmall();

@@ -2776,6 +2776,8 @@ add_test_executable(guest_thermal_sensors_tests ${LIBS_INCLUDE_DIR}/tests/GuestT
             add_test(NAME guest_direct_memory_pages_${pages} COMMAND guest_memory_tests direct-pages)
             set_tests_properties(guest_direct_memory_pages_${pages} PROPERTIES ENVIRONMENT "KYTY_DIRECT_MEMORY_PAGES=${pages}")
         endforeach()
+        add_test(NAME guest_direct_memory_pages_changing COMMAND guest_memory_tests direct-pages-changing)
+        set_tests_properties(guest_direct_memory_pages_changing PROPERTIES ENVIRONMENT "KYTY_DIRECT_MEMORY_PAGES=populate" TIMEOUT 120)
     endif()
     if(WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
         add_test(NAME guest_mmap_executable COMMAND guest_memory_tests executable-mappings)

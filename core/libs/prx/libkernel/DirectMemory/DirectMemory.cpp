@@ -1975,21 +1975,13 @@ static bool HostKeepsResident(std::size_t bytes) {
     return GlobalMemoryStatusEx(&status) != 0 && status.ullAvailPhys >= bytes + status.ullTotalPhys / 4;
 }
 
-static bool ReadableProtection(DWORD protect) {
-    if ((protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) return false;
-    return (protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
-}
-
-static void TouchReadablePages(std::uintptr_t start, std::uintptr_t end, std::size_t pageBytes) {
-    for (auto cursor = start; cursor < end;) {
-        MEMORY_BASIC_INFORMATION region{};
-        if (VirtualQuery(reinterpret_cast<const void*>(cursor), &region, sizeof(region)) != sizeof(region)) return;
-        const auto regionEnd = std::min(end, reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize);
-        if (region.State == MEM_COMMIT && ReadableProtection(region.Protect)) {
-            for (auto page = cursor; page < regionEnd; page += pageBytes) static_cast<void>(*reinterpret_cast<const volatile std::uint8_t*>(page));
-        }
-        cursor = regionEnd;
+static bool TouchPages(std::uintptr_t start, std::uintptr_t end, std::size_t pageBytes) {
+    for (auto page = start; page < end; page += pageBytes) {
+        std::uint8_t byte = 0;
+        SIZE_T read = 0;
+        if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(page), &byte, 1, &read) == 0 || read != 1) return false;
     }
+    return true;
 }
 
 static void PopulateDirectMapping(std::uintptr_t address, std::size_t bytes) {
@@ -2006,10 +1998,11 @@ static void PopulateDirectMapping(std::uintptr_t address, std::size_t bytes) {
     const auto chunks = (bytes + chunkBytes - 1) / chunkBytes;
     const auto workers = std::min<std::size_t>(chunks, std::max(1u, std::thread::hardware_concurrency()));
     std::atomic<std::size_t> next{0};
+    std::atomic<bool> stopped{false};
     const auto populate = [&] {
-        for (auto chunk = next++; chunk < chunks; chunk = next++) {
+        for (auto chunk = next++; chunk < chunks && !stopped.load(std::memory_order_relaxed); chunk = next++) {
             const auto first = address + chunk * chunkBytes;
-            TouchReadablePages(first, first + std::min(chunkBytes, bytes - chunk * chunkBytes), pageBytes);
+            if (!TouchPages(first, first + std::min(chunkBytes, bytes - chunk * chunkBytes), pageBytes)) stopped.store(true, std::memory_order_relaxed);
         }
     };
     std::vector<std::thread> threads;
