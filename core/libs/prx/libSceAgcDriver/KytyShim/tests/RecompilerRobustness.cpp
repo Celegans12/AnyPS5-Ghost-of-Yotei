@@ -14,9 +14,15 @@ struct Case {
 	uint8_t               mode;
 	uint8_t               shape;
 	std::vector<uint32_t> words;
+	bool                  requires_spirv = false;
 };
 
 const std::vector<Case> Cases = {
+    {"lds-append-in-a-vertex-shader", 0x03, 0x00, {0xd8f80000u, 0u, 0xbf810000u}, true},
+    {"lds-consume-in-a-vertex-shader", 0x03, 0x00, {0xd8f40000u, 0u, 0xbf810000u}, true},
+    {"lds-append-in-a-pixel-shader", 0x04, 0x00, {0xd8f80000u, 0u, 0xbf810000u}, true},
+    {"lds-append-in-a-compute-shader", 0x02, 0x00, {0xd8f80000u, 0u, 0xbf810000u}, true},
+    {"lds-consume-in-a-compute-shader", 0x02, 0x00, {0xd8f40000u, 0u, 0xbf810000u}, true},
     {"branch-target-outside-the-program", 0x00, 0x00, {0xbf827fffu, 0xbf810000u}},
     {"stale-lane-spill-after-read-lane-elimination", 0x32, 0x00, {0xd7610014u, 0x0201e205u, 0xbf810000u}},
     {"backward-branch-before-the-program", 0x00, 0x00, {0xbf828000u, 0xbf810000u}},
@@ -146,7 +152,12 @@ int main(int argc, char** argv) {
 	for (const auto& entry: Cases) {
 		if (argc >= 2 && std::string_view(argv[1]) != entry.name) continue;
 		found = true;
-		KytyFuzz::Run(entry.words, entry.mode, entry.shape);
+		bool emitted = false;
+		KytyFuzz::Run(entry.words, entry.mode, entry.shape, nullptr, &emitted);
+		if (entry.requires_spirv && !emitted) {
+			std::printf("%s: FAILED, did not emit SPIR-V\n", entry.name);
+			return 1;
+		}
 		std::printf("%s: ok\n", entry.name);
 	}
 	for (const auto& entry: Refusals) {

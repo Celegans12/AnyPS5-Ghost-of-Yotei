@@ -71,7 +71,9 @@ inline void ReportInvalid(const std::string& message, std::span<const uint32_t> 
 	}
 }
 
-inline void Run(std::span<const uint32_t> original, uint8_t mode, uint8_t shape, std::string* refusal = nullptr) {
+inline void Run(std::span<const uint32_t> original, uint8_t mode, uint8_t shape,
+	            std::string* refusal = nullptr, bool* emitted = nullptr) {
+	if (emitted != nullptr) *emitted = false;
 	static const auto profile = Profile();
 	std::vector<uint32_t> storage(original.begin(), original.end());
 	if (std::getenv("KYTY_FUZZ_PAD") != nullptr) storage.resize(original.size() + 16u, 0u);
@@ -134,6 +136,7 @@ inline void Run(std::span<const uint32_t> original, uint8_t mode, uint8_t shape,
 		}
 		if (!IR::ResourceSpecializationFits(translated.program, specialization)) return;
 		auto compiled = Recompiler::CompileProgram(std::move(translated), options, specialization, 0);
+		if (emitted != nullptr) *emitted = !compiled.spirv.empty();
 		const char* policy = std::getenv("KYTY_FUZZ_SPIRV");
 		if (!compiled.spirv.empty() && policy != nullptr && std::strcmp(policy, "off") != 0 && policy[0] != 0) {
 			std::string message;

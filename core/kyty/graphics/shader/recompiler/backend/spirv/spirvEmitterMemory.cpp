@@ -2559,9 +2559,17 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 	                 Binary(state, spv::OpINotEqual, TypeBool(state), count, ConstantU32(state, 0)),
 	                 bounds));
 	const auto atomic = EmitValueOrZeroIfCondition(state, condition, [&]() {
+		const auto pointer = EmitMemoryElementPointer(state, access, index);
 		const auto value = state.builder.AllocateId();
+		if (mem.kind == IR::ResourceKind::Lds && PrivateLdsStorage(state)) {
+			state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+			state.builder.AddFunction(
+			    spv::OpStore, pointer,
+			    Binary(state, append ? spv::OpIAdd : spv::OpISub, TypeU32(state), value, count));
+			return value;
+		}
 		state.builder.AddFunction(append ? spv::OpAtomicIAdd : spv::OpAtomicISub, TypeU32(state),
-		                          value, EmitMemoryElementPointer(state, access, index),
+		                          value, pointer,
 		                          ConstantU32(state, mem.kind == IR::ResourceKind::Gds
 		                                                 ? spv::ScopeDevice
 		                                                 : spv::ScopeWorkgroup),
