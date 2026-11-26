@@ -44,6 +44,7 @@ inline bool KernelClockStandsStillInPauses(int clockId) {
         case 8:
         case 11:
         case 12:
+        case 15:
         case 20:
             return true;
         default:
