@@ -12,6 +12,8 @@ from pathlib import Path
 
 OWNER = "simnJS"
 REPO = f"{OWNER}/AnyPS5"
+STAGED_BRANCH = "Brainrot"
+STAGE_PREFIX = "test/brainrot-integrate-"
 PR_WORKFLOWS = {
     "AnyKyty": ("anykyty.yml", "offline-checks.yml"),
     "Brainrot": ("brainrot.yml",),
@@ -252,8 +254,8 @@ def review(number, key, words, *, targeted=False):
     return True
 
 
-def git(*args):
-    result = subprocess.run(["git", *args], capture_output=True, check=False)
+def git(*args, env=None):
+    result = subprocess.run(["git", *args], capture_output=True, check=False, env=env)
     if result.returncode:
         raise RuntimeError("Could not inspect the PR commits")
     return result.stdout
@@ -305,26 +307,102 @@ def ci_passed(number, pull):
     return True
 
 
+def branch_head(branch):
+    return gh(f"repos/{REPO}/git/ref/heads/{branch}")["object"]["sha"]
+
+
+def push_with_lease(branch, sha, expected):
+    ref = f"refs/heads/{branch}"
+    git(
+        "-c", "credential.helper=",
+        "-c", "credential.https://github.com.helper=!gh auth git-credential",
+        "push", f"--force-with-lease={ref}:{expected}", "origin", f"{sha}:{ref}",
+    )
+
+
+def integration_commit(number, base, head, words):
+    result = subprocess.run(
+        ["git", "merge-tree", "--write-tree", "--no-messages", base, head],
+        capture_output=True, check=False,
+    )
+    if result.returncode == 1:
+        note(f"- #{number} needs manual conflict resolution.")
+        return None
+    if result.returncode:
+        raise RuntimeError("Git could not prepare the integration tree")
+    tree = result.stdout.decode().strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", tree):
+        raise RuntimeError("Git returned an invalid integration tree")
+    subject = f"chore: integrate pull request #{number}"
+    diff = git("diff", "--no-ext-diff", "--no-textconv", "--unified=0", base, tree)
+    paths = git("diff", "--name-only", "--no-renames", "-z", base, tree).split(b"\0")
+    if any(path.startswith(b".github/") for path in paths) or b"Binary files " in diff or b"Subproject commit " in diff:
+        note(f"- #{number} needs manual review of the resulting tree.")
+        return None
+    added = b"\n".join(line for line in diff.splitlines() if line.startswith(b"+"))
+    if not safe_for_publication(subject.encode() + b"\n" + b"\n".join(paths) + b"\n" + added, words):
+        note(f"- #{number} needs a manual publication check of the integrated result.")
+        return None
+    timestamp = max(int(git("show", "-s", "--format=%ct", sha)) for sha in (base, head))
+    date = f"{timestamp + 1} +0000"
+    return git(
+        "-c", "user.name=Simon", "-c", "user.email=git@simnjs.fr",
+        "-c", "commit.gpgSign=false", "commit-tree", tree,
+        "-p", base, "-p", head, "-m", subject,
+        env={**os.environ, "GIT_AUTHOR_DATE": date, "GIT_COMMITTER_DATE": date},
+    ).decode().strip()
+
+
+def stage_passed(number, branch, sha, repo_id):
+    remote = git("ls-remote", "--heads", "origin", f"refs/heads/{branch}").split()
+    if not remote:
+        push_with_lease(branch, sha, "")
+        note(f"- #{number} is waiting for CI on the integration branch.")
+        return False
+    if remote[0].decode() != sha:
+        note(f"- #{number} has an unexpected commit on its integration branch.")
+        return False
+    runs = gh(
+        f"repos/{REPO}/actions/workflows/brainrot.yml/runs"
+        f"?event=push&head_sha={sha}&branch={branch}&per_page=50"
+    )["workflow_runs"]
+    matching = [
+        run for run in runs
+        if run["event"] == "push" and run["head_sha"] == sha and run["head_branch"] == branch
+        and (run.get("head_repository") or {}).get("id") == repo_id
+    ]
+    if not matching or matching[0]["conclusion"] is None:
+        note(f"- #{number} is waiting for successful integration CI.")
+        return False
+    if matching[0]["conclusion"] != "success":
+        note(f"- #{number} has an unsuccessful integration CI run.")
+        return False
+    return True
+
+
 def merge(number, words):
     pull = gh(pull_api(number))
     target = pull["base"]["ref"]
     if (
         pull["state"] != "open" or pull["draft"] or target not in PR_WORKFLOWS
-        or pull["mergeable_state"] != "clean" or not pull["head"].get("repo")
-        or "automerge" not in {label["name"] for label in pull["labels"]}
+        or not pull["head"].get("repo") or "automerge" not in {label["name"] for label in pull["labels"]}
     ):
         return
-    head, base = pull["head"]["sha"], pull["base"]["sha"]
+    head, base = pull["head"]["sha"], branch_head(target)
     if not all(re.fullmatch(r"[0-9a-f]{40}", ref) for ref in (head, base)):
         raise RuntimeError("GitHub returned an invalid commit SHA")
     if not approved(number, head):
         note(f"- #{number} is waiting for the owner's label and approval of the current revision.")
         return
-    if not ci_passed(number, pull):
-        note(f"- #{number} is waiting for successful pull request CI.")
+    if pull["mergeable_state"] == "dirty":
+        note(f"- #{number} needs manual conflict resolution.")
+        return
+    mergeable_states = {"clean", "behind"} if target == STAGED_BRANCH else {"clean"}
+    if pull["mergeable_state"] not in mergeable_states:
         return
     git("fetch", "--quiet", "--no-tags", "origin", base, head)
-    if git("merge-base", base, head).decode().strip() != base:
+    fast_forward = git("merge-base", base, head).decode().strip() == base
+    if not fast_forward and target != STAGED_BRANCH:
         note(f"- #{number} needs to be updated to its target branch before integration.")
         return
     revision_range = f"{base}..{head}"
@@ -342,21 +420,33 @@ def merge(number, words):
     if not safe_for_publication(changes, words):
         note(f"- #{number} needs a manual publication check.")
         return
-    latest = gh(pull_api(number))
-    if (
-        latest["state"] != "open" or latest["draft"] or not latest["head"].get("repo")
-        or latest["base"]["ref"] != target or latest["base"]["sha"] != base
-        or latest["head"]["sha"] != head or latest["mergeable_state"] != "clean"
-        or "automerge" not in {label["name"] for label in latest["labels"]}
-        or not approved(number, head) or not ci_passed(number, latest)
-    ):
+    pr_ci = fast_forward and pull["base"]["sha"] == base and ci_passed(number, pull)
+    candidate = head
+    if not pr_ci:
+        if target != STAGED_BRANCH:
+            note(f"- #{number} is waiting for successful pull request CI.")
+            return
+        candidate = integration_commit(number, base, head, words) if not fast_forward else head
+        if not candidate:
+            return
+    def still_approved():
+        latest = gh(pull_api(number))
+        return (
+            latest["state"] == "open" and not latest["draft"] and latest["head"].get("repo")
+            and latest["base"]["ref"] == target and branch_head(target) == base
+            and latest["head"]["sha"] == head and latest["mergeable_state"] in mergeable_states
+            and "automerge" in {label["name"] for label in latest["labels"]}
+            and approved(number, head)
+            and (not pr_ci or latest["base"]["sha"] == base and ci_passed(number, latest))
+        )
+
+    if not still_approved():
         return
-    branch = f"refs/heads/{target}"
-    git(
-        "-c", "credential.helper=",
-        "-c", "credential.https://github.com.helper=!gh auth git-credential",
-        "push", f"--force-with-lease={branch}:{base}", "origin", f"{head}:{branch}",
-    )
+    if not pr_ci:
+        stage = f"{STAGE_PREFIX}{number}-{base}-{head}"
+        if not stage_passed(number, stage, candidate, pull["base"]["repo"]["id"]) or not still_approved():
+            return
+    push_with_lease(target, candidate, base)
     note(f"- Integrated the approved revision of #{number}.")
 
 
