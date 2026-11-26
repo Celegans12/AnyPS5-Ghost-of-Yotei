@@ -5,5 +5,7 @@ set(KYTY_THREAD_SAFETY_ERROR_SOURCES
     graphics/host_gpu/renderer/cache/textureCache.cpp
     graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
     graphics/host_gpu/renderer/pipeline/pipelineManifest.cpp
+    graphics/host_gpu/renderer/pipeline/pipelineShaderModule.cpp
+    graphics/host_gpu/renderer/pipeline/pipelineWarmup.cpp
     graphics/host_gpu/renderer/pipeline/pipelineSerialization.cpp
 )

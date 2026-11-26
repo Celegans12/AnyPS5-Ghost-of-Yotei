@@ -1,4 +1,6 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineShaderDiagnostics.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineShaderOptions.h"
 #if defined(ANYPS5_KYTY)
 #include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
 #endif
@@ -27,7 +29,6 @@
 #if defined(ANYPS5_KYTY)
 #include "graphics/host_gpu/renderer/pipeline/programLock.h"
 #endif
-#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
@@ -55,7 +56,6 @@
 #include <optional>
 #include <ranges>
 #include <span>
-#include <spirv-tools/libspirv.hpp>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -160,41 +160,6 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	message += '\n';
 	Log::WriteToConsoleAndLog(message);
 }
-
-#if defined(ANYPS5_KYTY)
-void LogShaderVariantBuild(const char* stage, uint64_t shader_hash, uint32_t user_data_count,
-                           const std::vector<uint32_t>& static_state, uint32_t push_data_cursor,
-                           const ShaderModule& module) {
-	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_SHADER_VARIANT_LOG");
-		return value != nullptr && std::strcmp(value, "1") == 0;
-	}();
-	if (!enabled || module.module == nullptr) return;
-
-	ShaderRecompiler::IR::Writer writer;
-	const auto fingerprint = [&writer](const auto& fields) {
-		writer.bytes.clear();
-		ShaderRecompiler::IR::IoAll(writer, fields);
-		return XXH3_64bits(writer.bytes.data(), writer.bytes.size());
-	};
-	const auto& specialization = module.specialization;
-	const auto& functions      = module.function_code;
-	const auto plain_fields = module.plain != nullptr
-	                              ? fmt::format(" plain_module={:016x} plain_spirv_words={}",
-	                                            module.plain->id, module.plain->spirv_words)
-	                              : std::string {};
-	PipelineCacheLog(
-	    "[kyty-variant] build stage={} shader={:016x} module={:016x} user_data_count={} "
-	    "static={:016x} push_start={} push_cursor={} buffers={:016x} images={:016x} "
-	    "samplers={:016x} linked_code={:016x} table={} spirv_words={}{} @{}",
-	    stage, shader_hash, module.id, user_data_count, fingerprint(static_state),
-	    module.info.bindings.push_data_start_dword, push_data_cursor,
-	    fingerprint(specialization.buffers), fingerprint(specialization.images),
-	    fingerprint(specialization.samplers), XXH3_64bits(functions.data(), functions.size() * sizeof(uint32_t)),
-	    module.info.table_mode, module.spirv_words, plain_fields,
-	    std::chrono::steady_clock::now().time_since_epoch().count());
-}
-#endif
 
 bool ReadAheadStrict(void* userdata, uint64_t address, std::span<uint32_t> values) {
 	return !values.empty() && static_cast<GuestReadLog*>(userdata)->Read(address, values.data(),
@@ -454,143 +419,11 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
 }
 
-void DumpShader(std::span<const uint32_t> words, const std::string& name) {
-	if (!Config::GraphicsDebugDumpEnabled()) {
-		return;
-	}
-	const auto path = Config::GetShaderLogFolder() / name;
-	Common::File::CreateDirectories(path.parent_path());
-	Common::File file(path);
-	if (file.IsInvalid()) {
-		const auto path_text = Common::PathToString(path);
-		LOGF_COLOR(Log::Color::BrightRed, "Can't create file: %s\n", path_text.c_str());
-		return;
-	}
-	file.Write(words.data(), words.size_bytes());
-}
-
-void ValidateShaderSpirv(const char* stage, uint64_t shader_hash,
-                         const std::vector<uint32_t>& spirv, bool maintenance8_enabled) {
-	if (!Config::ShaderValidationEnabled()) {
-		return;
-	}
-	spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
-	std::string          messages;
-	tools.SetMessageConsumer([&messages](spv_message_level_t, const char*,
-	                                     const spv_position_t& position, const char* message) {
-		messages += fmt::format("{}: {} ({}) {}\n", static_cast<int>(position.line),
-		                        static_cast<int>(position.column), static_cast<int>(position.index),
-		                        message);
-	});
-	spvtools::ValidatorOptions validator_options;
-	validator_options.SetAllowOffsetTextureOperand(maintenance8_enabled);
-	if (tools.Validate(spirv.data(), spirv.size(), validator_options)) {
-		return;
-	}
-	spvtools::SpirvTools disassembler(SPV_ENV_VULKAN_1_2);
-	std::string          text;
-	disassembler.Disassemble(spirv, &text,
-	                         static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_NO_HEADER) |
-	                             static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_FRIENDLY_NAMES) |
-	                             static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_COMMENT) |
-	                             static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_INDENT) |
-	                             static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_COLOR));
-	LOGF("%s\n", text.c_str());
-	EXIT("ShaderRecompiler %s SPIR-V validation failed hash=0x%016" PRIx64 ":\n%s", stage,
-	     shader_hash, messages.c_str());
-}
-
-vk::Format NarrowInputFormat(vk::Format format, uint32_t used_components) {
-	switch (format) {
-		case vk::Format::eR32G32B32A32Sfloat:
-			switch (used_components) {
-				case 1: return vk::Format::eR32Sfloat;
-				case 2: return vk::Format::eR32G32Sfloat;
-				case 3: return vk::Format::eR32G32B32Sfloat;
-				default: return format;
-			}
-		case vk::Format::eR32G32B32Sfloat:
-			switch (used_components) {
-				case 1: return vk::Format::eR32Sfloat;
-				case 2: return vk::Format::eR32G32Sfloat;
-				default: return format;
-			}
-		case vk::Format::eR16G16B16A16Sfloat:
-			switch (used_components) {
-				case 1: return vk::Format::eR16Sfloat;
-				case 2: return vk::Format::eR16G16Sfloat;
-				default: return format;
-			}
-		case vk::Format::eR8G8B8A8Unorm:
-			switch (used_components) {
-				case 1: return vk::Format::eR8Unorm;
-				case 2: return vk::Format::eR8G8Unorm;
-				default: return format;
-			}
-		case vk::Format::eR8G8B8A8Snorm:
-			return used_components == 2 ? vk::Format::eR8G8Snorm : format;
-		case vk::Format::eR8G8B8A8Uint:
-			switch (used_components) {
-				case 1: return vk::Format::eR8Uint;
-				case 2: return vk::Format::eR8G8Uint;
-				default: return format;
-			}
-		default: return format;
-	}
-}
-
-vk::Format InputFormat(const ShaderBufferResource& resource, uint32_t used_components) {
-	switch (resource.RawFormat()) {
-		case 113: return NarrowInputFormat(vk::Format::eR32G32B32A32Sfloat, used_components);
-		case 121: return vk::Format::eR16G16Sfloat;
-		default: break;
-	}
-	const auto format = VulkanFormat(resource.Format());
-	if (format == vk::Format::eUndefined ||
-	    ShaderRecompiler::Format::GetFormatInfo(resource.Format()).component_count == 0) {
-		EXIT("unknown vertex format: fmt = %u\n", resource.RawFormat());
-	}
-	return NarrowInputFormat(format, used_components);
-}
-
-std::vector<vk::Format> VertexInputFormats(const ShaderVertexInputInfo&                    input_info,
-                                           const ShaderRecompiler::IR::CompiledShaderInfo& program) {
-	std::vector<vk::Format> formats(input_info.resources_num);
-	for (int index = 0; index < input_info.resources_num; index++) {
-		const auto registers_num = input_info.resources_dst[index].registers_num;
-		EXIT_IF(registers_num < 1 || registers_num > 4);
-		const auto fetched = program.info.vertex_fetch_components[index];
-		formats[index] = InputFormat(input_info.resources[index],
-		                             fetched > 0 ? fetched : static_cast<uint32_t>(registers_num));
-	}
-	return formats;
-}
-
-constexpr uint32_t LanePairsKey = 0x574c5052u;
-
 void SkipCallExpansionFailure(uint64_t hash, const ShaderRecompiler::ShaderSource& source) {
 	Common::HackNotice::Report("dispatch whose call tables do not expand skipped",
 	                           "PipelineCache::GetProgram", hash, 0, source.refresh_failure);
 }
 
-}
-
-void AppendNativeRayTracingKey(ShaderType stage, std::vector<uint32_t>& key, bool native) {
-	if (native && stage == ShaderType::Pixel && RayTracing::NativeTraversals() && Config::RayTracingOracle() != 0) {
-		key.push_back(0x52544f00u | Config::RayTracingOracle());
-		if (Config::RayTracingStatsEnabled()) {
-			key.push_back(0x52545354u);
-		}
-	}
-	if (native && stage == ShaderType::Compute && RayTracing::NativeTraversals()) {
-		key.push_back(0x52545041u);
-		if (Config::RayTracingStatsEnabled()) {
-			key.push_back(0x52545354u);
-		}
-		if (const auto oracle = Config::RayTracingOracle(); oracle != 0) {
-			key.push_back(0x52544f00u | oracle);
-		}
-	}
 }
 
 std::string PipelineCacheTitleId() {
@@ -607,7 +440,6 @@ std::string PipelineCacheTitleId() {
 	return title_id;
 }
 
-namespace {
 bool LdsLaneSyncEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY76_LDS_SYNC");
@@ -626,38 +458,6 @@ bool F32ProductNoContractionEnabled() {
 		return on;
 	}();
 	return enabled;
-}
-
-uint32_t SubgroupStages(vk::ShaderStageFlags supported) {
-	uint32_t stages = 0;
-	for (const auto stage: {ShaderType::Vertex, ShaderType::Pixel, ShaderType::Compute, ShaderType::Mesh,
-	                        ShaderType::Local, ShaderType::TessellationControl, ShaderType::TessellationEvaluation}) {
-		if (supported & NativeShaderStage(stage)) {
-			stages |= 1u << static_cast<uint32_t>(stage);
-		}
-	}
-	return stages;
-}
-}
-
-ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
-	const auto operations = graphics.subgroup_supported_operations;
-	return {.maintenance8           = graphics.maintenance8_enabled,
-	        .native_float_min_max   = graphics.physical_device_properties.vendorID == 0x1002u,
-	        .device_clock_period_ps = graphics.device_clock_period_ps,
-	        .robust_buffer_access   = graphics.robust_buffer_access_enabled,
-	        .r8_srgb_views          = graphics.r8_srgb_views,
-	        .r8g8_srgb_views        = graphics.r8g8_srgb_views,
-	        .relaxed_float          = Config::RelaxedShaderFloatEnabled(),
-	        .ray_query              = graphics.ray_query_enabled,
-	        .lds_lane_sync          = LdsLaneSyncEnabled(),
-	        .native_float16         = graphics.shader_float16_enabled,
-	        .f32_product_no_contraction = F32ProductNoContractionEnabled(),
-	        .subgroup_arithmetic = bool(operations & vk::SubgroupFeatureFlagBits::eArithmetic),
-	        .subgroup_ballot     = bool(operations & vk::SubgroupFeatureFlagBits::eBallot),
-	        .subgroup_shuffle    = bool(operations & vk::SubgroupFeatureFlagBits::eShuffle),
-	        .subgroup_quad       = bool(operations & vk::SubgroupFeatureFlagBits::eQuad),
-	        .subgroup_stages     = SubgroupStages(graphics.subgroup_supported_stages)};
 }
 
 std::filesystem::path ShaderStorePath() {
@@ -1405,87 +1205,6 @@ ShaderModule* PipelineCache::Program::MatchModule(uint32_t push_data_cursor) {
 	return &*found;
 }
 
-ShaderModule PipelineCache::BuildModule(const ProgramKey&                                  key,
-                                       const ShaderRecompiler::CompileOptions&            options,
-                                       ShaderRecompiler::TranslateResult                  translated,
-                                       const ShaderRecompiler::IR::ResourceSpecialization& specialization,
-                                       std::span<const uint32_t> function_code,
-                                       uint32_t push_data_cursor, std::vector<uint32_t>& spirv,
-                                       std::vector<uint32_t>& plain_spirv,
-                                       std::string* table_refusal) const {
-	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::ShadersCompiled,
-	                                         Common::DebugCounters::Counter::ShaderCompileNs,
-	                                         Common::DebugCounters::Peak::ShaderCompileNs);
-	const auto profile         = SpirvProfile(m_graphics);
-	auto       compile_options = options;
-	compile_options.profile    = &profile;
-	compile_options.plain_mip_stats_variant = key.stage == ShaderType::Pixel;
-	auto result = ShaderRecompiler::CompileProgram(std::move(translated), compile_options,
-	                                               specialization, push_data_cursor);
-	if (compile_options.table_mode && result.spirv.empty()) {
-		if (table_refusal != nullptr) *table_refusal = std::move(result.table_refusal);
-		return {};
-	}
-	auto info = std::move(result.program).TakeCompiledInfo();
-
-	ShaderRecompiler::IR::Writer inputs;
-	ShaderRecompiler::IR::IoAll(inputs, key.stage, key.hash, key.user_data_count, key.static_state,
-	                            info.bindings.push_data_start_dword, specialization);
-	inputs.Raw(function_code.data(), function_code.size_bytes());
-	const auto id = XXH3_64bits(inputs.bytes.data(), inputs.bytes.size());
-
-	const auto* stage = ShaderRecompiler::StageName(key.stage);
-	DumpShader(result.spirv, fmt::format("{}_{:016x}_{:016x}.spv", stage, key.hash, id));
-	ValidateShaderSpirv(stage, key.hash, result.spirv, profile.maintenance8);
-	ShaderModule module {
-	    .id             = id,
-	    .module         = CompileSPV(result.spirv, m_graphics.device),
-	    .info           = std::move(info),
-	    .specialization = specialization,
-	    .function_code  = {function_code.begin(), function_code.end()},
-	};
-	module.spirv_words = static_cast<uint32_t>(result.spirv.size());
-	if (key.stage == ShaderType::Vertex || key.stage == ShaderType::Local) {
-		module.vertex_formats = VertexInputFormats(*options.input_info.vertex, module.info);
-	} else if (key.stage == ShaderType::Pixel &&
-	           options.input_info.pixel->parameter_mode == ShaderPixelParameterMode::Rectangle) {
-		module.rect_parameters = RectListParameters(*options.input_info.pixel, module.info);
-	} else if (key.stage == ShaderType::Mesh) {
-		module.mesh_task = options.input_info.vertex->indirect_draw;
-	} else if (key.stage == ShaderType::Compute) {
-		module.guest_traversal = RayTracing::NativeTraversals() && !options.native_ray_tracing;
-	}
-	if (!result.spirv_plain.empty()) {
-		ValidateShaderSpirv(stage, key.hash, result.spirv_plain, profile.maintenance8);
-		module.plain = MakePlainModule(module, result.spirv_plain, m_graphics.device);
-		EXIT_IF(module.plain == nullptr);
-	}
-#if defined(ANYPS5_KYTY)
-	LogShaderVariantBuild(stage, key.hash, key.user_data_count, key.static_state, push_data_cursor, module);
-#endif
-	spirv       = std::move(result.spirv);
-	plain_spirv = std::move(result.spirv_plain);
-	return module;
-}
-
-std::shared_ptr<const ShaderModule> MakePlainModule(const ShaderModule&       module,
-                                                    std::span<const uint32_t> spirv,
-                                                    vk::Device                device) {
-	auto plain = std::make_shared<ShaderModule>();
-	plain->id     = module.id ^ PlainModuleIdXor;
-	plain->module = CompileSPV(spirv, device);
-	if (plain->module == nullptr) {
-		return nullptr;
-	}
-	plain->info            = module.info;
-	plain->specialization  = module.specialization;
-	plain->function_code   = module.function_code;
-	plain->vertex_formats  = module.vertex_formats;
-	plain->rect_parameters = module.rect_parameters;
-	plain->spirv_words     = static_cast<uint32_t>(spirv.size());
-	return plain;
-}
-
 void PipelineCache::AddedModule(const ProgramKey& key, const Program& program,
                                 const ShaderModule& module, const std::vector<uint32_t>& spirv,
                                 const std::vector<uint32_t>&            plain_spirv,
@@ -1712,37 +1431,13 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	    .read_specialization_memory = ReadShaderGuestMemory,
 	    .image_heap                 = m_image_heap,
 	};
-	ShaderRecompiler::CompileOptions options {.wave_size = input_info.wave_size};
-	if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
-		options.stage            = input_info.logical_stage;
-		options.input_info.vertex = &input_info;
-		options.user_data_base   = 8;
-		if (options.stage == ShaderType::Mesh ||
-		    options.stage == ShaderType::TessellationControl) {
-			options.user_data_base = 0;
-		}
-		if (options.stage == ShaderType::Mesh) {
-			options.wave_size = input_info.mesh.wave_size;
-		}
-	} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
-		options.stage            = ShaderType::Pixel;
-		options.input_info.pixel = &input_info;
-	} else {
-		static_assert(std::is_same_v<InputInfo, ShaderComputeInputInfo>);
-		options.stage              = ShaderType::Compute;
-		options.input_info.compute = &input_info;
-		runtime.workgroup_counts   = input_info.workgroup_counts;
+	auto options = StageCompileOptions(input_info);
+	if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+		runtime.workgroup_counts      = input_info.workgroup_counts;
 		runtime.indirect_args_address = input_info.indirect_args_address;
 		runtime.runtime_stride        = RuntimeStride(params.hash);
 	}
-	m_lookup_key.stage           = options.stage;
-	m_lookup_key.hash            = params.hash;
-	m_lookup_key.user_data_count = params.user_data_count;
-	BuildStageStaticKey(input_info, m_lookup_key.static_state);
-	AppendNativeRayTracingKey(options.stage, m_lookup_key.static_state, !m_guest_traversal);
-	if (m_lane_pairs) {
-		m_lookup_key.static_state.push_back(LanePairsKey);
-	}
+	SetShaderProgramKey(m_lookup_key, params, input_info, !m_guest_traversal, m_lane_pairs);
 	auto entry = m_program_cache.find(m_lookup_key);
 	const auto bind = [&](const ShaderModule& module) {
 		input_info.stage = {.module = &module, .resources = &entry->second.resources};
@@ -1879,15 +1574,8 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	           natural;
 	const auto build = [&]() KYTY_REQUIRES(m_program_lock) -> const ShaderModule* {
 #endif
-	options.shader_hash     = params.hash;
-	options.user_data       = user_data;
-	options.back_code       = params.back_code;
-	options.dump_ir         = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
-	options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
-	options.native_ray_tracing = RayTracing::NativeTraversals() && !m_guest_traversal;
-	options.ray_stats          = options.native_ray_tracing && Config::RayTracingStatsEnabled();
-	options.rt_oracle          = options.native_ray_tracing ? Config::RayTracingOracle() : 0u;
-	options.wave_lane_pairs    = m_lane_pairs;
+	SetShaderCompileOptions(options, params.hash, user_data, params.back_code,
+	                        RayTracing::NativeTraversals() && !m_guest_traversal, m_lane_pairs);
 	ShaderRecompiler::ShaderSource source;
 	if (entry == m_program_cache.end()) {
 		DumpShader(params.code, fmt::format("original/{}_{:016x}.bin",
@@ -2782,18 +2470,7 @@ template <typename InputInfo>
 const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInfo& input_info,
                                             uint32_t& push_data_cursor, ProgramResolution& ahead) {
 	thread_local ProgramKey key;
-	if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
-		key.stage = input_info.logical_stage;
-	} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
-		key.stage = ShaderType::Pixel;
-	} else {
-		static_assert(std::is_same_v<InputInfo, ShaderComputeInputInfo>);
-		key.stage = ShaderType::Compute;
-	}
-	key.hash            = params.hash;
-	key.user_data_count = params.user_data_count;
-	BuildStageStaticKey(input_info, key.static_state);
-	AppendNativeRayTracingKey(key.stage, key.static_state);
+	SetShaderProgramKey(key, params, input_info);
 	const bool unlocked = t_ahead_unlocked;
 	Program*   program  = nullptr;
 	{
@@ -3006,40 +2683,15 @@ void PipelineCache::RunCompileJob(CompileJob& job, InputInfo& input_info) {
 	std::optional<ShaderRecompiler::IR::ResourcePlan> plan;
 	std::vector<uint32_t>                             spirv;
 	std::vector<uint32_t>                             plain_spirv;
-	ShaderRecompiler::CompileOptions                  options {.wave_size = input_info.wave_size};
+	auto options = StageCompileOptions(input_info);
 #if defined(ANYPS5_KYTY)
 	const auto compile = [&] {
 #else
 	[&] {
 #endif
 		const auto user_data = std::span(job.params.user_data).first(job.params.user_data_count);
-		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
-			options.stage             = input_info.logical_stage;
-			options.input_info.vertex = &input_info;
-			options.user_data_base    = 8;
-			if (options.stage == ShaderType::Mesh ||
-			    options.stage == ShaderType::TessellationControl) {
-				options.user_data_base = 0;
-			}
-			if (options.stage == ShaderType::Mesh) {
-				options.wave_size = input_info.mesh.wave_size;
-			}
-		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
-			options.stage            = ShaderType::Pixel;
-			options.input_info.pixel = &input_info;
-		} else {
-			options.stage              = ShaderType::Compute;
-			options.input_info.compute = &input_info;
-		}
-		options.shader_hash     = job.params.hash;
-		options.user_data       = user_data;
-		options.back_code       = job.params.back_code;
-		options.dump_ir         = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
-		options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
-		options.native_ray_tracing = RayTracing::NativeTraversals() && !job.guest_traversal;
-		options.ray_stats          = options.native_ray_tracing && Config::RayTracingStatsEnabled();
-		options.rt_oracle          = options.native_ray_tracing ? Config::RayTracingOracle() : 0u;
-		options.wave_lane_pairs    = job.lane_pairs;
+		SetShaderCompileOptions(options, job.params.hash, user_data, job.params.back_code,
+		                        RayTracing::NativeTraversals() && !job.guest_traversal, job.lane_pairs);
 		auto source = ShaderRecompiler::PrepareShaderSource(job.params.code, options);
 		if (!source.calls.empty() || source.unsupported_call_pc != UINT32_MAX) {
 			return;
@@ -3240,16 +2892,7 @@ const ShaderModule* PipelineCache::ChainModule(const ShaderParams& params, Input
                                                uint32_t& push_data_cursor,
                                                ShaderRecompiler::IR::ResourceSnapshot& resources) {
 	ProgramKey key;
-	if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
-		key.stage = input_info.logical_stage;
-	} else {
-		static_assert(std::is_same_v<InputInfo, ShaderPixelInputInfo>);
-		key.stage = ShaderType::Pixel;
-	}
-	key.hash            = params.hash;
-	key.user_data_count = params.user_data_count;
-	BuildStageStaticKey(input_info, key.static_state);
-	AppendNativeRayTracingKey(key.stage, key.static_state);
+	SetShaderProgramKey(key, params, input_info);
 	ShaderRecompiler::IR::ResourceSpecialization specialization;
 	bool                                         materialized = false;
 	for (uint32_t attempt = 0; attempt < 3; attempt++) {
@@ -3565,17 +3208,7 @@ PipelineCache::TableProgram PipelineCache::GetTableProgram(
     const ShaderParams& params, const InputInfo& input_info,
     const ShaderRecompiler::IR::ResourceSpecialization& specialization, uint32_t push_data_cursor) {
 	ProgramKey key;
-	if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
-		key.stage = input_info.logical_stage;
-	} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
-		key.stage = ShaderType::Pixel;
-	} else {
-		static_assert(std::is_same_v<InputInfo, ShaderComputeInputInfo>);
-		key.stage = ShaderType::Compute;
-	}
-	key.hash            = params.hash;
-	key.user_data_count = params.user_data_count;
-	BuildStageStaticKey(input_info, key.static_state);
+	SetShaderProgramKey(key, params, input_info, false);
 	key.static_state.push_back(TableKeyMarker);
 	const ProgramLockGuard lock(m_program_lock);
 	auto&                  variants = m_table_programs[key];
@@ -3622,30 +3255,14 @@ void PipelineCache::RunTableJob(CompileJob& job, InputInfo& input_info) {
 	std::vector<uint32_t>       spirv;
 	std::vector<uint32_t>       plain_spirv;
 	[&] {
-		ShaderRecompiler::CompileOptions options {.wave_size = input_info.wave_size};
+		auto options = StageCompileOptions(input_info);
 		const auto user_data = std::span(job.params.user_data).first(job.params.user_data_count);
-		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
-			options.stage             = input_info.logical_stage;
-			options.input_info.vertex = &input_info;
-			options.user_data_base    = 8;
-		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
-			options.stage            = ShaderType::Pixel;
-			options.input_info.pixel = &input_info;
-		} else {
-			options.stage              = ShaderType::Compute;
-			options.input_info.compute = &input_info;
-		}
 		if (options.stage == ShaderType::Mesh || options.stage == ShaderType::TessellationControl ||
 		    options.stage == ShaderType::Local || options.stage == ShaderType::TessellationEvaluation) {
 			refusal = "mesh and tessellation stages are not served";
 			return;
 		}
-		options.shader_hash        = job.params.hash;
-		options.user_data          = user_data;
-		options.back_code          = job.params.back_code;
-		options.dump_ir            = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
-		options.emit_debug_info    = Config::GraphicsDebugDumpEnabled();
-		options.native_ray_tracing = false;
+		SetShaderCompileOptions(options, job.params.hash, user_data, job.params.back_code, false);
 		options.table_mode         = true;
 		auto source = ShaderRecompiler::PrepareShaderSource(job.params.code, options);
 		if (!source.calls.empty() || source.unsupported_call_pc != UINT32_MAX) {

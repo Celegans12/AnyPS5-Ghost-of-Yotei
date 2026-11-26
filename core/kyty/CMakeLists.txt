@@ -161,9 +161,21 @@ string(SUBSTRING "${KYTY_UPSTREAM_REVISION}" 0 7 KYTY_GIT_HASH)
 set(KYTY_GIT_REVISION "${KYTY_UPSTREAM_REVISION}")
 configure_file("${KYTY_DIR}/cmake/kytyGitVersion.h.in" "${KYTY_GENERATED_DIR}/kytyGitVersion.h")
 
+set(kytyPipelineDir "${KYTY_DIR}/graphics/host_gpu/renderer/pipeline")
+set(kytyStorePipelineSources
+    pipelineSerialization.cpp
+    pipelineShaderModule.cpp
+    pipelineShaderOptions.h
+    pipelineStoreFormat.h
+    pipelineStoreRecord.cpp
+    pipelineStoreTypes.h)
+list(TRANSFORM kytyStorePipelineSources PREPEND "${kytyPipelineDir}/")
 file(GLOB_RECURSE KYTY_SHADER_STORE_SOURCES CONFIGURE_DEPENDS
-    "${KYTY_DIR}/graphics/shader/*.cpp" "${KYTY_DIR}/graphics/shader/*.h" "${KYTY_DIR}/graphics/shader/*.inc"
-    "${KYTY_DIR}/graphics/host_gpu/renderer/pipeline/*.cpp" "${KYTY_DIR}/graphics/host_gpu/renderer/pipeline/*.h")
+    "${KYTY_DIR}/graphics/shader/*.cpp" "${KYTY_DIR}/graphics/shader/*.h" "${KYTY_DIR}/graphics/shader/*.inc")
+list(APPEND KYTY_SHADER_STORE_SOURCES ${kytyStorePipelineSources}
+    "${KYTY_DIR}/graphics/host_gpu/renderer/renderTargetLimits.h")
+file(GLOB_RECURSE kytyStoreCheckSources CONFIGURE_DEPENDS
+    "${kytyPipelineDir}/*.cpp" "${kytyPipelineDir}/*.h" "${kytyPipelineDir}/*.inc")
 list(SORT KYTY_SHADER_STORE_SOURCES)
 string(JOIN "\n" kytyShaderStoreList ${KYTY_SHADER_STORE_SOURCES})
 file(CONFIGURE OUTPUT "${KYTY_GENERATED_DIR}/kytyShaderStoreSources.txt" CONTENT "${kytyShaderStoreList}\n")
@@ -171,10 +183,13 @@ add_custom_command(
     OUTPUT "${KYTY_GENERATED_DIR}/kytyShaderStoreStamp.stamp"
     BYPRODUCTS "${KYTY_GENERATED_DIR}/kytyShaderStoreStamp.h"
     COMMAND ${CMAKE_COMMAND} "-DLIST_FILE=${KYTY_GENERATED_DIR}/kytyShaderStoreSources.txt" "-DROOT=${KYTY_DIR}"
+            -P "${KYTY_DIR}/cmake/check_shader_store_sources.cmake"
+    COMMAND ${CMAKE_COMMAND} "-DLIST_FILE=${KYTY_GENERATED_DIR}/kytyShaderStoreSources.txt" "-DROOT=${KYTY_DIR}"
+            "-DPACKED_KEY_FILE=${kytyPipelineDir}/pipelineCache.h"
             "-DOUTPUT=${KYTY_GENERATED_DIR}/kytyShaderStoreStamp.h" -P "${KYTY_DIR}/cmake/shader_store_stamp.cmake"
     COMMAND ${CMAKE_COMMAND} -E touch "${KYTY_GENERATED_DIR}/kytyShaderStoreStamp.stamp"
-    DEPENDS ${KYTY_SHADER_STORE_SOURCES} "${KYTY_GENERATED_DIR}/kytyShaderStoreSources.txt"
-            "${KYTY_DIR}/cmake/shader_store_stamp.cmake"
+    DEPENDS ${KYTY_SHADER_STORE_SOURCES} ${kytyStoreCheckSources} "${KYTY_GENERATED_DIR}/kytyShaderStoreSources.txt"
+            "${KYTY_DIR}/cmake/check_shader_store_sources.cmake" "${KYTY_DIR}/cmake/shader_store_stamp.cmake"
     VERBATIM
 )
 add_custom_target(kyty_shader_store_stamp DEPENDS "${KYTY_GENERATED_DIR}/kytyShaderStoreStamp.stamp")
@@ -248,6 +263,8 @@ file(GLOB_RECURSE KYTY_COMMON_SOURCES CONFIGURE_DEPENDS "${KYTY_DIR}/common/*.cp
 set(KYTY_GPU_EXCEPTIONS
     graphics/host_gpu/renderer/pipeline/descriptors.cpp
     graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
+    graphics/host_gpu/renderer/pipeline/pipelineShaderDiagnostics.cpp
+    graphics/host_gpu/renderer/pipeline/pipelineShaderModule.cpp
     graphics/presentation/window/swapchain.cpp
 )
 list(TRANSFORM KYTY_GPU_EXCEPTIONS PREPEND "${KYTY_DIR}/")

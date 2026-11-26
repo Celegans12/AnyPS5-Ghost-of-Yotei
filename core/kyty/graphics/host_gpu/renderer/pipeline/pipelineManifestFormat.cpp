@@ -1159,14 +1159,6 @@ bool ReadLayout(std::span<const std::string_view>                 tokens,
 
 }
 
-uint64_t ManifestModule::ProgramHash() const {
-	if (back_hash == 0) {
-		return code_hash;
-	}
-	const uint64_t hashes[] = {code_hash, back_hash};
-	return XXH3_64bits(hashes, sizeof(hashes));
-}
-
 void NormalizeManifestInput(ManifestModule& module) {
 	if (auto* vertex = std::get_if<ShaderVertexInputInfo>(&module.input)) {
 		for (int i = 0; i < vertex->resources_num; i++) {

@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineManifest.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineShaderOptions.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -430,24 +431,6 @@ void PipelineCache::DecideRuntimeStrides(std::span<PipelineManifest*> manifests)
 	for (const auto hash: listed) {
 		if (!runtime.contains(hash)) {
 			m_baked_stride_programs.insert(hash);
-		}
-	}
-}
-
-void PipelineCache::SetHostInput(ManifestModule& module) const {
-	const auto& limits = m_graphics.GetPhysicalDeviceProperties().limits;
-	if (auto* compute = std::get_if<ShaderComputeInputInfo>(&module.input)) {
-		compute->host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
-		compute->lds_storage = compute->lds_size_dwords * 4u > limits.maxComputeSharedMemorySize;
-	} else if (auto* vertex = std::get_if<ShaderVertexInputInfo>(&module.input)) {
-		if (module.stage == ShaderType::Mesh) {
-			vertex->mesh.host_subgroup_size = m_graphics.subgroup_size;
-		}
-		if (vertex->clip_space.enabled) {
-			vertex->clip_space.half_extent[0] =
-			    static_cast<float>(std::min(limits.maxViewportDimensions[0], 16384u)) * 0.5f;
-			vertex->clip_space.half_extent[1] =
-			    static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u)) * 0.5f;
 		}
 	}
 }
@@ -2513,38 +2496,13 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 	                                      .user_data_count = record.user_data_count};
 	std::visit(
 	    [&]<typename InputInfo>(InputInfo& info) {
-		    options.wave_size = info.wave_size;
-		    if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
-			    options.stage             = info.logical_stage;
-			    options.input_info.vertex = &info;
-			    options.user_data_base    = 8;
-			    if (options.stage == ShaderType::Mesh ||
-			        options.stage == ShaderType::TessellationControl) {
-				    options.user_data_base = 0;
-			    }
-			    if (options.stage == ShaderType::Mesh) {
-				    options.wave_size = info.mesh.wave_size;
-			    }
-		    } else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
-			    options.stage            = ShaderType::Pixel;
-			    options.input_info.pixel = &info;
-		    } else {
-			    options.stage              = ShaderType::Compute;
-			    options.input_info.compute = &info;
-		    }
+		    options = StageCompileOptions(info);
 		    BuildStageStaticKey(info, key.static_state);
 	    },
 	    input);
 	const bool native = RayTracing::NativeTraversals() && !guest_traversal;
 	AppendNativeRayTracingKey(options.stage, key.static_state, native);
-	options.shader_hash        = key.hash;
-	options.user_data          = user_data;
-	options.back_code          = back_code;
-	options.dump_ir            = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
-	options.emit_debug_info    = Config::GraphicsDebugDumpEnabled();
-	options.native_ray_tracing = native;
-	options.ray_stats          = native && Config::RayTracingStatsEnabled();
-	options.rt_oracle          = native ? Config::RayTracingOracle() : 0u;
+	SetShaderCompileOptions(options, key.hash, user_data, back_code, native);
 	std::vector<uint32_t> spirv;
 	std::vector<uint32_t> plain_spirv;
 

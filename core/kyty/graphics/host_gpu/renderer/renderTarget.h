@@ -1,14 +1,13 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_RENDERTARGET_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_RENDERTARGET_H_
 
+#include "graphics/host_gpu/renderer/renderTargetLimits.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
 #include <cstdint>
 
 namespace Libs::Graphics {
-
-static constexpr uint32_t RENDER_COLOR_ATTACHMENTS_MAX = 8;
 
 struct RenderAttachment {
 	vk::ImageView           image_view    = nullptr;
