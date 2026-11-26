@@ -6,11 +6,16 @@ on:
   issue_comment:
     types: [created]
   pull_request_target:
-    branches: [AnyKyty]
+    branches: [AnyKyty, Brainrot]
     types: [opened, reopened, synchronize, ready_for_review, labeled]
   schedule:
     - cron: '13,43 * * * *'
   workflow_dispatch:
+    inputs:
+      pull_request:
+        description: Review a specific pull request by number
+        required: false
+        type: string
   push:
     branches: [test/hosted-maintenance]
 
@@ -61,7 +66,8 @@ jobs:
     if: >-
       github.repository == 'simnJS/AnyPS5' &&
       github.ref == 'refs/heads/AnyKyty' &&
-      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'schedule' ||
+       (github.event_name == 'workflow_dispatch' && !inputs.pull_request) ||
        (github.event_name == 'pull_request_target' && github.event.label.name == 'automerge'))
     runs-on: ubuntu-latest
     timeout-minutes: 10

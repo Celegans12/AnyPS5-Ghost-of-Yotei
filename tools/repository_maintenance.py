@@ -11,6 +11,7 @@ import urllib.request
 from pathlib import Path
 
 BASE_BRANCH = "AnyKyty"
+REVIEW_BRANCHES = {BASE_BRANCH, "Brainrot"}
 OWNER = "simnJS"
 REPO = f"{OWNER}/AnyPS5"
 WORKFLOWS = ("anykyty.yml", "offline-checks.yml")
@@ -31,7 +32,9 @@ On issues, ask for the smallest missing diagnostic detail or give a short
 answer grounded in the repository guidance. Avoid replies that merely restate
 the report or repeat an answer already given. On pull requests, comment only
 on actionable defects that can be established from the diff or a clearly
-missing verification that matters for the change. Do not claim to have run tests.
+missing verification that matters for the change. Review the diff against its own
+base branch. Do not suggest retargeting either of the supported branches. Do not
+claim to have run tests.
 Use plain Markdown without mentions, links, or HTML. Use 'reply' and give the
 public message in body, 'escalate' and use an empty body, or 'skip' and use
 an empty body. Never approve, close, label, or merge.
@@ -121,6 +124,7 @@ def model_review(context, key):
 
 
 def note(message):
+    print(message)
     with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
         print(message, file=summary)
 
@@ -132,13 +136,17 @@ def public_reply(body):
     )
 
 
-def review(number, key, words):
+def review(number, key, words, *, targeted=False):
     issue = gh(issue_api(number))
     if issue["state"] != "open" or issue["locked"] or issue["user"]["type"] == "Bot":
         return False
     is_pull = "pull_request" in issue
+    if targeted and not is_pull:
+        raise RuntimeError("The selected number must be a pull request")
     pull = gh(pull_api(number)) if is_pull else None
-    if pull and (pull["draft"] or pull["base"]["ref"] != BASE_BRANCH):
+    if pull and (pull["draft"] or pull["base"]["ref"] not in REVIEW_BRANCHES):
+        if targeted:
+            note(f"- #{number} is a draft or targets a branch outside automatic review.")
         return False
     thread = paginated(issue_api(number, "/comments?per_page=100"))
     human = [item for item in thread if item["user"]["type"] != "Bot"]
@@ -169,6 +177,7 @@ def review(number, key, words):
         ),
     }
     if pull:
+        context["base_branch"] = pull["base"]["ref"]
         if pull["changed_files"] > 25:
             note(f"- #{number} needs maintainer review because the diff is large.")
             return False
@@ -182,6 +191,8 @@ def review(number, key, words):
             return False
     result = model_review(context, key)
     if result["action"] == "skip":
+        if targeted:
+            note(f"- Reviewed #{number}. No actionable finding to publish.")
         return True
     body = result["body"].strip()
     if result["action"] != "reply" or not public_reply(body) or not safe_for_publication(body.encode(), words):
@@ -309,6 +320,12 @@ def run(mode):
         if gh("user")["login"] != OWNER:
             raise RuntimeError("The merge credential must belong to the repository owner")
     event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
+    selected_pull = event.get("inputs", {}).get("pull_request")
+    if mode == "review" and selected_pull:
+        if not re.fullmatch(r"[1-9][0-9]*", str(selected_pull)):
+            raise RuntimeError("Enter a positive integer pull request number")
+        review(int(selected_pull), key, words, targeted=True)
+        return
     item = event.get("pull_request") or event.get("issue")
     if item:
         numbers = [item["number"]]
