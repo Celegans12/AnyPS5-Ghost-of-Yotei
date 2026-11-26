@@ -64,6 +64,7 @@ void PipelineCache::WarmUp(const std::filesystem::path& path,
 	if (header.empty()) {
 		return;
 	}
+	const GuestClockHold clock_hold;
 	const auto           start = std::chrono::steady_clock::now();
 	std::vector<uint8_t> bytes;
 	bool read_store = false;

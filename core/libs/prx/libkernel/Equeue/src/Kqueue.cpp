@@ -644,7 +644,7 @@ std::optional<std::uint64_t> ScanDeadline(const KernelTimespec& timeout) {
         return std::nullopt;
     }
     const std::uint64_t span = static_cast<std::uint64_t>(timeout.tv_sec) * 1000000000ULL + static_cast<std::uint64_t>(timeout.tv_nsec);
-    return TimedWait::NowNanos() + span;
+    return TimedWait::ClockNanos() + span;
 }
 
 }

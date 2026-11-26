@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <limits>
 
 namespace SleepWake {
 
@@ -31,16 +32,15 @@ bool Enabled() {
     return enabled;
 }
 
-}
-
-void Sleep(std::uint64_t nanos) {
+bool SleepOnce(std::uint64_t nanos) {
     ThreadState& state = State();
     bool woken = false;
+    bool early = false;
     if (nanos != 0 && nanos <= MAX_WAKEABLE_NANOS && !state.sleeping && Enabled()) {
         if (TimedWait::NowNanos() - state.lastSleepEndNanos >= nanos) state.earlyWakes = 0;
         if (state.earlyWakes < EARLY_WAKES_PER_RUN) {
             state.sleeping = true;
-            const bool early = TimedWait::SleepNanosUnlessChanged(nanos, completions, completions.load(std::memory_order_seq_cst));
+            early = TimedWait::SleepNanosUnlessChanged(nanos, completions, completions.load(std::memory_order_seq_cst));
             state.sleeping = false;
             if (early) ++state.earlyWakes;
             woken = true;
@@ -48,6 +48,19 @@ void Sleep(std::uint64_t nanos) {
     }
     if (!woken) TimedWait::SleepNanos(nanos);
     state.lastSleepEndNanos = TimedWait::NowNanos();
+    return early;
+}
+
+}
+
+void Sleep(std::uint64_t nanos) {
+    const bool guest = TimedWait::FollowsGuestClock();
+    const std::uint64_t start = guest ? TimedWait::ClockNanos() : 0;
+    if (SleepOnce(nanos) || !guest) return;
+    const std::uint64_t deadline = nanos > std::numeric_limits<std::uint64_t>::max() - start ? std::numeric_limits<std::uint64_t>::max() : start + nanos;
+    for (std::uint64_t wait = TimedWait::WaitNanos(deadline); wait != 0; wait = TimedWait::WaitNanos(deadline)) {
+        if (SleepOnce(wait)) return;
+    }
 }
 
 }

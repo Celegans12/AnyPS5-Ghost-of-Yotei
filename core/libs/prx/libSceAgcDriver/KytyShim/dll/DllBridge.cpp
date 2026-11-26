@@ -552,6 +552,14 @@ std::uint64_t sceKernelGetProcessTimeCounter() {
     return Host(__func__)->kernel_process_time_counter();
 }
 
+void KernelPauseGuestClock_nid_no_patch() {
+    Host(__func__)->kernel_pause_guest_clock();
+}
+
+void KernelResumeGuestClock_nid_no_patch() {
+    Host(__func__)->kernel_resume_guest_clock();
+}
+
 void LibcRunReportSetGpu_nid_no_patch(unsigned vendorId, const char* name, const char* driver, unsigned apiVersion) noexcept {
     Host(__func__)->run_report_set_gpu(vendorId, name, driver, apiVersion);
 }

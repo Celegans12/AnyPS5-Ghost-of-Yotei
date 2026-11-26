@@ -138,7 +138,7 @@ void RunKtimers() {
             if (now >= timer.value) Fire(id, timer, now);
             if (timer.value == 0) continue;
             const Nanoseconds left = std::clamp<Nanoseconds>(timer.value - ClockNow(timer.clock), 0, LongestWait);
-            const std::uint64_t at = TimedWait::NowNanos() + static_cast<std::uint64_t>(left);
+            const std::uint64_t at = TimedWait::NowNanos() + TimedWait::GuestSpanWaitNanos(static_cast<std::uint64_t>(left));
             wake = wake ? std::min(*wake, at) : at;
         }
         if (wake) state.changed.WaitUntil(lock, *wake);

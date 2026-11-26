@@ -659,9 +659,9 @@ bool GuestSockets::WaitAny(const std::vector<Interest>& interests, std::uint64_t
     entries.push_back({waker, ReadMask, 0});
     std::uint64_t remaining = 0;
     if (deadlineNanos != 0) {
-        const std::uint64_t now = TimedWait::NowNanos();
+        const std::uint64_t now = TimedWait::ClockNanos();
         if (now >= deadlineNanos) return true;
-        remaining = deadlineNanos - now;
+        remaining = TimedWait::WaitNanos(deadlineNanos);
     }
 #ifdef _WIN32
     INT timeout = -1;

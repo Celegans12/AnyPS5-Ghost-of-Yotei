@@ -237,6 +237,8 @@ KytyDllHost MakeHost() {
     host.kernel_tsc_frequency = [] { return sceKernelGetTscFrequency(); };
     host.kernel_process_time = [] { return sceKernelGetProcessTime(); };
     host.kernel_process_time_counter = [] { return sceKernelGetProcessTimeCounter(); };
+    host.kernel_pause_guest_clock = [] { KernelPauseGuestClock_nid_no_patch(); };
+    host.kernel_resume_guest_clock = [] { KernelResumeGuestClock_nid_no_patch(); };
     host.run_report_set_gpu = [](std::uint32_t vendorId, const char* name, const char* driver, std::uint32_t apiVersion) { LibcRunReportSetGpu_nid_no_patch(vendorId, name, driver, apiVersion); };
     host.run_report_frame_presented = [] { LibcRunReportFramePresented_nid_no_patch(); };
     host.equeue_add_event = [](std::int64_t eq, const KytyDllEqueueEvent* event, int* result) {

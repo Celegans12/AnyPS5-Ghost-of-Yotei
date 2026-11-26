@@ -163,7 +163,7 @@ int MutexOperations::Timedlock(PthreadMutex* mutex, const KernelTimespec* abstim
             const auto now = std::chrono::system_clock::now();
             if (now >= deadline) return native.try_lock();
             const auto remaining = std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now).count();
-            const std::uint64_t slice = TimedWait::NowNanos() + static_cast<std::uint64_t>(std::min<std::int64_t>(remaining, 100000000));
+            const std::uint64_t slice = TimedWait::ClockNanos() + static_cast<std::uint64_t>(std::min<std::int64_t>(remaining, 100000000));
             if (TimedWait::ParkAcquire(current, [&] { return native.try_lock(); }, &slice)) return true;
         }
 #else

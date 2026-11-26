@@ -52,6 +52,8 @@
 #endif
 #endif
 
+extern "C" bool IsInitialPthread_nid_no_patch();
+
 static constexpr int GUEST_EPERM = 1;
 static constexpr int GUEST_EIO = 5;
 static constexpr int GUEST_EFAULT = 14;
@@ -124,6 +126,10 @@ struct GuestClockPause {
     std::atomic<bool> paused{false};
     std::atomic<std::uint64_t> pausedAt{0};
     std::atomic<std::uint64_t> pausedNanos{0};
+    std::atomic<std::uint64_t> pausedAtTicks{0};
+    std::atomic<std::uint64_t> pausedTicks{0};
+    std::uint64_t pausedAtRaw = 0;
+    std::uint64_t pausedAtRawTicks = 0;
 };
 
 GuestClockPause& ClockPause() {
@@ -143,6 +149,27 @@ static std::uint64_t PausedRawMonotonicNanos() {
     }
 }
 
+static std::uint64_t PausedTsc() {
+    auto& pause = ClockPause();
+    for (;;) {
+        const auto sequence = pause.sequence.load();
+        if ((sequence & 1u) != 0) continue;
+        const auto now = pause.paused.load() ? pause.pausedAtTicks.load() : GuestCpu::ReadTsc() - pause.pausedTicks.load();
+        if (pause.sequence.load() == sequence) return now;
+    }
+}
+
+static bool GuestClockPausedNow() {
+    return ClockPause().paused.load();
+}
+
+static bool InitialThreadFollowsGuestClock() {
+    return IsInitialPthread_nid_no_patch();
+}
+
+static const TimedWait::GuestClockSource g_guestClockSource{&PausedRawMonotonicNanos, &GuestClockPausedNow, &InitialThreadFollowsGuestClock};
+static const bool g_guestClockSourceInstalled = (TimedWait::SetGuestClockSource(&g_guestClockSource), true);
+
 static std::uint64_t GetMonotonicNanos() {
     if (TimeScale() == 1.0) return PausedRawMonotonicNanos();
     const auto origin = ClockOrigin();
@@ -155,7 +182,12 @@ extern "C" void KernelPauseGuestClock_nid_no_patch() {
     std::lock_guard lock(pause.mutex);
     if (pause.depth++ != 0) return;
     pause.sequence.fetch_add(1);
-    pause.pausedAt.store(RawMonotonicNanos() - pause.pausedNanos.load());
+    const std::uint64_t raw = RawMonotonicNanos();
+    const std::uint64_t ticks = GuestCpu::ReadTsc();
+    pause.pausedAtRaw = raw;
+    pause.pausedAtRawTicks = ticks;
+    pause.pausedAt.store(raw - pause.pausedNanos.load());
+    pause.pausedAtTicks.store(ticks - pause.pausedTicks.load());
     pause.paused.store(true);
     pause.sequence.fetch_add(1);
 }
@@ -165,7 +197,10 @@ extern "C" void KernelResumeGuestClock_nid_no_patch() {
     std::lock_guard lock(pause.mutex);
     if (pause.depth == 0 || --pause.depth != 0) return;
     pause.sequence.fetch_add(1);
-    pause.pausedNanos.store(RawMonotonicNanos() - pause.pausedAt.load());
+    const std::uint64_t raw = RawMonotonicNanos();
+    const std::uint64_t ticks = GuestCpu::ReadTsc();
+    pause.pausedNanos.store(pause.pausedNanos.load() + (raw > pause.pausedAtRaw ? raw - pause.pausedAtRaw : 0));
+    pause.pausedTicks.store(pause.pausedTicks.load() + (ticks > pause.pausedAtRawTicks ? ticks - pause.pausedAtRawTicks : 0));
     pause.paused.store(false);
     pause.sequence.fetch_add(1);
 }
@@ -408,12 +443,12 @@ static void CancellableSleep(std::uint64_t nanos) {
     if (nanos <= SleepWake::MAX_WAKEABLE_NANOS) {
         SleepWake::Sleep(nanos);
     } else {
-        const auto now = TimedWait::NowNanos();
+        const auto now = TimedWait::ClockNanos();
         const auto deadline = now + std::min(nanos, std::numeric_limits<std::uint64_t>::max() - now);
         std::mutex mutex;
         TimedWait::Condition condition;
         std::unique_lock lock(mutex);
-        while (!ThreadCancel::Requested() && TimedWait::NowNanos() < deadline) {
+        while (!ThreadCancel::Requested() && TimedWait::ClockNanos() < deadline) {
             ThreadCancel::Wait(condition, lock, deadline);
         }
     }
@@ -929,7 +964,7 @@ int APS5_VABI sceKernelGettimezone(KernelTimezone* tz) {
 }
 
 uint64_t APS5_VABI sceKernelReadTsc(void) {
-    return GuestCpu::ReadTsc();
+    return PausedTsc();
 }
 
 std::uint64_t APS5_VABI HostTscFrequency_nid_no_patch() {

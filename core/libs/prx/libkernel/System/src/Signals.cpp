@@ -494,7 +494,7 @@ bool DeliverUnblockedPending() {
 
 std::optional<std::uint64_t> SignalWaitDeadline(const KernelTimespec& timeout) {
     if (timeout.tv_sec > INT32_MAX) return std::nullopt;
-    const std::uint64_t now = TimedWait::NowNanos();
+    const std::uint64_t now = TimedWait::ClockNanos();
     if (timeout.tv_sec < 0) return now;
     return now + static_cast<std::uint64_t>(timeout.tv_sec) * 1000000000ULL + static_cast<std::uint64_t>(timeout.tv_nsec);
 }

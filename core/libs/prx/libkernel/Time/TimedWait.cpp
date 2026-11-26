@@ -28,6 +28,12 @@ constexpr std::uint64_t SHORT_SLEEP_NANOS = 50000ULL;
 constexpr std::uint64_t SHORT_SLEEP_SPIN_RUN_NANOS = 1000000ULL;
 constexpr unsigned SHORT_SLEEP_PAUSES_PER_CLOCK_READ = 8;
 constexpr std::uint64_t LEAD_NANOS = 20000ULL;
+constexpr std::uint64_t PAUSED_WAIT_NANOS = 1000000ULL;
+
+std::atomic<const GuestClockSource*>& GuestSource() {
+    static constinit std::atomic<const GuestClockSource*> source{nullptr};
+    return source;
+}
 
 std::mutex& ChangeSleepersMutex() {
     static std::mutex mutex;
@@ -55,6 +61,7 @@ struct ThreadWaitState {
     std::atomic<int> own{0};
     std::atomic<int>* bound = &own;
     int timerDepth = 0;
+    int guestClock = -1;
 };
 
 struct DeferredDrain {
@@ -310,21 +317,27 @@ bool EventSet(HANDLE event, DWORD milliseconds) {
 }
 
 bool WaitEventUntil(Waiter* waiter, std::uint64_t deadlineNanos) {
-    const std::uint64_t start = NowNanos();
+    const std::uint64_t start = ClockNanos();
     const std::uint64_t lead = LeadNanos(deadlineNanos > start ? deadlineNanos - start : 0);
     for (;;) {
-        const std::uint64_t now = NowNanos();
+        const std::uint64_t now = ClockNanos();
         if (now >= deadlineNanos) return EventSet(waiter->event, 0);
-        const std::uint64_t remaining = deadlineNanos - now;
+        const std::uint64_t remaining = WaitNanos(deadlineNanos);
+        if (remaining == 0) continue;
+        if (FollowsGuestClock() && GuestClockPaused()) {
+            if (EventSet(waiter->event, WholeMilliseconds(remaining))) return true;
+            continue;
+        }
         if (remaining > lead) {
             const std::uint64_t bulk = remaining - lead;
             LARGE_INTEGER due{};
             due.QuadPart = -static_cast<LONGLONG>(bulk / 100ULL);
+            const std::uint64_t dueNanos = NowNanos() + bulk;
             if (waiter->timer && SetWaitableTimer(waiter->timer, &due, 0, nullptr, nullptr, FALSE)) {
                 HANDLE handles[2] = {waiter->event, waiter->timer};
                 const DWORD result = AlertableWait(2, handles, INFINITE);
                 if (result == WAIT_OBJECT_0) return true;
-                if (result == WAIT_OBJECT_0 + 1) RecordTimerLate(deadlineNanos - lead);
+                if (result == WAIT_OBJECT_0 + 1) RecordTimerLate(dueNanos);
                 continue;
             }
             if (EventSet(waiter->event, WholeMilliseconds(bulk))) return true;
@@ -614,10 +627,12 @@ void SingleWaiterCondition::NotifyOne() {
 bool SingleWaiterCondition::waitSignal(const std::uint64_t* deadlineNanos) {
     DeliveryAllowance allowance;
     if (deadlineNanos == nullptr) return dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER) == 0;
-    const std::uint64_t now = NowNanos();
-    const std::uint64_t remaining = *deadlineNanos > now ? *deadlineNanos - now : 0;
-    const dispatch_time_t deadline = remaining >= static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) ? DISPATCH_TIME_FOREVER : dispatch_time(DISPATCH_TIME_NOW, static_cast<std::int64_t>(remaining));
-    return dispatch_semaphore_wait(semaphore, deadline) == 0;
+    for (;;) {
+        const std::uint64_t remaining = WaitNanos(*deadlineNanos);
+        const dispatch_time_t deadline = remaining >= static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) ? DISPATCH_TIME_FOREVER : dispatch_time(DISPATCH_TIME_NOW, static_cast<std::int64_t>(remaining));
+        if (dispatch_semaphore_wait(semaphore, deadline) == 0) return true;
+        if (ClockNanos() >= *deadlineNanos) return false;
+    }
 }
 #else
 SingleWaiterCondition::SingleWaiterCondition() {
@@ -634,12 +649,20 @@ void SingleWaiterCondition::NotifyOne() {
 
 bool SingleWaiterCondition::waitSignal(const std::uint64_t* deadlineNanos) {
     DeliveryAllowance allowance;
-    timespec deadline{};
-    if (deadlineNanos != nullptr) deadline = {static_cast<time_t>(*deadlineNanos / 1000000000ULL), static_cast<long>(*deadlineNanos % 1000000000ULL)};
     for (;;) {
+        timespec deadline{};
+        if (deadlineNanos != nullptr) {
+            const std::uint64_t wait = WaitNanos(*deadlineNanos);
+            const std::uint64_t now = NowNanos();
+            const std::uint64_t host = wait > std::numeric_limits<std::uint64_t>::max() - now ? std::numeric_limits<std::uint64_t>::max() : now + wait;
+            deadline = {static_cast<time_t>(host / 1000000000ULL), static_cast<long>(host % 1000000000ULL)};
+        }
         const int result = deadlineNanos == nullptr ? sem_wait(&semaphore) : sem_clockwait(&semaphore, CLOCK_MONOTONIC, &deadline);
         if (result == 0) return true;
-        if (errno == ETIMEDOUT) return false;
+        if (errno == ETIMEDOUT) {
+            if (ClockNanos() >= *deadlineNanos) return false;
+            continue;
+        }
         if (errno != EINTR) throw std::system_error(errno, std::generic_category(), "TimedWait: cannot wait for a wait semaphore");
     }
 }
@@ -650,6 +673,50 @@ bool SingleWaiterCondition::waitSignal(const std::uint64_t* deadlineNanos) {
 void BindThreadWaitState(std::atomic<int>* state) {
     auto& local = WaitState();
     local.bound = state != nullptr ? state : &local.own;
+    if (state != nullptr) local.guestClock = 1;
+}
+
+void SetGuestClockSource(const GuestClockSource* source) {
+    GuestSource().store(source, std::memory_order_release);
+}
+
+bool GuestClockPaused() {
+    const GuestClockSource* source = GuestSource().load(std::memory_order_acquire);
+    return source != nullptr && source->paused();
+}
+
+bool FollowsGuestClock() {
+    const GuestClockSource* source = GuestSource().load(std::memory_order_acquire);
+    if (source == nullptr) return false;
+    auto& local = WaitState();
+    if (local.guestClock < 0) local.guestClock = source->initialThread() ? 1 : 0;
+    return local.guestClock > 0;
+}
+
+std::uint64_t GuestNanos() {
+    const GuestClockSource* source = GuestSource().load(std::memory_order_acquire);
+    return source != nullptr ? source->now() : NowNanos();
+}
+
+std::uint64_t ClockNanos() {
+    const GuestClockSource* source = GuestSource().load(std::memory_order_acquire);
+    return source != nullptr && FollowsGuestClock() ? source->now() : NowNanos();
+}
+
+std::uint64_t GuestSpanWaitNanos(std::uint64_t remainingNanos) {
+    return remainingNanos != 0 && remainingNanos < PAUSED_WAIT_NANOS && GuestClockPaused() ? PAUSED_WAIT_NANOS : remainingNanos;
+}
+
+std::uint64_t WaitNanos(std::uint64_t deadlineNanos) {
+    const std::uint64_t now = ClockNanos();
+    if (deadlineNanos <= now) return 0;
+    const std::uint64_t remaining = deadlineNanos - now;
+    return remaining < PAUSED_WAIT_NANOS && FollowsGuestClock() && GuestClockPaused() ? PAUSED_WAIT_NANOS : remaining;
+}
+
+std::uint64_t WaitMicros(std::uint64_t deadlineNanos) {
+    const std::uint64_t nanos = WaitNanos(deadlineNanos);
+    return nanos / 1000ULL + (nanos % 1000ULL != 0 ? 1u : 0u);
 }
 
 bool Coarse() {
@@ -688,17 +755,19 @@ std::uint64_t NowNanos() {
 }
 
 std::uint64_t DeadlineNanos(std::uint64_t microseconds) {
-    const std::uint64_t now = NowNanos();
+    const std::uint64_t now = ClockNanos();
     if (microseconds > (std::numeric_limits<std::uint64_t>::max() - now) / 1000ULL) return std::numeric_limits<std::uint64_t>::max();
     return now + microseconds * 1000ULL;
 }
 
 std::uint64_t RemainingMicros(std::uint64_t deadlineNanos) {
-    const std::uint64_t now = NowNanos();
+    const std::uint64_t now = ClockNanos();
     return deadlineNanos > now ? (deadlineNanos - now) / 1000ULL : 0;
 }
 
-void SleepUntil(std::uint64_t deadlineNanos) {
+namespace {
+
+void SleepUntilHost(std::uint64_t deadlineNanos) {
 #ifdef _WIN32
     std::uint64_t now = NowNanos();
     const std::uint64_t lead = LeadNanos(deadlineNanos > now ? deadlineNanos - now : 0);
@@ -720,6 +789,17 @@ void SleepUntil(std::uint64_t deadlineNanos) {
     const std::uint64_t now = NowNanos();
     if (deadlineNanos > now) SleepNanos(deadlineNanos - now);
 #endif
+}
+
+}
+
+void SleepUntil(std::uint64_t deadlineNanos) {
+    for (;;) {
+        const std::uint64_t wait = WaitNanos(deadlineNanos);
+        if (wait == 0) return;
+        const std::uint64_t now = NowNanos();
+        SleepUntilHost(wait > std::numeric_limits<std::uint64_t>::max() - now ? std::numeric_limits<std::uint64_t>::max() : now + wait);
+    }
 }
 
 bool SleepNanosUnlessChanged(std::uint64_t nanos, const std::atomic<std::uint64_t>& counter, std::uint64_t observed) {

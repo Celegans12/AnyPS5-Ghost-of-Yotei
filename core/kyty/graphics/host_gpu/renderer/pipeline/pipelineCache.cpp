@@ -1565,6 +1565,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		}
 		return nullptr;
 	}
+	const GuestClockHold clock_hold;
 	if (WaitForCompile(m_lookup_key)) {
 		return GetProgram(params, input_info, push_data_cursor);
 	}
@@ -3775,8 +3776,9 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 				return &m_native_graphics_pipelines.try_emplace(key, created).first->second;
 			}
 		}
-		auto& cached           = m_native_graphics_pipelines[key];
-		cached.native_bindings = true;
+		const GuestClockHold clock_hold;
+		auto&                cached = m_native_graphics_pipelines[key];
+		cached.native_bindings      = true;
 #if defined(ANYPS5_KYTY)
 		if (!CreateGraphicsPipelineFast(cached, key, stages))
 #endif

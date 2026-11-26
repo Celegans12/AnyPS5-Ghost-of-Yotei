@@ -320,7 +320,7 @@ int WaitOnAddress(TValue* address, TValue expected, KernelUseconds* timeout, con
         return SCE_KERNEL_ERROR_EAGAIN;
     }
     if (timeout != nullptr) {
-        const std::uint64_t now = TimedWait::NowNanos();
+        const std::uint64_t now = TimedWait::ClockNanos();
         *timeout = woken && *deadline > now ? static_cast<KernelUseconds>((*deadline - now) / 1000) : 0;
     }
     return woken ? SYNC_ON_ADDRESS_OK : SCE_KERNEL_ERROR_ETIMEDOUT;
@@ -394,7 +394,7 @@ int UmtxDeadline(const void* sizeArgument, const void* timeArgument, std::option
         remaining = SaturatingNanos(time.timeout.tv_sec - now.tv_sec, time.timeout.tv_nsec - now.tv_nsec);
     }
     if (remaining < UNBOUNDED_WAIT_NANOS) {
-        deadlineNanos = TimedWait::NowNanos() + remaining;
+        deadlineNanos = TimedWait::ClockNanos() + remaining;
     }
     return 0;
 }
@@ -766,7 +766,7 @@ int ConditionDeadline(UserCondition* condition, std::uint64_t flags, const void*
         remaining = SaturatingNanos(timeout.tv_sec - now.tv_sec, timeout.tv_nsec - now.tv_nsec);
     }
     if (remaining < UNBOUNDED_WAIT_NANOS) {
-        deadlineNanos = TimedWait::NowNanos() + remaining;
+        deadlineNanos = TimedWait::ClockNanos() + remaining;
     }
     return 0;
 }

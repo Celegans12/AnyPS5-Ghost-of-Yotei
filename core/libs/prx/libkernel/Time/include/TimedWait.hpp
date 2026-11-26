@@ -16,10 +16,24 @@
 
 namespace TimedWait {
 
+struct GuestClockSource {
+    std::uint64_t (*now)();
+    bool (*paused)();
+    bool (*initialThread)();
+};
+
 bool Coarse();
 std::uint64_t TimerLateNanos();
 void BindThreadWaitState(std::atomic<int>* state);
+void SetGuestClockSource(const GuestClockSource* source);
+bool GuestClockPaused();
+bool FollowsGuestClock();
 std::uint64_t NowNanos();
+std::uint64_t GuestNanos();
+std::uint64_t ClockNanos();
+std::uint64_t WaitNanos(std::uint64_t deadlineNanos);
+std::uint64_t WaitMicros(std::uint64_t deadlineNanos);
+std::uint64_t GuestSpanWaitNanos(std::uint64_t remainingNanos);
 std::uint64_t DeadlineNanos(std::uint64_t microseconds);
 std::uint64_t RemainingMicros(std::uint64_t deadlineNanos);
 void SleepNanos(std::uint64_t nanos);
@@ -123,7 +137,10 @@ bool AcquireUntil(const void* key, std::uint64_t deadlineNanos, TTryLock tryLock
 #endif
     static_cast<void>(key);
     static_cast<void>(tryLock);
-    return tryLockFor(RemainingMicros(deadlineNanos));
+    for (;;) {
+        if (tryLockFor(WaitMicros(deadlineNanos))) return true;
+        if (ClockNanos() >= deadlineNanos) return false;
+    }
 }
 
 class Condition {
@@ -163,7 +180,10 @@ public:
         }
 #endif
         CoarseWaiter registered{coarseWaiters};
-        return coarse.wait_for(lock, std::chrono::microseconds(RemainingMicros(deadlineNanos))) == std::cv_status::no_timeout;
+        for (;;) {
+            if (coarse.wait_for(lock, std::chrono::microseconds(WaitMicros(deadlineNanos))) == std::cv_status::no_timeout) return true;
+            if (ClockNanos() >= deadlineNanos) return false;
+        }
     }
 
     template <class TLock, class TPredicate>

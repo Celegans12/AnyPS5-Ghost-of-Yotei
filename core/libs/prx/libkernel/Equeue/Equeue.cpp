@@ -96,11 +96,7 @@ KernelEqueuePrivate::~KernelEqueuePrivate() {
 }
 
 uint64_t KernelEqueuePrivate::MonotonicNs() {
-    return static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()
-        ).count()
-    );
+    return TimedWait::GuestNanos();
 }
 
 void KernelEqueuePrivate::Close() {
@@ -262,7 +258,7 @@ void KernelEqueuePrivate::WaitForDescriptors(std::unique_lock<std::mutex>& lock,
     WaitSet wait;
     GatherInterests(wait, waker, false);
     if (wait.repoll) {
-        const std::uint64_t soon = TimedWait::NowNanos() + FileRepollNs;
+        const std::uint64_t soon = TimedWait::ClockNanos() + FileRepollNs;
         if (deadlineNanos == 0 || deadlineNanos > soon) {
             deadlineNanos = soon;
         }
@@ -278,7 +274,7 @@ void KernelEqueuePrivate::WaitForDescriptors(std::unique_lock<std::mutex>& lock,
         if (wait.nearestTimerNs != std::numeric_limits<uint64_t>::max()) {
             const uint64_t nowMonotonic = MonotonicNs();
             const uint64_t remainingNs = wait.nearestTimerNs > nowMonotonic ? wait.nearestTimerNs - nowMonotonic : 0;
-            const uint64_t timerDeadline = TimedWait::NowNanos() + std::clamp<uint64_t>(remainingNs, 1000, static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) * 1000ULL);
+            const uint64_t timerDeadline = TimedWait::ClockNanos() + std::clamp<uint64_t>(remainingNs, 1000, static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) * 1000ULL);
             deadlineNanos = deadlineNanos == 0 ? timerDeadline : std::min(deadlineNanos, timerDeadline);
         }
     }
@@ -473,7 +469,7 @@ int KernelEqueuePrivate::WaitForEventsUntil(KernelEvent* ev, int num, std::uint6
         if (deadline == 0) {
             uint32_t timerWait = 0;
             const bool hasTimer = NextTimerWaitMicros(MonotonicNs(), &timerWait);
-            const std::uint64_t wake = hasTimer ? TimedWait::NowNanos() + static_cast<std::uint64_t>(timerWait) * 1000ULL : 0;
+            const std::uint64_t wake = hasTimer ? TimedWait::ClockNanos() + static_cast<std::uint64_t>(timerWait) * 1000ULL : 0;
             if (polling) {
                 WaitForDescriptors(lock, wake);
             } else if (hasTimer) {
@@ -484,7 +480,7 @@ int KernelEqueuePrivate::WaitForEventsUntil(KernelEvent* ev, int num, std::uint6
         } else {
             uint32_t timerWait = 0;
             const bool hasTimer = NextTimerWaitMicros(MonotonicNs(), &timerWait);
-            const std::uint64_t now = TimedWait::NowNanos();
+            const std::uint64_t now = TimedWait::ClockNanos();
             if (now >= deadline) {
                 return 0;
             }
@@ -889,11 +885,7 @@ int APS5_VABI sceKernelAddHRTimerEvent(KernelEqueue eq, int id, const KernelTime
     const uint64_t delayNs =
         static_cast<uint64_t>(delay.tv_sec) * 1000000000ULL +
         static_cast<uint64_t>(delay.tv_nsec);
-    const uint64_t nowNs = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()
-        ).count()
-    );
+    const uint64_t nowNs = KernelEqueuePrivate::MonotonicNs();
     KernelEqueueEvent event{};
     event.deadlineNs = (delayNs <= std::numeric_limits<uint64_t>::max() - nowNs)
         ? nowNs + delayNs : std::numeric_limits<uint64_t>::max();
