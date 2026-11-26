@@ -278,7 +278,7 @@ jobs:
             sanitizer: address
     env:
       GPU_TESTS: >-
-        ^(kyty_shim_(packed_unorm_blend|compute_execution|wave64_cross_lane|empty_buffer_replay|empty_buffer_replay_off|depth_target_alias|frame_capture_round_trip|buffer_null_range|descriptor_tables_draw|merged_hull_draw|image_write_back_alias|buffer_cache_pages))$
+        ^(kyty_shim_(packed_unorm_blend|compute_execution|wave64_cross_lane|empty_buffer_replay|empty_buffer_replay_off|depth_target_alias|frame_capture_round_trip|buffer_null_range|descriptor_tables_draw|merged_hull_draw|tiler_shaders_gpu|image_write_back_alias|buffer_cache_pages))$
       CPU_TESTS: ^(kyty_shim_.*|guest_gpu_fault|guest_host_write_filter|agc_kyty_shaders)$
     steps:
       - uses: actions/checkout@v7
