@@ -58,7 +58,12 @@ PipelineCache::GuestClockHold::~GuestClockHold() {
 	KernelResumeGuestClock_nid_no_patch();
 }
 
-PipelineCache::StallScope::StallScope(PipelineCache& cache): m_cache(cache) {
+PipelineCache::StallScope::StallScope(PipelineCache& cache): StallScope(cache, true) {}
+
+PipelineCache::StallScope::StallScope(PipelineCache& cache, bool hold_clock): m_cache(cache) {
+	if (hold_clock) {
+		m_clock_hold.emplace();
+	}
 	std::scoped_lock lock(cache.m_stall_mutex);
 	if (cache.m_stall.threads++ == 0) {
 		cache.m_stall.since = std::chrono::steady_clock::now();
@@ -66,8 +71,9 @@ PipelineCache::StallScope::StallScope(PipelineCache& cache): m_cache(cache) {
 }
 
 #if defined(ANYPS5_KYTY)
-PipelineCache::StallScope::StallScope(PipelineCache& cache, const char* what, uint64_t hash, const char* why)
-    : StallScope(cache) {
+PipelineCache::StallScope::StallScope(PipelineCache& cache, const char* what, uint64_t hash, const char* why,
+                                      bool hold_clock)
+    : StallScope(cache, hold_clock) {
 	PipelineRouteNote() = nullptr;
 	m_started = std::chrono::steady_clock::now();
 	m_what    = what;

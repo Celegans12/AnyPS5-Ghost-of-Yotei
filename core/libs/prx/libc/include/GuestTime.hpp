@@ -5,6 +5,7 @@
 #include "prx/libc/include/general/VabiMacros.hpp"
 
 extern "C" void LibcSetMonotonicTimeSource_nid_no_patch(std::uint64_t (APS5_VABI* source)());
+extern "C" void LibcSetSleepSource_nid_no_patch(void (APS5_VABI* sleep)(std::uint64_t nanos));
 
 struct GuestTm {
     int tm_sec;

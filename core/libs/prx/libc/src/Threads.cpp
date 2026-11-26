@@ -1,6 +1,7 @@
 #include "prx/libc/include/Api.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestTime.hpp"
 #ifdef _WIN32
 #include "prx/libc/include/PreciseWait.hpp"
 #endif
@@ -459,12 +460,23 @@ int APS5_VABI _Thrd_yield_nid_postfix() {
     return threadSuccess;
 }
 
+static std::atomic<void (APS5_VABI*)(std::uint64_t)> g_sleepSource{nullptr};
+
+void LibcSetSleepSource_nid_no_patch(void (APS5_VABI* sleep)(std::uint64_t nanos)) {
+    g_sleepSource.store(sleep, std::memory_order_release);
+}
+
 void APS5_VABI _ZNSt3__111this_thread9sleep_forERKNS_6chrono8durationIxNS_5ratioILl1ELl1000000000EEEEE_nid_postfix(const std::int64_t* nanoseconds) {
     std::int64_t remaining{};
     if (!GuestCopyIn_nid_no_patch(&remaining, nanoseconds, sizeof(remaining))) throw std::invalid_argument("this_thread::sleep_for: unreadable duration");
     constexpr std::int64_t maxChunk = longestSleepSeconds * nanosPerSecond;
     while (remaining > 0) {
         const auto chunk = std::min(remaining, maxChunk);
+        if (const auto sleep = g_sleepSource.load(std::memory_order_acquire)) {
+            sleep(static_cast<std::uint64_t>(chunk));
+            remaining -= chunk;
+            continue;
+        }
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::nanoseconds(chunk);
         for (;;) {
             const auto now = std::chrono::steady_clock::now();

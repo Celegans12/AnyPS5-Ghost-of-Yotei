@@ -121,6 +121,7 @@ int APS5_VABI pthread_rwlock_timedrdlock_nid_postfix(PthreadRwlock* rwlock, cons
     if (scePthreadRwlockTryrdlock(rwlock) == 0) return 0;
     KernelUseconds usec = 0;
     if (!PosixThread::RelativeMicroseconds(GUEST_REALTIME_CLOCK, abstime, &usec)) return PosixThread::GUEST_EINVAL;
+    const TimedWait::CivilClockWait civil(!KernelClockStandsStillInPauses(GUEST_REALTIME_CLOCK));
     return toPosix(scePthreadRwlockTimedrdlock(rwlock, usec));
 }
 
@@ -130,6 +131,7 @@ int APS5_VABI pthread_rwlock_timedwrlock_nid_postfix(PthreadRwlock* rwlock, cons
     if (scePthreadRwlockTrywrlock(rwlock) == 0) return 0;
     KernelUseconds usec = 0;
     if (!PosixThread::RelativeMicroseconds(GUEST_REALTIME_CLOCK, abstime, &usec)) return PosixThread::GUEST_EINVAL;
+    const TimedWait::CivilClockWait civil(!KernelClockStandsStillInPauses(GUEST_REALTIME_CLOCK));
     return toPosix(scePthreadRwlockTimedwrlock(rwlock, usec));
 }
 

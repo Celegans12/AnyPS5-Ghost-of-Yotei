@@ -673,7 +673,27 @@ bool SingleWaiterCondition::waitSignal(const std::uint64_t* deadlineNanos) {
 void BindThreadWaitState(std::atomic<int>* state) {
     auto& local = WaitState();
     local.bound = state != nullptr ? state : &local.own;
-    if (state != nullptr) local.guestClock = 1;
+}
+
+void FollowGuestClock() {
+    WaitState().guestClock = 1;
+}
+
+CivilClockWait::CivilClockWait(bool civil) {
+    if (civil) Engage();
+}
+
+CivilClockWait::~CivilClockWait() {
+    if (engaged) WaitState().guestClock = saved;
+}
+
+void CivilClockWait::Engage() {
+    if (engaged) return;
+    FollowsGuestClock();
+    auto& local = WaitState();
+    saved = local.guestClock;
+    local.guestClock = 0;
+    engaged = true;
 }
 
 void SetGuestClockSource(const GuestClockSource* source) {
@@ -890,7 +910,7 @@ void SleepNanos(std::uint64_t nanos) {
         SleepNanosCoarse(nanos);
         return;
     }
-    SleepUntil(NowNanos() + nanos);
+    SleepUntilHost(NowNanos() + nanos);
 #else
     struct SleepRegistration {
         std::atomic<int>* state = WaitState().bound;

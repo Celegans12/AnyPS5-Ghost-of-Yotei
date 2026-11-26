@@ -751,15 +751,17 @@ private:
 	public:
 		explicit StallScope(PipelineCache& cache);
 #if defined(ANYPS5_KYTY)
-		StallScope(PipelineCache& cache, const char* what, uint64_t hash, const char* why = nullptr);
+		StallScope(PipelineCache& cache, const char* what, uint64_t hash, const char* why = nullptr,
+		           bool hold_clock = true);
 		StallScope(PipelineCache& cache, const char* what, const ShaderModule& module);
 #endif
 		~StallScope();
 		KYTY_CLASS_NO_COPY(StallScope);
 
 	private:
-		PipelineCache& m_cache;
-		GuestClockHold m_clock_hold;
+		StallScope(PipelineCache& cache, bool hold_clock);
+		PipelineCache&                m_cache;
+		std::optional<GuestClockHold> m_clock_hold;
 #if defined(ANYPS5_KYTY)
 		std::chrono::steady_clock::time_point m_started;
 		const char*                           m_what = nullptr;

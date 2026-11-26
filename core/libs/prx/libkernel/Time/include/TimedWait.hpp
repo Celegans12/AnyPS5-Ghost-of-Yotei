@@ -26,6 +26,7 @@ bool Coarse();
 std::uint64_t TimerLateNanos();
 void BindThreadWaitState(std::atomic<int>* state);
 void SetGuestClockSource(const GuestClockSource* source);
+void FollowGuestClock();
 bool GuestClockPaused();
 bool FollowsGuestClock();
 std::uint64_t NowNanos();
@@ -36,6 +37,20 @@ std::uint64_t WaitMicros(std::uint64_t deadlineNanos);
 std::uint64_t GuestSpanWaitNanos(std::uint64_t remainingNanos);
 std::uint64_t DeadlineNanos(std::uint64_t microseconds);
 std::uint64_t RemainingMicros(std::uint64_t deadlineNanos);
+
+class CivilClockWait {
+public:
+    CivilClockWait() = default;
+    explicit CivilClockWait(bool civil);
+    ~CivilClockWait();
+    CivilClockWait(const CivilClockWait&) = delete;
+    CivilClockWait& operator=(const CivilClockWait&) = delete;
+    void Engage();
+
+private:
+    int saved = 0;
+    bool engaged = false;
+};
 void SleepNanos(std::uint64_t nanos);
 void SleepUntil(std::uint64_t deadlineNanos);
 bool SleepNanosUnlessChanged(std::uint64_t nanos, const std::atomic<std::uint64_t>& counter, std::uint64_t observed);

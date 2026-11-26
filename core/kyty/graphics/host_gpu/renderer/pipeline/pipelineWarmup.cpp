@@ -64,7 +64,6 @@ void PipelineCache::WarmUp(const std::filesystem::path& path,
 	if (header.empty()) {
 		return;
 	}
-	const GuestClockHold clock_hold;
 	const auto           start = std::chrono::steady_clock::now();
 	std::vector<uint8_t> bytes;
 	bool read_store = false;
@@ -132,6 +131,10 @@ void PipelineCache::WarmUp(const std::filesystem::path& path,
 		}
 	};
 	{
+		std::optional<GuestClockHold> clock_hold;
+		if (!jobs.empty()) {
+			clock_hold.emplace();
+		}
 		std::vector<std::jthread> helpers;
 		for (size_t thread = 1; thread < threads; thread++) {
 			helpers.emplace_back(work, thread);
@@ -170,7 +173,13 @@ void PipelineCache::WarmUp(const std::filesystem::path& path,
 			});
 		}
 	}
-	Common::ParallelFor(jobs.size(), [&](size_t i) { jobs[i](); });
+	{
+		std::optional<GuestClockHold> clock_hold;
+		if (!jobs.empty()) {
+			clock_hold.emplace();
+		}
+		Common::ParallelFor(jobs.size(), [&](size_t i) { jobs[i](); });
+	}
 #endif
 	std::erase_if(m_graphics_pipelines,
 	              [](const auto& entry) { return entry.second.pipeline == nullptr; });

@@ -211,16 +211,23 @@ static std::uint64_t GetStartNanos() {
 }
 
 static const std::uint64_t g_processStart = GetStartNanos();
-#ifdef _WIN32
 static std::uint64_t APS5_VABI LibcMonotonicNanos() {
     return GetMonotonicNanos();
 }
-#endif
+
+static void APS5_VABI LibcGuestSleep(std::uint64_t nanos) {
+    const bool guest = TimedWait::FollowsGuestClock();
+    const std::uint64_t start = guest ? TimedWait::ClockNanos() : 0;
+    TimedWait::SleepNanos(nanos);
+    if (!guest) return;
+    const std::uint64_t deadline = nanos > std::numeric_limits<std::uint64_t>::max() - start ? std::numeric_limits<std::uint64_t>::max() : start + nanos;
+    for (std::uint64_t wait = TimedWait::WaitNanos(deadline); wait != 0; wait = TimedWait::WaitNanos(deadline)) TimedWait::SleepNanos(wait);
+}
+
 static const bool g_clockSourceInstalled = [] {
     LibcSetProcessTimeSource_nid_no_patch(&sceKernelGetProcessTime);
-#ifdef _WIN32
     LibcSetMonotonicTimeSource_nid_no_patch(&LibcMonotonicNanos);
-#endif
+    LibcSetSleepSource_nid_no_patch(&LibcGuestSleep);
     return true;
 }();
 

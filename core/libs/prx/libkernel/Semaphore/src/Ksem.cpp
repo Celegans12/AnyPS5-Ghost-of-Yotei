@@ -100,6 +100,7 @@ int Wait(std::intptr_t id, bool once, const KernelTimespec* abstime) {
             ksem->available.Wait(lock, [&] { return ksem->count > 0; });
         } else {
             const auto deadline = *abstime;
+            const TimedWait::CivilClockWait civil(true);
             while (ksem->count == 0) {
                 KernelTimespec now{};
                 clock_gettime_nid_postfix(0, &now);

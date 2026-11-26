@@ -32,11 +32,11 @@ bool Enabled() {
     return enabled;
 }
 
-bool SleepOnce(std::uint64_t nanos) {
+bool SleepOnce(std::uint64_t nanos, bool wakeable) {
     ThreadState& state = State();
     bool woken = false;
     bool early = false;
-    if (nanos != 0 && nanos <= MAX_WAKEABLE_NANOS && !state.sleeping && Enabled()) {
+    if (wakeable && nanos != 0 && nanos <= MAX_WAKEABLE_NANOS && !state.sleeping && Enabled()) {
         if (TimedWait::NowNanos() - state.lastSleepEndNanos >= nanos) state.earlyWakes = 0;
         if (state.earlyWakes < EARLY_WAKES_PER_RUN) {
             state.sleeping = true;
@@ -56,10 +56,11 @@ bool SleepOnce(std::uint64_t nanos) {
 void Sleep(std::uint64_t nanos) {
     const bool guest = TimedWait::FollowsGuestClock();
     const std::uint64_t start = guest ? TimedWait::ClockNanos() : 0;
-    if (SleepOnce(nanos) || !guest) return;
+    const bool wakeable = nanos <= MAX_WAKEABLE_NANOS;
+    if (SleepOnce(nanos, wakeable) || !guest) return;
     const std::uint64_t deadline = nanos > std::numeric_limits<std::uint64_t>::max() - start ? std::numeric_limits<std::uint64_t>::max() : start + nanos;
     for (std::uint64_t wait = TimedWait::WaitNanos(deadline); wait != 0; wait = TimedWait::WaitNanos(deadline)) {
-        if (SleepOnce(wait)) return;
+        if (SleepOnce(wait, wakeable)) return;
     }
 }
 

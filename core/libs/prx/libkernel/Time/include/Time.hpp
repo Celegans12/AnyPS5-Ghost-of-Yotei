@@ -36,6 +36,21 @@ extern "C" {
 
 }
 
+inline bool KernelClockStandsStillInPauses(int clockId) {
+    switch (clockId) {
+        case 4:
+        case 5:
+        case 7:
+        case 8:
+        case 11:
+        case 12:
+        case 20:
+            return true;
+        default:
+            return false;
+    }
+}
+
 inline bool KernelTraceWaitEnabled() {
     static const bool enabled = std::getenv("APS5_TRACE_WAITS") != nullptr;
     return enabled;

@@ -101,6 +101,7 @@ int APS5_VABI pthread_mutex_timedlock_nid_postfix(PthreadMutex* mutex, const Ker
     if (scePthreadMutexTrylock(mutex) == 0) return 0;
     KernelUseconds usec = 0;
     if (!PosixThread::RelativeMicroseconds(GUEST_REALTIME_CLOCK, abstime, &usec)) return POSIX_EINVAL;
+    const TimedWait::CivilClockWait civil(!KernelClockStandsStillInPauses(GUEST_REALTIME_CLOCK));
     return PosixThread::ToErrno(scePthreadMutexTimedlock(mutex, usec));
 }
 

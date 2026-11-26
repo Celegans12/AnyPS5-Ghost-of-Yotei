@@ -162,6 +162,7 @@ int APS5_VABI sem_timedwait_nid_postfix(void* sem, const KernelTimespec* abstime
     if (!abstime) return WaitFor(semaphore, nullptr);
     KernelUseconds usec = 0;
     if (!PosixThread::RelativeMicroseconds(GUEST_REALTIME_CLOCK, abstime, &usec)) return Fail(PosixThread::GUEST_EINVAL);
+    const TimedWait::CivilClockWait civil(!KernelClockStandsStillInPauses(GUEST_REALTIME_CLOCK));
     return WaitFor(semaphore, &usec);
 }
 

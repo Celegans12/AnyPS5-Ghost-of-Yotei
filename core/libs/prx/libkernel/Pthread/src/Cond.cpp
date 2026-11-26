@@ -179,6 +179,7 @@ int CondOperations::AbsoluteTimedwait(PthreadCond* cond, PthreadMutex* mutex, co
     auto condition = resolveCond(cond, &clockId);
     if (!condition)
         return SCE_KERNEL_ERROR_EINVAL;
+    const TimedWait::CivilClockWait civil(!KernelClockStandsStillInPauses(clockId));
     if (!PosixThread::AbsoluteDeadlineNanos(clockId, abstime, &deadlineNanos))
         throw std::invalid_argument("Invalid absolute condition variable timeout");
     return waitUntil(std::move(condition), mutex, deadlineNanos, __builtin_return_address(0));

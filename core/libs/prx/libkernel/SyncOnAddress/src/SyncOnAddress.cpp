@@ -364,7 +364,7 @@ std::uint64_t SaturatingNanos(std::int64_t seconds, std::int64_t nanos) {
     return total <= 0 ? 0 : static_cast<std::uint64_t>(total);
 }
 
-int UmtxDeadline(const void* sizeArgument, const void* timeArgument, std::optional<std::uint64_t>& deadlineNanos) {
+int UmtxDeadline(const void* sizeArgument, const void* timeArgument, std::optional<std::uint64_t>& deadlineNanos, TimedWait::CivilClockWait& civil) {
     deadlineNanos.reset();
     if (timeArgument == nullptr) {
         return 0;
@@ -388,6 +388,7 @@ int UmtxDeadline(const void* sizeArgument, const void* timeArgument, std::option
     if ((time.flags & UMTX_ABSTIME) == 0) {
         remaining = SaturatingNanos(time.timeout.tv_sec, time.timeout.tv_nsec);
     } else {
+        if (!KernelClockStandsStillInPauses(static_cast<int>(time.clockId))) civil.Engage();
         KernelTimespec now{};
         clock_gettime_nid_postfix(static_cast<int>(time.clockId), &now);
 
@@ -402,7 +403,8 @@ int UmtxDeadline(const void* sizeArgument, const void* timeArgument, std::option
 template <class TValue>
 int UmtxWait(void* object, std::uint64_t expected, const void* sizeArgument, const void* timeArgument, const void* caller) {
     std::optional<std::uint64_t> deadline;
-    if (const int error = UmtxDeadline(sizeArgument, timeArgument, deadline); error != 0) {
+    TimedWait::CivilClockWait civil;
+    if (const int error = UmtxDeadline(sizeArgument, timeArgument, deadline, civil); error != 0) {
         return error;
     }
     if (object == nullptr) {
@@ -462,7 +464,8 @@ void WakeSemaphoreLocked(std::uintptr_t key, UserSemaphore* semaphore) {
 
 int SemWait(UserSemaphore* semaphore, const void* sizeArgument, const void* timeArgument, const void* caller) {
     std::optional<std::uint64_t> deadline;
-    if (const int error = UmtxDeadline(sizeArgument, timeArgument, deadline); error != 0) {
+    TimedWait::CivilClockWait civil;
+    if (const int error = UmtxDeadline(sizeArgument, timeArgument, deadline, civil); error != 0) {
         return error;
     }
     if (semaphore == nullptr) {
@@ -493,7 +496,8 @@ int SemWake(UserSemaphore* semaphore) {
 
 int Sem2Wait(UserSemaphore2* semaphore, const void* sizeArgument, const void* timeArgument, const void* caller) {
     std::optional<std::uint64_t> deadline;
-    if (const int error = UmtxDeadline(sizeArgument, timeArgument, deadline); error != 0) {
+    TimedWait::CivilClockWait civil;
+    if (const int error = UmtxDeadline(sizeArgument, timeArgument, deadline, civil); error != 0) {
         return error;
     }
     if (semaphore == nullptr) {
@@ -672,7 +676,8 @@ int MutexLock(UserMutex* mutex, bool acquire, const void* sizeArgument, const vo
         return GUEST_EINVAL;
     }
     std::optional<std::uint64_t> deadline;
-    if (const int error = UmtxDeadline(sizeArgument, timeArgument, deadline); error != 0) {
+    TimedWait::CivilClockWait civil;
+    if (const int error = UmtxDeadline(sizeArgument, timeArgument, deadline, civil); error != 0) {
         return error;
     }
     const std::uint32_t id = CurrentOwnerId();
@@ -747,7 +752,7 @@ int MutexWake(UserMutex* mutex) {
     return 0;
 }
 
-int ConditionDeadline(UserCondition* condition, std::uint64_t flags, const void* timeArgument, std::optional<std::uint64_t>& deadlineNanos) {
+int ConditionDeadline(UserCondition* condition, std::uint64_t flags, const void* timeArgument, std::optional<std::uint64_t>& deadlineNanos, TimedWait::CivilClockWait& civil) {
     deadlineNanos.reset();
     if (timeArgument == nullptr) {
         return 0;
@@ -761,6 +766,7 @@ int ConditionDeadline(UserCondition* condition, std::uint64_t flags, const void*
         remaining = SaturatingNanos(timeout.tv_sec, timeout.tv_nsec);
     } else {
         const int clock = (flags & CVWAIT_CLOCKID) != 0 ? static_cast<int>(std::atomic_ref<std::uint32_t>(condition->clockId).load()) : GUEST_CLOCK_REALTIME;
+        if (!KernelClockStandsStillInPauses(clock)) civil.Engage();
         KernelTimespec now{};
         clock_gettime_nid_postfix(clock, &now);
         remaining = SaturatingNanos(timeout.tv_sec - now.tv_sec, timeout.tv_nsec - now.tv_nsec);
@@ -782,7 +788,8 @@ int ConditionWait(UserCondition* condition, UserMutex* mutex, std::uint64_t flag
         NotImplemented_nid_no_patch("_umtx_op condition wait on a priority-protected umutex");
     }
     std::optional<std::uint64_t> deadline;
-    if (const int error = ConditionDeadline(condition, flags, timeArgument, deadline); error != 0) {
+    TimedWait::CivilClockWait civil;
+    if (const int error = ConditionDeadline(condition, flags, timeArgument, deadline, civil); error != 0) {
         return error;
     }
     const auto key = reinterpret_cast<std::uintptr_t>(condition);
@@ -875,7 +882,8 @@ int RwlockLock(UserRwlock* rwlock, bool writer, std::uint64_t operationFlags, co
         return error;
     }
     std::optional<std::uint64_t> deadline;
-    if (const int error = UmtxDeadline(sizeArgument, timeArgument, deadline); error != 0) {
+    TimedWait::CivilClockWait civil;
+    if (const int error = UmtxDeadline(sizeArgument, timeArgument, deadline, civil); error != 0) {
         return error;
     }
     std::atomic_ref<std::uint32_t> state(rwlock->state);

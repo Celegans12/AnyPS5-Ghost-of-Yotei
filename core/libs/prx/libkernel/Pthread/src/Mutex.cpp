@@ -159,6 +159,7 @@ int MutexOperations::Timedlock(PthreadMutex* mutex, const KernelTimespec* abstim
     auto* current = resolveMutex(mutex, true);
     return acquireMutex(current, [&](auto& native) {
 #ifdef _WIN32
+        const TimedWait::CivilClockWait civil(true);
         for (;;) {
             const auto now = std::chrono::system_clock::now();
             if (now >= deadline) return native.try_lock();
