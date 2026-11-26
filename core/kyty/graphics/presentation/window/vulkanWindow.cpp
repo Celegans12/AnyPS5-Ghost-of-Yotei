@@ -595,8 +595,8 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	}
 	physical_device.getProperties2(&properties2);
 	EXIT_NOT_IMPLEMENTED(!(properties11.subgroupSupportedOperations & vk::SubgroupFeatureFlagBits::eVote));
-	graphics.subgroup_arithmetic_enabled = static_cast<bool>(properties11.subgroupSupportedOperations &
-	                                                         vk::SubgroupFeatureFlagBits::eArithmetic);
+	graphics.subgroup_supported_stages     = properties11.subgroupSupportedStages;
+	graphics.subgroup_supported_operations = properties11.subgroupSupportedOperations;
 	graphics.physical_device_properties = properties2.properties;
 	graphics.driver_id                  = driver_properties.driverID;
 	graphics.max_push_descriptors       = push_descriptor.maxPushDescriptors;
@@ -612,9 +612,11 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	    (subgroup_stages & vk::ShaderStageFlagBits::eCompute) &&
 	    subgroup_control.minSubgroupSize <= 64 && subgroup_control.maxSubgroupSize >= 64;
 
-	LOGF("Vulkan subgroup: default=%u min=%u max=%u stages=0x%08x size_control=%s wave64=%s\n",
+	LOGF("Vulkan subgroup: default=%u min=%u max=%u size_control_stages=0x%08x subgroup_stages=0x%08x size_control=%s "
+	     "wave64=%s\n",
 	     graphics.subgroup_size, graphics.min_subgroup_size, graphics.max_subgroup_size,
 	     static_cast<vk::ShaderStageFlags::MaskType>(subgroup_stages),
+	     static_cast<vk::ShaderStageFlags::MaskType>(graphics.subgroup_supported_stages),
 	     graphics.compute_subgroup_size_control_enabled ? "true" : "false",
 	     graphics.SupportsComputeWave64() ? "true" : "false");
 	graphics.provoking_vertex_last_enabled    = provoking_vertex.provokingVertexLast;

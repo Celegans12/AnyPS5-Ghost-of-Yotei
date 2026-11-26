@@ -99,6 +99,20 @@ std::vector<uint8_t> StoreHeader(const GraphicContext& graphics) {
 	return std::move(header.bytes);
 }
 
+std::string StoreMismatch(std::span<const uint8_t> bytes, std::span<const uint8_t> header) {
+	uint64_t stamp = 0;
+	Reader   reader {bytes};
+	IoAll(reader, stamp);
+	if (reader.ok && stamp != BuildStamp()) {
+		return fmt::format("it was written by another build (stamp {:016x}, this build {:016x})", stamp,
+		                   BuildStamp());
+	}
+	if (bytes.size() < header.size()) {
+		return fmt::format("its header is truncated ({} of {} bytes)", bytes.size(), header.size());
+	}
+	return "its header was written for another device, other shader settings or another store layout";
+}
+
 }
 
 void ShaderStoreWriter::Open(const std::filesystem::path& path, std::span<const uint8_t> header,
@@ -172,11 +186,13 @@ void PipelineCache::WarmUp(const std::filesystem::path& path,
 	}
 	const auto           start = std::chrono::steady_clock::now();
 	std::vector<uint8_t> bytes;
-	if (Common::File file;
-	    Common::File::IsFileExisting(path) && file.Open(path, Common::File::Mode::Read)) {
+	bool read_store = false;
+	const bool existed = Common::File::IsFileExisting(path);
+	if (Common::File file; existed && file.Open(path, Common::File::Mode::Read)) {
 		bytes.resize(file.Size());
 		uint32_t read = 0;
 		file.Read(bytes.data(), static_cast<uint32_t>(bytes.size()), &read);
+		read_store = read == bytes.size();
 		bytes.resize(read);
 	}
 	Log::WriteToConsoleAndLog(fmt::format(
@@ -211,6 +227,10 @@ void PipelineCache::WarmUp(const std::filesystem::path& path,
 				DestroyModule(loaded[i].module);
 			}
 		}
+	}
+	if (!reusable && existed) {
+		const auto reason = read_store ? StoreMismatch(bytes, header) : "could not read the store";
+		Log::WriteToConsoleAndLog(fmt::format("Shader cache: replacing {}: {}\n", Common::PathToString(path), reason));
 	}
 	m_store.Open(path, header, reusable ? bytes.size() - records.size() : 0);
 

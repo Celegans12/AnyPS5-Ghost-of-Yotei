@@ -1572,8 +1572,7 @@ private:
 			if (m_last_decoration == None ? i == first_global : i == m_last_decoration + 1u) deco_at = out.size();
 			if (inst.op == spv::OpCapability && !m_caps_done) {
 				out.insert(out.end(), src.begin(), src.end());
-				for (const auto capability: {spv::CapabilityGroupNonUniform, spv::CapabilityGroupNonUniformBallot,
-				                             spv::CapabilityGroupNonUniformArithmetic}) {
+				for (const auto capability: {spv::CapabilityGroupNonUniform, spv::CapabilityGroupNonUniformBallot}) {
 					if (!m_caps.contains(capability)) Put(out, spv::OpCapability, {capability});
 				}
 				m_caps_done = true;

@@ -27,6 +27,7 @@
 #if defined(ANYPS5_KYTY)
 #include "graphics/host_gpu/renderer/pipeline/programLock.h"
 #endif
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
@@ -626,9 +627,21 @@ bool F32ProductNoContractionEnabled() {
 	}();
 	return enabled;
 }
+
+uint32_t SubgroupStages(vk::ShaderStageFlags supported) {
+	uint32_t stages = 0;
+	for (const auto stage: {ShaderType::Vertex, ShaderType::Pixel, ShaderType::Compute, ShaderType::Mesh,
+	                        ShaderType::Local, ShaderType::TessellationControl, ShaderType::TessellationEvaluation}) {
+		if (supported & NativeShaderStage(stage)) {
+			stages |= 1u << static_cast<uint32_t>(stage);
+		}
+	}
+	return stages;
+}
 }
 
 ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
+	const auto operations = graphics.subgroup_supported_operations;
 	return {.maintenance8           = graphics.maintenance8_enabled,
 	        .native_float_min_max   = graphics.physical_device_properties.vendorID == 0x1002u,
 	        .device_clock_period_ps = graphics.device_clock_period_ps,
@@ -640,7 +653,11 @@ ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	        .lds_lane_sync          = LdsLaneSyncEnabled(),
 	        .native_float16         = graphics.shader_float16_enabled,
 	        .f32_product_no_contraction = F32ProductNoContractionEnabled(),
-	        .subgroup_arithmetic        = graphics.subgroup_arithmetic_enabled};
+	        .subgroup_arithmetic = bool(operations & vk::SubgroupFeatureFlagBits::eArithmetic),
+	        .subgroup_ballot     = bool(operations & vk::SubgroupFeatureFlagBits::eBallot),
+	        .subgroup_shuffle    = bool(operations & vk::SubgroupFeatureFlagBits::eShuffle),
+	        .subgroup_quad       = bool(operations & vk::SubgroupFeatureFlagBits::eQuad),
+	        .subgroup_stages     = SubgroupStages(graphics.subgroup_supported_stages)};
 }
 
 std::filesystem::path ShaderStorePath() {

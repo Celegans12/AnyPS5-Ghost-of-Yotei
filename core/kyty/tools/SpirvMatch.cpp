@@ -41,43 +41,34 @@ bool ReadDump(const std::filesystem::path& path, Dump& dump) {
 	return Read(input, std::span(dump.words)) && IsSpirv(dump.words);
 }
 
+template <size_t Flags>
+using EarlierProfile = std::tuple<bool, bool, uint32_t, std::array<bool, Flags>>;
+
 bool ReadStoreHeader(std::istream& input) {
-	uint64_t stamp = 0;
-	ShaderRecompiler::Spirv::Profile profile;
-	uint32_t max_shared_memory = 0;
-	Writer layout;
-	IoStoreHeader(layout, stamp, profile, max_shared_memory);
-	if (!Read(input, std::span(layout.bytes))) return false;
-	Reader reader{layout.bytes};
-	IoStoreHeader(reader, stamp, profile, max_shared_memory);
-	const bool current = reader.ok && stamp != 0 && max_shared_memory != 0;
-	const auto has_frame_at = [&](size_t offset) {
-		uint32_t magic = 0;
-		input.clear();
-		input.seekg(offset + sizeof(Frame));
-		return Read(input, std::span(&magic, 1)) && magic == ZSTD_MAGICNUMBER;
-	};
-	const size_t current_size = layout.bytes.size();
-	const size_t legacy_size = current_size + sizeof(bool);
-	if ((!current || !has_frame_at(current_size)) && has_frame_at(legacy_size)) {
-		std::vector<uint8_t> bytes(legacy_size);
+	input.seekg(0, std::ios::end);
+	const auto end = input.tellg();
+	const auto try_profile = [&](auto profile) {
+		uint64_t stamp = 0;
+		uint32_t max_shared_memory = 0;
+		Writer layout;
+		IoStoreHeader(layout, stamp, profile, max_shared_memory);
+		const auto size = static_cast<std::streamoff>(layout.bytes.size());
+		if (end < size) return false;
 		input.clear();
 		input.seekg(0);
-		bool wave_split = false;
-		if (Read(input, std::span(bytes))) {
-			Reader legacy{bytes};
-			IoAll(legacy, stamp, profile.maintenance8, profile.native_float_min_max, profile.device_clock_period_ps,
-			      profile.robust_buffer_access, profile.r8_srgb_views, profile.r8g8_srgb_views, profile.relaxed_float,
-			      wave_split, profile.ray_query, profile.lds_lane_sync, max_shared_memory);
-			if (legacy.ok && legacy.bytes.empty() && stamp != 0 && max_shared_memory != 0) {
-				input.seekg(legacy_size);
-				return bool(input);
-			}
-		}
-	}
-	input.clear();
-	input.seekg(current_size);
-	return current && bool(input);
+		if (!Read(input, std::span(layout.bytes))) return false;
+		Reader reader{layout.bytes};
+		IoStoreHeader(reader, stamp, profile, max_shared_memory);
+		if (!reader.ok || stamp == 0 || max_shared_memory == 0) return false;
+		if (end == size) return true;
+		uint32_t magic = 0;
+		input.seekg(size + static_cast<std::streamoff>(sizeof(Frame)));
+		if (!Read(input, std::span(&magic, 1)) || magic != ZSTD_MAGICNUMBER) return false;
+		input.seekg(size);
+		return bool(input);
+	};
+	return try_profile(ShaderRecompiler::Spirv::Profile{}) || try_profile(EarlierProfile<9>{}) ||
+	       try_profile(EarlierProfile<8>{}) || try_profile(EarlierProfile<7>{}) || try_profile(EarlierProfile<6>{});
 }
 
 bool MatchShaderDump(std::span<const uint8_t> raw, std::span<Dump> dumps,

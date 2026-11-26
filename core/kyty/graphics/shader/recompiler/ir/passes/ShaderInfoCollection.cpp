@@ -588,15 +588,15 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 		case ValueOpcode::SubgroupUMinU32:
 		case ValueOpcode::SubgroupUMaxU32:
 		case ValueOpcode::SubgroupOrU32: info.subgroup_arithmetic = true; break;
-		case ValueOpcode::DppMoveU32:
 		case ValueOpcode::ReadFirstLane:
+			info.subgroup_ballot              = true;
+			info.subgroup_local_invocation_id = true;
+			break;
+		case ValueOpcode::DppMoveU32:
 		case ValueOpcode::ReadLane: {
 			info.subgroup_ballot  = true;
 			info.subgroup_shuffle = true;
 			if (inst.GetOpcode() == ValueOpcode::DppMoveU32) {
-				info.subgroup_local_invocation_id = true;
-			}
-			if (inst.GetOpcode() == ValueOpcode::ReadFirstLane) {
 				info.subgroup_local_invocation_id = true;
 			}
 			break;

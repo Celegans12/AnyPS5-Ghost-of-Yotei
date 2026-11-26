@@ -851,7 +851,11 @@ uint32_t EmitLiveMask(EmitterState& state) {
 }
 
 uint32_t EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst) {
-	auto& state = ctx.state;
+	auto&      state = ctx.state;
+	const auto stage_bit = 1u << static_cast<uint32_t>(state.program.stage);
+	if ((state.profile.subgroup_stages & stage_bit) == 0 || !state.profile.subgroup_ballot) {
+		ctx.Fail(inst, "requires subgroup ballot support in this shader stage");
+	}
 	if (ctx.other_half == nullptr && !QuadLanes(state) && state.profile.subgroup_arithmetic &&
 	    state.program.stage != ShaderType::Pixel) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformArithmetic);
@@ -869,6 +873,10 @@ uint32_t EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 		                          part);
 		return result;
 	}
+	if (!state.profile.subgroup_shuffle || (QuadLanes(state) && !state.profile.subgroup_quad)) {
+		ctx.Fail(inst, "requires subgroup shuffle support and, in quad mode, subgroup quad support");
+	}
+	state.builder.RequireCapability(spv::CapabilityGroupNonUniformShuffle);
 	ctx.quad_read     = true;
 	const auto ballot = ctx.Ballot(inst.Arg(1));
 	const auto lane   = ctx.FirstLane(ballot);

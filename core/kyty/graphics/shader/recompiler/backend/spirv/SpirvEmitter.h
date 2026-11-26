@@ -22,6 +22,10 @@ struct Profile {
 	bool native_float16 = true;
 	bool f32_product_no_contraction = true;
 	bool subgroup_arithmetic = true;
+	bool subgroup_ballot = true;
+	bool subgroup_shuffle = true;
+	bool subgroup_quad = true;
+	uint32_t subgroup_stages = ~0u;
 };
 
 inline constexpr Profile DefaultProfile {};
