@@ -461,6 +461,21 @@ set_tests_properties(kyty_shim_merged_hull PROPERTIES TIMEOUT 20 PASS_REGULAR_EX
 add_test(NAME kyty_shim_merged_hull_draw COMMAND kyty_shim_merged_hull_tests draw)
 set_tests_properties(kyty_shim_merged_hull_draw PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77)
 
+add_test_executable(kyty_shim_mesh_per_primitive_block_tests ${CMAKE_CURRENT_SOURCE_DIR}/MeshPerPrimitiveBlock.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+target_include_directories(kyty_shim_mesh_per_primitive_block_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_include_directories(kyty_shim_mesh_per_primitive_block_tests SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/3rdparty/SPIRV-Tools/include)
+configure_host_test_executable(kyty_shim_mesh_per_primitive_block_tests)
+if(MINGW)
+    target_link_libraries(kyty_shim_mesh_per_primitive_block_tests PRIVATE stdc++ gcc_eh)
+endif()
+target_link_libraries(kyty_shim_mesh_per_primitive_block_tests PRIVATE Kyty::gpu libkernel libc)
+add_test(NAME kyty_shim_mesh_per_primitive_block COMMAND kyty_shim_mesh_per_primitive_block_tests)
+set_tests_properties(kyty_shim_mesh_per_primitive_block PROPERTIES TIMEOUT 20
+        PASS_REGULAR_EXPRESSION "kyty_shim_mesh_per_primitive_block: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+add_test(NAME kyty_shim_mesh_per_primitive_block_draw COMMAND kyty_shim_mesh_per_primitive_block_tests draw)
+set_tests_properties(kyty_shim_mesh_per_primitive_block_draw PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "kyty_shim_mesh_per_primitive_block_draw: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+
 if(NOT ANYPS5_KYTY_DLL)
     add_test_executable(kyty_shim_recompiler_robustness_tests ${CMAKE_CURRENT_SOURCE_DIR}/RecompilerRobustness.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
     target_include_directories(kyty_shim_recompiler_robustness_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../fuzz)
