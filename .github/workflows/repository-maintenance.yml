@@ -1,0 +1,78 @@
+name: Repository maintenance
+
+on:
+  issues:
+    types: [opened, reopened, edited]
+  issue_comment:
+    types: [created]
+  pull_request_target:
+    branches: [AnyKyty]
+    types: [opened, reopened, synchronize, ready_for_review, labeled]
+  schedule:
+    - cron: '13,43 * * * *'
+  workflow_dispatch:
+  push:
+    branches: [test/hosted-maintenance]
+
+permissions: {}
+
+concurrency:
+  group: repository-maintenance-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.repository == 'simnJS/AnyPS5' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: python3 -I tools/repository_maintenance.py verify
+
+  review:
+    if: >-
+      github.repository == 'simnJS/AnyPS5' &&
+      github.ref == 'refs/heads/AnyKyty' &&
+      github.event.sender.type != 'Bot' &&
+      (github.event_name != 'issue_comment' || !github.event.issue.pull_request) &&
+      (github.event_name != 'pull_request_target' || github.event.action != 'labeled')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: repository-maintenance
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          PUBLIC_SCAN_WORDS: ${{ secrets.PUBLIC_SCAN_WORDS }}
+        run: python3 -I tools/repository_maintenance.py review
+
+  merge:
+    if: >-
+      github.repository == 'simnJS/AnyPS5' &&
+      github.ref == 'refs/heads/AnyKyty' &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'pull_request_target' && github.event.label.name == 'automerge'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: repository-maintenance
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - env:
+          GH_TOKEN: ${{ secrets.MAINTAINER_MERGE_TOKEN }}
+          PUBLIC_SCAN_WORDS: ${{ secrets.PUBLIC_SCAN_WORDS }}
+        run: python3 -I tools/repository_maintenance.py merge
