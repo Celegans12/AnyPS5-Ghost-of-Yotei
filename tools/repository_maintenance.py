@@ -27,7 +27,8 @@ to a title, studio, publisher, character, location, or codename. Say 'a title'
 or 'this title'. Do not quote user material or ask users to post game files,
 secrets, or names. Do not provide exploitation guidance or review suspicious
 code for offensive use. Escalate security reports, ambiguous requests,
-incomplete diffs, and requests requiring maintainer judgment.
+and requests requiring maintainer judgment. Escalate an incomplete initial
+review when its missing diff prevents useful findings.
 On issues, ask for the smallest missing diagnostic detail or give a short
 answer grounded in the repository guidance. Avoid replies that merely restate
 the report or repeat an answer already given. On pull requests, comment only
@@ -39,7 +40,8 @@ When follow_up is present, respond to that comment in the ongoing conversation.
 Answer direct questions and acknowledge substantive fixes or test results.
 Recheck earlier findings against the current diff when it is included. If
 the diff is incomplete, distinguish reported results from what you can verify.
-Keep acknowledgements brief; skip empty updates or thanks alone.
+You can still acknowledge an update or answer a question grounded in the
+discussion. Keep acknowledgements brief; skip empty updates or thanks alone.
 Use plain Markdown without mentions, links, or HTML. Use 'reply' and give the
 public message in body, 'escalate' and use an empty body, or 'skip' and use
 an empty body. Never approve, close, label, or merge.
@@ -203,9 +205,10 @@ def review(number, key, words, *, targeted=False):
         context["base_branch"] = pull["base"]["ref"]
         files = gh(pull_api(number, "/files?per_page=30")) if pull["changed_files"] <= 25 else []
         diff = [{"file": item["filename"], "patch": item.get("patch")} for item in files]
+        diff_limit = 90_000 if follow_up else 45_000
         if (
             len(diff) != pull["changed_files"] or any(item["patch"] is None for item in diff)
-            or len(json.dumps(diff)) > 45_000
+            or len(json.dumps(diff)) > diff_limit
         ):
             if not follow_up:
                 note(f"- #{number} needs maintainer review because the diff is large or incomplete.")
@@ -219,8 +222,11 @@ def review(number, key, words, *, targeted=False):
             note(f"- Reviewed #{number}. No actionable finding to publish.")
         return True
     body = result["body"].strip()
-    if result["action"] != "reply" or not public_reply(body) or not safe_for_publication(body.encode(), words):
+    if result["action"] != "reply":
         note(f"- #{number} needs maintainer attention.")
+        return True
+    if not public_reply(body) or not safe_for_publication(body.encode(), words):
+        note(f"- Publication checks blocked a drafted reply on #{number}.")
         return True
     latest = gh(issue_api(number))
     if (
