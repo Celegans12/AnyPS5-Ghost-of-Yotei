@@ -1140,6 +1140,11 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			ctx.Fail(inst, "uses depth comparison with a 3D image");
 			return;
 		}
+		if (op == IR::ValueOpcode::ImageGatherRaw &&
+		    (volume(mem.resource) || std::ranges::any_of(indirect_images, volume))) {
+			ctx.Fail(inst, "gathers from a 3D image");
+			return;
+		}
 		if (op == IR::ValueOpcode::ImageGatherRaw) {
 			uint32_t component_or_dref;
 			if (dref) {
