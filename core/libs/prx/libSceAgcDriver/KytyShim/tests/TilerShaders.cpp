@@ -239,10 +239,12 @@ void RunTilerDispatch(vk::Queue queue, vk::CommandBuffer cmd, vk::PipelineLayout
 	cmd.dispatch((num_texels + 63u) / 64u, 1, 1);
 	const vk::MemoryBarrier barrier {
 	    .srcAccessMask = vk::AccessFlagBits::eShaderWrite,
-	    .dstAccessMask = vk::AccessFlagBits::eHostRead,
+	    .dstAccessMask = vk::AccessFlagBits::eHostRead | vk::AccessFlagBits::eHostWrite |
+	                     vk::AccessFlagBits::eShaderRead,
 	};
 	cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
-	                    vk::PipelineStageFlagBits::eHost, {}, 1, &barrier, 0, nullptr, 0, nullptr);
+	                    vk::PipelineStageFlagBits::eHost | vk::PipelineStageFlagBits::eComputeShader,
+	                    {}, 1, &barrier, 0, nullptr, 0, nullptr);
 	Checked(cmd.end(), "endCommandBuffer");
 	vk::SubmitInfo submit {};
 	submit.commandBufferCount = 1;
