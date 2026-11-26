@@ -1,9 +1,13 @@
+#include "SamplerSpillProgram.hpp"
 #include "ShaderRecompilerRun.hpp"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
+#include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
+#include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "spirv/unified1/spirv.hpp"
 
 #include <cstdint>
 #include <cstdio>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -183,6 +187,124 @@ bool FlatOffsets() {
 	return ok;
 }
 
+bool SamplerSpillPhi() {
+	const auto& shader = SamplerSpillProgram::Words;
+	auto runtime_branch = shader;
+	runtime_branch[SamplerSpillProgram::RestoreCompare] = 0xbf068002u;
+	std::string refusal;
+	KytyFuzz::Run(runtime_branch, 1, 0, &refusal, nullptr, nullptr, nullptr, 32u);
+	if (refusal.find("GetSamplerResource dword 0 is not a valid runtime value") == std::string::npos) {
+		std::printf("sampler-spill-phi: FAILED, unexpected result on the reachable reuse path: %s\n", refusal.c_str());
+		return false;
+	}
+
+	auto unconditional_restore = shader;
+	unconditional_restore[SamplerSpillProgram::RestoreBranch] = 0xbf800000u;
+	const decltype(unconditional_restore)* cases[] {&unconditional_restore, &shader};
+	for (const auto* code: cases) {
+		bool emitted = false;
+		std::vector<uint32_t> spirv;
+		refusal.clear();
+		KytyFuzz::Run(*code, 1, 0, &refusal, &emitted, nullptr, &spirv, 32u);
+		if (!emitted || !KytyFuzz::Valid(spirv, refusal)) {
+			std::printf("sampler-spill-phi: FAILED, %s restore: %s\n",
+			            code == &shader ? "guarded" : "unconditional", refusal.c_str());
+			return false;
+		}
+	}
+	return true;
+}
+
+bool PhiReachability() {
+	using namespace KytyFuzz::IR;
+	using Term = KytyFuzz::Recompiler::CFG::TerminatorKind;
+	enum class Input { Same, Conflict, Undef, Runtime, Unreachable, Unseeded };
+	for (const auto input: {Input::Same, Input::Conflict, Input::Undef, Input::Runtime, Input::Unreachable,
+	                        Input::Unseeded}) {
+		Program program;
+		program.user_data_count = 1;
+		for (uint32_t id = 0; id < 8; ++id) {
+			auto& block = *program.block_storage.emplace_back(std::make_unique<Block>());
+			block.id = id;
+			program.blocks.push_back(&block);
+		}
+		auto& entry       = *program.blocks[0];
+		auto& outer       = *program.blocks[1];
+		auto& inner       = *program.blocks[2];
+		auto& keep        = *program.blocks[3];
+		auto& update      = *program.blocks[4];
+		auto& inner_latch = *program.blocks[5];
+		auto& outer_latch = *program.blocks[6];
+		auto& exit        = *program.blocks[7];
+		const auto link = [](Block& from, Block& yes, Block* no = nullptr, Value condition = {}) {
+			from.terminator.kind        = no == nullptr ? Term::Branch : Term::ConditionalBranch;
+			from.terminator.true_block  = &yes;
+			from.terminator.false_block = no;
+			from.condition             = condition;
+			from.AddBranch(&yes);
+			if (no != nullptr) from.AddBranch(no);
+		};
+		const Value runtime(&entry.AppendNewInst(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(0u))}));
+		const Value predicate(&entry.AppendNewInst(ValueOpcode::INotEqual32, {runtime, Value(0u)}));
+		const auto phi_flags = static_cast<uint64_t>(Type::U32);
+		auto& carried_outer = outer.AppendNewInst(ValueOpcode::Phi, {}, phi_flags);
+		auto& outer_count   = outer.AppendNewInst(ValueOpcode::Phi, {}, phi_flags);
+		auto& carried_inner = inner.AppendNewInst(ValueOpcode::Phi, {}, phi_flags);
+		auto& inner_count   = inner.AppendNewInst(ValueOpcode::Phi, {}, phi_flags);
+		auto& joined        = inner_latch.AppendNewInst(ValueOpcode::Phi, {}, phi_flags);
+		constexpr auto exec_nonzero = KytyFuzz::Recompiler::CFG::BranchCondition::ExecNonZero;
+		const auto exec = input == Input::Unreachable ? Value(true) : predicate;
+		const Value condition(&inner.AppendNewInst(ValueOpcode::ConditionRef, {exec}, static_cast<uint64_t>(exec_nonzero)));
+		link(entry, outer);
+		link(outer, inner);
+		link(inner, keep, &update, condition);
+		link(keep, inner_latch);
+		link(update, inner_latch);
+		const auto repeat = [&](Block& first, Block& header, Block& latch, Block& end, Inst& count) {
+			const Value next(&latch.AppendNewInst(ValueOpcode::IAdd32, {Value(&count), Value(1u)}));
+			const Value more(&latch.AppendNewInst(ValueOpcode::INotEqual32, {next, Value(2u)}));
+			link(latch, header, &end, more);
+			count.AddPhiOperand(&first, Value(0u));
+			count.AddPhiOperand(&latch, next);
+		};
+		repeat(outer, inner, inner_latch, outer_latch, inner_count);
+		repeat(entry, outer, outer_latch, exit, outer_count);
+		Value next(17u);
+		switch (input) {
+			case Input::Undef: next = Value(&update.AppendNewInst(ValueOpcode::UndefU32)); break;
+			case Input::Runtime:
+			case Input::Unseeded: next = runtime; break;
+			case Input::Conflict:
+			case Input::Unreachable: next = Value(29u); break;
+			case Input::Same: break;
+		}
+		const auto seed = input == Input::Unseeded ? Value(&entry.AppendNewInst(ValueOpcode::UndefU32)) : Value(17u);
+		carried_outer.AddPhiOperand(&entry, seed);
+		carried_outer.AddPhiOperand(&outer_latch, Value(&joined));
+		carried_inner.AddPhiOperand(&outer, Value(&carried_outer));
+		carried_inner.AddPhiOperand(&inner_latch, Value(&joined));
+		joined.AddPhiOperand(&keep, Value(&carried_inner));
+		joined.AddPhiOperand(&update, next);
+		auto& increment = exit.AppendNewInst(ValueOpcode::IAdd32, {Value(&joined), Value(1u)});
+		auto& output = exit.AppendNewInst(ValueOpcode::ReferenceU32, {Value(&increment)});
+		ValidateProgram(program);
+		ConstantPropagationPass(program.blocks);
+		RemoveIdentities(program);
+		ValidateProgram(program);
+		const bool fold = input == Input::Same || input == Input::Unreachable;
+		const auto* add = output.Arg(0).TryInstruction();
+		const auto* phi = add != nullptr && add->GetOpcode() == ValueOpcode::IAdd32
+		                      ? add->Arg(0).TryInstruction() : nullptr;
+		if (fold ? output.Arg(0) != Value(18u)
+		         : phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi || phi->Arg(1) != next) {
+			std::printf("phi-reachability: FAILED for nested loop input %u\n", static_cast<unsigned>(input));
+			return false;
+		}
+	}
+
+	return true;
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -196,6 +318,22 @@ int main(int argc, char** argv) {
 		found = true;
 		if (!FlatOffsets()) return 1;
 		std::printf("flat-offsets: ok\n");
+	}
+	if (argc >= 2 && std::string_view(argv[1]) == "sampler-spill-phi") {
+		found = true;
+		if (!SamplerSpillPhi()) return 1;
+		std::printf("sampler-spill-phi: ok\n");
+	}
+	if (argc >= 2 && std::string_view(argv[1]) == "phi-reachability") {
+		found = true;
+		Common::SoftExitScope soft;
+		try {
+			if (!PhiReachability()) return 1;
+		} catch (const std::exception& error) {
+			std::printf("phi-reachability: FAILED: %s\n", error.what());
+			return 1;
+		}
+		std::printf("phi-reachability: ok\n");
 	}
 	for (const auto& entry: Cases) {
 		if (argc >= 2 && std::string_view(argv[1]) != entry.name) continue;

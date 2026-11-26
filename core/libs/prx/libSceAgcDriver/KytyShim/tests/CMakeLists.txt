@@ -485,6 +485,12 @@ if(NOT ANYPS5_KYTY_DLL)
     add_test(NAME kyty_shim_recompiler_stale_lane_spill COMMAND kyty_shim_recompiler_robustness_tests stale-lane-spill-after-read-lane-elimination)
     set_tests_properties(kyty_shim_recompiler_stale_lane_spill PROPERTIES TIMEOUT 60 PASS_REGULAR_EXPRESSION "kyty_shim_recompiler_robustness: ok"
             FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+    add_test(NAME kyty_shim_recompiler_sampler_spill_phi COMMAND kyty_shim_recompiler_robustness_tests sampler-spill-phi)
+    set_tests_properties(kyty_shim_recompiler_sampler_spill_phi PROPERTIES TIMEOUT 20
+            PASS_REGULAR_EXPRESSION "sampler-spill-phi: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+    add_test(NAME kyty_shim_recompiler_phi_reachability COMMAND kyty_shim_recompiler_robustness_tests phi-reachability)
+    set_tests_properties(kyty_shim_recompiler_phi_reachability PROPERTIES TIMEOUT 20
+            PASS_REGULAR_EXPRESSION "phi-reachability: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
 endif()
 
 add_test_executable(kyty_shim_compute_execution_tests ${CMAKE_CURRENT_SOURCE_DIR}/ComputeExecution.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
@@ -498,6 +504,9 @@ target_link_libraries(kyty_shim_compute_execution_tests PRIVATE Kyty::gpu libker
 add_test(NAME kyty_shim_compute_execution COMMAND kyty_shim_compute_execution_tests)
 set_tests_properties(kyty_shim_compute_execution PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77
         PASS_REGULAR_EXPRESSION "kyty_shim_compute_execution: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+add_test(NAME kyty_shim_compute_sampler_spill COMMAND kyty_shim_compute_execution_tests sampler-spill)
+set_tests_properties(kyty_shim_compute_sampler_spill PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "sampler spill: 32/32 lanes sampled 1.0" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
 
 add_test_executable(kyty_shim_pair_codegen_tests ${CMAKE_CURRENT_SOURCE_DIR}/PairCodegen.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
 target_include_directories(kyty_shim_pair_codegen_tests PRIVATE ${LIBS_INCLUDE_DIR})
