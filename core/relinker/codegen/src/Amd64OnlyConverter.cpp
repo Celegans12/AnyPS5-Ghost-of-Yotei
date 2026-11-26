@@ -62,8 +62,11 @@ public:
         for (const bool avoidSegment : {true, false}) {
             if (!avoidSegment && _keepSegmentAccesses)
                 break;
-            if (index + 1 < _matches.size() && (_pending.contains(index + 1) || _movable(index + 1, true, avoidSegment))) {
-                if (auto placement = _relocate(index, index, index + 1))
+            auto last = index + 1;
+            while (last < _matches.size() && _end(last) - _address(index) < Amd64OnlySubstitutionTable::kJmpRel32.Size && _movable(last, false, avoidSegment))
+                ++last;
+            if (last < _matches.size() && (_pending.contains(last) || _movable(last, true, avoidSegment))) {
+                if (auto placement = _relocate(index, index, last))
                     return placement;
             }
             if (index > 0 && _movable(index - 1, false, avoidSegment)) {
@@ -78,6 +81,8 @@ public:
 
     [[nodiscard]] std::optional<Placement> Island(const std::size_t index) {
         const auto store = _address(index);
+        if (_entered(store, _end(index)))
+            return std::nullopt;
         for (std::size_t distance = 1;; ++distance) {
             bool inReach = false;
             for (const bool before : {true, false}) {
@@ -175,7 +180,7 @@ private:
     }
 
     [[nodiscard]] std::optional<Placement> _relocate(const std::size_t index, const std::size_t first, const std::size_t last, const bool allowInPlace = false) const {
-        if (_enteredWithin(first, last))
+        if (_end(last) - _address(first) < Amd64OnlySubstitutionTable::kJmpRel32.Size || _enteredWithin(first, last))
             return std::nullopt;
         StubBodyBuilder body;
         Placement placement;

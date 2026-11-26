@@ -253,7 +253,7 @@ Amd64OnlyMatch Amd64OnlyInstructionMatcher::_matchSha1(const DecodedInstruction&
 
 Amd64OnlyMatch Amd64OnlyInstructionMatcher::_matchClzero(const DecodedInstruction& instr, std::span<const std::uint8_t> trailing) const {
     const auto operands = DecodeClzero(instr.Data, instr.Length);
-    return _trampoline(kClzero.Name, instr.Length, _outOfLine(instr.Length, trailing, [&](StubBodyBuilder& body) { _clzeroLowering.EmitOutOfLine(body, operands); }));
+    return _trampoline(kClzero.Name, instr.Length, _outOfLine(instr.Length, trailing, [&](StubBodyBuilder& body) { _clzeroLowering.EmitOutOfLine(body, operands); }), false, true);
 }
 
 Amd64OnlyMatch Amd64OnlyInstructionMatcher::_matchRdpru(const DecodedInstruction& instr, std::span<const std::uint8_t> trailing) const {
