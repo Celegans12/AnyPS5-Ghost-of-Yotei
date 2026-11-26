@@ -1309,13 +1309,17 @@ void WalkerCompiler::EmitRead(const Node& node, uint32_t index) {
 	}
 	if (!args.empty()) {
 		for (const auto& arg: args) Branch(arg, m_ret);
-		const auto immediate =
-		    static_cast<int64_t>(static_cast<int32_t>(m_plan.memory_info[inst.Flags<MemoryFlags>().index].offset)) &
-		    ~int64_t {3};
-		const auto constant = int64_t {static_cast<uint32_t>(args[2].value) & ~3u} + immediate;
+		const auto raw_immediate =
+		    static_cast<int64_t>(static_cast<int32_t>(m_plan.memory_info[inst.Flags<MemoryFlags>().index].offset));
+		const auto scalar_buffer = op == ValueOpcode::ReadConstBuffer && (raw_immediate & 3) != 0;
+		const auto immediate = raw_immediate & ~int64_t {3};
+		const auto constant = scalar_buffer
+		    ? (int64_t {static_cast<uint32_t>(args[2].value)} + raw_immediate) & ~int64_t {3}
+		    : int64_t {static_cast<uint32_t>(args[2].value) & ~3u} + immediate;
 		const bool folded   = args[2].kind == Kind::Constant && constant + 4 <= INT32_MAX;
 		const auto offset   = folded ? Xbyak::RegExp(static_cast<size_t>(constant))
-		                             : c.r9 + static_cast<size_t>(immediate);
+		                             : scalar_buffer ? Xbyak::RegExp(c.r9)
+		                                             : c.r9 + static_cast<size_t>(immediate);
 		if (args[0].kind == Kind::UserData && args[1].kind == Kind::UserData) {
 			c.mov(c.rax, c.qword[At(m_bases.at({args[0].value, args[1].value}))]);
 		} else {
@@ -1323,7 +1327,13 @@ void WalkerCompiler::EmitRead(const Node& node, uint32_t index) {
 		}
 		if (!folded) {
 			Load(c.r9, args[2]);
-			c.and_(c.r9d, ~3u);
+			if (scalar_buffer) {
+				c.mov(c.r9d, c.r9d);
+				c.add(c.r9, static_cast<uint32_t>(raw_immediate));
+				c.and_(c.r9, ~3u);
+			} else {
+				c.and_(c.r9d, ~3u);
+			}
 		}
 		c.lea(c.r10, c.ptr[c.rax + offset]);
 		if (op == ValueOpcode::LoadAddressU32) {

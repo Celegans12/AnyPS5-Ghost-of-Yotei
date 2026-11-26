@@ -608,8 +608,9 @@ public:
 						offset = emit(ValueOpcode::ISub32, {dynamic, Value(indirect.table_offset)});
 						valid = emit(ValueOpcode::ULessThanEqual32, {Value(indirect.table_offset), dynamic});
 					} else {
-						offset = emit(ValueOpcode::IAdd32, {dynamic, Value(memory.offset & ~3u)});
-						valid = emit(ValueOpcode::ULessThanEqual32, {dynamic, offset});
+						const auto sum = emit(ValueOpcode::IAdd32, {read.Arg(1), Value(memory.offset)});
+						offset = emit(ValueOpcode::BitwiseAnd32, {sum, Value(~3u)});
+						valid = emit(ValueOpcode::ULessThanEqual32, {read.Arg(1), sum});
 					}
 				}
 				key = emit(ValueOpcode::SelectU32, {valid, offset, Value(UINT32_MAX)});
@@ -2765,9 +2766,14 @@ private:
 		}
 		if (require_bound && count.IsEmpty() && workgroup_axis == UINT32_MAX && !rows) return false;
 		if (!MakeRuntimeTableSource(*read, material_source)) return false;
+		if (memory->kind == ResourceKind::ScalarBuffer &&
+		    uint64_t {offset} + memory->offset > UINT32_MAX) return false;
 		selector.source = InternSource(material_source);
 		selector.stride = stride;
-		selector.offset = offset + (memory->offset & ~3u);
+		selector.offset = memory->kind == ResourceKind::ScalarBuffer
+		    ? static_cast<uint32_t>((uint64_t {offset} + memory->offset) &
+		                            (byte_bias.IsEmpty() ? ~uint64_t {3} : UINT32_MAX))
+		    : offset + (memory->offset & ~3u);
 		indirect.selector = std::move(selector);
 		indirect.selector_byte_bias = byte_bias;
 		indirect.key_count = count;
@@ -3210,6 +3216,11 @@ private:
 		Inst* table_handle = nullptr;
 		Value table_guard;
 		const uint32_t alignment_mask = allow_fixed ? ~3u : UINT32_MAX;
+		const auto physical_offset = [&](uint32_t offset, uint32_t immediate, ResourceKind kind) {
+			return allow_fixed && kind == ResourceKind::ScalarBuffer
+			    ? (uint64_t {offset} + immediate) & ~uint64_t {3}
+			    : uint64_t {offset & alignment_mask} + (immediate & alignment_mask);
+		};
 		for (uint32_t dword = 0; dword < plan.read_dwords; ++dword) {
 			auto* read = descriptor.dwords[dword].Resolve().TryInstruction();
 			if (read == nullptr) {
@@ -3276,10 +3287,11 @@ private:
 				table_stride = stride;
 				if (table_mask != nullptr) *table_mask = mask;
 			} else if (plan.table_indexed != indexed || table_stride != stride ||
+			           memory->kind != m_program.memory_info[plan.memory[0]].kind ||
 			           !EquivalentValue(m_program, key, current_key) ||
-			           uint64_t {table_offset & alignment_mask} + (table_immediate & alignment_mask) +
+			           physical_offset(table_offset, table_immediate, memory->kind) +
 			                   dword * sizeof(uint32_t) !=
-			               uint64_t {offset & alignment_mask} + (memory->offset & alignment_mask)) {
+			               physical_offset(offset, memory->offset, memory->kind)) {
 				return false;
 			}
 			plan.split_offsets |= !indexed && offset != table_offset;
@@ -3357,16 +3369,17 @@ private:
 			    low_memory->kind != ResourceKind::ScalarBuffer ||
 			    high_memory->kind != ResourceKind::ScalarBuffer ||
 			    low_memory->offset > INT32_MAX || high_memory->offset > INT32_MAX ||
-			    (low_memory->offset & ~3u) + 4u != (high_memory->offset & ~3u) ||
 			    !EquivalentValue(m_program, low->Arg(0), high->Arg(0)) ||
 			    !EquivalentValue(m_program, low->Arg(1), high->Arg(1)) ||
 			    !AvailableBefore(*low, *pointer) || !AvailableBefore(*high, *pointer) ||
 			    !MatchTableOffset(low->Arg(1), key, indirect.table_offset, indirect.table_stride) ||
+			    ((uint64_t {indirect.table_offset} + low_memory->offset) & ~uint64_t {3}) + 4u !=
+			        ((uint64_t {indirect.table_offset} + high_memory->offset) & ~uint64_t {3}) ||
 			    indirect.table_stride < 8u || (indirect.table_stride & 3u) != 0u ||
 			    !SetExactTableMaximum(key, indirect) ||
 			    (key.TryInstruction() != nullptr && !AvailableBefore(*key.Instruction(), handle)) ||
 			    !MakeRuntimeTableSource(*low, table_source)) return false;
-			indirect.table_immediate = low_memory->offset & ~3u;
+			indirect.table_immediate = low_memory->offset;
 		} else {
 			if (handle.GetOpcode() != ValueOpcode::GetImageResource ||
 			    !ImmediateU32(UnsignedResourceBound(child_key, handle), child.count) || child.count == 0u ||
@@ -3598,13 +3611,14 @@ private:
 		    low_memory->kind != ResourceKind::ScalarBuffer ||
 		    high_memory->kind != ResourceKind::ScalarBuffer ||
 		    low_memory->offset > INT32_MAX || high_memory->offset > INT32_MAX ||
-		    (low_memory->offset & ~3u) + 4u != (high_memory->offset & ~3u) ||
 		    !EquivalentValue(m_program, low->Arg(0), high->Arg(0)) ||
 		    !EquivalentValue(m_program, low->Arg(1), high->Arg(1)) ||
 		    !MatchTableOffset(low->Arg(1), row_key, indirect.table_offset, indirect.table_stride) ||
+		    ((uint64_t {indirect.table_offset} + low_memory->offset) & ~uint64_t {3}) + 4u !=
+		        ((uint64_t {indirect.table_offset} + high_memory->offset) & ~uint64_t {3}) ||
 		    row_key.IsEmpty() || indirect.table_stride < 8u || (indirect.table_stride & 3u) != 0u ||
 		    !MakeRuntimeTableSource(*low, table_source) || table_source.dword_count != 4u) return false;
-		indirect.table_immediate = low_memory->offset & ~3u;
+		indirect.table_immediate = low_memory->offset;
 		indirect.table_source = InternSource(table_source);
 		indirect.table_scalar = true;
 		uint64_t              function = 0;
@@ -3615,11 +3629,12 @@ private:
 				functions = body.aliases;
 			}
 		}
+		if (uint64_t {element_offset} + element_immediate > UINT32_MAX) return false;
 		indirect.pointer_table = DescriptorSource::IndirectDescriptor::PointerTable {
 		    .offset = record_offset,
 		    .buffer = true,
 		    .element_stride = element_stride,
-		    .element_offset = (element_offset & ~3u) + (element_immediate & ~3u),
+		    .element_offset = (element_offset + element_immediate) & ~3u,
 		    .function = function,
 		    .functions = std::move(functions)};
 		DescriptorSource source;

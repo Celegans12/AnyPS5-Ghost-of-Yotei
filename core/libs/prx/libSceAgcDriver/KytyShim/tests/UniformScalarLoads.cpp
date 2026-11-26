@@ -299,13 +299,15 @@ const IR::Inst* ReadLaneSource(IR::Value value) {
 	}
 }
 
-enum class RecordIndex { UserData, FirstLane, Waterfall };
+enum class RecordIndex { UserData, FirstLane, Waterfall, CombinedOffsets, OverlappingOffsets };
 
 void RuntimeOffsetDescriptors(RecordIndex index) {
-	const bool waterfall = index == RecordIndex::Waterfall;
+	const bool overlap = index == RecordIndex::OverlappingOffsets;
+	const bool combined = index == RecordIndex::CombinedOffsets || overlap;
+	const bool waterfall = index == RecordIndex::Waterfall || combined;
 	const bool wave_record = index != RecordIndex::UserData;
-	const uint32_t sampler_field = waterfall ? 128u : 8u;
-	const uint32_t image_field = waterfall ? 64u : 0u;
+	const uint32_t sampler_field = combined ? (overlap ? 1u : 5u) : waterfall ? 128u : 8u;
+	const uint32_t image_field = combined ? (overlap ? 4u : 1u) : waterfall ? 64u : 0u;
 	std::vector<uint32_t> code;
 	uint32_t loop_start = 0;
 	if (waterfall) {
@@ -376,15 +378,22 @@ void RuntimeOffsetDescriptors(RecordIndex index) {
 	};
 	bind_table(0, sampler_table, sizeof(samplers));
 	bind_table(4, image_table, sizeof(images));
-	bind_table(8, ConstantAddress, waterfall ? 160u : 96u);
-	if (waterfall) user_data[13] = 5u;
+	bind_table(8, ConstantAddress, combined ? 32u : waterfall ? 160u : 96u);
+	if (waterfall) user_data[13] = combined ? 3u : 5u;
 	const IR::SrtRuntime runtime {.user_data = user_data, .read_specialization_memory = ReadMemory};
 	IR::ResourceSpecialization specialization;
 	for (uint32_t record = 0; record < 2u; ++record) {
-		const auto address = ConstantAddress + (waterfall ? 4u + record * 16u : record * 48u);
-		if (waterfall) Poke(address - 4u + sampler_field, 7u);
-		Poke(address + image_field, 1u - record);
-		Poke(address + sampler_field, record);
+		if (combined) {
+			const auto address = ConstantAddress + record * 16u;
+			Poke(address, 7u);
+			Poke(address + 4u, overlap ? record : 0u);
+			Poke(address + 8u, overlap ? 7u : record);
+		} else {
+			const auto address = ConstantAddress + (waterfall ? 4u + record * 16u : record * 48u);
+			if (waterfall) Poke(address - 4u + sampler_field, 7u);
+			Poke(address + image_field, 1u - record);
+			Poke(address + sampler_field, record);
+		}
 	}
 	IR::ResourceSnapshot snapshot;
 	for (uint32_t record = 0; record < 2u; ++record) {
@@ -395,7 +404,7 @@ void RuntimeOffsetDescriptors(RecordIndex index) {
 			return;
 		}
 		const auto sampler = record;
-		const auto image = 1u - record;
+		const auto image = overlap ? record : combined ? 0u : 1u - record;
 		auto selected_image = snapshot.images.at(0);
 		uint32_t selected_sampler = 0;
 		if (wave_record) {
@@ -403,8 +412,10 @@ void RuntimeOffsetDescriptors(RecordIndex index) {
 			selected_image = table.slots.at(table.mapping.at(1u + image));
 			const auto offset = specialization.samplers.at(0).indirect_mapping_offset;
 			const auto& mapping = snapshot.flattened_srt;
-			Check(mapping.at(offset) == 2u && mapping.at(offset + 1u + sampler * 2u) == sampler,
-			      "both record keys occur in the sampler mapping");
+			const bool sampler_keys =
+			    mapping.at(offset) == 2u && mapping.at(offset + 1u + sampler * 2u) == sampler;
+			Check(sampler_keys, "both record keys occur in the sampler mapping");
+			if (combined && !sampler_keys) return;
 			selected_sampler = mapping.at(offset + 2u + sampler * 2u);
 		}
 		Check(selected_image.dwords == images[image], "the sample uses the selected texture");
@@ -447,6 +458,8 @@ int main() {
 	RuntimeOffsetDescriptors(RecordIndex::FirstLane);
 	try {
 		RuntimeOffsetDescriptors(RecordIndex::Waterfall);
+		RuntimeOffsetDescriptors(RecordIndex::CombinedOffsets);
+		RuntimeOffsetDescriptors(RecordIndex::OverlappingOffsets);
 	} catch (const Common::SoftExitError& error) {
 		Check(false, error.what());
 	}

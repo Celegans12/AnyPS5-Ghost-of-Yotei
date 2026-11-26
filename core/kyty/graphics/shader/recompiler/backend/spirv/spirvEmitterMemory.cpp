@@ -1101,11 +1101,11 @@ uint32_t LoadIndirectScalarBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	                            Unary(state, spv::OpUConvert, TypeU64(state),
 	                                  EmitUMax32(state, stride, ConstantU32(state, 1))),
 	                            Unary(state, spv::OpUConvert, TypeU64(state), ctx.Arg(handle, 2)));
-	const auto  offset = Binary(state, spv::OpIAdd, TypeU64(state),
-	                            Unary(state, spv::OpUConvert, TypeU64(state),
-	                                  Binary(state, spv::OpBitwiseAnd, TypeU32(state),
-	                                         ctx.Arg(inst, 1), ConstantU32(state, ~3u))),
-	                            ConstantU64(state, ctx.Memory(inst).offset & ~3u));
+	const auto  offset = Binary(state, spv::OpBitwiseAnd, TypeU64(state),
+	                            Binary(state, spv::OpIAdd, TypeU64(state),
+	                                   Unary(state, spv::OpUConvert, TypeU64(state), ctx.Arg(inst, 1)),
+	                                   ConstantU64(state, ctx.Memory(inst).offset)),
+	                            ConstantU64(state, ~uint64_t {3}));
 	const auto  end =
 	    Binary(state, spv::OpIAdd, TypeU64(state), offset, ConstantU64(state, sizeof(uint32_t)));
 	const auto scalar_address = [&]() {
@@ -2608,6 +2608,7 @@ uint32_t EmitReadConst(ValueEmitContext& ctx, const IR::Inst& inst) {
 void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto mem = ctx.Memory(inst);
 	if (mem.planning_only) return;
+	if (static_cast<int32_t>(mem.offset) < 0) ctx.Fail(inst, "has a negative scalar buffer immediate offset");
 	if (mem.kind == IR::ResourceKind::IndirectBuffer) {
 		ctx.Define(inst, LoadIndirectScalarBuffer(ctx, inst));
 		return;
@@ -2615,12 +2616,26 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& state        = ctx.state;
 	mem.kind           = IR::ResourceKind::ScalarBuffer;
 	const auto offset = inst.Arg(1).Resolve();
-	auto       index  = offset.IsImmediate()
-	                        ? ConstantU32(state, (offset.U32() >> 2u) + (mem.offset >> 2u))
-	                        : Binary(state, spv::OpShiftRightLogical, TypeU32(state),
-	                                 ctx.Arg(inst, 1), ConstantU32(state, 2));
-	if (!offset.IsImmediate() && mem.offset >= 4u) {
-		index = Binary(state, spv::OpIAdd, TypeU32(state), index, ConstantU32(state, mem.offset >> 2u));
+	const auto static_index = offset.IsImmediate()
+	                              ? static_cast<uint32_t>((uint64_t {offset.U32()} + mem.offset) >> 2u)
+	                              : 0u;
+	auto index = offset.IsImmediate()
+	                 ? ConstantU32(state, static_index)
+	                 : Binary(state, spv::OpShiftRightLogical, TypeU32(state), ctx.Arg(inst, 1),
+	                          ConstantU32(state, 2));
+	if (!offset.IsImmediate() && mem.offset != 0u) {
+		if ((mem.offset & 3u) != 0u) {
+			const auto low = Binary(state, spv::OpBitwiseAnd, TypeU32(state), ctx.Arg(inst, 1),
+			                        ConstantU32(state, 3));
+			const auto carry = Binary(state, spv::OpIAdd, TypeU32(state), low,
+			                          ConstantU32(state, mem.offset));
+			index = Binary(state, spv::OpIAdd, TypeU32(state), index,
+			               Binary(state, spv::OpShiftRightLogical, TypeU32(state), carry,
+			                      ConstantU32(state, 2)));
+		} else {
+			index = Binary(state, spv::OpIAdd, TypeU32(state), index,
+			               ConstantU32(state, mem.offset >> 2u));
+		}
 	}
 	const auto storage_load = [&]() {
 		const auto access  = PrepareMemoryResourceAccess(state, mem);
@@ -2629,7 +2644,7 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 		                                   ConstantU32(state, 2)));
 		constexpr uint32_t last_element = UINT32_MAX >> 2u;
 		if (state.profile.robust_buffer_access &&
-		    (!offset.IsImmediate() || (offset.U32() >> 2u) + (mem.offset >> 2u) > last_element - 63u)) {
+		    (!offset.IsImmediate() || static_index > last_element - 63u)) {
 			element = EmitGlsl<GLSLstd450UMin, IR::Type::U32>(state, element, ConstantU32(state, last_element));
 		}
 		const auto condition = EmitStorageElementInBounds(state, access, element);
@@ -2662,7 +2677,7 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	};
 	constexpr uint32_t uniform_words = IR::UniformBufferBytes / sizeof(uint32_t);
 	constexpr uint32_t base_words    = IR::UniformBufferBaseSlack / sizeof(uint32_t);
-	if (offset.IsImmediate() && (offset.U32() >> 2u) + (mem.offset >> 2u) < uniform_words - base_words) {
+	if (offset.IsImmediate() && static_index < uniform_words - base_words) {
 		ctx.Define(inst, bounded_load());
 		return;
 	}

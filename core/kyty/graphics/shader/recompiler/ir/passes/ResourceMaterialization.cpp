@@ -573,13 +573,14 @@ bool ResolveSelectorKeys(const ResourcePlan& program, const DescriptorSource::In
 	} else {
 		ShaderBufferResource material;
 		if (!DecodeBufferDescriptor(material_value, material) || selector->stride < 4u ||
-		    !std::has_single_bit(selector->stride) || (selector->offset & 3u) != 0u)
+		    !std::has_single_bit(selector->stride) ||
+		    ((selector->offset & 3u) != 0u && indirect.selector_byte_bias.IsEmpty()))
 			return false;
 		const auto domain_count = (uint64_t {1} << 32u) / selector->stride;
 		uint32_t bias = 0;
 		if (!indirect.selector_byte_bias.IsEmpty() &&
 		    !WalkedValue(program, indirect.selector_byte_bias, bias)) return false;
-		const auto first = uint64_t {selector->offset} + ((bias % selector->stride) & ~3u);
+		const auto first = (uint64_t {selector->offset} + (bias % selector->stride)) & ~uint64_t {3};
 		const auto available = material.GetSize() > first ? material.GetSize() - first : 0u;
 		const auto count = std::min(domain_count,
 		    available < 4u ? 0u : (available - 4u) / selector->stride + 1u);
@@ -660,6 +661,9 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		                                 "read_address={:#x} requested_bytes={}", row, child, base, offset,
 		    (base & AddressMask & ~uint64_t {3}) + (offset & ~uint64_t {3}), bytes));
 	};
+	const auto scalar_buffer_offset = [&](uint64_t offset) {
+		return (offset + indirect.table_immediate) & ~uint64_t {3};
+	};
 	const auto normalization_failed = [&](uint64_t offset, uint32_t key, uint64_t step,
 	                                      std::string_view key_kind) {
 		return failed("candidate", fmt::format("candidate_offset={:#x} {}={} stride={} step={}",
@@ -672,7 +676,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		table_base = table.Base48();
 		table_size = table.GetSize();
 		descriptors[resource_index] = {.dword_count = dword_count};
-		const uint64_t first = uint64_t {indirect.table_offset & ~3u} + (indirect.table_immediate & ~3u);
+		const uint64_t first = scalar_buffer_offset(indirect.table_offset);
 		const uint64_t rows = table_size >= first + 8u
 		    ? (table_size - first - 8u) / indirect.table_stride + 1u : 0u;
 		std::vector<uint32_t> words(table_size / 4u);
@@ -684,8 +688,9 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		};
 		std::optional<uint64_t> function_slot;
 		if (pointer.function != 0u) {
+			const auto pointer_slot = first - (indirect.table_offset & ~3u);
 			for (uint64_t slot = 0; slot + 8u <= indirect.table_stride && !function_slot; slot += 8u) {
-				if (slot == (indirect.table_immediate & ~7u)) continue;
+				if (slot < pointer_slot + 8u && pointer_slot < slot + 8u) continue;
 				for (uint64_t row = 0; row < rows; ++row) {
 					if (((indirect.table_offset & ~3u) + row * indirect.table_stride + slot + 8u) > table_size) break;
 					if ((row_word(row, (indirect.table_offset & ~3u) + slot) & AddressMask) ==
@@ -943,8 +948,8 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			             : 4u;
 			uint64_t first = 0u;
 			if (table_value.dword_count != 2u)
-				first = ((indirect.table_maximum ? indirect.table_offset : indirect.table_offset % step) &
-				         ~uint64_t {3}) + (indirect.table_immediate & ~3u);
+				first = scalar_buffer_offset(indirect.table_maximum ? indirect.table_offset
+				                                                : indirect.table_offset % step);
 			if (!indirect.table_maximum) domain /= step;
 			const auto count = table_size >= first + 4u
 			    ? std::min((table_size - first - 4u) / step + 1u, domain)
@@ -1131,8 +1136,10 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			byte_offsets.clear();
 			byte_offsets.reserve(keys.size());
 			for (const auto key: keys) {
-				const auto offset = uint64_t {(key * indirect.table_stride + indirect.table_offset) & ~3u} +
-				                    (indirect.table_immediate & ~3u);
+				const auto indexed_offset = uint64_t {key * indirect.table_stride + indirect.table_offset};
+				const auto offset = table_value.dword_count == 4u
+				    ? scalar_buffer_offset(indexed_offset)
+				    : (indexed_offset & ~uint64_t {3}) + (indirect.table_immediate & ~3u);
 				byte_offsets.push_back(offset <= UINT32_MAX ? static_cast<uint32_t>(offset) : UINT32_MAX);
 			}
 			std::ranges::sort(byte_offsets);
@@ -1157,9 +1164,11 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		DescriptorValue candidate;
 		candidate.dword_count = dword_count;
 		if (sources.empty()) {
+			const auto indexed_offset = uint64_t {key * indirect.table_stride + indirect.table_offset};
 			table_offset = byte_keys ? key
-			    : uint64_t {(key * indirect.table_stride + indirect.table_offset) & ~3u} +
-			          (indirect.table_immediate & ~3u);
+			    : table_value.dword_count == 4u ? scalar_buffer_offset(indexed_offset)
+			                                  : (indexed_offset & ~uint64_t {3}) +
+			                                        (indirect.table_immediate & ~3u);
 			if (!(byte_keys && key == UINT32_MAX) && table_offset <= UINT32_MAX &&
 			    !ReadScalarTable(table_base, table_size, table_offset, runtime,
 			                     std::span(candidate.dwords).first(read_dwords))) {

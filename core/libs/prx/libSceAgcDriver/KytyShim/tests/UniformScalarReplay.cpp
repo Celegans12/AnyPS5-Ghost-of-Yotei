@@ -53,6 +53,12 @@ struct Case {
     std::uint32_t offset;
 };
 
+struct OffsetCase {
+    Case          test;
+    std::uint32_t immediate;
+    std::uint32_t equivalent;
+};
+
 constexpr std::array Cases{
     Case{"aligned", Input, 0x100u, 0x24u},
     Case{"unaligned", Input + 0x44u, 0x100u, 0x24u},
@@ -240,6 +246,30 @@ int main(int argc, char** argv) {
             ++failures;
             std::cerr << test.name << ": " << failure << '\n';
             printTail(scalar.log);
+        }
+        constexpr std::array combined_cases {
+            OffsetCase{Case{"combined offset in bounds", Input, 8u, 3u}, 1u, 4u},
+            OffsetCase{Case{"combined offset outside", Input, 4u, 3u}, 1u, 4u},
+            OffsetCase{Case{"combined offset without carry", Input, 8u, 2u}, 1u, 0u},
+        };
+        for (std::size_t index = 0; index < combined_cases.size(); ++index) {
+            const auto& offset_case = combined_cases[index];
+            auto combined_words = ScalarWords;
+            combined_words[1] = 0x10000000u | offset_case.immediate;
+            auto single_words = ScalarWords;
+            single_words[1] = 0xfa000000u | offset_case.equivalent;
+            const auto combined = replay(tool, root / ("combined-" + std::to_string(index)), offset_case.test,
+                                         combined_words);
+            const auto single = replay(tool, root / ("single-" + std::to_string(index)), offset_case.test,
+                                       single_words);
+            if (combined.completed && single.completed && combined.frame == single.frame) {
+                std::cout << offset_case.test.name << ": ok\n";
+                continue;
+            }
+            ++failures;
+            std::cerr << offset_case.test.name << ": combining the register and immediate offsets changed the scalar load\n";
+            printTail(combined.log);
+            printTail(single.log);
         }
         if (failures != 0) return 1;
         std::filesystem::remove_all(root);
