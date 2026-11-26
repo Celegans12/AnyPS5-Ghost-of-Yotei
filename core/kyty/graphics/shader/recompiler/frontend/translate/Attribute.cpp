@@ -96,8 +96,14 @@ void Translator::V_INTERP_MOV_F32(const Decoder::Instruction& inst) {
 
 void Translator::EXP(const Decoder::Instruction& inst) {
 	uint32_t index = 0;
-	if (ExportTargetKindFromTarget(inst.exp.target, index) == IR::ExportTargetKind::Unknown) {
+	const auto kind = ExportTargetKindFromTarget(inst.exp.target, index);
+	if (kind == IR::ExportTargetKind::Unknown) {
 		EXIT("unsupported EXP target 0x%02x at pc 0x%08x", inst.exp.target, inst.pc);
+	}
+	if (program.stage == ShaderType::Compute && inst.exp.en != 0u &&
+	    kind != IR::ExportTargetKind::Null) {
+		EXIT("EXP target 0x%02x is not valid in a compute shader at pc 0x%08x",
+		     inst.exp.target, inst.pc);
 	}
 	std::array<IR::Value, 4> components {IR::Value(0u), IR::Value(0u), IR::Value(0u),
 	                                     IR::Value(0u)};

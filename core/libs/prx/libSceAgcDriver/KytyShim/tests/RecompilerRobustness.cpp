@@ -24,6 +24,12 @@ const std::vector<Case> Cases = {
     {"empty-program-end", 0x00, 0x00, {0xbf810000u}},
     {"lds-atomic-in-a-pixel-shader", 0x04, 0x00, {0xd8000000u, 0x00000100u, 0xbf810000u}},
     {"lds-umin-in-a-vertex-shader", 0x03, 0x00, {0xd8070000u, 0x00000100u, 0xbf810000u}},
+    {"image-get-lod-in-a-pixel-shader", 0x04, 0x00,
+     {0xf1800108u, 0x00400400u, 0xf8000801u, 0x00000004u, 0xbf810000u}},
+    {"null-export-in-a-compute-shader", 0x00, 0x00,
+     {0xf8000891u, 0x03020100u, 0xbf810000u}},
+    {"disabled-parameter-export-in-a-compute-shader", 0x00, 0x00,
+     {0xf8000a00u, 0x03020100u, 0xbf810000u}},
 };
 
 struct Refusal {
@@ -43,13 +49,19 @@ const std::vector<Refusal> Refusals = {
     {"position-export-from-a-pixel-shader", 0x04, 0x00, {0xf80008cfu, 0x03020100u, 0xbf810000u},
      "position export outside a vertex processing stage"},
     {"position-export-from-a-compute-shader", 0x00, 0x00, {0xf80008cfu, 0x03020100u, 0xbf810000u},
-     "position export outside a vertex processing stage"},
+     "not valid in a compute shader"},
+    {"parameter-export-from-a-compute-shader", 0x00, 0x00,
+     {0xf8000a01u, 0x03020100u, 0xbf810000u},
+     "not valid in a compute shader"},
     {"depth-compare-sample-on-a-3d-image", 0x04, 0x00, {0xf0a00110u, 0x00400400u, 0xf8000801u, 0x00000004u, 0xbf810000u},
      "depth comparison with a 3D image"},
     {"depth-compare-sample-on-a-multisampled-image", 0x04, 0x00, {0xf0a00130u, 0x00400400u, 0xf8000801u, 0x00000004u, 0xbf810000u},
      "samples a multisampled image"},
     {"sample-on-a-multisampled-image", 0x04, 0x00, {0xf0800130u, 0x00400400u, 0xf8000801u, 0x00000004u, 0xbf810000u},
      "samples a multisampled image"},
+    {"image-get-lod-in-a-vertex-shader", 0x03, 0x00,
+     {0xf1800308u, 0x00820000u, 0xf80008cfu, 0x03020100u, 0xbf810000u},
+     "image_get_lod requires a pixel or compute shader"},
 };
 
 struct ModeWrite {
