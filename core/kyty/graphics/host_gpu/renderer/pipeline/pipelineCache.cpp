@@ -2083,55 +2083,18 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 			if (ahead != nullptr) ahead->reads.Fail(AheadRefusal::Stage);
 			return ahead == nullptr;
 		};
-		const uint64_t layout_key[] = {vertex_params[0].hash, vertex_params[1].hash,
-		                               uint64_t {sh.m_vgtLsHsConfig & 0xfff00u} << 32u |
-		                                   sh.m_vgtTfParam |
-		                                   uint64_t {vertex_info[0].tess.merged_hull} << 63u};
-#else
-		const uint64_t layout_key[] = {vertex_params[0].hash, vertex_params[1].hash,
-		                               uint64_t {sh.m_vgtLsHsConfig & 0xfff00u} << 32u |
-		                                   sh.m_vgtTfParam};
 #endif
-		const auto layout_hash = XXH3_64bits(layout_key, sizeof(layout_key));
-		ShaderTessellationInputInfo tess;
+		auto tess = vertex_info[0].tess;
 		{
 			const ProgramLockGuard lock(m_program_lock);
-			if (ahead != nullptr) {
-				const auto found = m_tess_layouts.find(layout_hash);
-				if (found == m_tess_layouts.end()) {
+			if (!ResolveTessellationLayout(sh, vertex_params[0], vertex_params[1], vertex_regs.ls_regs.data_addr,
+			                               ahead != nullptr, tess)) {
+				if (ahead != nullptr) {
 					ahead->reads.Fail(AheadRefusal::Stage);
 					return false;
 				}
-				tess = found->second;
-			} else {
-				const auto [layout, inserted] =
-				    m_tess_layouts.try_emplace(layout_hash, vertex_info[0].tess);
-				if (inserted) {
-#if defined(ANYPS5_KYTY)
-					if (layout->second.merged_hull != 0) {
-						auto merged = layout->second;
-						if (!Common::Fallback::Run(
-						        "draw or dispatch skipped: its shader stage could not be prepared",
-						        "PipelineCache::ResolveGraphicsPrograms", vertex_params[1].hash,
-						        vertex_regs.ls_regs.data_addr, [&] {
-							        static_cast<void>(ShaderRecompiler::AnalyzeTessellationPrograms(
-							            vertex_params[0].code, vertex_params[1].code, merged));
-						        })) {
-							m_tess_layouts.erase(layout);
-							return skip_tessellation();
-						}
-						layout->second = merged;
-					} else
-#endif
-					if (!ShaderRecompiler::AnalyzeTessellationPrograms(
-					        vertex_params[0].code, vertex_params[1].code, layout->second)) {
-						EXIT("unsupported tessellation program shape: LS 0x%016" PRIx64
-						     " HS 0x%016" PRIx64 "\n",
-						     vertex_params[0].hash, vertex_params[1].hash);
-					}
-					StoreLayout(layout->first, layout->second);
-				}
-				tess = layout->second;
+				vertex_info[0].stage = {};
+				return true;
 			}
 		}
 #if defined(ANYPS5_KYTY)
@@ -3255,7 +3218,7 @@ void PipelineCache::RunTableJob(CompileJob& job, InputInfo& input_info) {
 	std::vector<uint32_t>       spirv;
 	std::vector<uint32_t>       plain_spirv;
 	[&] {
-		auto options = StageCompileOptions(input_info);
+		auto options = StageCompileOptions(input_info, true);
 		const auto user_data = std::span(job.params.user_data).first(job.params.user_data_count);
 		if (options.stage == ShaderType::Mesh || options.stage == ShaderType::TessellationControl ||
 		    options.stage == ShaderType::Local || options.stage == ShaderType::TessellationEvaluation) {
@@ -3263,7 +3226,6 @@ void PipelineCache::RunTableJob(CompileJob& job, InputInfo& input_info) {
 			return;
 		}
 		SetShaderCompileOptions(options, job.params.hash, user_data, job.params.back_code, false);
-		options.table_mode         = true;
 		auto source = ShaderRecompiler::PrepareShaderSource(job.params.code, options);
 		if (!source.calls.empty() || source.unsupported_call_pc != UINT32_MAX) {
 			refusal = "GPU-selected calls";
@@ -3317,8 +3279,7 @@ const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo
 #else
 	const auto        params      = PrepareProgram(regs, input_info);
 #endif
-	input_info.lds_storage = input_info.lds_size_dwords * 4u >
-	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
+	SetComputeLdsStorage(input_info);
 	uint32_t push_data_cursor =
 	    input_info.dispatch_indirect_threads ? ShaderRecompiler::IR::PushData::NoStart : 0u;
 	const ProgramLockGuard lock(m_program_lock);
@@ -3342,8 +3303,7 @@ const ShaderModule* PipelineCache::GetComputeProgramQueued(const HW::ComputeShad
 #else
 	const auto params = PrepareProgram(regs, input_info);
 #endif
-	input_info.lds_storage = input_info.lds_size_dwords * 4u >
-	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
+	SetComputeLdsStorage(input_info);
 	uint32_t push_data_cursor =
 	    input_info.dispatch_indirect_threads ? ShaderRecompiler::IR::PushData::NoStart : 0u;
 	const ProgramLockGuard lock(m_program_lock);
@@ -3456,8 +3416,7 @@ const ShaderModule* PipelineCache::GetComputeProgramAhead(const HW::ComputeShade
 #else
 	const auto params             = PrepareProgram(regs, input_info);
 #endif
-	input_info.lds_storage = input_info.lds_size_dwords * 4u >
-	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
+	SetComputeLdsStorage(input_info);
 	uint32_t push_data_cursor =
 	    input_info.dispatch_indirect_threads ? ShaderRecompiler::IR::PushData::NoStart : 0u;
 #if defined(ANYPS5_KYTY)

@@ -839,6 +839,9 @@ private:
 	void StoreModule(const ProgramKey& key, const Program& program, const ShaderModule& module,
 	                 const std::vector<uint32_t>& spirv, const std::vector<uint32_t>& plain_spirv);
 	void StorePipeline(const GraphicsPipelineKey& key);
+	bool ResolveTessellationLayout(const HW::ShaderRegisters& sh, const ShaderParams& ls,
+	                               const ShaderParams& hs, uint64_t address, bool lookup_only,
+	                               ShaderTessellationInputInfo& tess) KYTY_REQUIRES(m_program_lock);
 	void StoreLayout(uint64_t key, const ShaderTessellationInputInfo& layout);
 	[[nodiscard]] ModuleMap MapModules() const KYTY_REQUIRES(m_program_lock);
 	bool CreateGraphicsPipeline(Pipeline& pipeline, const GraphicsPipelineKey& key,
@@ -877,6 +880,7 @@ private:
 	                         std::span<const uint32_t> back_code, bool guest_traversal = false);
 	void CreateManifestPipeline(uint32_t index);
 	void CreateManifestComputePipeline(const ShaderModule& module, bool from_assets);
+	void SetComputeLdsStorage(ShaderComputeInputInfo& input) const;
 	void SetHostInput(ManifestModule& module) const;
 	const ShaderModule* FindCompiledModule(
 	    const ProgramKey& key, const ShaderRecompiler::IR::ResourceSpecialization& specialization,

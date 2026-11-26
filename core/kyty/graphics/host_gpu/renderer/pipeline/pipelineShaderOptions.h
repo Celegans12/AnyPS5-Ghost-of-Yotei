@@ -25,8 +25,9 @@ ShaderType ShaderStageForInput(const InputInfo& input) {
 }
 
 template <typename InputInfo>
-ShaderRecompiler::CompileOptions StageCompileOptions(const InputInfo& input) {
+ShaderRecompiler::CompileOptions StageCompileOptions(const InputInfo& input, bool table_mode = false) {
 	ShaderRecompiler::CompileOptions options {.stage = ShaderStageForInput(input), .wave_size = input.wave_size};
+	options.table_mode = table_mode;
 	if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 		options.input_info.vertex = &input;
 		if (options.stage != ShaderType::Mesh && options.stage != ShaderType::TessellationControl) {

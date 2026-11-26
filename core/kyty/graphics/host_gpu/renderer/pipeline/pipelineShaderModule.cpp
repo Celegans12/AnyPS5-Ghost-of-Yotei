@@ -3,11 +3,16 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineShaderOptions.h"
 
 #include "common/debugCounters.h"
+#if defined(ANYPS5_KYTY)
+#include "common/fallback.h"
+#endif
+#include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/rayTracing.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/shaderCompiler.h"
 
@@ -156,11 +161,51 @@ uint64_t ManifestModule::ProgramHash() const {
 	return XXH3_64bits(hashes, sizeof(hashes));
 }
 
+bool PipelineCache::ResolveTessellationLayout(const HW::ShaderRegisters& sh, const ShaderParams& ls,
+                                              const ShaderParams& hs, uint64_t address, bool lookup_only,
+                                              ShaderTessellationInputInfo& tess) {
+	uint64_t config = uint64_t {sh.m_vgtLsHsConfig & 0xfff00u} << 32u | sh.m_vgtTfParam;
+#if defined(ANYPS5_KYTY)
+	config |= uint64_t {tess.merged_hull} << 63u;
+#endif
+	const uint64_t key[] = {ls.hash, hs.hash, config};
+	const auto hash = XXH3_64bits(key, sizeof(key));
+	if (const auto found = m_tess_layouts.find(hash); found != m_tess_layouts.end()) {
+		tess = found->second;
+		return true;
+	}
+	if (lookup_only) {
+		return false;
+	}
+#if defined(ANYPS5_KYTY)
+	if (tess.merged_hull != 0) {
+		if (!Common::Fallback::Run("draw or dispatch skipped: its shader stage could not be prepared",
+		                           "PipelineCache::ResolveGraphicsPrograms", hs.hash, address, [&] {
+			                           static_cast<void>(ShaderRecompiler::AnalyzeTessellationPrograms(ls.code, hs.code, tess));
+		                           })) {
+			return false;
+		}
+	} else
+#endif
+	if (!ShaderRecompiler::AnalyzeTessellationPrograms(ls.code, hs.code, tess)) {
+		EXIT("unsupported tessellation program shape: LS 0x%016" PRIx64 " HS 0x%016" PRIx64 "\n",
+		     ls.hash, hs.hash);
+	}
+	m_tess_layouts.emplace(hash, tess);
+	StoreLayout(hash, tess);
+	return true;
+}
+
+void PipelineCache::SetComputeLdsStorage(ShaderComputeInputInfo& input) const {
+	input.lds_storage = input.lds_size_dwords * 4u >
+	                    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
+}
+
 void PipelineCache::SetHostInput(ManifestModule& module) const {
 	const auto& limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	if (auto* compute = std::get_if<ShaderComputeInputInfo>(&module.input)) {
 		compute->host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
-		compute->lds_storage = compute->lds_size_dwords * 4u > limits.maxComputeSharedMemorySize;
+		SetComputeLdsStorage(*compute);
 	} else if (auto* vertex = std::get_if<ShaderVertexInputInfo>(&module.input)) {
 		if (module.stage == ShaderType::Mesh) {
 			vertex->mesh.host_subgroup_size = m_graphics.subgroup_size;
