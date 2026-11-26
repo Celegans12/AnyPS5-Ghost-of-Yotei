@@ -772,12 +772,22 @@ private:
 		EXIT("%s", message.c_str());
 	}
 
+	struct CopyPosition {
+		uint32_t reg;
+		uint32_t pc;
+		const CopyPosition* parent;
+	};
+
 	Value NativeDescriptorSource(Value value, uint32_t reg, uint32_t use_pc,
-	                             bool follow_copies = false) const {
+	                             bool follow_copies = false, const CopyPosition* parent = nullptr) const {
 		value = value.Resolve();
 		const auto* phi = value.TryInstruction();
 		if (phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi || m_native_cfg.blocks.empty())
 			return value;
+		for (auto* at = parent; at != nullptr; at = at->parent) {
+			if (at->reg == reg && at->pc == use_pc) return value;
+		}
+		const CopyPosition position_on_path {reg, use_pc, parent};
 		std::vector<const Inst*> candidates;
 		for (const auto node: PhiWeb(value)) {
 			const auto* inst = node.TryInstruction();
@@ -864,7 +874,7 @@ private:
 				if (write->pc < block.start_pc) break;
 				if (RegIndex(write->reg) != reg) continue;
 				if (const auto copied = follow_copies ? CopiedRegister(write->pc, reg) : std::nullopt) {
-					const auto source = NativeDescriptorSource(value, copied->first, copied->second, true);
+					const auto source = NativeDescriptorSource(value, copied->first, copied->second, true, &position_on_path);
 					if (source == value.Resolve() || source.IsEmpty() ||
 					    (!selected.IsEmpty() && !EquivalentValue(m_program, selected, source)))
 						return value;
