@@ -21,6 +21,7 @@ struct Profile {
 	bool lds_lane_sync = true;
 	bool native_float16 = true;
 	bool f32_product_no_contraction = true;
+	bool subgroup_arithmetic = true;
 };
 
 inline constexpr Profile DefaultProfile {};

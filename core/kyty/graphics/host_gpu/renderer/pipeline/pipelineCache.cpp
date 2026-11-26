@@ -639,7 +639,8 @@ ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	        .ray_query              = graphics.ray_query_enabled,
 	        .lds_lane_sync          = LdsLaneSyncEnabled(),
 	        .native_float16         = graphics.shader_float16_enabled,
-	        .f32_product_no_contraction = F32ProductNoContractionEnabled()};
+	        .f32_product_no_contraction = F32ProductNoContractionEnabled(),
+	        .subgroup_arithmetic        = graphics.subgroup_arithmetic_enabled};
 }
 
 std::filesystem::path ShaderStorePath() {

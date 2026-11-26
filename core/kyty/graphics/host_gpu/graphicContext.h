@@ -57,6 +57,7 @@ struct GraphicContext {
 #endif
 	bool                                      mesh_shader_enabled                   = false;
 	bool                                      shader_float16_enabled                = false;
+	bool                                      subgroup_arithmetic_enabled           = false;
 	bool                                      native_ray_tracing_enabled            = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;

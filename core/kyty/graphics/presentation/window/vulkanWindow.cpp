@@ -595,6 +595,8 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	}
 	physical_device.getProperties2(&properties2);
 	EXIT_NOT_IMPLEMENTED(!(properties11.subgroupSupportedOperations & vk::SubgroupFeatureFlagBits::eVote));
+	graphics.subgroup_arithmetic_enabled = static_cast<bool>(properties11.subgroupSupportedOperations &
+	                                                         vk::SubgroupFeatureFlagBits::eArithmetic);
 	graphics.physical_device_properties = properties2.properties;
 	graphics.driver_id                  = driver_properties.driverID;
 	graphics.max_push_descriptors       = push_descriptor.maxPushDescriptors;
