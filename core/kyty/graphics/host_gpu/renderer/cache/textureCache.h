@@ -205,6 +205,7 @@ private:
 		uint32_t value     = 0;
 		bool     in_memory = false;
 	};
+	using PendingMetaClears = std::map<uint64_t, PendingMetaClear>;
 
 	struct MetaDataInfo {
 		std::bitset<8192> clear_mask;
@@ -365,6 +366,10 @@ private:
 	void                      DropPendingMetaClearsLocked(uint64_t address, uint64_t size)
 	    KYTY_REQUIRES(m_pending_meta_lock);
 	void                      UpdatePendingMetaBoundsLocked() KYTY_REQUIRES(m_pending_meta_lock);
+	void                      ErasePendingMetaClearsLocked(PendingMetaClears::iterator first, PendingMetaClears::iterator last)
+	    KYTY_REQUIRES(m_pending_meta_lock);
+	void HoldPendingMetaPagesLocked(uint64_t address, uint64_t size, bool hold) KYTY_REQUIRES(m_pending_meta_lock);
+	void DropPendingMetaClearsAround(uint64_t address, uint64_t size);
 	[[nodiscard]] bool        OverlapsSurfaceMetaLocked(uint64_t address, uint64_t size) const KYTY_REQUIRES(m_lock);
 	[[nodiscard]] bool        MaybePendingMeta(uint64_t address, uint64_t end) const;
 	static void               AddPendingMetaGranules(std::array<uint64_t, 64>& words, uint64_t address, uint64_t size);
@@ -493,7 +498,8 @@ private:
 	std::vector<std::pair<ImageId, uint64_t>>         m_parked_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 	Common::AnnotatedMutex                            m_pending_meta_lock;
-	std::map<uint64_t, PendingMetaClear>              m_pending_meta_clears KYTY_GUARDED_BY(m_pending_meta_lock);
+	PendingMetaClears                                 m_pending_meta_clears KYTY_GUARDED_BY(m_pending_meta_lock);
+	std::map<uint64_t, uint32_t>                      m_pending_meta_pages KYTY_GUARDED_BY(m_pending_meta_lock);
 	std::atomic<uint64_t>                             m_pending_meta_count {0};
 	std::atomic<uint64_t>                             m_pending_meta_begin {UINT64_MAX};
 	std::atomic<uint64_t>                             m_pending_meta_end {0};

@@ -177,6 +177,10 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 }
 
 TextureCache::~TextureCache() {
+	{
+		Common::ScopedLock pending {m_pending_meta_lock};
+		ErasePendingMetaClearsLocked(m_pending_meta_clears.begin(), m_pending_meta_clears.end());
+	}
 	m_slot_images.ForEach([&](ImageId id, const Image& image) KYTY_NO_THREAD_SAFETY_ANALYSIS {
 		if (image.registered) {
 			UnregisterImage(id);
@@ -2799,6 +2803,10 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 
 vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc, ImageId* stencil) {
 	CollectHotPagesOf(id);
+	if (desc.info.HasMetadata() && m_pending_meta_count.load(std::memory_order_acquire) != 0 &&
+	    m_page_manager.HasHotPages()) {
+		m_scheduler.Context().CollectHotPageWrites(desc.info.metadata.range.address, desc.info.metadata.range.size);
+	}
 	Common::ScopedLock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
@@ -3600,7 +3608,7 @@ bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size, bool inc
 }
 
 bool TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
-	DropPendingMetaClears(address, size);
+	DropPendingMetaClearsAround(address, size);
 	ImagePageTable::PageRange pages {};
 	if (ImagePageTable::TryGetPageRange(address, size, pages) &&
 	    !m_registered_pages.Any(pages.first, pages.last_exclusive)) {
@@ -3723,7 +3731,7 @@ bool TextureCache::OverlapsSurfaceMetaLocked(uint64_t address, uint64_t size) co
 }
 
 void TextureCache::NoteMetaFill(uint64_t address, uint64_t size, uint32_t value, bool in_memory) {
-	if ((value & 0xfu) != 0 || size == 0) {
+	if ((value & 0xfu) != 0 || size == 0 || (!in_memory && !GuestRange {address, size}.Valid())) {
 		return;
 	}
 	Common::ScopedLock lock {m_lock};
@@ -3741,6 +3749,40 @@ void TextureCache::NoteMetaFill(uint64_t address, uint64_t size, uint32_t value,
 		}
 	}
 	UpdatePendingMetaBoundsLocked();
+	if (!in_memory) {
+		HoldPendingMetaPagesLocked(address, size, true);
+	}
+}
+
+void TextureCache::HoldPendingMetaPagesLocked(uint64_t address, uint64_t size, bool hold) {
+	const auto first = Common::AlignDown(address, TRACKER_PAGE_SIZE);
+	const auto last  = Common::AlignDown(address + size - 1, TRACKER_PAGE_SIZE);
+	const auto watch = [&](uint64_t begin, uint64_t end) {
+		if (begin >= end) {
+			return;
+		}
+		if (hold) {
+			m_page_manager.UpdatePageWatchers<true>(begin, end - begin);
+		} else {
+			m_page_manager.UpdatePageWatchers<false>(begin, end - begin);
+		}
+	};
+	const auto edge = [&](uint64_t page) KYTY_REQUIRES(m_pending_meta_lock) {
+		if (hold) {
+			if (++m_pending_meta_pages[page] == 1) {
+				watch(page, page + TRACKER_PAGE_SIZE);
+			}
+		} else if (const auto found = m_pending_meta_pages.find(page);
+		           found != m_pending_meta_pages.end() && --found->second == 0) {
+			m_pending_meta_pages.erase(found);
+			watch(page, page + TRACKER_PAGE_SIZE);
+		}
+	};
+	edge(first);
+	if (last != first) {
+		watch(first + TRACKER_PAGE_SIZE, last);
+		edge(last);
+	}
 }
 
 void TextureCache::AddPendingMetaGranules(std::array<uint64_t, 64>& words, uint64_t address, uint64_t size) {
@@ -3811,8 +3853,50 @@ void TextureCache::DropPendingMetaClearsLocked(uint64_t address, uint64_t size) 
 	if (first == last) {
 		return;
 	}
-	m_pending_meta_clears.erase(first, last);
+	ErasePendingMetaClearsLocked(first, last);
 	UpdatePendingMetaBoundsLocked();
+}
+
+void TextureCache::ErasePendingMetaClearsLocked(PendingMetaClears::iterator first, PendingMetaClears::iterator last) {
+	for (auto it = first; it != last; ++it) {
+		if (!it->second.in_memory) {
+			HoldPendingMetaPagesLocked(it->first, it->second.size, false);
+		}
+	}
+	m_pending_meta_clears.erase(first, last);
+}
+
+void TextureCache::DropPendingMetaClearsAround(uint64_t address, uint64_t size) {
+	if (size == 0 || m_pending_meta_count.load(std::memory_order_acquire) == 0) {
+		return;
+	}
+	const uint64_t end        = size > UINT64_MAX - address ? UINT64_MAX : address + size;
+	const uint64_t page_begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);
+	const uint64_t page_end   = end > UINT64_MAX - TRACKER_PAGE_SIZE ? UINT64_MAX : Common::AlignUp(end, TRACKER_PAGE_SIZE);
+	if (page_end <= m_pending_meta_begin.load(std::memory_order_relaxed) ||
+	    page_begin >= m_pending_meta_end.load(std::memory_order_relaxed) || !MaybePendingMeta(page_begin, page_end)) {
+		return;
+	}
+	Common::ScopedLock pending {m_pending_meta_lock};
+	auto               it = m_pending_meta_clears.lower_bound(page_begin);
+	if (it != m_pending_meta_clears.begin()) {
+		const auto previous = std::prev(it);
+		if (previous->first + previous->second.size > page_begin) {
+			it = previous;
+		}
+	}
+	bool erased = false;
+	while (it != m_pending_meta_clears.end() && it->first < page_end) {
+		const auto next = std::next(it);
+		if (!it->second.in_memory || (it->first < end && address < it->first + it->second.size)) {
+			ErasePendingMetaClearsLocked(it, next);
+			erased = true;
+		}
+		it = next;
+	}
+	if (erased) {
+		UpdatePendingMetaBoundsLocked();
+	}
 }
 
 static bool HoldsFill(uint64_t address, uint64_t size, uint32_t value) {
@@ -3857,7 +3941,7 @@ void TextureCache::ApplyPendingMetaClears(const ImageInfo& info, MetaDataInfo& m
 			}
 		}
 	}
-	m_pending_meta_clears.erase(first, last);
+	ErasePendingMetaClearsLocked(first, last);
 	UpdatePendingMetaBoundsLocked();
 }
 
@@ -3939,7 +4023,13 @@ void TextureCache::RunGarbageCollector() {
 	const uint64_t   tick = m_gc_tick++;
 	{
 		Common::ScopedLock pending {m_pending_meta_lock};
-		std::erase_if(m_pending_meta_clears, [this](const auto& entry) { return m_gc_tick - entry.second.tick > 1; });
+		for (auto it = m_pending_meta_clears.begin(); it != m_pending_meta_clears.end();) {
+			const auto next = std::next(it);
+			if (m_gc_tick - it->second.tick > 1) {
+				ErasePendingMetaClearsLocked(it, next);
+			}
+			it = next;
+		}
 		std::array<uint64_t, 64> granules {};
 		for (const auto& [address, record]: m_pending_meta_clears) {
 			AddPendingMetaGranules(granules, address, record.size);

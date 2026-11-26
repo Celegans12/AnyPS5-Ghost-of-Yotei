@@ -41,6 +41,10 @@ struct TextureCacheTestAccess {
 		cache.CommitGpuWrite(cache.m_slot_images[image]);
 	}
 
+	static bool Watched(TextureCache& cache, uint64_t address) {
+		return cache.m_page_manager.IsWatched(address);
+	}
+
 	static std::array<bool, 2> ApplyPendingClears(TextureCache& cache, const ImageInfo& info) {
 		Common::ScopedLock         lock {cache.m_lock};
 		TextureCache::MetaDataInfo meta {};
@@ -88,7 +92,7 @@ const char* CheckFilledMetaClearReachesBind(GraphicContext& graphics, uint64_t b
 	constexpr uint64_t MetaOffset = 0x6000;
 	constexpr uint64_t SourceOffset = 0x7000;
 	constexpr uint64_t WriteBytes = 16;
-	constexpr uint32_t Cases = 17;
+	constexpr uint32_t Cases = 28;
 	static_assert(Stride * Cases <= DepthGuestBytes);
 	constexpr uint32_t Expanded = 0xffffffffu;
 	constexpr uint32_t StencilCleared = 0xf0u;
@@ -247,6 +251,105 @@ const char* CheckFilledMetaClearReachesBind(GraphicContext& graphics, uint64_t b
 		textures.NoteMetaFill(meta + SliceBytes, SliceBytes, 0, false);
 		expect(pending(meta), none, "a fill inside a live metadata entry was recorded");
 	}
+	const auto watched = [&](uint64_t meta) { return TextureCacheTestAccess::Watched(textures, meta); };
+	{
+		const auto meta = slot();
+		textures.NoteMetaFill(meta, MetaBytes, 0, false);
+		textures.NoteMetaFill(meta, MetaBytes, 0, false);
+		const bool held = watched(meta);
+		expect(pending(meta), both, "a replaced record of a fill on the GPU did not clear the HTile");
+		expect({held, watched(meta)}, first,
+		       "a record of a fill on the GPU did not write-protect its range exactly until it was applied");
+	}
+	{
+		const auto meta = slot();
+		textures.NoteMetaFill(meta, MetaBytes, 0, true);
+		expect({watched(meta), false}, none, "a record of a fill done in memory write-protected its range");
+		(void)pending(meta);
+	}
+	{
+		const auto meta = slot();
+		textures.NoteMetaFill(meta, MetaBytes, 0, false);
+		(void)textures.InvalidateMemory(meta + MetaBytes, sizeof(uint32_t));
+		expect({watched(meta), false}, none, "a write elsewhere on its page did not release a record's protection");
+		expect(pending(meta), none, "a record of a fill on the GPU was kept after a write elsewhere on its page");
+	}
+	{
+		const auto meta = slot();
+		textures.NoteMetaFill(meta, MetaBytes, 0, false);
+		textures.RunGarbageCollector();
+		textures.RunGarbageCollector();
+		expect({watched(meta), false}, none, "a record aged out by the GC kept its protection");
+		expect(pending(meta), none, "a record of a fill on the GPU older than one GC tick was kept");
+	}
+	{
+		const auto meta = slot();
+		textures.NoteMetaFill(meta, MetaBytes, 0, false);
+		textures.UnmapMemory(meta, MetaBytes);
+		expect({watched(meta), false}, none, "a record dropped by an unmap kept its protection");
+		expect(pending(meta), none, "a record of a fill on the GPU was kept after an unmap");
+	}
+	{
+		const auto meta = slot();
+		textures.NoteMetaFill(meta, MetaBytes, 0, false);
+		textures.NoteMetadataWrite(meta + SliceBytes, WriteBytes);
+		expect({watched(meta), false}, none, "a record dropped by a written binding kept its protection");
+		expect(pending(meta), none, "a record of a fill on the GPU was kept after a written binding over it");
+	}
+	{
+		const auto meta = slot();
+		textures.NoteMetaFill(meta, MetaBytes, 0, false);
+		(void)renderer.HandleFault(PageFaultAccess::Write, meta + MetaBytes);
+		expect({watched(meta), false}, none, "a write fault elsewhere on its page did not release a record's protection");
+		expect(pending(meta), none, "a record of a fill on the GPU was kept after a write fault on its page");
+	}
+	{
+		const auto meta = slot();
+		textures.NoteMetaFill(meta, SliceBytes, 0, false);
+		textures.NoteMetaFill(meta + SliceBytes, SliceBytes, 0, false);
+		ImageInfo info;
+		info.resources = {1, 1};
+		info.metadata.kind = ImageMetadataKind::Htile;
+		info.metadata.range = GuestRange {meta, SliceBytes};
+		const bool applied = TextureCacheTestAccess::ApplyPendingClears(textures, info)[0];
+		const bool held = watched(meta);
+		textures.NoteMetadataWrite(meta + SliceBytes, WriteBytes);
+		expect({applied, held}, both, "two records of fills on the GPU on one page did not hold it until both were gone");
+		expect({watched(meta), false}, none, "two records of fills on the GPU on one page left it protected");
+	}
+	{
+		constexpr uint32_t Records = 300;
+		const auto meta = slot();
+		for (uint32_t record = 0; record < Records; ++record) {
+			textures.NoteMetaFill(meta + record * sizeof(uint32_t), sizeof(uint32_t), 0, false);
+		}
+		const bool held = watched(meta);
+		textures.NoteMetadataWrite(meta, Records * sizeof(uint32_t));
+		expect({held, watched(meta)}, first, "300 records of fills on the GPU on one page did not hold it exactly until dropped");
+	}
+	{
+		constexpr uint64_t SpanBytes = 0x2000;
+		const auto middle = slot();
+		const auto start = middle - 2 * SliceBytes;
+		const auto tail = start + SpanBytes;
+		textures.NoteMetaFill(start, SpanBytes, 0, false);
+		textures.NoteMetaFill(tail, SliceBytes, 0, false);
+		expect({watched(start), watched(middle)}, both,
+		       "a record of a fill on the GPU over three pages did not protect its first and middle pages");
+		expect({watched(tail), false}, first, "a record of a fill on the GPU over three pages did not protect its last page");
+		textures.NoteMetadataWrite(start, WriteBytes);
+		expect({watched(start), watched(middle)}, none,
+		       "a dropped record over three pages left its first or middle page protected");
+		expect({watched(tail), false}, first,
+		       "a dropped record over three pages released its last page while another record held it");
+		textures.NoteMetadataWrite(tail, WriteBytes);
+		expect({watched(tail), false}, none, "the last record on a shared page left it protected after it was dropped");
+	}
+	expect(bind([&](uint64_t meta, uint64_t) {
+		       fill(meta, SliceBytes, 0);
+		       fill(meta + SliceBytes, SliceBytes, 0);
+	       }),
+	       both, "fills in memory of both layers' HTile on one page did not clear both layers");
 	const auto tick = scheduler.CurrentTick();
 	scheduler.Wait(tick);
 	scheduler.WaitPriorityOperations(tick);
