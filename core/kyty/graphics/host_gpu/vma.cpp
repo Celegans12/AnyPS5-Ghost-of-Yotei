@@ -199,6 +199,9 @@ void GraphicContext::LogMemoryBudget() const {
 }
 
 uint64_t GraphicContext::GetDeviceMemoryUsage() const {
+	if (m_memory_override_enabled) {
+		return m_memory_usage_override;
+	}
 	if (!CanReportMemoryUsage() || allocator == nullptr) {
 		return 0;
 	}
@@ -237,6 +240,9 @@ uint32_t GraphicContext::GetHeapUsage(std::span<HeapUsage, VK_MAX_MEMORY_HEAPS> 
 }
 
 uint64_t GraphicContext::GetTotalMemoryBudget() const {
+	if (m_memory_override_enabled) {
+		return m_memory_budget_override;
+	}
 	if (allocator == nullptr) {
 		return 0;
 	}
@@ -362,6 +368,11 @@ void GraphicContext::TrimRecycledImages() {
 		return;
 	}
 	DestroyRecycledImages(allocator);
+}
+
+size_t GraphicContext::RecycledImageCount() const {
+	std::lock_guard lock(g_recycled_mutex);
+	return g_recycled.size();
 }
 
 }

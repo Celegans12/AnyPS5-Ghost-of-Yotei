@@ -127,7 +127,9 @@ struct GraphicContext {
 	[[nodiscard]] bool CreateAllocator();
 	void               DestroyAllocator();
 	void               LogMemoryBudget() const;
-	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
+	[[nodiscard]] bool CanReportMemoryUsage() const noexcept {
+		return memory_budget_ext_enabled || m_memory_override_enabled;
+	}
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
 
@@ -141,11 +143,16 @@ struct GraphicContext {
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
 	void                   DeleteImage(VulkanImage& image);
 	void                   TrimRecycledImages();
+	[[nodiscard]] size_t   RecycledImageCount() const;
 
 	uint32_t screen_width  = 0;
 	uint32_t screen_height = 0;
 
 private:
+	friend struct VramBudgetTestAccess;
+	bool     m_memory_override_enabled = false;
+	uint64_t m_memory_budget_override  = 0;
+	uint64_t m_memory_usage_override   = 0;
 	mutable std::mutex                                 m_format_properties_mutex;
 	mutable std::map<vk::Format, vk::FormatProperties> m_format_properties;
 	mutable std::mutex                                 m_image_format_properties_mutex;
