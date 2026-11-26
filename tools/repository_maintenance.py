@@ -10,11 +10,12 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-BASE_BRANCH = "AnyKyty"
-REVIEW_BRANCHES = {BASE_BRANCH, "Brainrot"}
 OWNER = "simnJS"
 REPO = f"{OWNER}/AnyPS5"
-WORKFLOWS = ("anykyty.yml", "offline-checks.yml")
+PR_WORKFLOWS = {
+    "AnyKyty": ("anykyty.yml", "offline-checks.yml"),
+    "Brainrot": ("brainrot.yml",),
+}
 BOT = "github-actions[bot]"
 MARKER = "repository-maintenance"
 SCAN = Path(__file__).with_name("public-scan.sh")
@@ -160,7 +161,7 @@ def review(number, key, words, *, targeted=False):
     if targeted and not is_pull:
         raise RuntimeError("The selected number must be a pull request")
     pull = gh(pull_api(number)) if is_pull else None
-    if pull and (pull["draft"] or pull["base"]["ref"] not in REVIEW_BRANCHES):
+    if pull and (pull["draft"] or pull["base"]["ref"] not in PR_WORKFLOWS):
         if targeted:
             note(f"- #{number} is a draft or targets a branch outside automatic review.")
         return False
@@ -282,17 +283,21 @@ def approved(number, sha):
 
 def ci_passed(number, pull):
     sha = pull["head"]["sha"]
-    for workflow in WORKFLOWS:
+    for workflow in PR_WORKFLOWS[pull["base"]["ref"]]:
         runs = gh(
             f"repos/{REPO}/actions/workflows/{workflow}/runs"
             f"?event=pull_request&head_sha={sha}&per_page=50"
         )["workflow_runs"]
         matching = [
             run for run in runs
-            if any(item["number"] == number for item in run["pull_requests"])
-            or (
-                (run.get("head_repository") or {}).get("id") == pull["head"]["repo"]["id"]
-                and run["head_branch"] == pull["head"]["ref"]
+            if run["event"] == "pull_request" and run["head_sha"] == sha
+            and (
+                any(item["number"] == number for item in run["pull_requests"])
+                or (
+                    not run["pull_requests"]
+                    and (run.get("head_repository") or {}).get("id") == pull["head"]["repo"]["id"]
+                    and run["head_branch"] == pull["head"]["ref"]
+                )
             )
         ]
         if not matching or matching[0]["conclusion"] != "success":
@@ -302,8 +307,9 @@ def ci_passed(number, pull):
 
 def merge(number, words):
     pull = gh(pull_api(number))
+    target = pull["base"]["ref"]
     if (
-        pull["state"] != "open" or pull["draft"] or pull["base"]["ref"] != BASE_BRANCH
+        pull["state"] != "open" or pull["draft"] or target not in PR_WORKFLOWS
         or pull["mergeable_state"] != "clean" or not pull["head"].get("repo")
         or "automerge" not in {label["name"] for label in pull["labels"]}
     ):
@@ -311,10 +317,15 @@ def merge(number, words):
     head, base = pull["head"]["sha"], pull["base"]["sha"]
     if not all(re.fullmatch(r"[0-9a-f]{40}", ref) for ref in (head, base)):
         raise RuntimeError("GitHub returned an invalid commit SHA")
-    if not approved(number, head) or not ci_passed(number, pull):
+    if not approved(number, head):
+        note(f"- #{number} is waiting for the owner's label and approval of the current revision.")
+        return
+    if not ci_passed(number, pull):
+        note(f"- #{number} is waiting for successful pull request CI.")
         return
     git("fetch", "--quiet", "--no-tags", "origin", base, head)
     if git("merge-base", base, head).decode().strip() != base:
+        note(f"- #{number} needs to be updated to its target branch before integration.")
         return
     revision_range = f"{base}..{head}"
     paths = git("log", "-m", "--format=", "--name-only", "-z", revision_range).split(b"\0")
@@ -333,13 +344,14 @@ def merge(number, words):
         return
     latest = gh(pull_api(number))
     if (
-        latest["base"]["sha"] != base or latest["head"]["sha"] != head
-        or latest["mergeable_state"] != "clean"
+        latest["state"] != "open" or latest["draft"] or not latest["head"].get("repo")
+        or latest["base"]["ref"] != target or latest["base"]["sha"] != base
+        or latest["head"]["sha"] != head or latest["mergeable_state"] != "clean"
         or "automerge" not in {label["name"] for label in latest["labels"]}
         or not approved(number, head) or not ci_passed(number, latest)
     ):
         return
-    branch = f"refs/heads/{BASE_BRANCH}"
+    branch = f"refs/heads/{target}"
     git(
         "-c", "credential.helper=",
         "-c", "credential.https://github.com.helper=!gh auth git-credential",

@@ -10,6 +10,9 @@ on:
     types: [opened, reopened, synchronize, ready_for_review, labeled]
   schedule:
     - cron: '13,43 * * * *'
+  workflow_run:
+    workflows: [AnyKyty, Offline checks, Brainrot]
+    types: [completed]
   workflow_dispatch:
     inputs:
       pull_request:
@@ -43,6 +46,7 @@ jobs:
       github.repository == 'simnJS/AnyPS5' &&
       github.ref == 'refs/heads/AnyKyty' &&
       github.event.sender.type != 'Bot' &&
+      github.event_name != 'workflow_run' &&
       (github.event_name != 'pull_request_target' || github.event.action != 'labeled')
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -69,6 +73,8 @@ jobs:
       github.repository == 'simnJS/AnyPS5' &&
       github.ref == 'refs/heads/AnyKyty' &&
       (github.event_name == 'schedule' ||
+       (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request' &&
+        github.event.workflow_run.conclusion == 'success') ||
        (github.event_name == 'workflow_dispatch' && !inputs.pull_request) ||
        (github.event_name == 'pull_request_target' && github.event.label.name == 'automerge'))
     runs-on: ubuntu-latest
