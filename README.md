@@ -1,7 +1,7 @@
 <h1 align="center">Ghost of Yōtei on AnyKyty</h1>
 
 <p align="center"><b>Ghost of Yōtei (PPSA26344, v1.008) running in its open world on PC, on <a href="https://github.com/simnJS/AnyPS5/tree/AnyKyty">AnyKyty</a>: AnyPS5 with the Kyty graphics core.</b><br>
-<sub>Branch <code>yotei/best</code> on Celegans12/AnyPS5-Ghost-of-Yotei · progress thread: <a href="https://github.com/boykopovar/AnyPS5/discussions/675">#675</a> · AnyKyty thread: <a href="https://github.com/boykopovar/AnyPS5/discussions/22713">#22713</a> · <a href="#run-it">run it</a> · <a href="#updates">updates</a></sub></p>
+<sub>Branch <code>yotei/best</code> on Celegans12/AnyPS5-Ghost-of-Yotei · progress thread: <a href="https://github.com/boykopovar/AnyPS5/discussions/675">#675</a> · AnyKyty thread: <a href="https://github.com/boykopovar/AnyPS5/discussions/22713">#22713</a> · <a href="#run-it">run it</a> · <a href="#performance-options">performance options</a> · <a href="#updates">updates</a></sub></p>
 
 <table>
 <tr>
@@ -39,6 +39,93 @@
 <sub>* Measured by Pipodi on 2026-11-20 with this branch at our save (#675, comment 19773554): 400 s legs on a filled cache, about
 1.8 times our laptop, GPU around 77 % busy, about 4.7 cores used. Yōtei on Kyty is limited by the CPU side, so a faster GPU
 alone changes little; our earlier estimate of 18-23 fps for a desktop was too optimistic. More numbers are welcome in #675.</sub>
+
+## Performance options
+
+You can trade picture quality for frame rate with relinker patches: pick one file below and pass it to the relinker
+when you convert the game. The **1080p patch** makes the game render and output at 1920x1080 instead of 4K. The
+**quality ladder** patches use Yōtei's own internal scalability table (DarthPotato found it, #675 comment
+[19867317](https://github.com/boykopovar/AnyPS5/discussions/675#discussioncomment-19867317)): 22 rows of LOD scale, sun
+shadow views and small shadow caster culling, plus one number for the current row (row 0 is full quality). The game
+changes that number while it runs, so the patches rewrite every instruction that reads it to a fixed row. The relinker
+takes one `--patches` file per conversion, which is why the 1080p + ladder files exist.
+
+| Game version | File | What it changes | Presents per 10 s at our save |
+|---|---|---|---|
+| 1.008 | [`docs/yotei/yotei-1.008-1080p.toml`](docs/yotei/yotei-1.008-1080p.toml) | 1080p (shahulmubeen-a's patch, ported) | ~97 ([11-23](#where-it-stands-2026-11-23)) |
+| 01.512.000 | none | the game as it ships: 4K output, full detail | 100 |
+| 01.512.000 | [`yotei-1.512-1080p.toml`](docs/yotei/patches/yotei-1.512-1080p.toml) | 1080p (the same five sites, ported) | **105** |
+| 01.512.000 | [`yotei-1.512-1080p-ladder7.toml`](docs/yotei/patches/yotei-1.512-1080p-ladder7.toml) | 1080p + row 7: LOD scale 0.5, one sun shadow view fewer | **120** (+14 %) |
+| 01.512.000 | [`yotei-1.512-1080p-ladder11.toml`](docs/yotei/patches/yotei-1.512-1080p-ladder11.toml) | 1080p + row 11: LOD scale 0.2, two sun shadow views fewer | **159** (+51 %) |
+| 01.512.000 | [`yotei-1.512-1080p-ladder15.toml`](docs/yotei/patches/yotei-1.512-1080p-ladder15.toml) | 1080p + row 15: LOD scale 0.1, three sun shadow views fewer, small shadow casters dropped | **167** (+59 %) |
+| 01.512.000 | [`ladder7`](docs/yotei/patches/yotei-1.512-ladder7.toml), [`ladder11`](docs/yotei/patches/yotei-1.512-ladder11.toml), [`ladder15`](docs/yotei/patches/yotei-1.512-ladder15.toml) | the same rows without the 1080p patch (4K output) | not measured |
+| 02.002.000 | [DarthPotato/yotei-patches](https://github.com/DarthPotato/yotei-patches) | 1080p, rows 15 and 11, and a file that keeps ray-traced GI off | 15.6 fps at 1080p, ~23.8 fps with row 15 (his Ryzen 5 3600 + RTX 3080 desktop) |
+
+<sub>Our laptop (i9-11900H + RTX 3080 Laptop), yotei/best next9 on 01.512.000, standing at the Teshio save, warm cache,
+`KYTY_ASYNC_PIPELINES=0 KYTY_GPU_SPIN_US=0`, 240 s legs on 11-27, the rate after the world loads; two legs each in
+two series (4K and row 15: one leg). These are game settings for players, not A/Bs: the percentages are against the 1080p row.
+On this laptop the frame rate is set by the CPU side, so 1080p alone gains little here (+5 % over 4K); on a desktop
+whose GPU is the limit it gains much more (DarthPotato: 8.1 to 15.6 fps). The ladder rows cut what the game draws
+(about 40-45 % fewer draws and dispatches at row 15, by DarthPotato's count), which helps either way.</sub>
+
+The same spot on an overcast launch, 180 s into each run (the weather is picked at each launch):
+
+<table>
+<tr>
+<td width="50%"><img src="https://raw.githubusercontent.com/Celegans12/AnyPS5-Ghost-of-Yotei/bringup-media/yotei/2026-11-27/teshio-1512-4k.png" alt="Teshio canoe, 4K output, full detail"></td>
+<td width="50%"><img src="https://raw.githubusercontent.com/Celegans12/AnyPS5-Ghost-of-Yotei/bringup-media/yotei/2026-11-27/teshio-1512-1080p.png" alt="The same spot with the 1080p patch"></td>
+</tr>
+<tr>
+<td align="center"><sub>4K output, full detail (100)</sub></td>
+<td align="center"><sub>1080p patch, full detail (105)</sub></td>
+</tr>
+<tr>
+<td width="50%"><img src="https://raw.githubusercontent.com/Celegans12/AnyPS5-Ghost-of-Yotei/bringup-media/yotei/2026-11-27/teshio-1512-1080p-row7.png" alt="The same spot with 1080p and ladder row 7"></td>
+<td width="50%"><img src="https://raw.githubusercontent.com/Celegans12/AnyPS5-Ghost-of-Yotei/bringup-media/yotei/2026-11-27/teshio-1512-1080p-row11.png" alt="The same spot with 1080p and ladder row 11"></td>
+</tr>
+<tr>
+<td align="center"><sub>1080p + row 7 (120): little visible change at this spot</sub></td>
+<td align="center"><sub>1080p + row 11 (159): distant houses drop to dark low-detail models, sparser flowers</sub></td>
+</tr>
+<tr>
+<td width="50%"><img src="https://raw.githubusercontent.com/Celegans12/AnyPS5-Ghost-of-Yotei/bringup-media/yotei/2026-11-27/teshio-1512-1080p-row15.png" alt="The same spot with 1080p and ladder row 15"></td>
+<td></td>
+</tr>
+<tr>
+<td align="center"><sub>1080p + row 15 (167): low-detail houses, most flowers and grass gone, fewer shadows</sub></td>
+<td></td>
+</tr>
+</table>
+
+To apply one, unwrap the eboot, check the file against it, then convert with it:
+
+```
+python tools/unwrap_self.py <dump>/app0/eboot.bin eboot.elf
+relinker --verify-patches docs/yotei/patches/yotei-1.512-1080p-ladder15.toml eboot.elf
+relinker <your usual options> --patches docs/yotei/patches/yotei-1.512-1080p-ladder15.toml eboot.elf <runtime>/eboot.exe
+```
+
+`--verify-patches` must report every site ok (5 for the 1080p file, 16 for a ladder file, 21 for 1080p + ladder) and
+none mismatched; a mismatch means another game version. The 01.512.000 files are for app0/eboot.bin md5
+`41c6624c2b515c6608c49fa55ae3d418`.
+
+- **The ladder rows make the game look worse on purpose**: lower-detail models, sparser grass and fewer shadows. They are
+  for playability, not for comparing builds; all our other numbers are the 1080p patch at full detail. Rows 16-21 also
+  stop drawing the player's body, so 15 is the lowest useful row. In 01.512.000, 16 instructions read the row (17 in
+  02.002.000); each becomes `mov r32, <row>; nop`.
+- **Changing the patch file starts the NVIDIA shader cache over** (the driver keeps one per converted executable), so
+  the first start after a switch compiles again. Pick a file and keep it.
+- **For playing, keep `KYTY_ASYNC_PIPELINES=1`** (AnyKyty's default). Our measurements use `0` so that nothing pops
+  in, but then the game freezes whenever a new pipeline compiles.
+- **Don't turn on ray tracing in the game's menu**: it stops with `Insufficient RTGI memory`, and the setting is saved
+  with your game. DarthPotato's 02.002.000 repository has a patch that keeps ray-traced GI off.
+- **A cold first run can commit about 40 GB of memory**: on a machine with less RAM, leave the Windows page file
+  system-managed.
+- **A 1.008 save works on 01.512.000**: our Teshio save from 1.008 loads straight into the world.
+
+Credits: the 1080p sites are shahulmubeen-a's 02.002.000 patch; the quality ladder, its addresses for 01.512.000 and
+02.002.000 and the patch technique are DarthPotato's ([yotei-patches](https://github.com/DarthPotato/yotei-patches),
+CC0). We ported both to 01.512.000 and checked every site with `--verify-patches`.
 
 ## Speed over time
 
@@ -194,7 +281,9 @@ another value has to be configured anew).
 
 For 1080p (recommended), add the patch file [`docs/yotei/yotei-1.008-1080p.toml`](docs/yotei/yotei-1.008-1080p.toml)
 to your relinker command. It is shahulmubeen-a's 1080p patch for 02.002.000, ported to v1.008; this build's relinker
-applies all five of its sites. It is for v1.008 only (app0/eboot.bin md5 `748168945449666277eb772f7a371cbc`).
+applies all five of its sites. It is for v1.008 only (app0/eboot.bin md5 `748168945449666277eb772f7a371cbc`). For 01.512.000 use
+[`docs/yotei/patches/yotei-1.512-1080p.toml`](docs/yotei/patches/yotei-1.512-1080p.toml) instead; the other speed
+settings are in [performance options](#performance-options).
 
 ```
 python tools/unwrap_self.py <dump>/app0/eboot.bin eboot.elf
