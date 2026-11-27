@@ -292,6 +292,7 @@ public:
 private:
 	friend struct BufferCacheTestAccess;
 	friend struct BufferCacheGcTestAccess;
+	friend struct VramBudgetTestAccess;
 	friend struct IndirectDispatchTestAccess;
 	friend class TextureCache;
 
@@ -600,9 +601,11 @@ private:
 	static constexpr size_t                                    WrittenMemoSlots = 1024;
 	std::unique_ptr<std::array<WrittenMemo, WrittenMemoSlots>> m_written_memo =
 	    std::make_unique<std::array<WrittenMemo, WrittenMemoSlots>>();
+	uint64_t m_memory_budget      = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
+	void     UpdateMemoryThresholds(uint64_t budget_bytes);
 	void                                       NoteBufferRegions(const Buffer& buffer, bool insert);
 	void                                       GrowRegionTables(uint64_t region);
 	std::vector<uint32_t>                      m_region_buffer_count;

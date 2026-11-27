@@ -506,10 +506,12 @@ private:
 	std::atomic<uint64_t>                             m_pending_meta_end {0};
 	static constexpr uint32_t                         PendingMetaGranuleBits = 16;
 	std::array<std::atomic<uint64_t>, 64>             m_pending_meta_granules {};
+	uint64_t                                          m_memory_budget      = 0;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
+	void             UpdateMemoryThresholds(uint64_t budget_bytes);
 	uint64_t         m_gc_tick                = 0;
 	std::atomic<uint32_t> m_partial_candidates {0};
 	uint64_t         m_image_set_epoch        = 0;
@@ -530,6 +532,7 @@ private:
 	[[nodiscard]] uint64_t      ImageEpochInRegionUnlocked(uint64_t address, uint64_t size) const;
 
 	friend struct TextureCacheTestAccess;
+	friend struct VramBudgetTestAccess;
 	friend class BufferCache;
 	friend class RenderExecutor;
 	friend class ImageHeap;
