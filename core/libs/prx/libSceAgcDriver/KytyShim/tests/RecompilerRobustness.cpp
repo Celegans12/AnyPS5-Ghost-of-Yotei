@@ -5,11 +5,15 @@
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "spirv/unified1/spirv.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -305,6 +309,252 @@ bool PhiReachability() {
 	return true;
 }
 
+struct MadCase {
+	const char*           name;
+	std::vector<uint32_t> words;
+	bool                  fused;
+};
+
+const std::vector<MadCase> MadCases = {
+    {"v_mac_f32", {0x7e080302u, 0x3e080300u, 0xf8000801u, 0x00000004u, 0xbf810000u}, false},
+    {"v_mad_f32", {0xd5410004u, 0x040a0300u, 0xf8000801u, 0x00000004u, 0xbf810000u}, false},
+    {"v_fmac_f32", {0x7e080302u, 0x56080300u, 0xf8000801u, 0x00000004u, 0xbf810000u}, true},
+    {"v_fma_f32", {0xd54b0004u, 0x040a0300u, 0xf8000801u, 0x00000004u, 0xbf810000u}, true},
+};
+
+struct MadScan {
+	uint32_t fma            = 0;
+	uint32_t product_sums   = 0;
+	uint32_t exact_products = 0;
+	uint32_t output_stores  = 0;
+	uint32_t output_type    = 0;
+	uint32_t f32_type       = 0;
+	size_t   output_store   = 0;
+	size_t   first_function = 0;
+};
+
+MadScan ScanMad(const std::vector<uint32_t>& words) {
+	MadScan                    scan;
+	std::set<uint32_t>         glsl;
+	std::set<uint32_t>         f32_types;
+	std::set<uint32_t>         no_contraction;
+	std::set<uint32_t>         location_zero;
+	std::set<uint32_t>         output_variables;
+	std::map<uint32_t, uint32_t> vector_sizes;
+	std::map<uint32_t, size_t> definitions;
+	std::vector<size_t>       stores;
+	for (size_t offset = 5; offset < words.size();) {
+		const uint32_t count = words[offset] >> 16u;
+		if (count == 0u || count > words.size() - offset) return {};
+		const auto opcode = static_cast<spv::Op>(words[offset] & 0xffffu);
+		if (opcode == spv::OpExtInstImport && count >= 3u &&
+		    std::string_view(reinterpret_cast<const char*>(&words[offset + 2u])).starts_with("GLSL.std.450")) {
+			glsl.insert(words[offset + 1u]);
+		}
+		if (opcode == spv::OpTypeFloat && count >= 3u && words[offset + 2u] == 32u) {
+			f32_types.insert(words[offset + 1u]);
+			scan.f32_type = words[offset + 1u];
+		}
+		if (opcode == spv::OpTypeVector && count >= 4u) vector_sizes.emplace(words[offset + 1u], words[offset + 3u]);
+		if (opcode == spv::OpDecorate && count >= 3u) {
+			if (words[offset + 2u] == spv::DecorationNoContraction) no_contraction.insert(words[offset + 1u]);
+			if (count >= 4u && words[offset + 2u] == spv::DecorationLocation && words[offset + 3u] == 0u) {
+				location_zero.insert(words[offset + 1u]);
+			}
+		}
+		if (opcode == spv::OpVariable && count >= 4u && words[offset + 3u] == spv::StorageClassOutput) {
+			output_variables.insert(words[offset + 2u]);
+		}
+		if (opcode == spv::OpStore && count >= 3u) stores.push_back(offset);
+		if (opcode == spv::OpFunction && scan.first_function == 0u) scan.first_function = offset;
+		if (count >= 3u) {
+			switch (opcode) {
+				case spv::OpBitcast:
+				case spv::OpCopyObject:
+				case spv::OpCompositeConstruct:
+				case spv::OpCompositeExtract:
+				case spv::OpCompositeInsert:
+				case spv::OpVectorShuffle:
+				case spv::OpFNegate:
+				case spv::OpFAdd:
+				case spv::OpFMul:
+				case spv::OpExtInst:
+				case spv::OpLoad:
+				case spv::OpConstantComposite:
+				case spv::OpConstantNull:
+					definitions.emplace(words[offset + 2u], offset);
+					break;
+				default: break;
+			}
+		}
+		offset += count;
+	}
+	uint32_t output = 0u;
+	for (const auto variable: output_variables) {
+		if (!location_zero.contains(variable)) continue;
+		if (output != 0u) return {};
+		output = variable;
+	}
+	if (output == 0u) return scan;
+	for (const auto store: stores) {
+		if (words[store + 1u] != output) continue;
+		++scan.output_stores;
+		scan.output_store = store;
+	}
+	if (scan.output_stores != 1u) return scan;
+	const auto root = words[scan.output_store + 2u];
+	if (const auto found = definitions.find(root); found != definitions.end()) {
+		scan.output_type = words[found->second + 1u];
+	}
+	std::vector<std::pair<uint32_t, uint32_t>> pending {{root, 0u}};
+	std::set<std::pair<uint32_t, uint32_t>>    visited;
+	while (!pending.empty()) {
+		const auto [id, lane] = pending.back();
+		pending.pop_back();
+		if (!visited.insert({id, lane}).second) continue;
+		const auto found = definitions.find(id);
+		if (found == definitions.end()) continue;
+		const auto offset = found->second;
+		const auto count = words[offset] >> 16u;
+		const auto opcode = static_cast<spv::Op>(words[offset] & 0xffffu);
+		if (lane == UINT32_MAX && opcode == spv::OpExtInst && count >= 8u && f32_types.contains(words[offset + 1u]) &&
+		    glsl.contains(words[offset + 3u]) && words[offset + 4u] == 50u) {
+			++scan.fma;
+		}
+		if (lane == UINT32_MAX && opcode == spv::OpFAdd && count >= 5u &&
+		    f32_types.contains(words[offset + 1u])) {
+			for (const auto operand: {words[offset + 3u], words[offset + 4u]}) {
+				const auto product = definitions.find(operand);
+				if (product == definitions.end()) continue;
+				const auto product_offset = product->second;
+				if ((words[product_offset] & 0xffffu) != spv::OpFMul ||
+				    !f32_types.contains(words[product_offset + 1u])) continue;
+				++scan.product_sums;
+				scan.exact_products += no_contraction.contains(operand) && no_contraction.contains(id);
+			}
+		}
+		const auto push = [&](size_t index, uint32_t component) {
+			if (index < count) pending.emplace_back(words[offset + index], component);
+		};
+		switch (opcode) {
+			case spv::OpBitcast:
+			case spv::OpCopyObject:
+			case spv::OpFNegate: push(3u, lane); break;
+			case spv::OpCompositeConstruct:
+				if (lane != UINT32_MAX) push(3u + lane, UINT32_MAX);
+				break;
+			case spv::OpCompositeExtract:
+				if (lane == UINT32_MAX && count == 5u) push(3u, words[offset + 4u]);
+				break;
+			case spv::OpCompositeInsert:
+				if (lane != UINT32_MAX && count == 6u) {
+					if (words[offset + 5u] == lane) push(3u, UINT32_MAX);
+					else push(4u, lane);
+				}
+				break;
+			case spv::OpVectorShuffle:
+				if (lane != UINT32_MAX && 5u + lane < count) {
+					const auto first = definitions.find(words[offset + 3u]);
+					if (first == definitions.end()) break;
+					const auto size = vector_sizes.find(words[first->second + 1u]);
+					if (size == vector_sizes.end()) break;
+					const auto selected = words[offset + 5u + lane];
+					if (selected < size->second) push(3u, selected);
+					else if (selected != UINT32_MAX) push(4u, selected - size->second);
+				}
+				break;
+			case spv::OpFAdd:
+			case spv::OpFMul:
+				push(3u, lane);
+				push(4u, lane);
+				break;
+			case spv::OpExtInst:
+				for (size_t index = 5u; index < count; ++index) push(index, lane);
+				break;
+			default: break;
+		}
+	}
+	return scan;
+}
+
+std::vector<uint32_t> MaskMadOutput(const std::vector<uint32_t>& words, const MadScan& scan) {
+	if (scan.output_stores != 1u || scan.output_type == 0u || scan.first_function == 0u) return {};
+	auto masked = words;
+	const auto replacement = masked[3u]++;
+	masked[scan.output_store + 2u] = replacement;
+	masked.insert(masked.begin() + scan.first_function,
+	              {(3u << 16u) | static_cast<uint32_t>(spv::OpUndef), scan.output_type, replacement});
+	return masked;
+}
+
+std::vector<uint32_t> MaskMadComponent(const std::vector<uint32_t>& words, const MadScan& scan) {
+	if (scan.output_stores != 1u || scan.output_type == 0u || scan.f32_type == 0u ||
+	    scan.first_function == 0u || scan.first_function >= scan.output_store) return {};
+	auto masked = words;
+	const auto source = masked[scan.output_store + 2u];
+	const auto undefined = masked[3u]++;
+	const auto replacement = masked[3u]++;
+	masked[scan.output_store + 2u] = replacement;
+	masked.insert(masked.begin() + scan.first_function,
+	              {(3u << 16u) | static_cast<uint32_t>(spv::OpUndef), scan.f32_type, undefined});
+	masked.insert(masked.begin() + scan.output_store + 3u,
+	              {(6u << 16u) | static_cast<uint32_t>(spv::OpCompositeInsert),
+	               scan.output_type, replacement, undefined, source, 0u});
+	return masked;
+}
+
+bool MadNotFused() {
+	bool ok = true;
+	for (const auto& entry: MadCases) {
+		for (const bool exact: {true, false}) {
+			const std::string what = std::string(entry.name) + (exact ? "" : " with f32_product_no_contraction off");
+			auto profile = KytyFuzz::Profile();
+			profile.f32_product_no_contraction = exact;
+			std::vector<uint32_t> spirv;
+			std::string           refusal;
+			bool                  emitted = false;
+			KytyFuzz::Run(entry.words, 0x04, 0x00, &refusal, &emitted, &profile, &spirv);
+			if (!emitted) {
+				std::printf("mad-not-fused: FAILED, %s did not emit SPIR-V: %s\n", what.c_str(), refusal.c_str());
+				ok = false;
+				continue;
+			}
+			std::string message;
+			if (!KytyFuzz::Valid(spirv, message)) {
+				std::printf("mad-not-fused: FAILED, %s is not valid SPIR-V: %s\n", what.c_str(), message.c_str());
+				ok = false;
+				continue;
+			}
+			const auto scan     = ScanMad(spirv);
+			const bool expected = scan.output_stores == 1u &&
+			                      (entry.fused ? scan.fma == 1u && scan.product_sums == 0u
+			                                   : scan.fma == 0u && scan.product_sums == 1u && scan.exact_products == 1u);
+			if (!expected) {
+				std::printf("mad-not-fused: FAILED, %s: fma=%u product_sums=%u no_contraction_pairs=%u\n", what.c_str(), scan.fma,
+				            scan.product_sums, scan.exact_products);
+				ok = false;
+				continue;
+			}
+			const auto CheckMask = [&](const std::vector<uint32_t>& masked, const char* name) {
+				if (masked.empty() || !KytyFuzz::Valid(masked, message)) {
+					std::printf("mad-not-fused: FAILED, %s %s control is invalid: %s\n", what.c_str(), name, message.c_str());
+					return false;
+				}
+				const auto masked_scan = ScanMad(masked);
+				if (masked_scan.output_stores != 1u || masked_scan.fma != 0u ||
+				    masked_scan.product_sums != 0u || masked_scan.exact_products != 0u) {
+					std::printf("mad-not-fused: FAILED, %s %s dead arithmetic reached the export scan\n", what.c_str(), name);
+					return false;
+				}
+				return true;
+			};
+			ok = CheckMask(MaskMadOutput(spirv, scan), "whole-export") && ok;
+			ok = CheckMask(MaskMadComponent(spirv, scan), "component") && ok;
+		}
+	}
+	return ok;
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -367,6 +617,11 @@ int main(int argc, char** argv) {
 			return 1;
 		}
 		std::printf("%s: ok\n", entry.name);
+	}
+	if (argc < 2 || std::string_view(argv[1]) == "mad-not-fused") {
+		found = true;
+		if (!MadNotFused()) return 1;
+		std::printf("mad-not-fused: ok\n");
 	}
 	if (!found) {
 		std::printf("kyty_shim_recompiler_robustness: unknown case %s\n", argv[1]);
