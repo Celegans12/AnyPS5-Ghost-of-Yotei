@@ -282,9 +282,9 @@ if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
     configure_host_test_executable(kyty_shim_vram_budget_tests)
     target_link_libraries(kyty_shim_vram_budget_tests PRIVATE libSceAgcDriver libkernel libc)
     add_test(NAME kyty_shim_vram_budget COMMAND kyty_shim_vram_budget_tests)
-    set_tests_properties(kyty_shim_vram_budget PROPERTIES TIMEOUT 25 SKIP_RETURN_CODE 77
-            ENVIRONMENT "KYTY_GPU_PIPELINE=0"
-            PASS_REGULAR_EXPRESSION "kyty_shim_vram_budget: ok" FAIL_REGULAR_EXPRESSION "FAILED")
+    add_test(NAME kyty_shim_vram_budget_guest_eviction COMMAND kyty_shim_vram_budget_tests guest-eviction)
+    set_tests_properties(kyty_shim_vram_budget kyty_shim_vram_budget_guest_eviction
+            PROPERTIES TIMEOUT 25 SKIP_RETURN_CODE 77 ENVIRONMENT "KYTY_GPU_PIPELINE=0")
     if(NOT ANYPS5_ENABLE_ASAN)
         target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/IndirectDispatchDimensions.cpp)
         add_test_executable(kyty_shim_indirect_dispatch_dimensions_tests ${CMAKE_CURRENT_SOURCE_DIR}/IndirectDispatchDimensionsMain.cpp)

@@ -50,17 +50,7 @@ constexpr uint64_t GiB          = 1024ull * 1024 * 1024;
 constexpr uint64_t GuestBytes   = 0x20000;
 constexpr int      CpuReadWrite = 0x03;
 
-const char* CheckVramBudget(GraphicContext& graphics, uint64_t address) {
-	VramBudgetTestAccess::SetReportedMemory(graphics, 16 * GiB, 0);
-
-	RenderContext    renderer(graphics);
-	CommandProcessor producer(renderer, 0);
-	producer.Reset();
-	auto& scheduler = renderer.GetCommandScheduler();
-	auto& textures  = renderer.GetTextureCache();
-	auto& buffers   = renderer.GetBufferCache();
-	scheduler.Begin(producer.GetCtx(), producer.GetUcfg(), producer.GetShCtx());
-
+const char* CheckVramBudget(GraphicContext& graphics, TextureCache& textures, BufferCache& buffers) {
 	const auto tex_trigger_large  = VramBudgetTestAccess::TextureTrigger(textures);
 	const auto tex_pressure_large = VramBudgetTestAccess::TexturePressure(textures);
 	const auto tex_critical_large = VramBudgetTestAccess::TextureCritical(textures);
@@ -109,6 +99,15 @@ const char* CheckVramBudget(GraphicContext& graphics, uint64_t address) {
 		return "deleted recyclable image did not enter the recycle pool";
 	}
 
+	VramBudgetTestAccess::SetReportedMemory(graphics, 6 * GiB, 6 * GiB);
+	textures.RunGarbageCollector();
+	if (graphics.RecycledImageCount() != 0) {
+		return "pressure GC pass did not drain the recycled image pool";
+	}
+	return nullptr;
+}
+
+const char* CheckGuestEviction(GraphicContext& graphics, TextureCache& textures, uint64_t address) {
 	ImageInfo info;
 	info.data.address = address;
 	info.pixel_format = vk::Format::eR8G8B8A8Unorm;
@@ -129,55 +128,70 @@ const char* CheckVramBudget(GraphicContext& graphics, uint64_t address) {
 	if (VramBudgetTestAccess::IsImageRegistered(textures, id)) {
 		return "critical memory pressure did not evict a recent unused texture";
 	}
-	if (graphics.RecycledImageCount() != 0) {
-		return "pressure GC pass did not drain the recycled image pool";
-	}
-
-	const auto last = scheduler.CurrentTick();
-	scheduler.Wait(last);
-	scheduler.WaitPriorityOperations(last);
 	return nullptr;
 }
 
+const char* CheckVramCase(GraphicContext& graphics, uint64_t address) {
+	VramBudgetTestAccess::SetReportedMemory(graphics, (address == 0 ? 16 : 6) * GiB, 0);
+
+	RenderContext    renderer(graphics);
+	CommandProcessor producer(renderer, 0);
+	producer.Reset();
+	auto& scheduler = renderer.GetCommandScheduler();
+	auto& textures  = renderer.GetTextureCache();
+	scheduler.Begin(producer.GetCtx(), producer.GetUcfg(), producer.GetShCtx());
+
+	const auto* failure = address == 0 ? CheckVramBudget(graphics, textures, renderer.GetBufferCache())
+	                                  : CheckGuestEviction(graphics, textures, address);
+	const auto last = scheduler.CurrentTick();
+	scheduler.Wait(last);
+	scheduler.WaitPriorityOperations(last);
+	return failure;
 }
 
-extern "C" int RunKytyVramBudgetTest() {
+}
+
+extern "C" int RunKytyVramBudgetTest(bool guest_eviction) {
+	const char* name = guest_eviction ? "kyty_shim_vram_budget_guest_eviction" : "kyty_shim_vram_budget";
 	Common::InitializeThreads();
 	Config::Initialize();
 	Config::Load(Config::ConfigOptions {});
 	KytyShimTests::TestVulkanDevice gpu;
 	if (const auto* unavailable = gpu.Initialize()) {
 		const bool required = std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr;
-		std::fprintf(stderr, "kyty_shim_vram_budget: %s, no usable Vulkan device (%s)\n",
-		             required ? "FAILED" : "skipped", unavailable);
+		std::fprintf(stderr, "%s: %s, no usable Vulkan device (%s)\n",
+		             name, required ? "FAILED" : "skipped", unavailable);
 		return required ? 1 : 77;
 	}
 	if (!gpu.graphics.CreateAllocator()) {
-		std::fputs("kyty_shim_vram_budget: FAILED: could not create the allocator\n", stderr);
+		std::fprintf(stderr, "%s: FAILED: could not create the allocator\n", name);
 		return 1;
 	}
-	void* guest = nullptr;
-	if (sceKernelMapFlexibleMemory(&guest, GuestBytes, CpuReadWrite, 0) != 0 || guest == nullptr) {
-		std::fputs("kyty_shim_vram_budget: FAILED: could not map guest backing\n", stderr);
+
+	uint64_t address = 0;
+	if (guest_eviction) {
+		void* guest = nullptr;
+		if (sceKernelMapFlexibleMemory(&guest, GuestBytes, CpuReadWrite, 0) != 0 || guest == nullptr) {
+			std::fprintf(stderr, "%s: FAILED: could not map guest backing\n", name);
+			return 1;
+		}
+		address = reinterpret_cast<uint64_t>(guest);
+	}
+	const bool invalid_range = guest_eviction && !GuestRange {address, GuestBytes}.Valid();
+	const char* failure = invalid_range ? nullptr : CheckVramCase(gpu.graphics, address);
+	if (guest_eviction && sceKernelMunmap(address, GuestBytes) != 0) {
+		std::fprintf(stderr, "%s: FAILED: could not unmap guest backing\n", name);
 		return 1;
 	}
-	const auto address = reinterpret_cast<uint64_t>(guest);
-	if (!GuestRange {address, GuestBytes}.Valid()) {
-		(void)sceKernelMunmap(address, GuestBytes);
-		const bool required = std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr;
-		std::fprintf(stderr, "kyty_shim_vram_budget: %s, guest range 0x%llx is outside Kyty bounds\n",
-		             required ? "FAILED" : "skipped", static_cast<unsigned long long>(address));
-		return required ? 1 : 77;
-	}
-	const char* failure = CheckVramBudget(gpu.graphics, address);
-	if (sceKernelMunmap(address, GuestBytes) != 0) {
-		std::fputs("kyty_shim_vram_budget: FAILED: could not unmap guest backing\n", stderr);
-		return 1;
+	if (invalid_range) {
+		std::fprintf(stderr, "%s: skipped, guest range 0x%llx is outside Kyty bounds\n",
+		             name, static_cast<unsigned long long>(address));
+		return 77;
 	}
 	if (failure != nullptr) {
-		std::fprintf(stderr, "kyty_shim_vram_budget: FAILED: %s\n", failure);
+		std::fprintf(stderr, "%s: FAILED: %s\n", name, failure);
 		return 1;
 	}
-	std::puts("kyty_shim_vram_budget: ok");
+	std::printf("%s: ok\n", name);
 	return 0;
 }
